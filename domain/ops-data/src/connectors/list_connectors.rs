@@ -100,13 +100,10 @@ mod tests {
     use aruna_runner::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use std::collections::HashMap;
-    use tempfile::tempdir;
 
     #[tokio::test]
     async fn lists_created_connectors() {
-        let tempdir = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let context = DriverContext {
             storage_handle,
             net_handle: None,

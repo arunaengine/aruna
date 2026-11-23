@@ -10,9 +10,8 @@ use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId, 
 use aruna_core::types::Key;
 use aruna_core::user::id::UserId;
 use aruna_runner::driver::{DriverContext, drive};
-use aruna_runner::testing::path_context;
+use aruna_runner::testing::memory_context;
 use ed25519_dalek::SigningKey;
-use tempfile::tempdir;
 use ulid::Ulid;
 
 fn actor(seed: u8) -> Actor {
@@ -97,8 +96,7 @@ fn opened(config: &RealmConfigDocument) -> Vec<Vec<u8>> {
 #[tokio::test]
 async fn stores_profile_entry() {
     // Profile and sealed password land together; a replace without password keeps the entry.
-    let dir = tempdir().unwrap();
-    let ctx = path_context(dir.path().to_str().unwrap());
+    let ctx = memory_context();
     let actor = actor(1);
     seed(&ctx, &actor, RealmNodeKind::Management).await;
 
@@ -149,8 +147,7 @@ async fn stores_profile_entry() {
 
 #[tokio::test]
 async fn refuses_server_node() {
-    let dir = tempdir().unwrap();
-    let ctx = path_context(dir.path().to_str().unwrap());
+    let ctx = memory_context();
     let actor = actor(1);
     seed(&ctx, &actor, RealmNodeKind::Server).await;
     let refused = set(&ctx, &actor, Some(input(None, None))).await;

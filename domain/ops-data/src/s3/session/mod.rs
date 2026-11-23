@@ -252,14 +252,14 @@ mod tests {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::identity::s3_session::SESSION_MAX_TTL;
     use aruna_runner::driver::{DriverContext, drive};
-    use aruna_storage::storage::worker::FjallStorage;
+    use aruna_storage::storage::memory::MemoryStorage;
     use std::time::Duration;
     use tempfile::TempDir;
     use ulid::Ulid;
 
     fn test_context() -> (TempDir, DriverContext) {
         let directory = tempfile::tempdir().unwrap();
-        let storage = FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         (
             directory,
             DriverContext {

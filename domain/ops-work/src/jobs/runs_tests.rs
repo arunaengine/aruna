@@ -103,12 +103,8 @@ fn auth(user_id: UserId, realm_id: RealmId) -> AuthContext {
 
 #[tokio::test]
 async fn run_read_rights() {
-    let temp = tempfile::tempdir().unwrap();
     let context = DriverContext {
-        storage_handle: aruna_storage::storage::worker::FjallStorage::open(
-            temp.path().to_str().unwrap(),
-        )
-        .unwrap(),
+        storage_handle: aruna_storage::storage::memory::MemoryStorage::open(),
         net_handle: None,
         blob_handle: None,
         graph_handle: None,

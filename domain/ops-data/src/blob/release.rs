@@ -1085,7 +1085,7 @@ mod tests {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::format::{EncodingClass, StoredFormat, StoredLayout};
     use aruna_runner::driver::{DriverContext, drive};
-    use aruna_storage::storage::worker::FjallStorage;
+    use aruna_storage::storage::memory::MemoryStorage;
     use std::collections::HashMap;
     use std::time::SystemTime;
     use tempfile::{TempDir, tempdir};
@@ -1225,7 +1225,7 @@ mod tests {
 
     fn setup() -> (TempDir, DriverContext) {
         let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let context = DriverContext {
             storage_handle: storage,
             net_handle: None,

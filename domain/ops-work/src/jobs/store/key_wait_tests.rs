@@ -12,13 +12,12 @@ use aruna_core::structs::storage::encryption::BucketKeyRef;
 use aruna_runner::driver::DriverContext;
 use aruna_storage::scan::iter_prefix_page;
 use aruna_storage::storage::handle::StorageHandle;
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use aruna_test_harness::jobs::{insert_job, read_job_record, read_key_waits};
 
 fn temp_storage() -> (tempfile::TempDir, StorageHandle) {
     let dir = tempfile::tempdir().expect("temp dir");
-    let storage =
-        FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+    let storage = MemoryStorage::open();
     (dir, storage)
 }
 

@@ -1033,9 +1033,7 @@ pub mod test {
 
     #[tokio::test]
     pub async fn test_add_user() {
-        let random_path = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let net_handle = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -1133,8 +1131,7 @@ pub mod test {
 
     async fn add_context() -> (DriverContext, NetHandle, TempDir) {
         let random_path = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let net_handle = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),

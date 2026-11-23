@@ -64,8 +64,7 @@ use aruna_core::types::Key;
 use aruna_core::types::Value;
 use aruna_ops_identity::placement::policy::subject::{SubjectScanError, SubjectScanResult};
 use aruna_runner::driver::{DriverContext, drive, node_facts};
-use aruna_storage::storage::worker::FjallStorage;
-use tempfile::tempdir;
+use aruna_storage::storage::memory::MemoryStorage;
 use ulid::Ulid;
 
 fn node(seed: u8) -> NodeId {
@@ -169,9 +168,9 @@ async fn demand_snapshot(ctx: &DriverContext) -> ComputeDemandSnapshot {
         .unwrap()
 }
 
-fn test_ctx(root: &str) -> DriverContext {
+fn test_ctx() -> DriverContext {
     DriverContext {
-        storage_handle: FjallStorage::open(root).unwrap(),
+        storage_handle: MemoryStorage::open(),
         net_handle: None,
         blob_handle: None,
         graph_handle: None,
@@ -274,8 +273,7 @@ fn device_advertises_nothing() {
 
 #[tokio::test]
 async fn device_seeds_empty() {
-    let dir = tempdir().unwrap();
-    let ctx = test_ctx(dir.path().to_str().unwrap());
+    let ctx = test_ctx();
     let realm_id = RealmId::from_bytes([9u8; 32]);
     let local = node(1);
     let mut config = realm_config(realm_id, &[local]);
@@ -311,8 +309,7 @@ async fn device_seeds_empty() {
 async fn device_publishes_locally() {
     // A device heartbeat revises the stored document but queues no outbox
     // row: it holds no topic the row could ever be published into.
-    let dir = tempdir().unwrap();
-    let ctx = test_ctx(dir.path().to_str().unwrap());
+    let ctx = test_ctx();
     let realm_id = RealmId::from_bytes([3u8; 32]);
     let local = node(1);
     let mut config = realm_config(realm_id, &[node(2)]);
@@ -345,8 +342,7 @@ async fn device_publishes_locally() {
 
 #[tokio::test]
 async fn seed_writes_document() {
-    let dir = tempdir().unwrap();
-    let ctx = test_ctx(dir.path().to_str().unwrap());
+    let ctx = test_ctx();
     let realm_id = RealmId::from_bytes([1u8; 32]);
     let local = node(1);
     let mut config = realm_config(realm_id, &[local]);
@@ -385,8 +381,7 @@ async fn seed_writes_document() {
 
 #[tokio::test]
 async fn publish_queues_labels() {
-    let dir = tempdir().unwrap();
-    let ctx = test_ctx(dir.path().to_str().unwrap());
+    let ctx = test_ctx();
     let realm_id = RealmId::from_bytes([2u8; 32]);
     let local = node(1);
     let mut config = realm_config(realm_id, &[local, node(2)]);
@@ -446,8 +441,7 @@ async fn publish_queues_labels() {
 
 #[tokio::test]
 async fn heartbeat_refreshes_labels() {
-    let dir = tempdir().unwrap();
-    let ctx = test_ctx(dir.path().to_str().unwrap());
+    let ctx = test_ctx();
     let realm_id = RealmId::from_bytes([3u8; 32]);
     let local = node(1);
     let mut config = realm_config(realm_id, &[local]);
@@ -517,8 +511,7 @@ async fn heartbeat_refreshes_labels() {
 
 #[tokio::test]
 async fn unseeded_heartbeat_noop() {
-    let dir = tempdir().unwrap();
-    let ctx = test_ctx(dir.path().to_str().unwrap());
+    let ctx = test_ctx();
     let realm_id = RealmId::from_bytes([4u8; 32]);
     let local = node(1);
     write_realm_config(&ctx, &realm_config(realm_id, &[local])).await;
@@ -585,8 +578,7 @@ async fn write_registry(ctx: &DriverContext, record: &MetadataRegistryRecord) {
 #[tokio::test]
 async fn counts_held_documents() {
     // Records whose placement bucket the node holds, plus NIL placements, count.
-    let dir = tempdir().unwrap();
-    let ctx = test_ctx(dir.path().to_str().unwrap());
+    let ctx = test_ctx();
     let realm_id = RealmId::from_bytes([7u8; 32]);
     let local = node(1);
     let config = sharded_config(realm_id);
@@ -783,8 +775,7 @@ async fn write_row(ctx: &DriverContext, key_space: &str, key: Key, value: Vec<u8
 async fn publishes_separate_snapshots() {
     // Logical demand and physical reservation are different controls: a
     // terminal family leaves demand while its node still reserves capacity.
-    let dir = tempdir().unwrap();
-    let ctx = test_ctx(dir.path().to_str().unwrap());
+    let ctx = test_ctx();
     let realm_id = RealmId::from_bytes([9u8; 32]);
     let local = node(1);
     write_realm_config(&ctx, &realm_config(realm_id, &[local])).await;
@@ -870,8 +861,7 @@ fn held_demand(node_id: NodeId, group_id: Ulid, families: Vec<DemandFamily>) -> 
 async fn merges_group_demand() {
     // Shared families count once, non-members stop counting, and a member
     // without a fresh heartbeat leaves the view understated.
-    let dir = tempdir().unwrap();
-    let ctx = test_ctx(dir.path().to_str().unwrap());
+    let ctx = test_ctx();
     let realm_id = RealmId::from_bytes([12u8; 32]);
     let local = node(1);
     let peer = node(2);
@@ -920,8 +910,7 @@ async fn merges_group_demand() {
 #[tokio::test]
 async fn ignores_user_devices() {
     // A user device sends no heartbeat, so it must not leave the view understated.
-    let dir = tempdir().unwrap();
-    let ctx = test_ctx(dir.path().to_str().unwrap());
+    let ctx = test_ctx();
     let realm_id = RealmId::from_bytes([15u8; 32]);
     let local = node(1);
     let mut config = realm_config(realm_id, &[local]);
@@ -947,8 +936,7 @@ async fn ignores_user_devices() {
 async fn departure_stops_offers() {
     // Departure revokes future eligibility and reports what it could not
     // resolve, without deleting a reservation or blocking removal.
-    let dir = tempdir().unwrap();
-    let ctx = test_ctx(dir.path().to_str().unwrap());
+    let ctx = test_ctx();
     let realm_id = RealmId::from_bytes([10u8; 32]);
     let local = node(1);
     write_realm_config(&ctx, &realm_config(realm_id, &[local])).await;
@@ -1000,8 +988,7 @@ async fn departure_stops_offers() {
 async fn removal_revokes_eligibility() {
     // A node the realm no longer places learns of its removal through config
     // sync. It stops offering execution without ending a receipted one.
-    let dir = tempdir().unwrap();
-    let ctx = test_ctx(dir.path().to_str().unwrap());
+    let ctx = test_ctx();
     let realm_id = RealmId::from_bytes([13u8; 32]);
     let local = node(1);
     let mut config = realm_config(realm_id, &[local]);
@@ -1054,8 +1041,7 @@ async fn removal_revokes_eligibility() {
 
 #[tokio::test]
 async fn rejoin_clears_departure() {
-    let dir = tempdir().unwrap();
-    let ctx = test_ctx(dir.path().to_str().unwrap());
+    let ctx = test_ctx();
     let realm_id = RealmId::from_bytes([11u8; 32]);
     let local = node(1);
     write_realm_config(&ctx, &realm_config(realm_id, &[local])).await;
@@ -1091,8 +1077,7 @@ async fn rejoin_clears_departure() {
 async fn drain_survives_placement() {
     // An operator drain must outlive a return-to-placement observation:
     // otherwise the very next placement sync silently undrains the node.
-    let dir = tempdir().unwrap();
-    let ctx = test_ctx(dir.path().to_str().unwrap());
+    let ctx = test_ctx();
     let realm_id = RealmId::from_bytes([8u8; 32]);
     let local = node(1);
     write_realm_config(&ctx, &realm_config(realm_id, &[local])).await;
@@ -1149,8 +1134,7 @@ fn indexed_family(index: usize) -> JobFamilyId {
 async fn truncates_busy_group() {
     // A group that overflows the shared family budget is flagged alone: a
     // quiet group keeps a complete view and admits normally.
-    let dir = tempdir().unwrap();
-    let ctx = test_ctx(dir.path().to_str().unwrap());
+    let ctx = test_ctx();
     let realm_id = RealmId::from_bytes([14u8; 32]);
     let busy = Ulid::from_bytes([1u8; 16]);
     let quiet = Ulid::from_bytes([2u8; 16]);
@@ -1182,8 +1166,7 @@ async fn truncates_busy_group() {
 async fn heartbeat_keeps_drain() {
     // A drain recorded while the heartbeat scans must survive its write, and
     // the heartbeat must never undrain a node on its own.
-    let dir = tempdir().unwrap();
-    let ctx = test_ctx(dir.path().to_str().unwrap());
+    let ctx = test_ctx();
     let realm_id = RealmId::from_bytes([16u8; 32]);
     let local = node(1);
     write_realm_config(&ctx, &realm_config(realm_id, &[local])).await;
@@ -1217,8 +1200,7 @@ async fn heartbeat_keeps_drain() {
 
 #[tokio::test]
 async fn heartbeat_keeps_departure() {
-    let dir = tempdir().unwrap();
-    let ctx = test_ctx(dir.path().to_str().unwrap());
+    let ctx = test_ctx();
     let realm_id = RealmId::from_bytes([17u8; 32]);
     let local = node(1);
     write_realm_config(&ctx, &realm_config(realm_id, &[local])).await;
@@ -1248,8 +1230,7 @@ async fn heartbeat_keeps_departure() {
 
 #[tokio::test]
 async fn heartbeat_populates_utilization() {
-    let dir = tempdir().unwrap();
-    let ctx = test_ctx(dir.path().to_str().unwrap());
+    let ctx = test_ctx();
     let realm_id = RealmId::from_bytes([8u8; 32]);
     let local = node(1);
     write_realm_config(&ctx, &realm_config(realm_id, &[local])).await;
@@ -1278,8 +1259,7 @@ async fn heartbeat_populates_utilization() {
 /// revision is published by the next tick without a new revision, then cleared.
 #[tokio::test]
 async fn unchanged_skips_publish() {
-    let dir = tempdir().unwrap();
-    let ctx = test_ctx(dir.path().to_str().unwrap());
+    let ctx = test_ctx();
     let realm_id = RealmId::from_bytes([18u8; 32]);
     let local = node(1);
     write_realm_config(&ctx, &realm_config(realm_id, &[local])).await;

@@ -1191,7 +1191,7 @@ mod tests {
     use aruna_core::structs::storage::replication::VersionedObjectArn;
     use aruna_core::user::id::UserId;
     use aruna_runner::driver::{DriverContext, drive};
-    use aruna_storage::storage::worker::FjallStorage;
+    use aruna_storage::storage::memory::MemoryStorage;
     use std::sync::Arc;
     use std::time::SystemTime;
 
@@ -1283,7 +1283,7 @@ mod tests {
     /// policy: the same state an S3 request of the same shape is judged against.
     async fn policy_fixture(expression: Option<&str>) -> PolicyFixture {
         let dir = tempfile::tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let realm_id = RealmId::from_bytes([4u8; 32]);
         let user_id = UserId::local(Ulid::from_bytes([5; 16]), realm_id);
         let group_id = Ulid::from_bytes([6; 16]);

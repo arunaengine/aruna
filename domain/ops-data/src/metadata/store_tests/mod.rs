@@ -14,7 +14,7 @@ use aruna_rdf_graph::GraphHandle;
 use aruna_runner::driver::DriverContext;
 use aruna_runner::testing::send_metadata_effect;
 use aruna_storage::storage::handle::StorageHandle;
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use aruna_test_harness::metadata::export_rocrate_jsonld;
 use tempfile::{TempDir, tempdir};
 use ulid::Ulid;

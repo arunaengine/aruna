@@ -524,7 +524,7 @@ mod tests {
     use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_runner::driver::{DriverContext, drive};
     use aruna_scheduler::TaskHandle;
-    use aruna_storage::storage::worker::FjallStorage;
+    use aruna_storage::storage::memory::MemoryStorage;
     use axum::extract::State;
     use axum::routing::{get, post};
     use axum::{Form, Json, Router};
@@ -743,7 +743,7 @@ mod tests {
 
     async fn spawn_test_node(provider: OidcProviderConfig, claim_admin: bool) -> TestNode {
         let temp_dir = tempfile::tempdir().unwrap();
-        let storage = FjallStorage::open(temp_dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let net = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),

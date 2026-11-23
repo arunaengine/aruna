@@ -676,8 +676,7 @@ mod tests {
 
     async fn setup_finalize_fixture() -> FinalizeFixture {
         let tempdir = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let context = Arc::new(DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,
@@ -1343,9 +1342,7 @@ mod tests {
 
     #[tokio::test]
     async fn emit_warns_absent() {
-        let tempdir = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let context = DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,

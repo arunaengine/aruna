@@ -6,7 +6,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_runner::driver::DriverContext;
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use tempfile::{TempDir, tempdir};
 use ulid::Ulid;
 
@@ -19,7 +19,7 @@ use aruna_core::types::{Key, TxnId, Value};
 
 pub(crate) async fn context() -> (TempDir, DriverContext) {
     let directory = tempdir().unwrap();
-    let storage = FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     (
         directory,
         DriverContext {

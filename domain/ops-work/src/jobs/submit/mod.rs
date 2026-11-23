@@ -566,10 +566,9 @@ mod tests {
     use aruna_runner::driver::{DriverContext, drive};
     use aruna_scheduler::TaskHandle;
     use aruna_storage::storage::handle::StorageHandle;
-    use aruna_storage::storage::worker::FjallStorage;
+    use aruna_storage::storage::memory::MemoryStorage;
     use aruna_test_harness::jobs::read_job_record;
     use byteview::ByteView;
-    use tempfile::tempdir;
     use ulid::Ulid;
 
     fn node_id(seed: u8) -> NodeId {
@@ -765,8 +764,7 @@ mod tests {
 
     #[tokio::test]
     async fn existing_bucket_persisted() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let ctx = context(storage.clone());
         let submission = SubmitJobSpec {
             payload: execution_payload(),
@@ -787,8 +785,7 @@ mod tests {
 
     #[tokio::test]
     async fn retention_is_stored() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let ctx = context(storage.clone());
         let mut submission = spec(None);
         submission.retention_ms = 42;
@@ -804,8 +801,7 @@ mod tests {
 
     #[tokio::test]
     async fn existing_dedup_stable() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let ctx = context(storage);
         let submission = SubmitJobSpec {
             payload: execution_payload(),
@@ -842,8 +838,7 @@ mod tests {
     #[tokio::test]
     async fn records_source_run() {
         use aruna_core::structs::execution::harvest::{HarvestJobSpec, HarvestSelector};
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let ctx = context(storage.clone());
         let source = HarvestSource::new(
             Ulid::from_bytes([6u8; 16]),
@@ -894,8 +889,7 @@ mod tests {
 
     #[tokio::test]
     async fn records_import_run() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let ctx = context(storage.clone());
         let base = spec(None);
         let rule = BackendImport {
@@ -968,8 +962,7 @@ mod tests {
 
     #[tokio::test]
     async fn submit_creates_job() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let ctx = context(storage.clone());
 
         let result = drive(operation(spec(None)), &ctx)
@@ -989,8 +982,7 @@ mod tests {
 
     #[tokio::test]
     async fn dedup_returns_existing() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let ctx = context(storage.clone());
 
         let first = drive(operation(spec(Some(b"k".to_vec()))), &ctx)
@@ -1010,8 +1002,7 @@ mod tests {
 
     #[tokio::test]
     async fn rocrate_cap_enforced() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let ctx = context(storage.clone());
         let mut first = rocrate_spec(1, None);
         seed_upload(&ctx, &mut first, 3, u64::MAX).await;
@@ -1055,8 +1046,7 @@ mod tests {
     async fn claims_upload_atomically() {
         // An upload-backed import claims its upload in the creating transaction, so the job
         // keeps it across expiry; a refused claim leaves no job or dedup row behind.
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let ctx = context(storage.clone());
         let mut first = rocrate_spec(4, Some(b"first".to_vec()));
         let upload_id = seed_upload(&ctx, &mut first, 3, 2_000).await;
@@ -1097,8 +1087,7 @@ mod tests {
 
     #[tokio::test]
     async fn rocrate_dedup_first() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let ctx = context(storage.clone());
         let mut submission = rocrate_spec(1, Some(b"import".to_vec()));
         seed_upload(&ctx, &mut submission, 3, u64::MAX).await;
@@ -1141,8 +1130,7 @@ mod tests {
     // Equal logical keys from different owners must not share a dedup row.
     #[tokio::test]
     async fn dedup_scoped() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let ctx = context(storage.clone());
 
         let first = drive(operation(spec(Some(b"k".to_vec()))), &ctx)
@@ -1161,8 +1149,7 @@ mod tests {
     // Same idempotency key + a different plan is a JobPlanConflict, not a silent reuse.
     #[tokio::test]
     async fn dedup_plan_conflict() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let ctx = context(storage.clone());
 
         let mut first_spec = spec(Some(b"k".to_vec()));
@@ -1195,8 +1182,7 @@ mod tests {
     // non-persisted drain kick.
     #[tokio::test]
     async fn submit_writes_once() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let ctx = context(storage.clone());
 
         let before = storage.snapshot_metrics().requests_total;
@@ -1218,8 +1204,7 @@ mod tests {
     // A dedup row left dangling by a quarantined record must not ghost future submits.
     #[tokio::test]
     async fn ghost_dedup_heals() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let ctx = context(storage.clone());
         let ghost = JobId::from_bytes([9u8; 16]);
         let submission = spec(Some(b"k".to_vec()));
@@ -1248,8 +1233,7 @@ mod tests {
     // a plan conflict against a job that no longer exists.
     #[tokio::test]
     async fn ghost_conflict_heals() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let ctx = context(storage.clone());
         let ghost = JobId::from_bytes([9u8; 16]);
         let submission = spec(Some(b"k".to_vec()));
@@ -1278,8 +1262,7 @@ mod tests {
     // Same when the record row still exists but no longer decodes.
     #[tokio::test]
     async fn corrupt_dedup_heals() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let ctx = context(storage.clone());
         let ghost = JobId::from_bytes([9u8; 16]);
         let submission = spec(Some(b"k".to_vec()));
@@ -1313,8 +1296,7 @@ mod tests {
 
     #[tokio::test]
     async fn dedup_after_terminal() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let ctx = context(storage.clone());
 
         let first = drive(operation(spec(Some(b"k".to_vec()))), &ctx)

@@ -111,10 +111,7 @@ impl InboundEventHandler for RecordingEvictedHandler {
 
 async fn eviction_test_service() -> (TempDir, Arc<DocumentSyncService>) {
     let dir = tempfile::tempdir().expect("eviction service tempdir");
-    let storage = aruna_storage::storage::worker::FjallStorage::open(
-        dir.path().join("storage").to_str().expect("utf-8 path"),
-    )
-    .expect("storage opens");
+    let storage = aruna_storage::storage::memory::MemoryStorage::open();
     let endpoint = Endpoint::builder(presets::Minimal)
         .secret_key(iroh::SecretKey::from_bytes(&[123u8; 32]))
         .relay_mode(iroh::RelayMode::Disabled)
@@ -511,14 +508,7 @@ fn invalid_announcement_timing() {
 
 #[tokio::test]
 async fn net_handle_creates() -> Result<()> {
-    let temp_dir = tempfile::tempdir().map_err(|e| NetError::Io(e.to_string()))?;
-    let storage = aruna_storage::storage::worker::FjallStorage::open(
-        temp_dir
-            .path()
-            .to_str()
-            .ok_or_else(|| NetError::Io("Invalid temp path".to_string()))?,
-    )
-    .map_err(|e| NetError::Io(e.to_string()))?;
+    let storage = aruna_storage::storage::memory::MemoryStorage::open();
 
     let config = NetConfig {
         discovery_method: DiscoveryMethod::None,
@@ -544,13 +534,7 @@ async fn net_handle_creates() -> Result<()> {
 
 async fn notification_wake_handle() -> Result<(TempDir, NetHandle)> {
     let temp_dir = tempfile::tempdir().map_err(|e| NetError::Io(e.to_string()))?;
-    let storage = aruna_storage::storage::worker::FjallStorage::open(
-        temp_dir
-            .path()
-            .to_str()
-            .ok_or_else(|| NetError::Io("Invalid temp path".to_string()))?,
-    )
-    .map_err(|e| NetError::Io(e.to_string()))?;
+    let storage = aruna_storage::storage::memory::MemoryStorage::open();
     let config = NetConfig {
         discovery_method: DiscoveryMethod::None,
         relay_method: RelayMethod::None,
@@ -604,22 +588,8 @@ async fn dashboard_wake_arrives() -> Result<()> {
 
 #[tokio::test]
 async fn endpoint_only_unauthorized() -> Result<()> {
-    let temp_a = tempfile::tempdir().map_err(|e| NetError::Io(e.to_string()))?;
-    let temp_b = tempfile::tempdir().map_err(|e| NetError::Io(e.to_string()))?;
-    let storage_a = aruna_storage::storage::worker::FjallStorage::open(
-        temp_a
-            .path()
-            .to_str()
-            .ok_or_else(|| NetError::Io("Invalid temp path".to_string()))?,
-    )
-    .map_err(|e| NetError::Io(e.to_string()))?;
-    let storage_b = aruna_storage::storage::worker::FjallStorage::open(
-        temp_b
-            .path()
-            .to_str()
-            .ok_or_else(|| NetError::Io("Invalid temp path".to_string()))?,
-    )
-    .map_err(|e| NetError::Io(e.to_string()))?;
+    let storage_a = aruna_storage::storage::memory::MemoryStorage::open();
+    let storage_b = aruna_storage::storage::memory::MemoryStorage::open();
     let peer = NetHandle::new(
         NetConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -692,13 +662,7 @@ impl InboundEventHandler for HoldingInboundHandler {
 
 pub(crate) async fn test_net_handle() -> Result<(NetHandle, TempDir)> {
     let temp_dir = tempfile::tempdir().map_err(|e| NetError::Io(e.to_string()))?;
-    let storage = aruna_storage::storage::worker::FjallStorage::open(
-        temp_dir
-            .path()
-            .to_str()
-            .ok_or_else(|| NetError::Io("Invalid temp path".to_string()))?,
-    )
-    .map_err(|e| NetError::Io(e.to_string()))?;
+    let storage = aruna_storage::storage::memory::MemoryStorage::open();
     let handle = NetHandle::new(
         NetConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -1172,14 +1136,7 @@ async fn repeat_shutdown_joins() -> Result<()> {
 
 #[tokio::test]
 async fn peer_warnings() -> Result<()> {
-    let temp_dir = tempfile::tempdir().map_err(|e| NetError::Io(e.to_string()))?;
-    let storage = aruna_storage::storage::worker::FjallStorage::open(
-        temp_dir
-            .path()
-            .to_str()
-            .ok_or_else(|| NetError::Io("Invalid temp path".to_string()))?,
-    )
-    .map_err(|e| NetError::Io(e.to_string()))?;
+    let storage = aruna_storage::storage::memory::MemoryStorage::open();
     let missing_peer = iroh::SecretKey::from_bytes(&[99u8; 32]).public();
     let handle = NetHandle::new(
         NetConfig {

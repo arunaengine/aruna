@@ -123,7 +123,7 @@ mod tests {
     use aruna_p2p::NetHandle;
     use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_runner::driver::{DriverContext, drive};
-    use aruna_storage::storage::worker::FjallStorage;
+    use aruna_storage::storage::memory::MemoryStorage;
     use std::sync::Arc;
     use tempfile::TempDir;
     use ulid::Ulid;
@@ -177,8 +177,7 @@ mod tests {
 
     async fn spawn_context() -> (TempDir, Arc<DriverContext>) {
         let dir = tempfile::tempdir().expect("temp dir");
-        let storage =
-            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let storage = MemoryStorage::open();
         let net = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().expect("bind addr"),

@@ -318,8 +318,7 @@ mod tests {
     use aruna_core::types::Key;
     use aruna_core::user::id::UserId;
     use aruna_runner::driver::{DriverContext, drive};
-    use aruna_runner::testing::path_context;
-    use tempfile::tempdir;
+    use aruna_runner::testing::memory_context;
     use ulid::Ulid;
 
     fn actor(realm_id: RealmId) -> Actor {
@@ -371,8 +370,7 @@ mod tests {
     #[tokio::test]
     async fn stores_portal_features() {
         // A later config read must see the map, or portals would keep the old defaults.
-        let dir = tempdir().unwrap();
-        let ctx = path_context(dir.path().to_str().unwrap());
+        let ctx = memory_context();
         let actor = actor(RealmId::from_bytes([1u8; 32]));
         seed(&ctx, &actor).await;
 
@@ -392,8 +390,7 @@ mod tests {
 
     #[tokio::test]
     async fn refuses_invalid_names() {
-        let dir = tempdir().unwrap();
-        let ctx = path_context(dir.path().to_str().unwrap());
+        let ctx = memory_context();
         let actor = actor(RealmId::from_bytes([1u8; 32]));
         seed(&ctx, &actor).await;
 

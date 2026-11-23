@@ -21,7 +21,7 @@ use aruna_core::storage_entries::{
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_runner::driver::{DriverContext, drive};
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 
 const OLDER: Ulid = Ulid::from_parts(1, 10);
 
@@ -101,7 +101,7 @@ async fn stored(
     captured: bool,
 ) -> (tempfile::TempDir, DriverContext) {
     let directory = tempfile::tempdir().unwrap();
-    let storage = FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let mut writes = vec![
         create_event_entry(event).unwrap(),
         materialization_status_entry(status).unwrap(),

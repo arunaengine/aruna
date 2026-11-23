@@ -187,7 +187,6 @@ mod tests {
     use aruna_storage::storage;
     use byteview::ByteView;
     use ed25519_dalek::SigningKey;
-    use tempfile::tempdir;
     use ulid::Ulid;
 
     #[test]
@@ -257,9 +256,7 @@ mod tests {
 
     #[tokio::test]
     async fn ticket_discovery_paginates() {
-        let tempdir = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let context = DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,

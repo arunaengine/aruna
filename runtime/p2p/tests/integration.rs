@@ -18,7 +18,7 @@ use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_p2p::error::NetError;
 use aruna_p2p::streams::BiStream;
 use aruna_p2p::{InboundEventHandler, NetHandle};
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use async_trait::async_trait;
 use byteview::ByteView;
 use iroh::endpoint::ReadToEndError;
@@ -86,7 +86,7 @@ impl InboundEventHandler for TestInboundHandler {
 /// A single-node handle for the in-process loopback tests.
 async fn local_handle() -> Result<(NetHandle, tempfile::TempDir), Box<dyn std::error::Error>> {
     let dir = tempdir()?;
-    let storage = FjallStorage::open(dir.path().to_str().ok_or("invalid temp path")?)?;
+    let storage = MemoryStorage::open();
     let handle = NetHandle::new(
         NetConfig {
             bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
@@ -132,8 +132,7 @@ impl InboundEventHandler for HoldingInboundHandler {
 
 #[tokio::test]
 async fn storage_iter_pagination() -> Result<(), Box<dyn std::error::Error>> {
-    let temp_dir = tempdir()?;
-    let storage = FjallStorage::open(temp_dir.path().to_str().ok_or("invalid temp path")?)?;
+    let storage = MemoryStorage::open();
 
     for (k, v) in [
         (b"a1", b"v1"),
@@ -201,10 +200,8 @@ async fn storage_iter_pagination() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn dht_put_get() -> Result<(), Box<dyn std::error::Error>> {
-    let temp_a = tempdir()?;
-    let temp_b = tempdir()?;
-    let storage_a = FjallStorage::open(temp_a.path().to_str().ok_or("invalid temp path")?)?;
-    let storage_b = FjallStorage::open(temp_b.path().to_str().ok_or("invalid temp path")?)?;
+    let storage_a = MemoryStorage::open();
+    let storage_b = MemoryStorage::open();
 
     let cfg = || NetConfig {
         bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
@@ -281,12 +278,9 @@ async fn dht_fallback() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn dht_fallback_inner() -> Result<(), Box<dyn std::error::Error>> {
-    let temp_a = tempdir()?;
-    let temp_b = tempdir()?;
-    let temp_c = tempdir()?;
-    let storage_a = FjallStorage::open(temp_a.path().to_str().ok_or("invalid temp path")?)?;
-    let storage_b = FjallStorage::open(temp_b.path().to_str().ok_or("invalid temp path")?)?;
-    let storage_c = FjallStorage::open(temp_c.path().to_str().ok_or("invalid temp path")?)?;
+    let storage_a = MemoryStorage::open();
+    let storage_b = MemoryStorage::open();
+    let storage_c = MemoryStorage::open();
 
     let secret_a = iroh::SecretKey::from_bytes(&[61u8; 32]);
     let secret_b = iroh::SecretKey::from_bytes(&[62u8; 32]);
@@ -360,10 +354,8 @@ async fn dht_fallback_inner() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn stream_send_receive() -> Result<(), Box<dyn std::error::Error>> {
-    let temp_a = tempdir()?;
-    let temp_b = tempdir()?;
-    let storage_a = FjallStorage::open(temp_a.path().to_str().ok_or("invalid temp path")?)?;
-    let storage_b = FjallStorage::open(temp_b.path().to_str().ok_or("invalid temp path")?)?;
+    let storage_a = MemoryStorage::open();
+    let storage_b = MemoryStorage::open();
 
     let cfg = || NetConfig {
         bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
@@ -609,10 +601,8 @@ async fn loopback_stream_bounds() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn rejects_internal_alpn() -> Result<(), Box<dyn std::error::Error>> {
-    let temp_a = tempdir()?;
-    let temp_b = tempdir()?;
-    let storage_a = FjallStorage::open(temp_a.path().to_str().ok_or("invalid temp path")?)?;
-    let storage_b = FjallStorage::open(temp_b.path().to_str().ok_or("invalid temp path")?)?;
+    let storage_a = MemoryStorage::open();
+    let storage_b = MemoryStorage::open();
 
     let cfg = || NetConfig {
         bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
@@ -642,12 +632,9 @@ async fn rejects_internal_alpn() -> Result<(), Box<dyn std::error::Error>> {
 async fn offline_peer_bounded() -> Result<(), Box<dyn std::error::Error>> {
     // Repeated requests to a peer that went away must not repay a dial each
     // time, and the peer must become reachable again once its address returns.
-    let temp_a = tempdir()?;
-    let temp_b = tempdir()?;
-    let temp_c = tempdir()?;
-    let storage_a = FjallStorage::open(temp_a.path().to_str().ok_or("invalid temp path")?)?;
-    let storage_b = FjallStorage::open(temp_b.path().to_str().ok_or("invalid temp path")?)?;
-    let storage_c = FjallStorage::open(temp_c.path().to_str().ok_or("invalid temp path")?)?;
+    let storage_a = MemoryStorage::open();
+    let storage_b = MemoryStorage::open();
+    let storage_c = MemoryStorage::open();
 
     let secret_b = iroh::SecretKey::from_bytes(&[71u8; 32]);
     let node_b = secret_b.public();
@@ -734,10 +721,10 @@ async fn setup_realm() -> Result<RealmFixture, Box<dyn std::error::Error>> {
     let temp_a = tempdir()?;
     let temp_b = tempdir()?;
     let temp_c = tempdir()?;
-    let storage_a = FjallStorage::open(temp_a.path().to_str().ok_or("invalid temp path")?)?;
-    let storage_b = FjallStorage::open(temp_b.path().to_str().ok_or("invalid temp path")?)?;
+    let storage_a = MemoryStorage::open();
+    let storage_b = MemoryStorage::open();
     let b_storage = storage_b.clone();
-    let storage_c = FjallStorage::open(temp_c.path().to_str().ok_or("invalid temp path")?)?;
+    let storage_c = MemoryStorage::open();
     let secret_a = iroh::SecretKey::from_bytes(&[72u8; 32]);
     let b_secret = iroh::SecretKey::from_bytes(&[73u8; 32]);
     let secret_c = iroh::SecretKey::from_bytes(&[74u8; 32]);

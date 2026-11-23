@@ -39,7 +39,7 @@ use aruna_core::structs::sync_relationship::{
 };
 use aruna_core::user::id::UserId;
 use aruna_runner::driver::{DriverContext, drive};
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use std::time::SystemTime;
 use ulid::Ulid;
 
@@ -77,7 +77,7 @@ fn policy(expression: &str) -> RequestPolicy {
 
 async fn setup_auth(expression: Option<&str>) -> (tempfile::TempDir, DriverContext) {
     let tempdir = tempfile::tempdir().unwrap();
-    let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let context = DriverContext {
         storage_handle: storage.clone(),
         net_handle: None,
@@ -168,7 +168,7 @@ async fn setup_auth(expression: Option<&str>) -> (tempfile::TempDir, DriverConte
 
 fn storage_context() -> (tempfile::TempDir, DriverContext) {
     let tempdir = tempfile::tempdir().unwrap();
-    let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let context = DriverContext {
         storage_handle: storage,
         net_handle: None,
@@ -429,8 +429,7 @@ fn serving_changes_identity() {
 
 #[tokio::test]
 async fn delete_supersedes_reconcile() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let context = DriverContext {
         storage_handle: storage.clone(),
         net_handle: None,
@@ -464,8 +463,7 @@ async fn delete_supersedes_reconcile() {
 
 #[tokio::test]
 async fn delete_blocks_status() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let context = DriverContext {
         storage_handle: storage,
         net_handle: None,
@@ -500,8 +498,7 @@ async fn delete_blocks_status() {
 
 #[tokio::test]
 async fn status_stages_reconcile() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let context = DriverContext {
         storage_handle: storage.clone(),
         net_handle: None,
@@ -611,8 +608,7 @@ async fn failure_needs_commit() {
     assert!(!store_status(&context, &detached).await.unwrap());
     assert!(journaled(&context).await.is_empty());
 
-    let tempdir = tempfile::tempdir().unwrap();
-    let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let context = DriverContext {
         storage_handle: storage,
         net_handle: None,
@@ -631,8 +627,7 @@ async fn failure_needs_commit() {
 
 #[tokio::test]
 async fn status_stays_handling() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let context = DriverContext {
         storage_handle: storage,
         net_handle: None,

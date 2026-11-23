@@ -1020,11 +1020,7 @@ mod tests {
     async fn sole_holder_local() {
         let dir = tempfile::tempdir().expect("temp dir");
         let realm_id = RealmId::from_bytes([61u8; 32]);
-        let storage_path = dir.path().join("storage");
-        let storage_handle = aruna_storage::storage::worker::FjallStorage::open(
-            storage_path.to_str().expect("utf8 path"),
-        )
-        .expect("storage opens");
+        let storage_handle = aruna_storage::storage::memory::MemoryStorage::open();
         let peer = iroh::SecretKey::from_bytes(&[62u8; 32]).public();
         let net = NetHandle::new(
             NetConfig {

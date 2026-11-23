@@ -1115,7 +1115,7 @@ mod tests {
     use aruna_runner::driver::{DriverContext, drive, node_routing};
     use aruna_storage::scan::iter_prefix_page;
     use aruna_storage::storage::handle::StorageHandle;
-    use aruna_storage::storage::worker::FjallStorage;
+    use aruna_storage::storage::memory::MemoryStorage;
     use std::collections::HashMap;
     use std::time::SystemTime;
     use tempfile::{TempDir, tempdir};
@@ -1165,7 +1165,7 @@ mod tests {
 
     fn setup_context() -> (TempDir, StorageHandle, DriverContext) {
         let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let context = DriverContext {
             storage_handle: storage.clone(),
             net_handle: None,

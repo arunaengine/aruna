@@ -28,9 +28,8 @@ pub struct Fixture {
 }
 
 /// A storage-only context on a store opened at `path`, with an open vault.
-pub fn context(path: &std::path::Path) -> DriverContext {
-    let storage_handle =
-        aruna_storage::storage::worker::FjallStorage::open(path.to_str().unwrap()).unwrap();
+pub fn context() -> DriverContext {
+    let storage_handle = aruna_storage::storage::memory::MemoryStorage::open();
     storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
     DriverContext {
         storage_handle,
@@ -68,7 +67,7 @@ impl Fixture {
     /// Stores the realm and the group on a node whose plan names the nodes of `members`.
     pub async fn new(members: &[u8]) -> Self {
         let dir = tempdir().unwrap();
-        let context = context(dir.path());
+        let context = context();
         let seed = GroupSeed::new(members);
         let writes = StorageEffect::BatchWrite {
             writes: seed.rows,

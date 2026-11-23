@@ -84,7 +84,6 @@ mod test {
     use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_scheduler::TaskHandle;
     use aruna_storage::storage;
-    use tempfile::tempdir;
     use ulid::Ulid;
 
     use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
@@ -98,9 +97,7 @@ mod test {
 
     #[tokio::test]
     pub async fn public_roles_readonly() {
-        let random_path = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let net_handle = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -270,9 +267,7 @@ mod test {
 
     #[tokio::test]
     pub async fn test_check_permissions() {
-        let random_path = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let net_handle = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),

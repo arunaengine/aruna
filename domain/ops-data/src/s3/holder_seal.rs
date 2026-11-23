@@ -206,7 +206,7 @@ mod tests {
     async fn seals_admin_key() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_str().unwrap();
-        let storage = aruna_storage::storage::worker::FjallStorage::open(root).unwrap();
+        let storage = aruna_storage::storage::memory::MemoryStorage::open();
         storage.open_vault(NodeVaultKey::random());
         let net = aruna_p2p::NetHandle::new(aruna_runner::testing::local_net(), storage.clone())
             .await

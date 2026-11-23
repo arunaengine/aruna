@@ -937,14 +937,11 @@ mod test {
     use aruna_runner::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use std::time::SystemTime;
-    use tempfile::tempdir;
     use ulid::Ulid;
 
     #[tokio::test]
     async fn test_delete_bucket() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,
@@ -1065,9 +1062,7 @@ mod test {
     #[tokio::test]
     async fn removes_encryption_settings() {
         use aruna_core::structs::storage::encryption::{BucketKeyRef, EncryptionMode};
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,
@@ -1180,9 +1175,7 @@ mod test {
 
     #[tokio::test]
     async fn removes_replication_config() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,
@@ -1233,9 +1226,7 @@ mod test {
 
     #[tokio::test]
     async fn deletes_sync_records() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,
@@ -1354,9 +1345,7 @@ mod test {
 
     #[tokio::test]
     async fn nonempty_bucket_rejected() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,
@@ -1423,9 +1412,7 @@ mod test {
 
     #[tokio::test]
     async fn versioned_bucket_rejected() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,

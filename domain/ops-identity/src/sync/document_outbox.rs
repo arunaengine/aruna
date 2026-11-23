@@ -292,8 +292,7 @@ mod tests {
     use aruna_runner::driver::drive;
     use aruna_runner::testing::test_context;
     use aruna_storage::storage::handle::StorageHandle;
-    use aruna_storage::storage::worker::FjallStorage;
-    use tempfile::tempdir;
+    use aruna_storage::storage::memory::MemoryStorage;
     use ulid::Ulid;
 
     /// The outbox record stored at `key`.
@@ -439,9 +438,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_record_deleted() {
-        let dir = tempdir().expect("temp dir");
-        let storage =
-            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let storage = MemoryStorage::open();
         let corrupt_key = b"000-corrupt-outbox".to_vec();
         write_raw_record(&storage, corrupt_key.clone(), vec![1, 2, 3]).await;
 
@@ -462,9 +459,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_before_valid() {
-        let dir = tempdir().expect("temp dir");
-        let storage =
-            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let storage = MemoryStorage::open();
         let corrupt_key = b"000-corrupt-outbox".to_vec();
         let valid = new_identified_record(
             Ulid::generate(),
@@ -722,9 +717,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_clears_index() {
-        let dir = tempdir().expect("temp dir");
-        let storage =
-            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let storage = MemoryStorage::open();
         let realm_id = RealmId::from_bytes([7u8; 32]);
         let record = new_identified_record(
             Ulid::generate(),
@@ -769,9 +762,7 @@ mod tests {
 
     #[tokio::test]
     async fn keeps_generic_index() {
-        let dir = tempdir().expect("temp dir");
-        let storage =
-            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let storage = MemoryStorage::open();
         let user_id = UserId::local(Ulid::from_parts(7, 1), RealmId::from_bytes([3; 32]));
         let metadata = new_identified_record(
             Ulid::generate(),
@@ -832,9 +823,7 @@ mod tests {
 
     #[tokio::test]
     async fn clears_malformed_index() {
-        let dir = tempdir().expect("temp dir");
-        let storage =
-            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let storage = MemoryStorage::open();
         let realm_id = RealmId::from_bytes([7u8; 32]);
         let record = new_identified_record(
             Ulid::generate(),

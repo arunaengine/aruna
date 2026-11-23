@@ -12,7 +12,7 @@ rust-version.workspace = true
 
 [features]
 # Shared test helpers; only dev-dependencies enable it.
-test-hooks = ["dep:async-trait", "dep:tempfile"]
+test-hooks = ["dep:async-trait", "dep:tempfile", "aruna-storage/test-hooks"]
 
 [dependencies]
 aruna-blob = { workspace = true }

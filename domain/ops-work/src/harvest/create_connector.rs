@@ -246,7 +246,6 @@ mod tests {
     use aruna_ops_data::connectors::harvest_rows::{parse_connector_read, read_connector_effect};
     use aruna_runner::driver::{DriverContext, drive};
     use aruna_storage::storage;
-    use tempfile::tempdir;
 
     fn input() -> CreateConnectorInput {
         CreateConnectorInput {
@@ -408,9 +407,7 @@ mod tests {
 
     #[tokio::test]
     async fn persists_connector_record() {
-        let tempdir = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let context = DriverContext {
             storage_handle,
             net_handle: None,

@@ -470,7 +470,6 @@ mod test {
     use aruna_scheduler::TaskHandle;
     use aruna_storage::storage;
     use std::collections::{BTreeSet, HashSet};
-    use tempfile::tempdir;
     use ulid::Ulid;
 
     fn actor(realm_id: RealmId, node_seed: u8, user_seed: u8) -> Actor {
@@ -720,9 +719,7 @@ mod test {
 
     #[tokio::test]
     pub async fn test_group_creation() {
-        let random_path = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let net_handle = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -801,9 +798,7 @@ mod test {
 
     #[tokio::test]
     pub async fn owner_cap_blocks() {
-        let random_path = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let net_handle = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),

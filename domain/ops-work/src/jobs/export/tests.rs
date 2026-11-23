@@ -48,7 +48,7 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::data::identity::{ObjectLocation, normalized_id};
 use aruna_core::user::id::UserId;
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use aruna_test_harness::staging::setup_driver_context;
 use std::collections::HashMap;
 use std::io::{Read, Seek, Write};
@@ -539,9 +539,8 @@ async fn fixture_roundtrip() {
 async fn selection_skips_discovery() {
     // An export into another realm resolves a hash locally and never asks the DHT for holders,
     // so a node without discovery reports no outage for it.
-    let dir = tempfile::tempdir().unwrap();
     let driver = DriverContext {
-        storage_handle: FjallStorage::open(dir.path().to_str().unwrap()).unwrap(),
+        storage_handle: MemoryStorage::open(),
         net_handle: None,
         blob_handle: None,
         graph_handle: None,

@@ -485,7 +485,7 @@ mod tests {
     use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_runner::driver::{DriverContext, drive};
     use aruna_scheduler::TaskHandle;
-    use aruna_storage::storage::worker::FjallStorage;
+    use aruna_storage::storage::memory::MemoryStorage;
     use tempfile::tempdir;
 
     fn selector(location: &str) -> PlacementSelector {
@@ -524,7 +524,7 @@ mod tests {
     /// this node's key, so a policy cannot be created without one.
     async fn setup() -> (tempfile::TempDir, DriverContext, Actor) {
         let dir = tempdir().expect("temp dir");
-        let storage = FjallStorage::open(dir.path().to_str().expect("path")).expect("storage");
+        let storage = MemoryStorage::open();
         let secret = iroh::SecretKey::from_bytes(&[3u8; 32]);
         let realm_id = RealmId([21u8; 32]);
         let net_handle = NetHandle::new(

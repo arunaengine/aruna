@@ -171,8 +171,7 @@ async fn seed_credential(context: &DriverContext, owner: UserId, group_id: Group
 
 async fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
-    let storage =
-        aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = aruna_storage::storage::memory::MemoryStorage::open();
     let context = DriverContext {
         storage_handle: storage,
         net_handle: None,

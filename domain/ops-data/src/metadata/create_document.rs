@@ -961,7 +961,7 @@ mod tests {
     };
     use aruna_core::structured_id::StructuredId;
     use aruna_storage::storage::handle::{EffectReceiver, StorageHandle};
-    use aruna_storage::storage::worker::FjallStorage;
+    use aruna_storage::storage::memory::MemoryStorage;
 
     use aruna_runner::driver::{DriverContext, drive};
 
@@ -1620,8 +1620,7 @@ mod tests {
 
     fn conflict_test_context(storage: StorageHandle, temp: &std::path::Path) -> Arc<DriverContext> {
         let node_id = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
-        let metadata_storage =
-            FjallStorage::open(temp.join("meta-store").to_str().unwrap()).unwrap();
+        let metadata_storage = MemoryStorage::open();
         let graph_handle = aruna_rdf_graph::GraphHandle::open(
             temp.join("meta"),
             node_id,

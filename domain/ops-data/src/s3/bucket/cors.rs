@@ -217,8 +217,7 @@ mod tests {
     /// drops first and the folder is removed with the test.
     fn make_context() -> (tempfile::TempDir, DriverContext) {
         let temp_dir = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_dir.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let context = DriverContext {
             storage_handle,
             net_handle: None,

@@ -31,7 +31,7 @@ use aruna_core::user::id::UserId;
 use aruna_runner::driver::{DriverContext, drive};
 use aruna_storage::scan::iter_prefix_page;
 use aruna_storage::storage::handle::StorageHandle;
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use aruna_test_harness::jobs::{
     find_dedup_job, insert_job, list_job_entries, read_crate_status, read_job_record,
     read_launch_record, read_state,
@@ -69,8 +69,7 @@ async fn batch_write(
 
 fn temp_storage() -> (tempfile::TempDir, StorageHandle) {
     let dir = tempdir().expect("temp dir");
-    let storage =
-        FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+    let storage = MemoryStorage::open();
     (dir, storage)
 }
 

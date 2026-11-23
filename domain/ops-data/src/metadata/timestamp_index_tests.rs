@@ -41,7 +41,7 @@ fn record(document_id: Ulid, updated_at_ms: u64) -> MetadataRegistryRecord {
 fn context() -> (DriverContext, tempfile::TempDir) {
     let dir = tempdir().unwrap();
     let context = DriverContext {
-        storage_handle: storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap(),
+        storage_handle: storage::memory::MemoryStorage::open(),
         net_handle: None,
         blob_handle: None,
         graph_handle: None,

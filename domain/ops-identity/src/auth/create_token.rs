@@ -194,14 +194,11 @@ mod test {
     use aruna_runner::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use ed25519_dalek::SigningKey;
-    use tempfile::tempdir;
     use ulid::Ulid;
 
     #[tokio::test]
     pub async fn test_token_creation() {
-        let random_path = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
 
         let context = DriverContext {
             storage_handle,

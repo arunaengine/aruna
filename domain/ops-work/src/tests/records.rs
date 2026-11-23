@@ -29,7 +29,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_storage::storage::handle::StorageHandle;
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use tempfile::TempDir;
 
 use crate::jobs::lifecycle::launch_checks::LocalCapabilityOperation;
@@ -426,8 +426,7 @@ pub fn actor(node_id: NodeId) -> Actor {
 /// resolve the family view run against real rows.
 pub async fn context(config: &RealmConfigDocument, publisher: NodeId) -> (TempDir, DriverContext) {
     let dir = tempfile::tempdir().expect("temp dir");
-    let storage: StorageHandle =
-        FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
+    let storage: StorageHandle = MemoryStorage::open();
     let target = DocumentTarget::RealmConfig { realm_id: REALM };
     let event = storage
         .send_effect(Effect::Storage(StorageEffect::Write {

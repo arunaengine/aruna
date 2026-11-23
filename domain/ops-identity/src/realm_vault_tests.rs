@@ -53,8 +53,7 @@ fn realm_config(revision: u8) -> (RealmConfigDocument, RealmSecretRef) {
 
 fn context() -> (TempDir, DriverContext) {
     let dir = tempfile::tempdir().unwrap();
-    let storage_handle =
-        aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage_handle = aruna_storage::storage::memory::MemoryStorage::open();
     storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
     let context = DriverContext {
         storage_handle,

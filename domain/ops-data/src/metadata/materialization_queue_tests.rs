@@ -15,10 +15,9 @@ use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_runner::driver::{DriverContext, drive, drive_retry};
 use aruna_storage::storage::handle::StorageHandle;
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use std::collections::BTreeSet;
 use std::thread;
-use tempfile::tempdir;
 
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::StorageEvent;
@@ -306,8 +305,7 @@ async fn index_job_keys(storage: &StorageHandle) -> Vec<(u64, Ulid, Ulid)> {
 
 #[tokio::test]
 async fn corrupt_job_only() {
-    let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let corrupt_key = vec![0];
     write_entries(
         &storage,
@@ -339,8 +337,7 @@ async fn corrupt_job_only() {
 
 #[tokio::test]
 async fn jobs_exist_deletes() {
-    let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let corrupt_key = vec![0];
     let event = create_event(
         Ulid::from_bytes([12u8; 16]),
@@ -369,8 +366,7 @@ async fn jobs_exist_deletes() {
 
 #[tokio::test]
 async fn corrupt_global_job() {
-    let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let document_id = Ulid::from_bytes([14u8; 16]);
     let old_event_id = Ulid::from_parts(14, 1);
     let newer_event_id = Ulid::from_parts(14, 2);
@@ -422,8 +418,7 @@ async fn corrupt_global_job() {
 
 #[tokio::test]
 async fn orphan_malformed_sidecar() {
-    let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let document_id = Ulid::from_bytes([16u8; 16]);
     let old_event_id = Ulid::from_parts(16, 1);
     let newer_event_id = Ulid::from_parts(16, 2);
@@ -448,8 +443,7 @@ async fn orphan_malformed_sidecar() {
 
 #[tokio::test]
 async fn orphan_valid_sidecar() {
-    let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let document_id = Ulid::from_bytes([17u8; 16]);
     let old_event_id = Ulid::from_parts(17, 1);
     let newer_event_id = Ulid::from_parts(17, 2);
@@ -474,8 +468,7 @@ async fn orphan_valid_sidecar() {
 
 #[tokio::test]
 async fn orphan_global_job() {
-    let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let document_id = Ulid::from_bytes([22u8; 16]);
     let event_id = Ulid::from_parts(22, 1);
     let job = MetadataMaterializationRecord {
@@ -517,8 +510,7 @@ async fn orphan_global_job() {
 
 #[tokio::test]
 async fn corrupt_job_deleted() {
-    let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let document_id = Ulid::from_bytes([13u8; 16]);
     let event_id = Ulid::from_bytes([255u8; 16]);
     let mut corrupt_key = document_id.to_bytes().to_vec();
@@ -545,8 +537,7 @@ async fn corrupt_job_deleted() {
 async fn scan_stops_early() {
     // Due jobs sort before future jobs, so the scan returns at the first
     // future key without paging the whole keyspace.
-    let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let now_ms = unix_timestamp_millis();
     let document_id = Ulid::from_bytes([40u8; 16]);
     let due_event = Ulid::from_parts(1, 1);
@@ -597,8 +588,7 @@ async fn scan_stops_early() {
 async fn scan_batches_reads() {
     // A page of due jobs resolves in a handful of batch reads instead of a
     // sidecar, event and status read per row.
-    let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let now_ms = unix_timestamp_millis();
     let mut writes = Vec::new();
     for index in 0..64u8 {
@@ -633,8 +623,7 @@ async fn scan_batches_reads() {
 async fn probe_reads_one() {
     // The timer probe asks for a single due job, so it must not resolve the
     // whole page of index rows behind it.
-    let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let mut writes = Vec::new();
     for index in 0..64u8 {
         let document_id = Ulid::from_bytes([100 + index; 16]);
@@ -666,8 +655,7 @@ async fn probe_reads_one() {
 async fn stale_index_pruned() {
     // An index row with no sidecar, and one whose sidecar due time differs,
     // are both deleted and yield no job.
-    let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let now_ms = unix_timestamp_millis();
     let orphan = MetadataMaterializationRecord {
         document_id: Ulid::from_bytes([42u8; 16]),
@@ -722,8 +710,7 @@ async fn stale_index_pruned() {
 async fn older_check_bounded() {
     // The predecessor check for one document must not scan the sidecar rows
     // of unrelated documents.
-    let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let document_id = Ulid::from_bytes([44u8; 16]);
     let first = Ulid::from_parts(1, 1);
     let middle = Ulid::from_parts(2, 1);
@@ -774,8 +761,7 @@ fn application_failure() -> MetadataMaterializationError {
 async fn failure_cap_parks() {
     // The apply that spends the last of the failure budget parks as a dead
     // letter: both job rows go, the record that can requeue them stays.
-    let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let document_id = Ulid::from_bytes([45u8; 16]);
     let event_id = Ulid::from_parts(1, 1);
     let event = create_event(document_id, event_id, "capped");
@@ -972,8 +958,7 @@ fn handle_failure_transient() {
 async fn deadletters_requeue_due() {
     // A due dead letter returns to the queue with one failure of budget left
     // and a pending status; one that is not due yet stays parked.
-    let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let document_id = Ulid::from_bytes([48u8; 16]);
     let event_id = Ulid::from_parts(4, 1);
     let event = create_event(document_id, event_id, "requeue");
@@ -1033,8 +1018,7 @@ async fn deadletters_requeue_due() {
 async fn requeued_parks_fast() {
     // A requeued dead letter carries one failure of budget, so a document
     // that is still poisonous re-parks after a single apply.
-    let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let document_id = Ulid::from_bytes([53u8; 16]);
     let event_id = Ulid::from_parts(6, 1);
     let event = create_event(document_id, event_id, "poison");
@@ -1107,8 +1091,7 @@ fn materialized_status(
 async fn deadletter_drops_superseded() {
     // Requeueing a dead letter whose document has since materialized a newer
     // event would regress the projection, so the dead letter is dropped.
-    let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let document_id = Ulid::from_bytes([54u8; 16]);
     let old_event_id = Ulid::from_parts(1, 1);
     let newer_event_id = Ulid::from_parts(2, 1);
@@ -1226,8 +1209,7 @@ fn requeue_reads_guard() {
 async fn park_skips_superseded() {
     // Parking a job the document has already moved past must not leave a
     // dead letter that a later sweep could resurrect.
-    let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let document_id = Ulid::from_bytes([55u8; 16]);
     let old_event_id = Ulid::from_parts(1, 1);
     let newer_event_id = Ulid::from_parts(2, 1);
@@ -1526,8 +1508,7 @@ async fn reschedule_batch(
 async fn finish_commits_chunks() {
     // More jobs than one chunk holds still resolve completely, and they do
     // so in several transactions so a late failure cannot undo early work.
-    let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let count = MATERIALIZATION_FINISH_CHUNK + 3;
     let finished = reschedule_batch(&storage, count).await;
 
@@ -1551,8 +1532,7 @@ async fn finish_commits_chunks() {
 async fn finish_avoids_conflicts() {
     // A status write for a document outside the chunk, landing inside the finish
     // transaction, must not conflict: the transaction reads only the chunk's guard rows.
-    let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let finished = reschedule_batch(&storage, 4).await;
 
     let document_id = Ulid::from_bytes([120u8; 16]);
@@ -1578,8 +1558,7 @@ async fn finish_avoids_conflicts() {
 async fn finish_keeps_newer() {
     // A newer event landing inside an older completion's finish transaction makes the commit
     // lose its conflict; the rerun keeps the newer status and its job stays due.
-    let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let document_id = Ulid::from_bytes([77u8; 16]);
     let old_event_id = Ulid::from_parts(1, 1);
     let newer_event_id = Ulid::from_parts(2, 1);
@@ -1664,8 +1643,7 @@ async fn finish_keeps_newer() {
 
 #[tokio::test]
 async fn finish_not_regress() {
-    let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let document_id = Ulid::from_bytes([3u8; 16]);
     let old_event_id = Ulid::from_parts(3, 1);
     let newer_event_id = Ulid::from_parts(4, 1);
@@ -1773,8 +1751,7 @@ async fn finish_not_regress() {
 // A late merge published its merged graph; the raw view must show it without lowering the status.
 #[tokio::test]
 async fn finish_stores_merge() {
-    let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let document_id = Ulid::from_bytes([5u8; 16]);
     let late_event = create_event(document_id, Ulid::from_parts(5, 1), "late");
     let newer_event = create_event(document_id, Ulid::from_parts(6, 1), "newer");
@@ -1854,8 +1831,7 @@ fn crate_render(names: &[&str]) -> String {
 // Two late merges of one drain chain through the shared raw cache and keep the newer content.
 #[tokio::test]
 async fn late_merges_chain() {
-    let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let context = DriverContext {
         storage_handle: storage.clone(),
         net_handle: None,
@@ -1953,8 +1929,7 @@ async fn late_merges_chain() {
 // the retry's sidecar and capture mark.
 #[tokio::test]
 async fn prune_keeps_retry() {
-    let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let document_id = Ulid::from_bytes([7u8; 16]);
     let event = create_event(document_id, Ulid::from_parts(7, 1), "retried");
     let first = MetadataMaterializationRecord {
@@ -2029,8 +2004,7 @@ async fn prune_keeps_retry() {
 // A captured job whose event is gone is an orphan; the scan removes its capture mark with it.
 #[tokio::test]
 async fn prune_drops_orphan() {
-    let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let document_id = Ulid::from_bytes([8u8; 16]);
     let event_id = Ulid::from_parts(8, 1);
     let job = MetadataMaterializationRecord {
@@ -2072,8 +2046,7 @@ async fn prune_drops_orphan() {
 async fn supersedes_prior_rows() {
     // A second revision replaces the document's postings: rows it does not write are deleted
     // in the same commit, found through the document's own rows.
-    let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let document_id = Ulid::from_bytes([5u8; 16]);
     let record = |event_id: Ulid, object: &str| aruna_core::metadata::IriIndexRecord {
         document_id,
@@ -2228,8 +2201,7 @@ async fn older_check_local() {
 
 #[tokio::test]
 async fn older_queued_job() {
-    let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let document_id = Ulid::from_bytes([10u8; 16]);
     let older_event_id = Ulid::from_parts(10, 1);
     let newer_event_id = Ulid::from_parts(10, 2);
@@ -2283,8 +2255,7 @@ async fn older_queued_job() {
 async fn reschedules_batched() {
     // Three failing jobs across distinct documents resolve in one finish
     // transaction: the request delta stays at single-transaction scale.
-    let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let jobs: Vec<_> = (0..3u8)
         .map(|seed| {
             let document_id = Ulid::from_bytes([70 + seed; 16]);
@@ -2370,8 +2341,7 @@ async fn reschedules_batched() {
 async fn failing_apply_reschedules() {
     // A non-terminal apply failure (missing metadata handle) reschedules the
     // job with attempts advanced and both rows kept at a new due time.
-    let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let document_id = Ulid::from_bytes([90u8; 16]);
     let event_id = Ulid::from_parts(3, 1);
     let event = create_event(document_id, event_id, "reschedule");

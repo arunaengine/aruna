@@ -215,7 +215,7 @@ mod tests {
     use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
     use aruna_core::types::GroupId;
     use aruna_storage::storage::handle::StorageHandle;
-    use aruna_storage::storage::worker::FjallStorage;
+    use aruna_storage::storage::memory::MemoryStorage;
     use byteview::ByteView;
     use tempfile::{TempDir, tempdir};
     use ulid::Ulid;
@@ -277,8 +277,7 @@ mod tests {
     fn setup_fixture() -> Fixture {
         let storage_dir = tempdir().expect("temp dir");
         let metadata_dir = tempdir().expect("metadata dir");
-        let storage = FjallStorage::open(storage_dir.path().to_str().expect("utf-8 path"))
-            .expect("storage opens");
+        let storage = MemoryStorage::open();
         let node_id = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
         let graph_handle = aruna_rdf_graph::GraphHandle::open(
             metadata_dir.path(),
@@ -597,10 +596,8 @@ mod tests {
     #[tokio::test]
     async fn unconfigured_reports_none() {
         // An absent count must stay distinguishable from zero documents.
-        let storage_dir = tempdir().expect("temp dir");
         let context = DriverContext {
-            storage_handle: FjallStorage::open(storage_dir.path().to_str().expect("utf-8 path"))
-                .expect("storage opens"),
+            storage_handle: MemoryStorage::open(),
             net_handle: None,
             blob_handle: None,
             graph_handle: None,

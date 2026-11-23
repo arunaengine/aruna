@@ -80,9 +80,7 @@ pub(crate) fn test_genesis(seed: u8) -> ::irokle::OpId {
 
 pub(crate) fn test_storage() -> (TempDir, StorageHandle) {
     let dir = tempfile::tempdir().expect("temp dir");
-    let storage =
-        aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().expect("temp path"))
-            .expect("storage opens");
+    let storage = aruna_storage::storage::memory::MemoryStorage::open();
     (dir, storage)
 }
 

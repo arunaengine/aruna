@@ -18,10 +18,9 @@ use aruna_runner::driver::{DriverContext, drive};
 use aruna_runner::testing::write_entries;
 use aruna_scheduler::{InboundTaskHandler, TaskHandle};
 use aruna_storage::storage::handle::StorageHandle;
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use async_trait::async_trait;
 use std::sync::Arc;
-use tempfile::tempdir;
 use tokio::sync::mpsc;
 
 async fn project_create_events(
@@ -199,9 +198,7 @@ async fn outbox_rows(storage: &StorageHandle) -> Vec<DocumentOutboxRecord> {
 async fn projection_takes_fence() {
     // An admitted projection stamps the generation it resolved at onto
     // every outbox row it commits.
-    let dir = tempdir().expect("temp dir");
-    let storage =
-        FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+    let storage = MemoryStorage::open();
     let mut event = create_event();
     event.node_id = node(1);
     let config = activated_config(event.record.realm_id, &[node(1), node(2), node(3)]);
@@ -231,9 +228,7 @@ async fn projection_takes_fence() {
 async fn fence_rejects_create() {
     // The departing holder closed generation one: the projection must not
     // commit a row the drained bucket can no longer publish.
-    let dir = tempdir().expect("temp dir");
-    let storage =
-        FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+    let storage = MemoryStorage::open();
     let mut event = create_event();
     event.node_id = node(1);
     let config = activated_config(event.record.realm_id, &[node(1), node(2), node(3)]);
@@ -276,9 +271,7 @@ async fn fence_rejects_create() {
 async fn deferred_mint_retries() {
     // A locally authored create whose shard has no live holder must keep its
     // pending marker so a later placement change still mints the genesis.
-    let dir = tempdir().expect("temp dir");
-    let storage =
-        FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+    let storage = MemoryStorage::open();
     let mut event = create_event();
     event.node_id = node(1);
     let live = realm_config(event.record.realm_id, &[node(1), node(2), node(3)]);
@@ -328,9 +321,7 @@ async fn pending_marker_exists(storage: &StorageHandle, key: Vec<u8>) -> bool {
 
 #[tokio::test]
 async fn tombstone_blocks_projection() {
-    let dir = tempdir().expect("temp dir");
-    let storage =
-        FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+    let storage = MemoryStorage::open();
     let event = create_event();
     let tombstone = GraphLifecycleRecord::deleted(
         event.record.graph_iri.clone(),
@@ -388,9 +379,7 @@ async fn tombstone_blocks_projection() {
 
 #[tokio::test]
 async fn malformed_marker_deleted() {
-    let dir = tempdir().expect("temp dir");
-    let storage =
-        FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+    let storage = MemoryStorage::open();
     let corrupt_key = b"short".to_vec();
     write_entries(
         &storage,
@@ -423,9 +412,7 @@ async fn malformed_marker_deleted() {
 
 #[tokio::test]
 async fn malformed_before_valid() {
-    let dir = tempdir().expect("temp dir");
-    let storage =
-        FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+    let storage = MemoryStorage::open();
     let corrupt_key = b"short".to_vec();
     let event = create_event();
     let valid_key = pending_projection_key(event.record.document_id, event.event_id);
@@ -468,9 +455,7 @@ async fn malformed_before_valid() {
 
 #[tokio::test]
 async fn orphan_pending_marker() {
-    let dir = tempdir().expect("temp dir");
-    let storage =
-        FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+    let storage = MemoryStorage::open();
     let document_id = Ulid::from_bytes([21u8; 16]);
     let event_id = Ulid::from_parts(21, 1);
     let marker_key = pending_projection_key(document_id, event_id);
@@ -504,9 +489,7 @@ async fn orphan_pending_marker() {
 
 #[tokio::test]
 async fn timer_for_marker() {
-    let dir = tempdir().expect("temp dir");
-    let storage =
-        FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+    let storage = MemoryStorage::open();
     let event = create_event();
     write_entries(
         &storage,
@@ -558,9 +541,7 @@ fn origin_holders_frozen() {
 // peers are that bucket's live holders.
 #[tokio::test]
 async fn outbox_rides_stored() {
-    let dir = tempdir().expect("temp dir");
-    let storage =
-        FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+    let storage = MemoryStorage::open();
     let event = create_event();
     let config = realm_config(event.record.realm_id, &[event.node_id, node(2), node(3)]);
     let event = stamped(event, &config);
@@ -767,8 +748,7 @@ async fn journaled_aged(
     age_ms: u64,
     change: Option<MetadataEventPayload>,
 ) -> (MetadataEventRecord, Vec<SourceEvent>) {
-    let dir = tempdir().expect("temp dir");
-    let storage = FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage");
+    let storage = MemoryStorage::open();
     let mut event = create_event();
     if let Some(payload) = change {
         event.payload = payload;
@@ -826,8 +806,7 @@ async fn journaled_aged(
 #[tokio::test]
 async fn projected_audit_message() {
     let audit_details = async |message: Option<&str>, lifecycle_event: Option<Ulid>| {
-        let dir = tempdir().expect("temp dir");
-        let storage = FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage");
+        let storage = MemoryStorage::open();
         let event = create_event();
         let mut stored = event.clone();
         stored.event_id = lifecycle_event.unwrap_or(event.event_id);
@@ -874,9 +853,7 @@ async fn projected_audit_message() {
 // outbox publish; replay re-plans it once eligible holders exist.
 #[tokio::test]
 async fn holderless_projection_defers() {
-    let dir = tempdir().expect("temp dir");
-    let storage =
-        FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+    let storage = MemoryStorage::open();
     let event = create_event();
     let config = realm_config(event.record.realm_id, &[]);
     write_entries(
@@ -1113,9 +1090,7 @@ fn skew_event(updated_at_ms: u64, occurred_at_ms: u64) -> MetadataEventRecord {
 
 #[tokio::test]
 async fn skewed_direct_writes() {
-    let dir = tempdir().expect("temp dir");
-    let storage =
-        FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+    let storage = MemoryStorage::open();
     let now_ms = aruna_core::time::unix_timestamp_millis();
     let event = skew_event(now_ms + DEFAULT_SKEW_MS + 60_000, now_ms);
     let marker_key = pending_projection_key(event.record.document_id, event.event_id);
@@ -1147,9 +1122,7 @@ async fn skewed_direct_writes() {
 
 #[tokio::test]
 async fn skewed_queue_keeps() {
-    let dir = tempdir().expect("temp dir");
-    let storage =
-        FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+    let storage = MemoryStorage::open();
     let now_ms = aruna_core::time::unix_timestamp_millis();
     let event = skew_event(now_ms + DEFAULT_SKEW_MS + 60_000, now_ms);
     let marker_key = pending_projection_key(event.record.document_id, event.event_id);
@@ -1470,9 +1443,7 @@ async fn owned_recovery_waits() {
     };
     use aruna_core::keyspaces::{APPLIED_ORDER_KEYSPACE, APPLIED_SYNC_KEYSPACE};
 
-    let dir = tempdir().expect("temp dir");
-    let storage =
-        FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+    let storage = MemoryStorage::open();
     let event = create_event();
     let document_id = event.record.document_id;
     let marker = pending_projection_key(document_id, event.event_id);

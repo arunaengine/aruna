@@ -110,10 +110,7 @@ fn transient_errors_retry() {
 // A resumed manifest read is authorized again on its own path before anything is read.
 #[tokio::test]
 async fn manifest_read_authorized() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let storage_handle =
-        aruna_storage::storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap())
-            .unwrap();
+    let storage_handle = aruna_storage::storage::memory::MemoryStorage::open();
     let context = aruna_runner::testing::test_context(storage_handle.clone());
     let node_id = iroh::SecretKey::from_bytes(&[4; 32]).public();
     let claim_token = Ulid::from_bytes([6; 16]);

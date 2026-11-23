@@ -239,7 +239,6 @@ mod test {
     use aruna_storage::storage;
     use aruna_test_harness::s3::seed_upload;
     use std::time::{Duration, SystemTime};
-    use tempfile::tempdir;
 
     impl ListUploadsOperation {
         fn with_scan_limit(mut self, scan_round_limit: usize) -> Self {
@@ -296,9 +295,7 @@ mod test {
 
     #[tokio::test]
     async fn bucket_filters() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = test_context(storage_handle.clone());
 
         seed_upload(
@@ -335,9 +332,7 @@ mod test {
 
     #[tokio::test]
     async fn scans_foreign_rounds() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = test_context(storage_handle.clone());
 
         seed_upload(
@@ -370,9 +365,7 @@ mod test {
 
     #[tokio::test]
     async fn scan_budget_fails() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = test_context(storage_handle.clone());
 
         for (index, key) in ["a", "b", "c"].into_iter().enumerate() {
@@ -394,9 +387,7 @@ mod test {
 
     #[tokio::test]
     async fn sorts_before_cutoff() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = test_context(storage_handle.clone());
 
         seed_upload(
@@ -429,9 +420,7 @@ mod test {
 
     #[tokio::test]
     async fn zero_limit_empty() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = test_context(storage_handle.clone());
 
         seed_upload(
@@ -452,9 +441,7 @@ mod test {
 
     #[tokio::test]
     async fn key_order_stable() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = test_context(storage_handle.clone());
 
         let first = Ulid::generate();
@@ -497,9 +484,7 @@ mod test {
 
     #[tokio::test]
     async fn orders_same_key() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = test_context(storage_handle.clone());
 
         let versions = {
@@ -551,9 +536,7 @@ mod test {
 
     #[tokio::test]
     async fn markers_paginate() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = test_context(storage_handle.clone());
 
         for key in ["a", "b", "c", "d"] {
@@ -597,9 +580,7 @@ mod test {
 
     #[tokio::test]
     async fn resumes_same_key() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = test_context(storage_handle.clone());
 
         let ids = [
@@ -664,9 +645,7 @@ mod test {
 
     #[tokio::test]
     async fn resumes_missing_marker() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = test_context(storage_handle.clone());
 
         let lower = Ulid::from_bytes([1; 16]);
@@ -706,9 +685,7 @@ mod test {
 
     #[tokio::test]
     async fn prefix_filters() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = test_context(storage_handle.clone());
 
         for key in ["docs/1", "docs/2", "images/1", "readme"] {
@@ -743,9 +720,7 @@ mod test {
 
     #[tokio::test]
     async fn delimiter_groups() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = test_context(storage_handle.clone());
 
         for key in ["a.txt", "dir/1", "dir/2", "z.txt"] {

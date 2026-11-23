@@ -400,14 +400,11 @@ mod tests {
     use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome};
     use aruna_runner::driver::{DriverContext, drive};
     use aruna_storage::storage;
-    use tempfile::tempdir;
     use ulid::Ulid;
 
     #[tokio::test]
     async fn kept_records_resume() {
-        let dir = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let context = DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,
@@ -483,9 +480,7 @@ mod tests {
     async fn retry_survives_crash() {
         use std::sync::Arc;
 
-        let dir = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let context = Arc::new(DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,

@@ -15,7 +15,7 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_p2p::NetHandle;
 use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_storage::storage::handle::StorageHandle;
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use tempfile::TempDir;
 
 use crate::tests::records::{Family, REALM, secret, serve_job_record, serve_launch_offer, user};
@@ -24,8 +24,7 @@ use aruna_runner::driver::DriverContext;
 
 pub(super) async fn fixture() -> (TempDir, Arc<DriverContext>, NetHandle, Family) {
     let dir = tempfile::tempdir().expect("temp dir");
-    let storage: StorageHandle =
-        FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
+    let storage: StorageHandle = MemoryStorage::open();
     let net = NetHandle::new(
         NetConfig {
             bind_addr: "127.0.0.1:0".parse().expect("loopback"),

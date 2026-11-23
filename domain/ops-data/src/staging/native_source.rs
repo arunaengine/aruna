@@ -704,7 +704,7 @@ mod tests {
     use aruna_core::structs::storage::replication::ArunaArn;
     use aruna_core::structs::sync_relationship::{ReferenceHandling, SyncMode, SyncStatusSnapshot};
     use aruna_runner::driver::{DriverContext, drive};
-    use aruna_storage::storage::worker::FjallStorage;
+    use aruna_storage::storage::memory::MemoryStorage;
 
     fn child<T, E>(result: Result<T, E>) -> IoResult
     where
@@ -848,8 +848,7 @@ mod tests {
         use crate::replication::sync_relationship::store::StoreRelationshipOperation;
         use aruna_core::structs::storage::blob::BucketInfo;
         use aruna_core::structs::storage::format::Compression;
-        let tempdir = tempfile::tempdir().unwrap();
-        let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let context = DriverContext {
             storage_handle: storage.clone(),
             net_handle: None,

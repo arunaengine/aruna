@@ -129,9 +129,7 @@ mod tests {
             value: ByteView::from(*b"config"),
             txn_id: None,
         })));
-        let directory = tempdir().unwrap();
-        let direct =
-            storage::worker::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+        let direct = storage::memory::MemoryStorage::open();
         let (storage_handle, receivers) = storage::handle::StorageHandle::new();
         let receiver = receivers.foreground;
         drop(receivers.bulk);
@@ -271,8 +269,7 @@ mod tests {
     #[tokio::test]
     async fn config_commit_reloads() {
         let directory = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let net_handle = aruna_p2p::NetHandle::new(
             aruna_p2p::config::NetConfig {
                 discovery_method: aruna_p2p::config::DiscoveryMethod::None,
@@ -335,9 +332,7 @@ mod tests {
     async fn missing_handle_result() {
         // Reduced-capability nodes must still see the storage result, not a
         // dropped effect; the peer link is only a post-write side channel.
-        let directory = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let context = DriverContext {
             storage_handle,
             net_handle: None,

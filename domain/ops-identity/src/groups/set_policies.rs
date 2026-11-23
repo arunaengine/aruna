@@ -440,7 +440,7 @@ mod tests {
     use aruna_core::user::id::UserId;
     use aruna_runner::driver::{DriverContext, drive};
     use aruna_scheduler::TaskHandle;
-    use aruna_storage::storage::worker::FjallStorage;
+    use aruna_storage::storage::memory::MemoryStorage;
     use tempfile::tempdir;
     use ulid::Ulid;
 
@@ -503,7 +503,7 @@ mod tests {
 
     async fn setup_group() -> (tempfile::TempDir, DriverContext, Actor, Ulid) {
         let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let context = DriverContext {
             storage_handle: storage,
             net_handle: None,

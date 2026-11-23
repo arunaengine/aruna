@@ -290,7 +290,7 @@ mod tests {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::user::id::UserId;
     use aruna_runner::driver::DriverContext;
-    use aruna_storage::storage::worker::FjallStorage;
+    use aruna_storage::storage::memory::MemoryStorage;
     use tempfile::tempdir;
 
     async fn process_batch(
@@ -331,7 +331,7 @@ mod tests {
 
     fn setup_state() -> TestState {
         let storage_dir = tempdir().unwrap();
-        let storage_handle = FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+        let storage_handle = MemoryStorage::open();
         let realm_id = RealmId::from_bytes([9u8; 32]);
         TestState {
             _storage_dir: storage_dir,

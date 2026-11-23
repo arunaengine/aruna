@@ -599,13 +599,10 @@ mod tests {
     use aruna_runner::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use std::collections::HashMap;
-    use tempfile::tempdir;
 
     #[tokio::test]
     async fn merges_public_secret() {
-        let tempdir = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
         let context = DriverContext {
             storage_handle,
@@ -670,9 +667,7 @@ mod tests {
     // reads through the group's connector of the same source root and login, never another.
     #[tokio::test]
     async fn matches_source_root() {
-        let tempdir = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
         let context = DriverContext {
             storage_handle,
@@ -871,9 +866,7 @@ mod tests {
 
     #[tokio::test]
     async fn uses_stored_descriptor() {
-        let tempdir = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
         let context = DriverContext {
             storage_handle,
@@ -971,9 +964,7 @@ mod tests {
     async fn compact_binding_resolves() {
         use crate::connectors::root_record::root_write;
         use aruna_core::structs::storage::distribution::source_root::RootEntry;
-        let tempdir = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
         let context = DriverContext {
             storage_handle,

@@ -288,8 +288,7 @@ mod tests {
 
     fn context() -> (DriverContext, tempfile::TempDir) {
         let dir = tempdir().unwrap();
-        let context = context_at(dir.path().to_str().unwrap());
-        (context, dir)
+        (aruna_runner::testing::memory_context(), dir)
     }
 
     fn context_at(path: &str) -> DriverContext {

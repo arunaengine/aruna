@@ -1290,9 +1290,9 @@ mod tests {
         }
     }
 
-    fn context(root: &str) -> Arc<DriverContext> {
+    fn context() -> Arc<DriverContext> {
         Arc::new(DriverContext {
-            storage_handle: aruna_storage::storage::worker::FjallStorage::open(root).unwrap(),
+            storage_handle: aruna_storage::storage::memory::MemoryStorage::open(),
             net_handle: None,
             blob_handle: None,
             graph_handle: None,
@@ -1305,10 +1305,7 @@ mod tests {
     /// A drain consults the eviction journal through the net handle, so a
     /// context without one never exercises that gate.
     async fn net_context(root: &Path) -> (Arc<DriverContext>, NetHandle) {
-        let storage_handle = aruna_storage::storage::worker::FjallStorage::open(
-            root.join("storage").to_str().unwrap(),
-        )
-        .unwrap();
+        let storage_handle = aruna_storage::storage::memory::MemoryStorage::open();
         let net_handle = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -1431,8 +1428,7 @@ mod tests {
     async fn late_strategy_mapped() {
         // One pass publishes the successor map and activates from it: leaving
         // the activation to the retry interval strands the work for a restart.
-        let directory = tempdir().unwrap();
-        let context = context(directory.path().to_str().unwrap());
+        let context = context();
         let realm_id = RealmId::from_bytes([61; 32]);
         let (document, late) = late_strategy_config(realm_id);
         store_config(&context, &document).await;
@@ -1498,8 +1494,7 @@ mod tests {
     async fn terminal_starts_successor() {
         // A second join published during an active expansion must wait, then
         // start exactly one successor against the newest map.
-        let directory = tempdir().unwrap();
-        let context = context(directory.path().to_str().unwrap());
+        let context = context();
         let realm_id = RealmId::from_bytes([63; 32]);
         let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         document.ensure_node(node(1), RealmNodeKind::Management);
@@ -1616,8 +1611,7 @@ mod tests {
     async fn one_issuer_publishes() {
         // Every Management node reconciles, but only the deterministic issuer
         // may publish: a rival value at one epoch makes it unusable forever.
-        let directory = tempdir().unwrap();
-        let context = context(directory.path().to_str().unwrap());
+        let context = context();
         let realm_id = RealmId::from_bytes([62; 32]);
         let (document, _late) = late_strategy_config(realm_id);
         store_config(&context, &document).await;
@@ -1932,10 +1926,7 @@ mod tests {
     async fn close_conflicts_write() {
         // A write that read the open fence and then paused must not commit
         // after the departing holder closed that generation.
-        let directory = tempdir().unwrap();
-        let storage =
-            aruna_storage::storage::worker::FjallStorage::open(directory.path().to_str().unwrap())
-                .unwrap();
+        let storage = aruna_storage::storage::memory::MemoryStorage::open();
         let realm_id = RealmId::from_bytes([9; 32]);
         let placement = fenced_bucket();
 
@@ -1992,10 +1983,7 @@ mod tests {
 
     #[tokio::test]
     async fn close_is_monotone() {
-        let directory = tempdir().unwrap();
-        let storage =
-            aruna_storage::storage::worker::FjallStorage::open(directory.path().to_str().unwrap())
-                .unwrap();
+        let storage = aruna_storage::storage::memory::MemoryStorage::open();
         let realm_id = RealmId::from_bytes([10; 32]);
         let placement = fenced_bucket();
         let stored = || async {
@@ -2066,10 +2054,7 @@ mod tests {
     async fn close_heals_malformed() {
         // An unparseable value admits no generation, so a close that reported
         // success without rewriting it would brick the bucket for good.
-        let directory = tempdir().unwrap();
-        let storage =
-            aruna_storage::storage::worker::FjallStorage::open(directory.path().to_str().unwrap())
-                .unwrap();
+        let storage = aruna_storage::storage::memory::MemoryStorage::open();
         let realm_id = RealmId::from_bytes([12; 32]);
         let placement = fenced_bucket();
         let (key_space, key) = fence_read(&realm_id, &placement);

@@ -112,8 +112,8 @@ mod tests {
     use super::*;
     use aruna_runner::driver::{DriverContext, drive, drive_retry};
 
-    fn context(dir: &tempfile::TempDir) -> DriverContext {
-        aruna_runner::testing::path_context(dir.path().to_str().unwrap())
+    fn context() -> DriverContext {
+        aruna_runner::testing::memory_context()
     }
 
     /// Reads the name row and answers it with `stored`.
@@ -173,8 +173,7 @@ mod tests {
 
     #[tokio::test]
     async fn claims_until_released() {
-        let dir = tempfile::tempdir().unwrap();
-        let context = context(&dir);
+        let context = context();
         let claim = |now| ClaimNameOperation::new("data", "in/a.txt", now, 200);
         assert!(drive(claim(100), &context).await.unwrap());
         assert!(!drive(claim(150), &context).await.unwrap());
@@ -191,8 +190,7 @@ mod tests {
     #[tokio::test]
     async fn one_claim_wins() {
         // Concurrent claims of one name leave exactly one winner and no error.
-        let dir = tempfile::tempdir().unwrap();
-        let context = context(&dir);
+        let context = context();
         let build = || ClaimNameOperation::new("data", "in/a.txt", 100, 200);
         let runs: Vec<_> = (0..8)
             .map(|_| drive_retry(build, &context, b"claim"))

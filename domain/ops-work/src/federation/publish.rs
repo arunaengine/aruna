@@ -306,7 +306,6 @@ mod tests {
     use aruna_runner::driver::{DriverContext, drive};
     use aruna_storage::task_timers::read_timer;
     use ed25519_dalek::SigningKey;
-    use tempfile::tempdir;
     use ulid::Ulid;
 
     fn node(seed: u8) -> NodeId {
@@ -473,12 +472,8 @@ mod tests {
     #[tokio::test]
     async fn materialized_change_shortens() {
         // Replicated settings arriving at the reporter persist a due time a few seconds away.
-        let dir = tempdir().unwrap();
         let context = DriverContext {
-            storage_handle: aruna_storage::storage::worker::FjallStorage::open(
-                dir.path().to_str().unwrap(),
-            )
-            .unwrap(),
+            storage_handle: aruna_storage::storage::memory::MemoryStorage::open(),
             net_handle: None,
             blob_handle: None,
             graph_handle: None,
@@ -537,12 +532,8 @@ mod tests {
     #[tokio::test]
     async fn disabled_survives_restart() {
         // The attempt count is stored, so a restarted node does not withdraw again.
-        let dir = tempdir().unwrap();
         let context = DriverContext {
-            storage_handle: aruna_storage::storage::worker::FjallStorage::open(
-                dir.path().to_str().unwrap(),
-            )
-            .unwrap(),
+            storage_handle: aruna_storage::storage::memory::MemoryStorage::open(),
             net_handle: None,
             blob_handle: None,
             graph_handle: None,

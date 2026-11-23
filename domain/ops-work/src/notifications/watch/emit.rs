@@ -24,7 +24,7 @@ mod tests {
     use aruna_p2p::NetHandle;
     use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_runner::driver::{DriverContext, drive};
-    use aruna_storage::storage::worker::FjallStorage;
+    use aruna_storage::storage::memory::MemoryStorage;
     use tempfile::{TempDir, tempdir};
     use ulid::Ulid;
 
@@ -114,7 +114,7 @@ mod tests {
 
     async fn ctx_with_net(realm: RealmId, secret: [u8; 32]) -> (TempDir, DriverContext, NetHandle) {
         let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let net = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),

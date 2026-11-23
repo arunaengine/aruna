@@ -13,7 +13,6 @@ use aruna_core::structs::placement::record::{FIRST_GRANTABLE_HANDLE, HandleRange
 use aruna_core::structured_id::PlacementHandle;
 use aruna_core::user::id::UserId;
 use aruna_runner::driver::{DriverContext, drive};
-use tempfile::tempdir;
 
 fn node(seed: u8) -> NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -27,9 +26,9 @@ fn actor(realm_id: RealmId) -> Actor {
     }
 }
 
-fn context(root: &str) -> DriverContext {
+fn context() -> DriverContext {
     DriverContext {
-        storage_handle: aruna_storage::storage::worker::FjallStorage::open(root).unwrap(),
+        storage_handle: aruna_storage::storage::memory::MemoryStorage::open(),
         net_handle: None,
         blob_handle: None,
         graph_handle: None,
@@ -78,8 +77,7 @@ fn range(owner: NodeId, start: u32, end: u32) -> HandleRange {
 
 #[tokio::test]
 async fn allocation_survives_restart() {
-    let temp = tempdir().unwrap();
-    let context = context(temp.path().to_str().unwrap());
+    let context = context();
     let realm_id = RealmId::from_bytes([60; 32]);
     let actor = actor(realm_id);
     seed_range_config(
@@ -114,8 +112,7 @@ async fn allocation_survives_restart() {
 
 #[tokio::test]
 async fn concurrent_allocation_unique() {
-    let temp = tempdir().unwrap();
-    let context = context(temp.path().to_str().unwrap());
+    let context = context();
     let realm_id = RealmId::from_bytes([64; 32]);
     let actor = actor(realm_id);
     seed_range_config(
@@ -146,8 +143,7 @@ async fn concurrent_allocation_unique() {
 
 #[tokio::test]
 async fn allocation_sets_provenance() {
-    let temp = tempdir().unwrap();
-    let context = context(temp.path().to_str().unwrap());
+    let context = context();
     let realm_id = RealmId::from_bytes([61; 32]);
     let actor = actor(realm_id);
     let document = seed_range_config(
@@ -182,8 +178,7 @@ async fn allocation_sets_provenance() {
 
 #[tokio::test]
 async fn exhaustion_returns_error() {
-    let temp = tempdir().unwrap();
-    let context = context(temp.path().to_str().unwrap());
+    let context = context();
     let realm_id = RealmId::from_bytes([62; 32]);
     let actor = actor(realm_id);
     // Beyond the reserved first handle the range has one allocatable
@@ -215,8 +210,7 @@ async fn exhaustion_returns_error() {
 
 #[tokio::test]
 async fn no_range_exhausted() {
-    let temp = tempdir().unwrap();
-    let context = context(temp.path().to_str().unwrap());
+    let context = context();
     let realm_id = RealmId::from_bytes([63; 32]);
     let actor = actor(realm_id);
     // A range owned by a different node grants this node nothing.

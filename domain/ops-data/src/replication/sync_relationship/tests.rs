@@ -18,7 +18,7 @@ use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::structs::sync_relationship::{SyncMode, SyncState, SyncStatusSnapshot};
 use aruna_core::user::id::UserId;
 use aruna_runner::driver::{DriverContext, drive, drive_retry};
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use byteview::ByteView;
 use std::time::SystemTime;
 use tempfile::{TempDir, tempdir};
@@ -26,7 +26,7 @@ use ulid::Ulid;
 
 fn test_context() -> (TempDir, DriverContext) {
     let tempdir = tempdir().unwrap();
-    let storage_handle = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+    let storage_handle = MemoryStorage::open();
     let context = DriverContext {
         storage_handle,
         net_handle: None,

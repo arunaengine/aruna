@@ -202,9 +202,8 @@ mod tests {
     use aruna_core::task::{PersistedTaskTimer, TaskKey};
     use aruna_runner::driver::DriverContext;
     use aruna_scheduler::TaskHandle;
-    use aruna_storage::storage::worker::FjallStorage;
+    use aruna_storage::storage::memory::MemoryStorage;
     use aruna_test_harness::metadata::refusing;
-    use tempfile::tempdir;
     use ulid::Ulid;
 
     async fn read_timer(
@@ -228,9 +227,7 @@ mod tests {
 
     #[tokio::test]
     async fn projection_failure_retries() {
-        let temp_dir = tempdir().expect("temp dir");
-        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
-            .expect("storage opens");
+        let storage = MemoryStorage::open();
         let context = DriverContext {
             storage_handle: storage.clone(),
             net_handle: None,
@@ -342,9 +339,7 @@ mod tests {
     // queue their prune jobs; the error comes after them.
     #[tokio::test]
     async fn failed_wake_prunes() {
-        let temp_dir = tempdir().expect("temp dir");
-        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
-            .expect("storage opens");
+        let storage = MemoryStorage::open();
         let refused = refusing(storage.clone(), TASK_TIMER_KEYSPACE);
         let context = aruna_runner::testing::test_context(refused);
         let (realm_id, group_id) = (RealmId::from_bytes([7u8; 32]), Ulid::from_parts(3, 1));

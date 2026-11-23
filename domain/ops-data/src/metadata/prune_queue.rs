@@ -685,7 +685,7 @@ mod tests {
     use aruna_runner::driver::{DriverContext, drive};
     use aruna_scheduler::TaskHandle;
     use aruna_storage::storage::handle::StorageHandle;
-    use aruna_storage::storage::worker::FjallStorage;
+    use aruna_storage::storage::memory::MemoryStorage;
     use aruna_test_harness::metadata::{
         process_graph_tombstones, process_prune_batch, prune_jobs_exist, refusing,
     };
@@ -812,10 +812,8 @@ mod tests {
 
     #[tokio::test]
     async fn lifecycle_tombstone_processing() {
-        let dir = tempdir().expect("temp dir");
         let metadata_dir = tempdir().expect("metadata dir");
-        let storage =
-            FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
+        let storage = MemoryStorage::open();
         let node_id = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
         let graph_handle = aruna_rdf_graph::GraphHandle::open(
             metadata_dir.path(),
@@ -880,10 +878,8 @@ mod tests {
     #[tokio::test]
     async fn prunes_index_rows() {
         // Deleting a document drops its IRI reference index rows.
-        let dir = tempdir().expect("temp dir");
         let metadata_dir = tempdir().expect("metadata dir");
-        let storage =
-            FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
+        let storage = MemoryStorage::open();
         let node_id = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
         let graph_handle = aruna_rdf_graph::GraphHandle::open(
             metadata_dir.path(),
@@ -1004,11 +1000,8 @@ mod tests {
     // a caller with a durable row runs it again.
     #[tokio::test]
     async fn failed_enqueue_errs() {
-        let (dir, metadata_dir) = (
-            tempdir().expect("temp dir"),
-            tempdir().expect("metadata dir"),
-        );
-        let storage = FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("opens");
+        let metadata_dir = tempdir().expect("metadata dir");
+        let storage = MemoryStorage::open();
         let (graph, index_key, tombstone) = indexed_tombstone(&storage, metadata_dir.path()).await;
         let store = refusing(storage.clone(), PRUNE_JOB_KEYSPACE);
 
@@ -1023,11 +1016,8 @@ mod tests {
     // Index rows that could not be deleted fail the run; the queued prune job is kept.
     #[tokio::test]
     async fn failed_index_errs() {
-        let (dir, metadata_dir) = (
-            tempdir().expect("temp dir"),
-            tempdir().expect("metadata dir"),
-        );
-        let storage = FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("opens");
+        let metadata_dir = tempdir().expect("metadata dir");
+        let storage = MemoryStorage::open();
         let (graph, index_key, tombstone) = indexed_tombstone(&storage, metadata_dir.path()).await;
         let store = refusing(storage.clone(), aruna_core::keyspaces::IRI_INDEX_KEYSPACE);
 
@@ -1041,9 +1031,7 @@ mod tests {
 
     #[tokio::test]
     async fn job_dropped_when() {
-        let dir = tempdir().expect("temp dir");
-        let storage =
-            FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
+        let storage = MemoryStorage::open();
         let job = GraphPruneRecord::new("urn:graph:not-deleted".to_string(), 1);
         write_entries(&storage, vec![graph_prune_entry(&job).expect("job entry")]).await;
         let context = DriverContext {
@@ -1064,9 +1052,7 @@ mod tests {
 
     #[tokio::test]
     async fn corrupt_prune_job() {
-        let dir = tempdir().expect("temp dir");
-        let storage =
-            FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
+        let storage = MemoryStorage::open();
         let corrupt_key = vec![0];
         write_entries(
             &storage,
@@ -1098,9 +1084,7 @@ mod tests {
 
     #[tokio::test]
     async fn existence_deletes_corrupt() {
-        let dir = tempdir().expect("temp dir");
-        let storage =
-            FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
+        let storage = MemoryStorage::open();
         let corrupt_key = vec![0];
         let valid_job = GraphPruneRecord::new("urn:graph:valid".to_string(), 1);
         write_entries(
@@ -1122,9 +1106,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_handle_reschedules() {
-        let dir = tempdir().expect("temp dir");
-        let storage =
-            FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
+        let storage = MemoryStorage::open();
         let graph_iri = "urn:graph:deleted";
         let job = GraphPruneRecord::new(graph_iri.to_string(), 1);
         write_entries(
@@ -1163,9 +1145,7 @@ mod tests {
 
     #[tokio::test]
     async fn existence_reflects_queue() {
-        let dir = tempdir().expect("temp dir");
-        let storage =
-            FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
+        let storage = MemoryStorage::open();
 
         assert!(!prune_jobs_exist(&storage_context(&storage)).await.unwrap());
         let job = GraphPruneRecord::new("urn:graph:queued".to_string(), 1);

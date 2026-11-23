@@ -11,9 +11,8 @@ use aruna_core::secrets::SecretFields;
 use aruna_core::structs::identity::admin_audit::{AuditIndex, audit_prefix};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_runner::driver::{DriverContext, drive};
-use aruna_runner::testing::path_context;
+use aruna_runner::testing::memory_context;
 use ed25519_dalek::SigningKey;
-use tempfile::tempdir;
 
 fn realm_key() -> SigningKey {
     SigningKey::from_bytes(&[5u8; 32])
@@ -29,8 +28,8 @@ fn actor() -> Actor {
 }
 
 /// A realm whose config made the actor's node a management node.
-async fn seeded(root: &str) -> DriverContext {
-    let ctx = path_context(root);
+async fn seeded() -> DriverContext {
+    let ctx = memory_context();
     let config = CreateRealmConfig {
         actor: actor(),
         realm_description: "Realm".to_string(),
@@ -78,8 +77,7 @@ async fn listed(ctx: &DriverContext, owner: SecretOwner) -> Vec<SecretEntry> {
 
 #[tokio::test]
 async fn registers_follow_changes() {
-    let dir = tempdir().unwrap();
-    let ctx = seeded(dir.path().to_str().unwrap()).await;
+    let ctx = seeded().await;
     let created = run(&ctx, group(), create(), false, 10)
         .await
         .unwrap()
@@ -135,8 +133,7 @@ async fn registers_follow_changes() {
 
 #[tokio::test]
 async fn foreign_writer_ignored() {
-    let dir = tempdir().unwrap();
-    let ctx = seeded(dir.path().to_str().unwrap()).await;
+    let ctx = seeded().await;
     let created = run(&ctx, group(), create(), false, 10)
         .await
         .unwrap()
@@ -158,8 +155,7 @@ async fn foreign_writer_ignored() {
 
 #[tokio::test]
 async fn readback_audits_first() {
-    let dir = tempdir().unwrap();
-    let ctx = seeded(dir.path().to_str().unwrap()).await;
+    let ctx = seeded().await;
     let owner = SecretOwner::User(actor().user_id);
     let refused = run(&ctx, group(), create(), true, 9).await;
     assert_eq!(refused, Err(aruna_core::secrets::SecretError::Rule.into()));
@@ -213,8 +209,7 @@ fn named(name: &str) -> SecretChange {
 
 #[tokio::test]
 async fn pages_skip_deleted() {
-    let dir = tempdir().unwrap();
-    let ctx = seeded(dir.path().to_str().unwrap()).await;
+    let ctx = seeded().await;
     for (seed, name) in [(10, "a"), (11, "b"), (12, "c")] {
         run(&ctx, group(), named(name), false, seed).await.unwrap();
     }
@@ -246,8 +241,7 @@ async fn pages_skip_deleted() {
 
 #[tokio::test]
 async fn long_description_refused() {
-    let dir = tempdir().unwrap();
-    let ctx = seeded(dir.path().to_str().unwrap()).await;
+    let ctx = seeded().await;
     let long = "x".repeat(aruna_core::secrets::MAX_DESCRIPTION + 1);
     let mut change = create();
     if let SecretChange::Create { description, .. } = &mut change {
@@ -275,8 +269,7 @@ async fn long_description_refused() {
 #[tokio::test]
 async fn readback_needs_audit() {
     // When the audit row cannot be written, the read-back ends without an entry to open.
-    let dir = tempdir().unwrap();
-    let ctx = seeded(dir.path().to_str().unwrap()).await;
+    let ctx = seeded().await;
     let owner = SecretOwner::User(actor().user_id);
     run(&ctx, owner, create(), true, 10).await.unwrap();
     let mut read = ReadbackOperation::new(actor().realm_id, owner, name(), actor().user_id);
@@ -304,8 +297,7 @@ async fn group_widening_notified() {
     use aruna_core::keyspaces::{AUTH_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE};
     use aruna_core::secrets::{Delivery, ResponseExposure, SecretConsumer, UseRule};
     use aruna_core::structs::identity::group::GroupAuthorizationDocument;
-    let dir = tempdir().unwrap();
-    let ctx = seeded(dir.path().to_str().unwrap()).await;
+    let ctx = seeded().await;
     let group_id = Ulid::from_bytes([7; 16]);
     let auth =
         GroupAuthorizationDocument::default_group_doc(actor().user_id, actor().realm_id, group_id);

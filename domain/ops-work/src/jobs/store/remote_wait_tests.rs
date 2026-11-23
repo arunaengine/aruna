@@ -40,12 +40,8 @@ fn auth() -> AuthContext {
 
 #[tokio::test]
 async fn wake_until_acknowledged() {
-    let dir = tempfile::tempdir().unwrap();
     let context = DriverContext {
-        storage_handle: aruna_storage::storage::worker::FjallStorage::open(
-            dir.path().to_str().unwrap(),
-        )
-        .unwrap(),
+        storage_handle: aruna_storage::storage::memory::MemoryStorage::open(),
         net_handle: None,
         blob_handle: None,
         graph_handle: None,

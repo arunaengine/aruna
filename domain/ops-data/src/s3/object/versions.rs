@@ -704,7 +704,6 @@ mod test {
     use aruna_storage::storage;
     use std::collections::HashMap;
     use std::time::{Duration, UNIX_EPOCH};
-    use tempfile::tempdir;
 
     fn created_by() -> UserId {
         UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]))
@@ -818,9 +817,7 @@ mod test {
 
     #[tokio::test]
     async fn newest_first_returned() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = test_context(storage_handle.clone());
 
         let versions = ordered_ulids(2);
@@ -866,9 +863,7 @@ mod test {
 
     #[tokio::test]
     async fn head_breaks_tie() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = test_context(storage_handle.clone());
 
         let versions = ordered_ulids(2);
@@ -905,9 +900,7 @@ mod test {
 
     #[tokio::test]
     async fn delete_markers_included() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = test_context(storage_handle.clone());
 
         let versions = ordered_ulids(2);
@@ -950,9 +943,7 @@ mod test {
 
     #[tokio::test]
     async fn markers_resume() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = test_context(storage_handle.clone());
 
         // Two keys, "a" with two versions and "b" with one version.
@@ -1012,9 +1003,7 @@ mod test {
 
     #[tokio::test]
     async fn delimiter_groups() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = test_context(storage_handle.clone());
 
         for (index, key) in ["a.txt", "dir/1", "dir/2", "z.txt"].iter().enumerate() {
@@ -1052,9 +1041,7 @@ mod test {
 
     #[tokio::test]
     async fn reference_metadata_returned() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = test_context(storage_handle.clone());
 
         let version_id = Ulid::generate();
@@ -1120,9 +1107,7 @@ mod test {
 
     #[tokio::test]
     async fn keys_sort() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = test_context(storage_handle.clone());
 
         for (index, key) in ["b", "aa", "a/1"].iter().enumerate() {
@@ -1151,9 +1136,7 @@ mod test {
 
     #[tokio::test]
     async fn scan_cap_truncates() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = test_context(storage_handle.clone());
 
         // Three delimiter groups; each head round makes bounded progress so the
@@ -1211,9 +1194,7 @@ mod test {
 
     #[tokio::test]
     async fn keeps_all_versions() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = test_context(storage_handle.clone());
 
         // Seed more versions than the scan limit; every storage page must

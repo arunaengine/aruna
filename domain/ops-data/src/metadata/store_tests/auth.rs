@@ -6,8 +6,7 @@ use super::*;
 
 pub(super) fn auth_storage() -> (TempDir, StorageHandle) {
     let dir = tempdir().expect("temp dir");
-    let storage =
-        FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+    let storage = MemoryStorage::open();
     (dir, storage)
 }
 

@@ -601,10 +601,9 @@ mod tests {
     use aruna_core::user::id::UserId;
     use aruna_runner::driver::DriverContext;
     use aruna_scheduler::TaskHandle;
-    use aruna_storage::storage::worker::FjallStorage;
+    use aruna_storage::storage::memory::MemoryStorage;
     use std::collections::BTreeSet;
     use std::time::Duration;
-    use tempfile::tempdir;
     use ulid::Ulid;
 
     fn record(group_id: Ulid, document_id: Ulid, realm_id: RealmId) -> MetadataAuditRecord {
@@ -1286,8 +1285,7 @@ mod tests {
     #[tokio::test]
     async fn forwarded_policy_deny() {
         // A serving peer must apply the same policy context as the REST gate.
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let context = std::sync::Arc::new(DriverContext {
             storage_handle: storage.clone(),
             net_handle: None,
@@ -1463,8 +1461,7 @@ mod tests {
     #[tokio::test]
     async fn local_page_paging() {
         // Cursor paging walks the group's records; a document filter narrows.
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let context = DriverContext {
             storage_handle: storage,
             net_handle: None,

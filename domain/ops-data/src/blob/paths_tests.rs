@@ -10,14 +10,11 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::HashIndex;
 use aruna_runner::driver::{DriverContext, drive};
 use aruna_storage::storage;
-use tempfile::tempdir;
 use ulid::Ulid;
 
 #[tokio::test]
 async fn resolves_empty_hash() {
-    let random_path = tempdir().unwrap();
-    let storage_handle =
-        storage::worker::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
+    let storage_handle = storage::memory::MemoryStorage::open();
     let context = DriverContext {
         storage_handle,
         net_handle: None,
@@ -36,9 +33,7 @@ async fn resolves_empty_hash() {
 
 #[tokio::test]
 async fn resolves_existing_aliases() {
-    let random_path = tempdir().unwrap();
-    let storage_handle =
-        storage::worker::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
+    let storage_handle = storage::memory::MemoryStorage::open();
     let context = DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,

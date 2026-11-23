@@ -10,7 +10,7 @@ use crate::plugins::rows::tests::child_result;
 use crate::plugins::rows::tests::{page_result, values_result};
 use aruna_core::plugin_runs::RunState;
 use aruna_runner::driver::{DriverContext, drive};
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 #[allow(unused_imports)]
 use aruna_test_harness::plugins::queued;
 use tempfile::{TempDir, tempdir};
@@ -18,7 +18,7 @@ use tempfile::{TempDir, tempdir};
 /// A node context on its own empty storage.
 pub(crate) fn opened() -> (TempDir, DriverContext) {
     let dir = tempdir().unwrap();
-    let storage_handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage_handle = MemoryStorage::open();
     let ctx = DriverContext {
         storage_handle,
         net_handle: None,

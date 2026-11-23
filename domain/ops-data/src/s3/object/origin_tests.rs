@@ -97,16 +97,8 @@ async fn seed(context: &DriverContext, actor: &Actor, listed: bool) -> Ulid {
     version_id
 }
 
-fn test_context(temp: &tempfile::TempDir) -> DriverContext {
-    DriverContext {
-        storage_handle: aruna_storage::storage::worker::FjallStorage::open(temp.path().to_str().unwrap()).unwrap(),
-        net_handle: None,
-        blob_handle: None,
-        graph_handle: None,
-        task_handle: None,
-        compute_handle: None,
-        outbound_handle: None,
-    }
+fn test_context() -> DriverContext {
+    aruna_runner::testing::memory_context()
 }
 
 fn actor() -> Actor {
@@ -123,8 +115,7 @@ fn actor() -> Actor {
 async fn connector_name_read() {
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_core::structs::execution::staging::StagingStrategy;
-    let temp = tempfile::tempdir().unwrap();
-    let context = test_context(&temp);
+    let context = test_context();
     let actor = actor();
     seed(&context, &actor, true).await;
     let (group_id, connector_id) = (Ulid::from_bytes([2; 16]), Ulid::from_bytes([5; 16]));
@@ -202,8 +193,7 @@ async fn connector_name_read() {
 #[tokio::test]
 async fn database_identifiers_read() {
     for listed in [true, false] {
-        let temp = tempfile::tempdir().unwrap();
-        let context = test_context(&temp);
+        let context = test_context();
         let actor = actor();
         let realm_id = actor.realm_id;
         let version_id = seed(&context, &actor, listed).await;

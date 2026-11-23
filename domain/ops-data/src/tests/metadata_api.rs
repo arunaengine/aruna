@@ -24,9 +24,7 @@ pub(crate) struct MetadataTest {
 pub(crate) fn metadata_test() -> MetadataTest {
     let storage_dir = tempdir().expect("storage dir");
     let metadata_dir = tempdir().expect("metadata dir");
-    let storage_handle =
-        storage::worker::FjallStorage::open(storage_dir.path().to_str().expect("storage path"))
-            .expect("storage opens");
+    let storage_handle = storage::memory::MemoryStorage::open();
     let graph_handle = aruna_rdf_graph::GraphHandle::open(
         metadata_dir.path(),
         iroh::SecretKey::from_bytes(&[7u8; 32]).public(),

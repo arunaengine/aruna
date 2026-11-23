@@ -127,11 +127,15 @@ pub fn path_context(root: &str) -> DriverContext {
     )
 }
 
-/// A storage-only driver context on a fresh temporary store.
+/// A storage-only driver context on a fresh in-memory store, with a scratch directory.
 pub fn temp_context() -> (tempfile::TempDir, DriverContext) {
     let dir = tempfile::tempdir().expect("temp dir");
-    let context = path_context(dir.path().to_str().expect("temp path"));
-    (dir, context)
+    (dir, memory_context())
+}
+
+/// A storage-only driver context on a fresh in-memory store.
+pub fn memory_context() -> DriverContext {
+    test_context(aruna_storage::storage::memory::MemoryStorage::open())
 }
 
 /// Writes one value outside a transaction; panics on any other answer.

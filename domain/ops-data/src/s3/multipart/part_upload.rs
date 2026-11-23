@@ -655,7 +655,6 @@ mod test {
     use aruna_core::structs::storage::multipart::{BackendUpload, MultipartUploadStatus};
     use aruna_runner::driver::{DriverContext, drive};
     use aruna_storage::storage;
-    use tempfile::tempdir;
 
     fn test_user_id() -> UserId {
         UserId::local(Ulid::from_bytes([8u8; 16]), RealmId::from_bytes([1u8; 32]))
@@ -1167,9 +1166,7 @@ mod test {
 
     #[tokio::test]
     async fn missing_upload_rejected() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let context = DriverContext {
             storage_handle,
             net_handle: None,

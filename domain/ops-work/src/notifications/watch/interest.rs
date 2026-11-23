@@ -594,7 +594,7 @@ mod tests {
     use aruna_p2p::NetHandle;
     use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_runner::driver::{DriverContext, drive};
-    use aruna_storage::storage::worker::FjallStorage;
+    use aruna_storage::storage::memory::MemoryStorage;
     use tempfile::{TempDir, tempdir};
     use ulid::Ulid;
 
@@ -645,8 +645,8 @@ mod tests {
         Ok((digest, filtered.check_failed))
     }
 
-    fn test_ctx(root: &str) -> DriverContext {
-        aruna_runner::testing::path_context(root)
+    fn test_ctx() -> DriverContext {
+        aruna_runner::testing::memory_context()
     }
 
     async fn ctx_with_net(
@@ -654,7 +654,7 @@ mod tests {
         secret: [u8; 32],
     ) -> (TempDir, DriverContext, NetHandle) {
         let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let net = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -908,8 +908,7 @@ mod tests {
 
     #[tokio::test]
     async fn dirty_page_caps() {
-        let temp = tempdir().unwrap();
-        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let ctx = test_ctx();
         for index in 0..=DIRTY_REALM_CAP {
             assert!(matches!(
                 ctx.storage_handle
@@ -932,8 +931,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_marks_dirty() {
-        let temp = tempdir().unwrap();
-        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let ctx = test_ctx();
         let owner = user(1, 2);
         let group_id = Ulid::generate();
 
@@ -952,8 +950,7 @@ mod tests {
 
     #[tokio::test]
     async fn publish_clears_markers() {
-        let temp = tempdir().unwrap();
-        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let ctx = test_ctx();
         let node_id = node(5);
         let owner = user(1, 2);
         install_realm_config(&ctx, owner.realm_id, &[node_id]).await;
@@ -1016,8 +1013,7 @@ mod tests {
     // another replication handoff.
     #[tokio::test]
     async fn unchanged_skips_publish() {
-        let temp = tempdir().unwrap();
-        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let ctx = test_ctx();
         let realm_id = RealmId([7u8; 32]);
         let node_id = node(5);
         let owner = user(7, 2);
@@ -1069,8 +1065,7 @@ mod tests {
     // empty digests stop producing replicated events.
     #[tokio::test]
     async fn retry_stays_dirty() {
-        let temp = tempdir().unwrap();
-        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let ctx = test_ctx();
         let realm_id = RealmId([8u8; 32]);
         let node_id = node(6);
         let owner = user(8, 2);
@@ -1114,8 +1109,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_publishes_empty() {
-        let temp = tempdir().unwrap();
-        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let ctx = test_ctx();
         let node_id = node(5);
         let owner = user(1, 2);
         install_realm_config(&ctx, owner.realm_id, &[node_id]).await;
@@ -1155,8 +1149,7 @@ mod tests {
 
     #[tokio::test]
     async fn digest_omits_moved() {
-        let temp = tempdir().unwrap();
-        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let ctx = test_ctx();
         let realm_id = RealmId([2u8; 32]);
         let local_node_id = node(5);
         let remote_node_id = node(6);
@@ -1207,8 +1200,7 @@ mod tests {
 
     #[tokio::test]
     async fn marker_respects_generation() {
-        let temp = tempdir().unwrap();
-        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let ctx = test_ctx();
         let realm_id = RealmId([1u8; 32]);
 
         // Two distinct generations for the same realm marker: only the observed
@@ -1256,8 +1248,7 @@ mod tests {
 
     #[tokio::test]
     async fn rebuild_reads_digests() {
-        let temp = tempdir().unwrap();
-        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let ctx = test_ctx();
         let realm_id = RealmId([3u8; 32]);
         let holder = node(11);
         install_realm_config(&ctx, realm_id, &[holder]).await;

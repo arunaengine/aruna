@@ -11,9 +11,8 @@ use aruna_core::secrets::SecretFields;
 use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
 use aruna_core::user::id::UserId;
 use aruna_runner::driver::{DriverContext, drive};
-use aruna_runner::testing::path_context;
+use aruna_runner::testing::memory_context;
 use ed25519_dalek::SigningKey;
-use tempfile::tempdir;
 
 fn actor() -> Actor {
     let realm_id = RealmId::from_bytes([1u8; 32]);
@@ -77,8 +76,7 @@ fn opened(config: &RealmConfigDocument) -> Vec<SecretFields> {
 
 #[tokio::test]
 async fn value_follows_record() {
-    let dir = tempdir().unwrap();
-    let ctx = path_context(dir.path().to_str().unwrap());
+    let ctx = memory_context();
     seed(&ctx, RealmNodeKind::Management).await;
 
     let created = run(&ctx, create(), 10).await.unwrap().unwrap();
@@ -109,14 +107,12 @@ async fn value_follows_record() {
 
 #[tokio::test]
 async fn refusals_write_nothing() {
-    let dir = tempdir().unwrap();
-    let ctx = path_context(dir.path().to_str().unwrap());
+    let ctx = memory_context();
     seed(&ctx, RealmNodeKind::Server).await;
     let refused = run(&ctx, create(), 10).await;
     assert_eq!(refused, Err(RealmSecretError::NotManagementNode));
 
-    let dir = tempdir().unwrap();
-    let ctx = path_context(dir.path().to_str().unwrap());
+    let ctx = memory_context();
     seed(&ctx, RealmNodeKind::Management).await;
     let created = run(&ctx, create(), 10).await.unwrap().unwrap();
     let stale = SecretChange::Replace {
@@ -141,8 +137,7 @@ async fn early_value_kept() {
     use aruna_core::admin_documents::AdminDocumentOperation as Op;
     use aruna_core::reducer::AdminDocumentState;
     use aruna_core::storage_entries::{reducer_state_entry, reducer_state_key};
-    let dir = tempdir().unwrap();
-    let ctx = path_context(dir.path().to_str().unwrap());
+    let ctx = memory_context();
     seed(&ctx, RealmNodeKind::Management).await;
     let other = Actor {
         node_id: iroh::SecretKey::from_bytes(&[8; 32]).public(),
@@ -239,8 +234,7 @@ async fn widening_notifies_admins() {
     use aruna_core::keyspaces::{AUTH_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE};
     use aruna_core::secrets::{Delivery, ResponseExposure, SecretConsumer, UseRule};
     use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
-    let dir = tempdir().unwrap();
-    let ctx = path_context(dir.path().to_str().unwrap());
+    let ctx = memory_context();
     seed(&ctx, RealmNodeKind::Management).await;
     let mut auth = RealmAuthorizationDocument::default_realm_doc(actor().realm_id);
     for role in auth

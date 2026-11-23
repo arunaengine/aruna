@@ -12,7 +12,7 @@ use aruna_core::structs::execution::staging::{
 };
 use aruna_core::structs::identity::auth::PathRestriction;
 use aruna_core::user::id::UserId;
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use tempfile::tempdir;
 
 use super::*;
@@ -202,8 +202,7 @@ fn unreadable_config_refuses() {
 async fn rejects_foreign_peer() {
     // The blob replication plane must refuse peers that are unknown or not
     // sync-eligible before any manifest is read.
-    let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let realm_id = aruna_core::structs::identity::realm::RealmId::from_bytes([3u8; 32]);
     let server = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
     let user = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
@@ -273,8 +272,7 @@ async fn rejects_foreign_peer() {
 
 #[tokio::test]
 async fn checks_advance_policy() {
-    let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let context = DriverContext {
         storage_handle: storage,
         net_handle: None,
@@ -480,8 +478,7 @@ async fn denies_offered_bucket() {
 
 #[tokio::test]
 async fn foreign_reads_denied() {
-    let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let context = DriverContext {
         storage_handle: storage,
         net_handle: None,

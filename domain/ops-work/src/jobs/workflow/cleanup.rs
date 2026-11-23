@@ -383,8 +383,7 @@ mod tests {
     };
     use aruna_core::user::id::UserId;
     use aruna_storage::storage::handle::StorageHandle;
-    use aruna_storage::storage::worker::FjallStorage;
-    use tempfile::tempdir;
+    use aruna_storage::storage::memory::MemoryStorage;
     use tokio_util::sync::CancellationToken;
     use ulid::Ulid;
 
@@ -743,8 +742,7 @@ mod tests {
 
     #[tokio::test]
     async fn revoke_failure_cleans() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let context = aruna_runner::testing::test_context(storage.clone());
         let access_key = "malformed-access";
         let _ = storage
@@ -775,8 +773,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_revoke_succeeds() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let ctx = job_context(storage, &[]);
 
         let outcome =
@@ -790,8 +787,7 @@ mod tests {
 
     #[tokio::test]
     async fn orphan_cleanup_fails() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let ctx = job_context(storage, &[]);
         let job_id = JobId::from_bytes([10; 16]);
 
@@ -809,8 +805,7 @@ mod tests {
 
     #[tokio::test]
     async fn revoked_revoke_stable() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let context = aruna_runner::testing::test_context(storage.clone());
         let mut access = user_access("revoked-access");
         let revoked_at = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
@@ -834,8 +829,7 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_uses_name() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let context = aruna_runner::testing::test_context(storage.clone());
         let first = StubBackend::new(ExecutorKind::Docker, vec![Ok(())]);
         let second = StubBackend::new(ExecutorKind::Docker, vec![Ok(())]);
@@ -880,8 +874,7 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_retry_succeeds() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let context = aruna_runner::testing::test_context(storage.clone());
         let backend = StubBackend::new(
             ExecutorKind::Docker,
@@ -908,8 +901,7 @@ mod tests {
     #[tokio::test]
     async fn existing_never_deletes() {
         // The bucket a run works inside is the caller's; cleanup never drops it.
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let ctx = job_context(storage, &[]);
         let job_id = JobId::from_bytes([14; 16]);
         let bucket = "existing-workspace";

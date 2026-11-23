@@ -67,7 +67,6 @@ mod test {
     use aruna_runner::driver::DriverContext;
     use aruna_runner::driver::drive;
     use aruna_storage::storage;
-    use tempfile::tempdir;
     use ulid::Ulid;
 
     #[test]
@@ -81,9 +80,7 @@ mod test {
 
     #[tokio::test]
     pub async fn gets_user_access() {
-        let temp_handle = tempdir().unwrap();
-        let temp_root = temp_handle.path().to_str().unwrap();
-        let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
 
         let user_identity = Default::default();
         let access_key_id = UserAccess::build_access_key(&Ulid::generate().to_string()).unwrap();

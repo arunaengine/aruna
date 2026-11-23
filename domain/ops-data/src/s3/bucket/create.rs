@@ -796,14 +796,11 @@ mod test {
     use aruna_runner::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use std::time::SystemTime;
-    use tempfile::tempdir;
     use ulid::Ulid;
 
     #[tokio::test]
     async fn test_create_bucket() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = DriverContext {
             storage_handle,
             net_handle: None,
@@ -838,9 +835,7 @@ mod test {
 
     #[tokio::test]
     async fn duplicate_bucket_rejected() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = DriverContext {
             storage_handle,
             net_handle: None,
@@ -884,9 +879,7 @@ mod test {
 
     #[tokio::test]
     async fn recreation_gets_incarnation() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = DriverContext {
             storage_handle,
             net_handle: None,
@@ -940,9 +933,7 @@ mod test {
 
     #[tokio::test]
     async fn member_binds_incarnation() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = DriverContext {
             storage_handle,
             net_handle: None,

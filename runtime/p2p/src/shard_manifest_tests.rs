@@ -11,10 +11,9 @@ use aruna_core::document::{
     DocumentSyncRevision, DocumentTarget, ShardManifest, ShardManifestEntry,
 };
 use aruna_core::id::NodeId;
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use async_trait::async_trait;
 use std::{sync::Arc, time::Duration};
-use tempfile::tempdir;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use ulid::Ulid;
@@ -247,12 +246,8 @@ fn invalid_pages_fail() {
 
 #[tokio::test]
 async fn oversized_request_rejected() {
-    let dir_a = tempdir().expect("client temp dir");
-    let dir_b = tempdir().expect("server temp dir");
-    let storage_a = FjallStorage::open(dir_a.path().to_str().expect("client temp path"))
-        .expect("client storage");
-    let storage_b = FjallStorage::open(dir_b.path().to_str().expect("server temp path"))
-        .expect("server storage");
+    let storage_a = MemoryStorage::open();
+    let storage_b = MemoryStorage::open();
     let config = || NetConfig {
         bind_addr: "127.0.0.1:0".parse().expect("bind address"),
         discovery_method: DiscoveryMethod::None,

@@ -192,12 +192,8 @@ mod tests {
     #[tokio::test]
     async fn write_checks_admin() {
         // Only an admin of the bucket's group writes its metadata, checked in the write itself.
-        let temp = tempfile::tempdir().unwrap();
         let context = DriverContext {
-            storage_handle: aruna_storage::storage::worker::FjallStorage::open(
-                temp.path().to_str().unwrap(),
-            )
-            .unwrap(),
+            storage_handle: aruna_storage::storage::memory::MemoryStorage::open(),
             net_handle: None,
             blob_handle: None,
             graph_handle: None,

@@ -164,8 +164,7 @@ mod tests {
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
     use aruna_runner::driver::{DriverContext, drive};
-    use aruna_storage::storage::worker::FjallStorage;
-    use tempfile::tempdir;
+    use aruna_storage::storage::memory::MemoryStorage;
     use ulid::Ulid;
 
     fn make_record(document_id: Ulid, last_event_id: Ulid) -> MetadataRegistryRecord {
@@ -213,8 +212,7 @@ mod tests {
     async fn withholds_stale_status() {
         // A registry row replicated ahead of its document event must not export
         // the graph materialized for the previous event.
-        let temp_dir = tempdir().unwrap();
-        let storage_handle = FjallStorage::open(temp_dir.path().to_str().unwrap()).unwrap();
+        let storage_handle = MemoryStorage::open();
         let context = DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,

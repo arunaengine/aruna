@@ -481,7 +481,6 @@ mod tests {
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::node_info::NodeUrls;
     use aruna_runner::driver::{DriverContext, drive};
-    use tempfile::tempdir;
     use tokio_util::sync::CancellationToken;
     use ulid::Ulid;
 
@@ -778,8 +777,8 @@ mod tests {
         assert_eq!(status.message.as_deref(), Some("down"));
     }
 
-    fn test_ctx(root: &str) -> DriverContext {
-        aruna_runner::testing::path_context(root)
+    fn test_ctx() -> DriverContext {
+        aruna_runner::testing::memory_context()
     }
 
     async fn write_config(ctx: &DriverContext, config: &RealmConfigDocument, local: NodeId) {
@@ -807,8 +806,7 @@ mod tests {
     #[tokio::test]
     async fn refuses_server_node() {
         // Only a device has an owner to run local jobs for.
-        let dir = tempdir().unwrap();
-        let ctx = test_ctx(dir.path().to_str().unwrap());
+        let ctx = test_ctx();
         let local = node(1);
         write_config(&ctx, &realm_config(local, RealmNodeKind::Server), local).await;
 
@@ -821,8 +819,7 @@ mod tests {
 
     #[tokio::test]
     async fn refuses_foreign_caller() {
-        let dir = tempdir().unwrap();
-        let ctx = test_ctx(dir.path().to_str().unwrap());
+        let ctx = test_ctx();
         let local = node(1);
         let config = realm_config(local, RealmNodeKind::User { owner: owner(2) });
         write_config(&ctx, &config, local).await;
@@ -837,8 +834,7 @@ mod tests {
     #[tokio::test]
     async fn refuses_while_paused() {
         // Pause stops local compute like it stops serving and syncing.
-        let dir = tempdir().unwrap();
-        let ctx = test_ctx(dir.path().to_str().unwrap());
+        let ctx = test_ctx();
         let local = node(1);
         let config = realm_config(local, RealmNodeKind::User { owner: owner(2) });
         write_config(&ctx, &config, local).await;
@@ -937,13 +933,13 @@ mod tests {
         }
     }
 
-    fn device_ctx(root: &str) -> DriverContext {
+    fn device_ctx() -> DriverContext {
         DriverContext {
             compute_handle: Some(std::sync::Arc::new(
                 aruna_compute::registry::ExecutorRegistry::new()
                     .with_backend("docker", std::sync::Arc::new(StubBackend)),
             )),
-            ..test_ctx(root)
+            ..test_ctx()
         }
     }
 
@@ -968,8 +964,7 @@ mod tests {
     async fn keeps_runs_local() {
         // The device owns the job and tells nobody: no outbox row, no family
         // record, and a second run is refused by the owner's own ceiling.
-        let dir = tempdir().unwrap();
-        let ctx = device_ctx(dir.path().to_str().unwrap());
+        let ctx = device_ctx();
         let local = node(1);
         let caller = owner(2);
         let config = realm_config(local, RealmNodeKind::User { owner: caller });
@@ -1004,8 +999,7 @@ mod tests {
         // The realm's own launch path declines a device whatever it advertises,
         // so local compute never becomes a dispatch target.
         use crate::tests::records::Family;
-        let dir = tempdir().unwrap();
-        let ctx = test_ctx(dir.path().to_str().unwrap());
+        let ctx = test_ctx();
         let local = node(1);
         let config = realm_config(local, RealmNodeKind::User { owner: owner(2) });
         write_config(&ctx, &config, local).await;
@@ -1036,8 +1030,7 @@ mod tests {
     async fn pins_output_destination() {
         // A declared output with no endpoint fails capture mid-run, so the
         // device names itself as the writer before the job exists.
-        let dir = tempdir().unwrap();
-        let ctx = device_ctx(dir.path().to_str().unwrap());
+        let ctx = device_ctx();
         let local = node(1);
         let caller = owner(2);
         let config = realm_config(local, RealmNodeKind::User { owner: caller });
@@ -1147,8 +1140,7 @@ mod tests {
     async fn runs_without_bucket() {
         // A device run owns no bucket, and an input the request left open is
         // pinned to the version it resolves to at accept time.
-        let dir = tempdir().unwrap();
-        let ctx = device_ctx(dir.path().to_str().unwrap());
+        let ctx = device_ctx();
         let local = node(1);
         let caller = owner(2);
         write_config(

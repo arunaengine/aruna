@@ -344,7 +344,7 @@ mod tests {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::user::id::UserId;
     use aruna_storage::storage::handle::StorageHandle;
-    use aruna_storage::storage::worker::FjallStorage;
+    use aruna_storage::storage::memory::MemoryStorage;
     use tempfile::tempdir;
     use ulid::Ulid;
 
@@ -395,7 +395,7 @@ mod tests {
         aruna_p2p::NetHandle,
     ) {
         let dir = tempdir().unwrap();
-        let storage: StorageHandle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage: StorageHandle = MemoryStorage::open();
         let realm_id = RealmId([1u8; 32]);
         let net = aruna_p2p::NetHandle::new(
             aruna_p2p::config::NetConfig {

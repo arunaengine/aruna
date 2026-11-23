@@ -1622,19 +1622,8 @@ mod tests {
         assert_eq!(reclaim.first(), Ok(Next::Done(0)));
     }
 
-    fn context(root: &std::path::Path) -> DriverContext {
-        DriverContext {
-            storage_handle: aruna_storage::storage::worker::FjallStorage::open(
-                root.to_str().unwrap(),
-            )
-            .unwrap(),
-            net_handle: None,
-            blob_handle: None,
-            graph_handle: None,
-            task_handle: None,
-            compute_handle: None,
-            outbound_handle: None,
-        }
+    fn context() -> DriverContext {
+        aruna_runner::testing::memory_context()
     }
 
     async fn put(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
@@ -1655,8 +1644,7 @@ mod tests {
     async fn pending_target_settles() {
         use aruna_core::structs::storage::format::StoredLayout;
         for generation in [1, 2] {
-            let directory = tempfile::tempdir().unwrap();
-            let context = context(directory.path());
+            let context = context();
             let source = BucketKeyRef::new(Ulid::from_bytes([3; 16]), 1);
             let plan = SealPlan {
                 key: source,
@@ -1720,8 +1708,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_failure_retained() {
-        let directory = tempfile::tempdir().unwrap();
-        let context = context(directory.path());
+        let context = context();
         let target = TransitionTarget {
             compression: Compression::Off,
             plan: None,
@@ -1775,8 +1762,7 @@ mod tests {
 
     #[tokio::test]
     async fn promoted_source_retried() {
-        let directory = tempfile::tempdir().unwrap();
-        let context = context(directory.path());
+        let context = context();
         let source = BucketKeyRef::new(Ulid::from_bytes([3; 16]), 1);
         let mut key = BucketKeyRecord::new(source, Ulid::nil(), [4; 32], 0);
         key.state = KeyState::Retiring;
@@ -1892,8 +1878,7 @@ mod tests {
             TransitionKind::Rotate,
             TransitionKind::Decrypt,
         ] {
-            let directory = tempfile::tempdir().unwrap();
-            let context = context(directory.path());
+            let context = context();
             let source = BucketKeyRef::new(Ulid::from_bytes([3; 16]), 1);
             let plan = SealPlan {
                 key: if kind == TransitionKind::Rotate {
@@ -2096,8 +2081,7 @@ mod tests {
     #[tokio::test]
     async fn reclaim_between_reads() {
         // A reclaim commits after the cleanup check began: the check must still see the copy.
-        let directory = tempfile::tempdir().unwrap();
-        let context = context(directory.path());
+        let context = context();
         let storage = &context.storage_handle;
         let mut old = pending(None);
         let hash = aruna_core::structs::checksum::HASH_BLAKE3.to_string();
@@ -2162,8 +2146,7 @@ mod tests {
 
     #[tokio::test]
     async fn retirement_pages_rows() {
-        let directory = tempfile::tempdir().unwrap();
-        let context = context(directory.path());
+        let context = context();
         let storage = &context.storage_handle;
         let source = BucketKeyRef::new(Ulid::from_bytes([3; 16]), 1);
         let target = TransitionTarget {
@@ -2211,8 +2194,7 @@ mod tests {
 
     #[tokio::test]
     async fn retirement_waits_envelopes() {
-        let directory = tempfile::tempdir().unwrap();
-        let context = context(directory.path());
+        let context = context();
         let source = BucketKeyRef::new(Ulid::from_bytes([3; 16]), 1);
         let mut key = BucketKeyRecord::new(source, Ulid::nil(), [4; 32], 0);
         key.state = KeyState::Retiring;

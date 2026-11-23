@@ -19,8 +19,7 @@ const SOURCE: &str = "sealed";
 /// Storage only: no blob adapter exists, so any content read would fail the copy.
 fn context() -> (TempDir, DriverContext) {
     let temp = tempdir().unwrap();
-    let storage_handle =
-        storage::worker::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
+    let storage_handle = storage::memory::MemoryStorage::open();
     let context = DriverContext {
         storage_handle,
         net_handle: None,

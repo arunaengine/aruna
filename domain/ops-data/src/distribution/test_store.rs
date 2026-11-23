@@ -28,7 +28,7 @@ use aruna_core::types::TxnId;
 #[cfg(test)]
 use aruna_storage::storage::handle::StorageHandle;
 #[cfg(test)]
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 #[cfg(test)]
 use byteview::ByteView;
 #[cfg(test)]
@@ -38,7 +38,7 @@ use ulid::Ulid;
 #[cfg(test)]
 pub fn open() -> (TempDir, StorageHandle) {
     let dir = tempfile::tempdir().expect("tempdir must be created");
-    let handle = FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage");
+    let handle = MemoryStorage::open();
     (dir, handle)
 }
 

@@ -161,7 +161,6 @@ mod tests {
     use aruna_storage::storage;
     use std::collections::HashMap;
     use std::time::SystemTime;
-    use tempfile::tempdir;
 
     #[test]
     fn answers_from_snapshot() {
@@ -367,9 +366,7 @@ mod tests {
 
     #[tokio::test]
     async fn multipart_returns_parts() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = test_context(storage_handle.clone());
 
         let location = location();
@@ -410,9 +407,7 @@ mod tests {
 
     #[tokio::test]
     async fn simple_omits_parts() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = test_context(storage_handle.clone());
 
         let location = location();
@@ -439,9 +434,7 @@ mod tests {
 
     #[tokio::test]
     async fn targets_specific_version() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = test_context(storage_handle.clone());
 
         let location = location();
@@ -497,9 +490,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_marker_rejected() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = test_context(storage_handle.clone());
 
         let version_id = Ulid::generate();

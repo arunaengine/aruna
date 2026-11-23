@@ -38,7 +38,7 @@ use ulid::Ulid;
 use super::{RebuildStatsError, RebuildStatsOperation};
 use crate::s3::rebuild_counts::CounterDeltas;
 use aruna_runner::driver::{DriverContext, drive};
-use aruna_runner::testing::{path_context, test_context};
+use aruna_runner::testing::{memory_context, path_context, test_context};
 use aruna_storage::storage::handle::StorageHandle;
 
 const GROUP_A: GroupId = Ulid::from_parts(1, 1);
@@ -354,8 +354,7 @@ async fn commit_live(
 /// their rows, and delete markers over several pages count only as markers.
 #[tokio::test]
 async fn walk_matches_totals() {
-    let temp = tempdir().unwrap();
-    let ctx = path_context(temp.path().to_str().unwrap());
+    let ctx = memory_context();
     let plain_stored = fixture(&ctx).await;
 
     let (output, _) = run(RebuildStatsOperation::new(), &ctx, None).await;
@@ -404,8 +403,7 @@ async fn walk_matches_totals() {
 /// snapshot holds never clamps, and drift in the old rows is replaced.
 #[tokio::test]
 async fn walk_counts_concurrent() {
-    let temp = tempdir().unwrap();
-    let ctx = path_context(temp.path().to_str().unwrap());
+    let ctx = memory_context();
     bucket(&ctx, "alpha", GROUP_A).await;
     let plain = location(100);
     let hash = [1u8; 32];
@@ -466,8 +464,7 @@ async fn walk_counts_concurrent() {
 /// first, and the node-wide walk after it skips alpha without counting it twice.
 #[tokio::test]
 async fn quota_buckets_first() {
-    let temp = tempdir().unwrap();
-    let ctx = path_context(temp.path().to_str().unwrap());
+    let ctx = memory_context();
     let plain_stored = fixture(&ctx).await;
     let realm_id = RealmId::from_bytes([5u8; 32]);
     let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());

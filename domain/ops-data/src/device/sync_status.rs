@@ -686,10 +686,7 @@ mod tests {
     async fn runs_pending_beat() {
         // A device always has its folder beat pending, so an explicit run must move it to now.
         use aruna_runner::testing::RecordingTaskHandler;
-        let dir = tempfile::tempdir().unwrap();
-        let storage =
-            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
-                .unwrap();
+        let storage = aruna_storage::storage::memory::MemoryStorage::open();
         let (seen, mut fired) = tokio::sync::mpsc::channel(16);
         let task = aruna_scheduler::TaskHandle::new();
         task.set_inbound_handler(Arc::new(RecordingTaskHandler { seen }))
@@ -731,10 +728,7 @@ mod tests {
     #[tokio::test]
     async fn drops_failed_contact() {
         // The first failed attempt shows the realm as unreachable; the next answer restores it.
-        let dir = tempfile::tempdir().unwrap();
-        let storage =
-            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
-                .unwrap();
+        let storage = aruna_storage::storage::memory::MemoryStorage::open();
         let context = Arc::new(DriverContext {
             storage_handle: storage,
             net_handle: None,
@@ -772,10 +766,7 @@ mod tests {
     #[tokio::test]
     async fn retries_explicit_sync() {
         // An owner-requested run re-arms retryable failures only.
-        let dir = tempfile::tempdir().unwrap();
-        let storage =
-            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
-                .unwrap();
+        let storage = aruna_storage::storage::memory::MemoryStorage::open();
         let context = Arc::new(DriverContext {
             storage_handle: storage,
             net_handle: None,

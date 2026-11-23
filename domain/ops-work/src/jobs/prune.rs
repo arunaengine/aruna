@@ -506,11 +506,10 @@ pub(crate) mod tests {
     use aruna_runner::driver::{DriverContext, drive};
     use aruna_runner::testing::test_context;
     use aruna_storage::scan::iter_prefix_page;
-    use aruna_storage::storage::worker::FjallStorage;
+    use aruna_storage::storage::memory::MemoryStorage;
     use aruna_test_harness::jobs::insert_job;
     use aruna_test_harness::jobs::read_job_record;
     use byteview::ByteView;
-    use tempfile::tempdir;
     use ulid::Ulid;
 
     /// One prune pass with nothing kept back.
@@ -804,8 +803,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn expired_job_pruned() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let context = aruna_runner::testing::test_context(storage.clone());
         let finished = unix_timestamp_millis().saturating_sub(JOB_RETENTION_MS + 1);
         insert_job(
@@ -826,8 +824,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn staging_rows_pruned() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let context = aruna_runner::testing::test_context(storage.clone());
         let job_id = JobId::from_bytes([3u8; 16]);
         let finished = unix_timestamp_millis().saturating_sub(JOB_RETENTION_MS + 1);
@@ -865,8 +862,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn unexpired_job_retained() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let context = aruna_runner::testing::test_context(storage.clone());
         insert_job(
             &context,
@@ -885,8 +881,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn expired_tombstone_pruned() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let context = aruna_runner::testing::test_context(storage.clone());
         let job_id = JobId::from_bytes([8u8; 16]);
         let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
@@ -908,8 +903,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn rocrate_retention_prunes() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let context = aruna_runner::testing::test_context(storage.clone());
         let job_id = JobId::from_bytes([6u8; 16]);
         let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
@@ -1009,8 +1003,7 @@ pub(crate) mod tests {
     async fn cleanup_holds_prune() {
         // Cleanup retries are uncapped, so a queued cleanup can outlive retention; the
         // parent carries the fence state `authorize_cleanup` reads, so it is kept.
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let context = aruna_runner::testing::test_context(storage.clone());
         let job_id = JobId::from_bytes([4u8; 16]);
         let finished = unix_timestamp_millis().saturating_sub(JOB_RETENTION_MS + 1);
@@ -1037,8 +1030,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn held_window_moves() {
         // A full window of jobs held by their cleanups does not stop a later due job.
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let context = aruna_runner::testing::test_context(storage.clone());
         let finished = unix_timestamp_millis().saturating_sub(JOB_RETENTION_MS + 10);
         for seed in 1..=4u8 {
@@ -1066,8 +1058,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn partial_prune_continues() {
         // A job whose staging rows fill the pass keeps the run going, also when held jobs follow.
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let context = aruna_runner::testing::test_context(storage.clone());
         let finished = unix_timestamp_millis().saturating_sub(JOB_RETENTION_MS + 20);
         let large = JobId::from_bytes([9u8; 16]);
@@ -1110,8 +1101,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn finished_cleanup_prunes() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let context = aruna_runner::testing::test_context(storage.clone());
         let job_id = JobId::from_bytes([5u8; 16]);
         let finished = unix_timestamp_millis().saturating_sub(JOB_RETENTION_MS + 1);
@@ -1138,8 +1128,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn restore_arms_timer() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let context = aruna_runner::testing::test_context(storage.clone());
         insert_job(
             &context,

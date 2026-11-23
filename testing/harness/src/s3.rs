@@ -24,12 +24,12 @@ use aruna_core::keyspaces::UPLOAD_KEYSPACE;
 use aruna_core::structs::storage::multipart::MultipartUpload;
 use aruna_runner::driver::DriverContext;
 use aruna_storage::storage::handle::StorageHandle;
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use tempfile::{TempDir, tempdir};
 
 pub fn test_storage() -> (TempDir, StorageHandle) {
     let directory = tempdir().unwrap();
-    let storage = FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     (directory, storage)
 }
 
@@ -49,7 +49,7 @@ pub async fn full_context() -> (TempDir, DriverContext) {
     let temp_root = temp_handle.path().to_str().unwrap();
     let blob_root = format!("{temp_root}/blobstore");
     std::fs::create_dir_all(&blob_root).unwrap();
-    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
+    let storage_handle = storage::memory::MemoryStorage::open();
     storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
     let net_handle = NetHandle::new(aruna_runner::testing::local_net(), storage_handle.clone())
         .await

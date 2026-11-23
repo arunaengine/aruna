@@ -30,7 +30,7 @@ use aruna_core::user::id::UserId;
 use aruna_p2p::NetHandle;
 use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_runner::driver::DriverContext;
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use bytes::Bytes;
 use tempfile::TempDir;
 use ulid::Ulid;
@@ -64,10 +64,9 @@ pub struct BaoNode {
 /// A node with storage, net and blob handles, and a metadata handle when `metadata` holds.
 pub async fn export_node(realm_id: RealmId, metadata: bool) -> BaoNode {
     let tempdir = tempfile::tempdir().unwrap();
-    let root = tempdir.path().to_str().unwrap();
     let blob_root = tempdir.path().join("blobstore");
     std::fs::create_dir_all(&blob_root).unwrap();
-    let storage = FjallStorage::open(root).unwrap();
+    let storage = MemoryStorage::open();
     let net = NetHandle::new(
         NetConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),

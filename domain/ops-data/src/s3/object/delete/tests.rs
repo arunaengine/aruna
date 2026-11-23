@@ -652,9 +652,7 @@ fn purge_skips_history() {
 
 #[tokio::test]
 async fn missing_version_rejected() {
-    let temp_handle = tempdir().unwrap();
-    let storage_handle =
-        storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+    let storage_handle = storage::memory::MemoryStorage::open();
     let context = DriverContext {
         storage_handle,
         net_handle: None,
@@ -689,7 +687,7 @@ async fn creates_tombstone() {
     let blob_root = format!("{temp_root}/blobstore");
     std::fs::create_dir_all(&blob_root).unwrap();
 
-    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
+    let storage_handle = storage::memory::MemoryStorage::open();
     let net_handle = NetHandle::new(aruna_runner::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
@@ -843,7 +841,7 @@ async fn deletes_version() {
     let blob_root = format!("{temp_root}/blobstore");
     std::fs::create_dir_all(&blob_root).unwrap();
 
-    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
+    let storage_handle = storage::memory::MemoryStorage::open();
     let net_handle = NetHandle::new(aruna_runner::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
@@ -1256,9 +1254,7 @@ async fn pending_archive_shared() {
         global_shard_key, shard_for_archive, usage_group_key,
     };
 
-    let temp_handle = tempdir().unwrap();
-    let storage_handle =
-        storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+    let storage_handle = storage::memory::MemoryStorage::open();
     let context = DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
@@ -1339,9 +1335,7 @@ async fn pending_archive_shared() {
 async fn malformed_owner_aborts() {
     use aruna_core::keyspaces::COPY_OWNER_KEYSPACE;
 
-    let temp_handle = tempdir().unwrap();
-    let storage_handle =
-        storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+    let storage_handle = storage::memory::MemoryStorage::open();
     let context = DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
@@ -1390,9 +1384,7 @@ async fn removes_envelope_rows() {
     };
     use aruna_core::structs::storage::usage::usage_group_key;
 
-    let temp_handle = tempdir().unwrap();
-    let storage_handle =
-        storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+    let storage_handle = storage::memory::MemoryStorage::open();
     let context = DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
@@ -1457,9 +1449,7 @@ async fn removes_pending_copy() {
     use aruna_core::structs::storage::usage::usage_group_key;
 
     for mode in [EncryptionMode::VaultLocked, EncryptionMode::Off] {
-        let temp_handle = tempdir().unwrap();
-        let path = temp_handle.path().to_str().unwrap();
-        let storage_handle = storage::worker::FjallStorage::open(path).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let context = DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,
@@ -1699,7 +1689,7 @@ async fn bucket_rows_sum() {
     let temp_root = temp_handle.path().to_str().unwrap();
     let blob_root = format!("{temp_root}/blobstore");
     std::fs::create_dir_all(&blob_root).unwrap();
-    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
+    let storage_handle = storage::memory::MemoryStorage::open();
     let net_handle = NetHandle::new(aruna_runner::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();

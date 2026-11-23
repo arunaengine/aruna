@@ -902,7 +902,7 @@ mod tests {
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_runner::driver::{DriverContext, drive};
     use aruna_storage::storage::handle::StorageHandle;
-    use aruna_storage::storage::worker::FjallStorage;
+    use aruna_storage::storage::memory::MemoryStorage;
 
     const OBJECT: &str = "https://example.test/object";
 
@@ -1103,8 +1103,7 @@ mod tests {
     #[tokio::test]
     async fn lookup_reads_points() {
         // Candidates come from backlink rows and point reads, capped, without the registry list.
-        let dir = tempfile::tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let cursor = Ulid::from_parts(2, 1);
         let (first, stale, last) = (
             Ulid::from_parts(5, 1),
@@ -1150,8 +1149,7 @@ mod tests {
     #[tokio::test]
     async fn replaces_old_postings() {
         // A new revision deletes the rows it does not write again, with their document rows.
-        let dir = tempfile::tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let doc = Ulid::from_parts(5, 1);
         let first = Ulid::from_parts(1, 1);
         let second = Ulid::from_parts(2, 1);
@@ -1178,8 +1176,7 @@ mod tests {
     async fn reads_object_prefix() {
         // More than a registry's worth of rows under other objects: a predicate-less lookup
         // still costs a few seeks and only the object's own rows.
-        let dir = tempfile::tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let cursor = Ulid::from_parts(1, 1);
         let noise: Vec<_> = (0..1100u64)
             .map(|index| {
@@ -1225,8 +1222,7 @@ mod tests {
     #[tokio::test]
     async fn pages_after_document() {
         // Documents come in id order across predicates; `next` continues after the last one.
-        let dir = tempfile::tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let cursor = Ulid::from_parts(1, 1);
         let docs: Vec<_> = (1..=5u128)
             .map(|index| Ulid::from_parts(9, index))
@@ -1269,8 +1265,7 @@ mod tests {
     #[tokio::test]
     async fn budget_ends_lookup() {
         // An exhausted budget fails the lookup instead of returning a partial page.
-        let dir = tempfile::tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let doc = Ulid::from_parts(3, 1);
         let cursor = Ulid::from_parts(1, 1);
         write_document(&storage, doc, &[record(doc, cursor, "p", OBJECT)]).await;
@@ -1286,8 +1281,7 @@ mod tests {
     async fn decode_error_classified() {
         // A corrupt row must stay a conversion failure: callers charge those to
         // the document, while storage failures must never spend that budget.
-        let dir = tempfile::tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let key = iri_reference_key("p", OBJECT, Ulid::from_parts(1, 1));
         let rows = LinkRows {
             writes: vec![(
@@ -1341,8 +1335,7 @@ mod tests {
     #[tokio::test]
     async fn rebuild_skips_newer() {
         // A rebuild commits a document's rows only while its status still names the event.
-        let dir = tempfile::tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let cursor = Ulid::from_parts(1, 1);
         let record_at = registry_record(Ulid::from_parts(6, 1), cursor);
         let doc = record_at.document_id;

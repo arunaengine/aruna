@@ -596,10 +596,7 @@ mod tests {
         MetadataRegistryRecord,
     ) {
         let dir = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::storage::worker::FjallStorage::open(
-            dir.path().join("storage").to_str().expect("storage path"),
-        )
-        .unwrap();
+        let storage = aruna_storage::storage::memory::MemoryStorage::open();
         let graph = aruna_rdf_graph::GraphHandle::open(
             dir.path().join("metadata"),
             node(1),

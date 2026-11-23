@@ -132,7 +132,6 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::Arc;
     use std::time::Duration;
-    use tempfile::tempdir;
     use tokio::sync::mpsc;
     use ulid::Ulid;
 
@@ -353,9 +352,7 @@ mod tests {
 
     #[tokio::test]
     async fn emit_schedules_drain() {
-        let tempdir = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let task_handle = TaskHandle::new();
         let (seen_tx, mut seen_rx) = mpsc::channel(1);
         task_handle

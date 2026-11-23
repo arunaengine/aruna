@@ -348,7 +348,7 @@ fn due_prefix_ms(key: &[u8]) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_storage::storage::worker::FjallStorage;
+    use aruna_storage::storage::memory::MemoryStorage;
 
     #[test]
     fn ulid_suffix_trips() {
@@ -384,8 +384,7 @@ mod tests {
 
     #[tokio::test]
     async fn probe_outbox_age() {
-        let temp = tempfile::tempdir().unwrap();
-        let storage = FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
 
         let empty = probe_outbox_lag(&storage, false).await.unwrap();
         assert_eq!(empty, QueueLagSnapshot::default());
@@ -406,8 +405,7 @@ mod tests {
 
     #[tokio::test]
     async fn probe_queue_records() {
-        let temp = tempfile::tempdir().unwrap();
-        let storage = FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         for index in 0u32..3 {
             write_key(
                 &storage,

@@ -325,13 +325,10 @@ mod tests {
     use aruna_core::handle::Handle;
     use aruna_runner::driver::{DriverContext, drive};
     use aruna_storage::storage;
-    use tempfile::tempdir;
 
     #[tokio::test]
     async fn persists_connector_secret() {
-        let tempdir = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
         let context = DriverContext {
             storage_handle,
@@ -398,9 +395,7 @@ mod tests {
     // by another definition, another group or a connector with credentials, is refused.
     #[tokio::test]
     async fn given_id_registered() {
-        let tempdir = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
         let context = DriverContext {
             storage_handle,
@@ -452,9 +447,7 @@ mod tests {
     // Two groups registering one new id at the same time: exactly one gets it.
     #[tokio::test]
     async fn concurrent_id_once() {
-        let tempdir = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
         let context = DriverContext {
             storage_handle,

@@ -302,9 +302,7 @@ mod tests {
     // Without a host a job is never stopped and a pause simply passes.
     #[tokio::test]
     async fn hostless_effects_answer() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_str().unwrap();
-        let storage = aruna_storage::storage::worker::FjallStorage::open(path).unwrap();
+        let storage = aruna_storage::storage::memory::MemoryStorage::open();
         let context = crate::testing::test_context(storage);
         let event = dispatch_job(JobEffect::Stops, &context, 0, None).await;
         assert_eq!(event, Event::Job(JobEvent::Stops(JobStops::default())));

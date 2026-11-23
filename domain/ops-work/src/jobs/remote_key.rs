@@ -741,12 +741,8 @@ mod tests {
 
     #[tokio::test]
     async fn wake_requires_parked() {
-        let dir = tempfile::tempdir().unwrap();
         let context = DriverContext {
-            storage_handle: aruna_storage::storage::worker::FjallStorage::open(
-                dir.path().to_str().unwrap(),
-            )
-            .unwrap(),
+            storage_handle: aruna_storage::storage::memory::MemoryStorage::open(),
             net_handle: None,
             blob_handle: None,
             graph_handle: None,
@@ -840,10 +836,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let context = DriverContext {
-            storage_handle: aruna_storage::storage::worker::FjallStorage::open(
-                dir.path().to_str().unwrap(),
-            )
-            .unwrap(),
+            storage_handle: aruna_storage::storage::memory::MemoryStorage::open(),
             net_handle: None,
             blob_handle: None,
             graph_handle: None,
@@ -1039,25 +1032,13 @@ mod tests {
         assert_eq!(registrations(&context).await, 1);
     }
 
-    fn empty_context(dir: &tempfile::TempDir) -> DriverContext {
-        DriverContext {
-            storage_handle: aruna_storage::storage::worker::FjallStorage::open(
-                dir.path().to_str().unwrap(),
-            )
-            .unwrap(),
-            net_handle: None,
-            blob_handle: None,
-            graph_handle: None,
-            task_handle: None,
-            compute_handle: None,
-            outbound_handle: None,
-        }
+    fn empty_context() -> DriverContext {
+        aruna_runner::testing::memory_context()
     }
 
     #[tokio::test]
     async fn offline_waiter_recovers() {
-        let (key_dir, waiter_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-        let (key_node, waiter_node) = (empty_context(&key_dir), empty_context(&waiter_dir));
+        let (key_node, waiter_node) = (empty_context(), empty_context());
         let node = |seed| iroh::SecretKey::from_bytes(&[seed; 32]).public();
         let (source, waiter) = (node(1), node(2));
         let job_id = JobId::from_bytes([5; 16]);
@@ -1143,8 +1124,7 @@ mod tests {
     async fn paging_reaches_later() {
         use crate::jobs::store::row_calls::WAKE_PAGE;
 
-        let dir = tempfile::tempdir().unwrap();
-        let context = empty_context(&dir);
+        let context = empty_context();
         let key = BucketKeyRef::new(Ulid::from_bytes([8; 16]), 1);
         let auth = AuthContext {
             user_id: UserId::new(Ulid::from_bytes([2; 16]), RealmId([1; 32])),

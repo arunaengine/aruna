@@ -22,6 +22,7 @@ use aruna_plugin_contract::artifact::{ArtifactDigest, check_artifact};
 use aruna_runner::driver::{DriverContext, drive};
 use aruna_runner::testing::test_context;
 use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::memory::MemoryStorage;
 use aruna_storage::storage::worker::FjallStorage;
 use tempfile::{TempDir, tempdir};
 
@@ -31,7 +32,7 @@ const T0: u64 = 1_762_700_000_000;
 
 fn opened() -> (TempDir, DriverContext) {
     let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     (dir, test_context(storage))
 }
 
@@ -67,7 +68,7 @@ fn faulty(real: StorageHandle, matching: fn(&StorageEffect) -> bool, nth: usize)
 
 fn faulty_context(matching: fn(&StorageEffect) -> bool, nth: usize) -> (TempDir, DriverContext) {
     let dir = tempdir().unwrap();
-    let real = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let real = MemoryStorage::open();
     (dir, test_context(faulty(real, matching, nth)))
 }
 

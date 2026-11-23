@@ -167,7 +167,6 @@ mod test {
     use aruna_test_harness::s3::seed_upload;
     use std::collections::HashMap;
     use std::time::SystemTime;
-    use tempfile::tempdir;
 
     fn part_location() -> BackendLocation {
         BackendLocation {
@@ -235,9 +234,7 @@ mod test {
 
     #[tokio::test]
     async fn varint_parts_sorted() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = test_context(storage_handle.clone());
 
         let upload_id = Ulid::generate();
@@ -273,9 +270,7 @@ mod test {
 
     #[tokio::test]
     async fn marker_paginates() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = test_context(storage_handle.clone());
 
         let upload_id = Ulid::generate();
@@ -319,9 +314,7 @@ mod test {
 
     #[tokio::test]
     async fn zero_limit_resumes() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = test_context(storage_handle.clone());
 
         let upload_id = Ulid::generate();
@@ -370,9 +363,7 @@ mod test {
 
     #[tokio::test]
     async fn missing_upload_rejected() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = test_context(storage_handle);
 
         let result = drive(
@@ -392,9 +383,7 @@ mod test {
 
     #[tokio::test]
     async fn target_mismatch_rejected() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = test_context(storage_handle.clone());
 
         let upload_id = Ulid::generate();
@@ -421,9 +410,7 @@ mod test {
 
     #[tokio::test]
     async fn completing_upload_listed() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = test_context(storage_handle.clone());
 
         let upload_id = Ulid::generate();
@@ -453,9 +440,7 @@ mod test {
 
     #[tokio::test]
     async fn closed_upload_rejected() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = test_context(storage_handle.clone());
 
         let upload_id = Ulid::generate();

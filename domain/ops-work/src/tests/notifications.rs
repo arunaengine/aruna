@@ -21,7 +21,7 @@ use aruna_runner::driver::{DriverContext, drive};
 #[cfg(test)]
 use aruna_storage::storage::handle::StorageHandle;
 #[cfg(test)]
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 #[cfg(test)]
 use tempfile::{TempDir, tempdir};
 use ulid::Ulid;
@@ -29,7 +29,7 @@ use ulid::Ulid;
 #[cfg(test)]
 pub fn temp_storage() -> (TempDir, StorageHandle) {
     let directory = tempdir().unwrap();
-    let storage = FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     (directory, storage)
 }
 

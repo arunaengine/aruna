@@ -427,7 +427,7 @@ mod tests {
     use aruna_core::structs::storage::usage::{UsageCounters, usage_backend_key, usage_hash_key};
     use aruna_core::types::Value;
     use aruna_runner::driver::{DriverContext, drive};
-    use aruna_runner::testing::path_context;
+    use aruna_runner::testing::{memory_context, path_context};
     use aruna_storage::scan::iter_prefix_page;
     use std::collections::HashMap;
     use tempfile::tempdir;
@@ -604,8 +604,7 @@ mod tests {
     async fn frees_unreferenced_copy() {
         // The location row, the queue row, the counters and the queued physical
         // delete all move in one transaction.
-        let dir = tempdir().unwrap();
-        let context = path_context(dir.path().to_str().unwrap());
+        let context = memory_context();
         seed(&context, 10).await;
 
         let verdict = drive(reclaim_op(candidate_key()), &context).await.unwrap();
@@ -653,8 +652,7 @@ mod tests {
     #[tokio::test]
     async fn archive_owner_pins() {
         // A pending or mid-promotion version owns the archive without any hash alias.
-        let dir = tempdir().unwrap();
-        let context = path_context(dir.path().to_str().unwrap());
+        let context = memory_context();
         seed(&context, 10).await;
         let version = VersionKey::new("bucket", "key", Ulid::from_bytes([6u8; 16]));
         let owner = CopyOwner::new(ArchiveKey::of(&location(10)), version);
@@ -690,8 +688,7 @@ mod tests {
     #[tokio::test]
     async fn later_page_pins() {
         // A live alias past the first page still keeps the copy.
-        let dir = tempdir().unwrap();
-        let context = path_context(dir.path().to_str().unwrap());
+        let context = memory_context();
         seed(&context, 10).await;
         for n in 0..ALIAS_PAGE as u128 {
             add_alias(&context, Ulid::from_parts(1, n), false).await;
@@ -706,8 +703,7 @@ mod tests {
     #[tokio::test]
     async fn pinned_copy_survives() {
         // An alias whose version still names this backend cancels the candidate.
-        let dir = tempdir().unwrap();
-        let context = path_context(dir.path().to_str().unwrap());
+        let context = memory_context();
         seed(&context, 10).await;
         add_alias(&context, Ulid::from_bytes([6u8; 16]), true).await;
 
@@ -733,8 +729,7 @@ mod tests {
 
     #[tokio::test]
     async fn refreshed_candidate_waits() {
-        let dir = tempdir().unwrap();
-        let context = path_context(dir.path().to_str().unwrap());
+        let context = memory_context();
         seed(&context, 10).await;
         let refreshed = ReclaimCandidate {
             enqueued_at: SystemTime::UNIX_EPOCH + Duration::from_secs(3_600),
@@ -776,8 +771,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_owner_blocks() {
-        let dir = tempdir().unwrap();
-        let context = path_context(dir.path().to_str().unwrap());
+        let context = memory_context();
         seed(&context, 10).await;
         let version_id = Ulid::from_bytes([6u8; 16]);
         add_alias(&context, version_id, true).await;
@@ -831,8 +825,7 @@ mod tests {
 
     #[tokio::test]
     async fn corrupt_owner_blocks() {
-        let dir = tempdir().unwrap();
-        let context = path_context(dir.path().to_str().unwrap());
+        let context = memory_context();
         seed(&context, 10).await;
         let version_id = Ulid::from_bytes([6u8; 16]);
         add_alias(&context, version_id, true).await;
@@ -877,8 +870,7 @@ mod tests {
             ManagedCopyState::Quarantined(ManagedCopyQuarantine::PolicyViolation),
             ManagedCopyState::UnresolvedDeparted,
         ] {
-            let dir = tempdir().unwrap();
-            let context = path_context(dir.path().to_str().unwrap());
+            let context = memory_context();
             seed(&context, 10).await;
             let version_id = Ulid::from_bytes([6u8; 16]);
             add_alias(&context, version_id, true).await;
@@ -970,8 +962,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_conflicts_commit() {
-        let dir = tempdir().unwrap();
-        let context = path_context(dir.path().to_str().unwrap());
+        let context = memory_context();
         seed(&context, 10).await;
         let mut operation = CallRun::new(reclaim_op(candidate_key()));
         let mut effects = std::collections::VecDeque::from_iter(operation.start());
@@ -1044,8 +1035,7 @@ mod tests {
     #[tokio::test]
     async fn other_never_pins() {
         // Deduplication is per backend, so a copy elsewhere holds nothing here.
-        let dir = tempdir().unwrap();
-        let context = path_context(dir.path().to_str().unwrap());
+        let context = memory_context();
         seed(&context, 10).await;
         add_alias(&context, Ulid::from_bytes([7u8; 16]), false).await;
 
@@ -1056,8 +1046,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_location_drops() {
-        let dir = tempdir().unwrap();
-        let context = path_context(dir.path().to_str().unwrap());
+        let context = memory_context();
         write(
             &context,
             BLOB_RECLAIM_KEYSPACE,
@@ -1083,8 +1072,7 @@ mod tests {
     #[tokio::test]
     async fn grace_defers_candidate() {
         // Inside the grace window the sweep leaves both rows alone.
-        let dir = tempdir().unwrap();
-        let context = path_context(dir.path().to_str().unwrap());
+        let context = memory_context();
         seed(&context, 10).await;
 
         let outcome = sweep_at(&context, SystemTime::UNIX_EPOCH, None)
@@ -1105,8 +1093,7 @@ mod tests {
         // A candidate written after a long apply carries its enqueue time, so a
         // sweep past the operation-start grace but not the enqueue grace must
         // defer it rather than free the bytes early.
-        let dir = tempdir().unwrap();
-        let context = path_context(dir.path().to_str().unwrap());
+        let context = memory_context();
         seed(&context, 10).await;
         let started_at = SystemTime::UNIX_EPOCH;
         let enqueued_at = started_at + Duration::from_secs(6 * 60 * 60);
@@ -1140,8 +1127,7 @@ mod tests {
 
     #[tokio::test]
     async fn sweep_frees_due() {
-        let dir = tempdir().unwrap();
-        let context = path_context(dir.path().to_str().unwrap());
+        let context = memory_context();
         seed(&context, 10).await;
         let due = SystemTime::UNIX_EPOCH
             + CleanupStrategy::DEFAULT_RECLAIM_AFTER
@@ -1157,8 +1143,7 @@ mod tests {
     async fn sweep_caps_tick() {
         // A long queue must hand the task loop back instead of draining in one
         // tick; the rows left over are picked up by the retry sweep.
-        let dir = tempdir().unwrap();
-        let context = path_context(dir.path().to_str().unwrap());
+        let context = memory_context();
         for index in 0..=RECLAIM_TICK_LIMIT {
             let mut blake3 = [0u8; 32];
             blake3[..8].copy_from_slice(&(index as u64).to_be_bytes());
@@ -1286,8 +1271,7 @@ mod tests {
     #[tokio::test]
     async fn status_counts_backend() {
         // Another backend's queue rows must not show up in this one's depth.
-        let dir = tempdir().unwrap();
-        let context = path_context(dir.path().to_str().unwrap());
+        let context = memory_context();
         seed(&context, 10).await;
         write(
             &context,
@@ -1323,8 +1307,7 @@ mod tests {
     async fn status_dates_cleanups() {
         // A stalled physical delete outlives its candidate row, so the queue
         // time has to come from the cleanup key itself.
-        let dir = tempdir().unwrap();
-        let context = path_context(dir.path().to_str().unwrap());
+        let context = memory_context();
         let queued = Ulid::from_datetime(SystemTime::UNIX_EPOCH + Duration::from_secs(120));
         write(
             &context,
@@ -1363,8 +1346,7 @@ mod tests {
 
     #[tokio::test]
     async fn keeps_external_bytes() {
-        let dir = tempdir().unwrap();
-        let context = path_context(dir.path().to_str().unwrap());
+        let context = memory_context();
         let backend_id = Ulid::from_bytes([7u8; 16]);
         let backend = BackendRef::Group(backend_id);
         let record = GroupStorage {

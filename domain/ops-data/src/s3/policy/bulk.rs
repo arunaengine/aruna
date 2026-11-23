@@ -899,7 +899,7 @@ mod tests {
         let temp_root = temp_handle.path().to_str().expect("utf8 path");
         let blob_root = format!("{temp_root}/blobstore");
         std::fs::create_dir_all(&blob_root).expect("blob root");
-        let storage_handle = storage::worker::FjallStorage::open(temp_root).expect("storage opens");
+        let storage_handle = storage::memory::MemoryStorage::open();
         let secret = iroh::SecretKey::from_bytes(&[3u8; 32]);
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let net_handle = NetHandle::new(

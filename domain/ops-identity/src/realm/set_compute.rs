@@ -321,8 +321,7 @@ mod tests {
     use aruna_core::structs::placement::compute_config::{GroupComputeQuota, LocationLink};
     use aruna_core::user::id::UserId;
     use aruna_runner::driver::{DriverContext, drive};
-    use aruna_runner::testing::path_context;
-    use tempfile::tempdir;
+    use aruna_runner::testing::memory_context;
     use ulid::Ulid;
 
     fn actor(realm_id: RealmId) -> Actor {
@@ -383,8 +382,7 @@ mod tests {
     async fn stores_compute_config() {
         // The mutation must survive as the document a later read resolves, or
         // the planner and the quota gate would keep deciding on stale values.
-        let dir = tempdir().unwrap();
-        let ctx = path_context(dir.path().to_str().unwrap());
+        let ctx = memory_context();
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let actor = actor(realm_id);
         seed(&ctx, &actor, &management_config(realm_id, &actor)).await;
@@ -415,8 +413,7 @@ mod tests {
     async fn refuses_invalid_links() {
         // A zero bandwidth would make one transfer estimate infinite, so the
         // mutation is refused instead of clamped.
-        let dir = tempdir().unwrap();
-        let ctx = path_context(dir.path().to_str().unwrap());
+        let ctx = memory_context();
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let actor = actor(realm_id);
         seed(&ctx, &actor, &management_config(realm_id, &actor)).await;
@@ -442,8 +439,7 @@ mod tests {
     #[tokio::test]
     async fn refuses_unauthorized_caller() {
         // Nothing is written when the caller holds no realm-config write.
-        let dir = tempdir().unwrap();
-        let ctx = path_context(dir.path().to_str().unwrap());
+        let ctx = memory_context();
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let actor = actor(realm_id);
         seed(&ctx, &actor, &management_config(realm_id, &actor)).await;
@@ -481,8 +477,7 @@ mod tests {
     async fn refuses_server_node() {
         // A realm admin token still may not write the config on a server node:
         // peers reject a realm-config event whose origin is not management.
-        let dir = tempdir().unwrap();
-        let ctx = path_context(dir.path().to_str().unwrap());
+        let ctx = memory_context();
         let realm_id = RealmId::from_bytes([5u8; 32]);
         let actor = actor(realm_id);
         let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);

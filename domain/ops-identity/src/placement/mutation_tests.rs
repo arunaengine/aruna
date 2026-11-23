@@ -10,15 +10,13 @@ use crate::realm::mutate_placement::tests::{actor, seed_config, strategy};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::NodePlacementEntry;
 use aruna_runner::driver::drive;
-use aruna_runner::testing::path_context;
-use tempfile::tempdir;
+use aruna_runner::testing::memory_context;
 
 #[tokio::test]
 async fn concurrent_mutations_land() {
     // Writers racing on one document conflict at commit; each re-drives
     // its own mutation, so all of them land instead of one failing.
-    let root = tempdir().unwrap();
-    let context = path_context(root.path().to_str().unwrap());
+    let context = memory_context();
     let actor = actor(RealmId::from_bytes([21; 32]));
     seed_config(&context, &actor).await;
     let ids: Vec<Ulid> = (1..=6u8).map(|seed| Ulid::from_bytes([seed; 16])).collect();

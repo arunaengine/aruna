@@ -307,7 +307,6 @@ mod tests {
     use aruna_runner::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use byteview::ByteView;
-    use tempfile::tempdir;
     use ulid::Ulid;
 
     fn realm() -> RealmId {
@@ -320,10 +319,9 @@ mod tests {
             .to_string()
     }
 
-    fn open_context(tempdir: &tempfile::TempDir) -> DriverContext {
+    fn open_context() -> DriverContext {
         DriverContext {
-            storage_handle: storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap())
-                .unwrap(),
+            storage_handle: storage::memory::MemoryStorage::open(),
             net_handle: None,
             blob_handle: None,
             graph_handle: None,
@@ -399,8 +397,7 @@ mod tests {
     async fn redemption_rechecks_cap() {
         // The other management node's device landed in the config after this
         // secret was minted, so the redemption must refuse it.
-        let tempdir = tempdir().unwrap();
-        let context = open_context(&tempdir);
+        let context = open_context();
         let owner = UserId::local(Ulid::generate(), realm());
         let enrollment_id = Ulid::generate();
         write_config(&context, Some(1), &[]).await;
@@ -417,8 +414,7 @@ mod tests {
     async fn retry_keeps_slot() {
         // Once the joiner itself is in the config, its own retry must not be
         // charged a second device.
-        let tempdir = tempdir().unwrap();
-        let context = open_context(&tempdir);
+        let context = open_context();
         let owner = UserId::local(Ulid::generate(), realm());
         let enrollment_id = Ulid::generate();
         write_config(&context, Some(1), &[]).await;
@@ -436,9 +432,7 @@ mod tests {
 
     #[tokio::test]
     async fn reserves_same_node() {
-        let tempdir = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let context = DriverContext {
             storage_handle,
             net_handle: None,
@@ -513,8 +507,7 @@ mod tests {
     #[tokio::test]
     async fn lapsed_renewal_expires() {
         // A node whose reservation and secret both lapsed cannot revive the secret.
-        let tempdir = tempdir().unwrap();
-        let context = open_context(&tempdir);
+        let context = open_context();
         let enrollment_id = Ulid::generate();
         drive(
             CreateSecretOperation::new(CreateSecretInput {
@@ -548,9 +541,7 @@ mod tests {
 
     #[tokio::test]
     async fn expired_reservation_reclaimed() {
-        let tempdir = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let context = DriverContext {
             storage_handle,
             net_handle: None,

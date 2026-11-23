@@ -9,8 +9,8 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::share::{ShareAction, ShareMode, ShareTarget, ShareUses};
 use aruna_runner::driver::{DriverContext, drive, drive_retry};
 
-fn context(dir: &tempfile::TempDir) -> DriverContext {
-    aruna_runner::testing::path_context(dir.path().to_str().unwrap())
+fn context() -> DriverContext {
+    aruna_runner::testing::memory_context()
 }
 
 async fn save(context: &DriverContext, link: ShareLink) {
@@ -48,8 +48,7 @@ fn link(owner: u8, id: u8) -> ShareLink {
 
 #[tokio::test]
 async fn lists_own_links() {
-    let dir = tempfile::tempdir().unwrap();
-    let context = context(&dir);
+    let context = context();
     for (owner, id) in [(3, 10), (3, 11), (4, 12)] {
         save(&context, link(owner, id)).await;
     }
@@ -75,8 +74,7 @@ async fn lists_own_links() {
 
 #[tokio::test]
 async fn log_pages_ordered() {
-    let dir = tempfile::tempdir().unwrap();
-    let context = context(&dir);
+    let context = context();
     let share = Ulid::from_bytes([7; 16]);
     let other = Ulid::from_bytes([8; 16]);
     let event = |at| ShareEvent {
@@ -119,8 +117,7 @@ async fn log_pages_ordered() {
 
 #[tokio::test]
 async fn concurrent_logs_count() {
-    let dir = tempfile::tempdir().unwrap();
-    let context = context(&dir);
+    let context = context();
     let share = Ulid::from_bytes([7; 16]);
     let event = ShareEvent {
         at: 1,

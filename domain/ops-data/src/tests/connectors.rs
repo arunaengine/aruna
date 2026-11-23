@@ -30,8 +30,7 @@ use aruna_runner::testing::test_context;
 /// A storage-only context with an open node vault for connector secrets.
 pub(crate) fn vault_context() -> (TempDir, DriverContext) {
     let tempdir = tempdir().unwrap();
-    let storage_handle =
-        storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+    let storage_handle = storage::memory::MemoryStorage::open();
     storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
     (tempdir, test_context(storage_handle))
 }

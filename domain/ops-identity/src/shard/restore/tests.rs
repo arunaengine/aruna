@@ -18,8 +18,7 @@ use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::placement::record::PlacementStrategy;
 use aruna_core::user::id::UserId;
 use aruna_runner::driver::{DriverContext, drive};
-use aruna_storage::storage::worker::FjallStorage;
-use tempfile::tempdir;
+use aruna_storage::storage::memory::MemoryStorage;
 
 fn node(seed: u8) -> NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -300,9 +299,7 @@ fn config_rebinds_matrix() {
 
 #[tokio::test]
 async fn bad_config_degrades() {
-    let dir = tempdir().expect("tempdir must open");
-    let storage =
-        FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage must open");
+    let storage = MemoryStorage::open();
     let realm_id = RealmId([8; 32]);
     let target = DocumentTarget::RealmConfig { realm_id };
     let event = storage

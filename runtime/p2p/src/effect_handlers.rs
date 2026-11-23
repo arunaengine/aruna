@@ -789,14 +789,13 @@ mod tests {
     use aruna_core::effects::{DhtEffect, DhtGetOptions, NetEffect};
     use aruna_core::events::{DhtEvent, NetEvent};
     use aruna_core::keys::realm_presence_key;
-    use aruna_storage::storage::worker::FjallStorage;
+    use aruna_storage::storage::memory::MemoryStorage;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
     async fn handler_context(seed: u8) -> (crate::NetHandle, NetEffectContext, TempDir, RealmId) {
         let directory = tempfile::tempdir().expect("test storage directory");
-        let storage = FjallStorage::open(directory.path().to_str().expect("test path"))
-            .expect("test storage");
+        let storage = MemoryStorage::open();
         let realm_id = RealmId::from_bytes([seed; 32]);
         let handle = crate::NetHandle::new(
             crate::config::NetConfig {
@@ -835,16 +834,8 @@ mod tests {
     ) {
         let first_directory = tempfile::tempdir().expect("first storage directory");
         let second_directory = tempfile::tempdir().expect("second storage directory");
-        let first_storage =
-            FjallStorage::open(first_directory.path().to_str().expect("first storage path"))
-                .expect("first storage");
-        let second_storage = FjallStorage::open(
-            second_directory
-                .path()
-                .to_str()
-                .expect("second storage path"),
-        )
-        .expect("second storage");
+        let first_storage = MemoryStorage::open();
+        let second_storage = MemoryStorage::open();
         let realm_id = RealmId::from_bytes([seed; 32]);
         let first_secret = iroh::SecretKey::from_bytes(&[seed; 32]);
         let second_secret = iroh::SecretKey::from_bytes(&[seed + 1; 32]);

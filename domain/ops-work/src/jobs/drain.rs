@@ -534,11 +534,10 @@ mod tests {
     use aruna_runner::driver::{DriverContext, drive};
     use aruna_scheduler::TaskHandle;
     use aruna_storage::scan::iter_prefix_page;
-    use aruna_storage::storage::worker::FjallStorage;
+    use aruna_storage::storage::memory::MemoryStorage;
     use aruna_test_harness::jobs::insert_job;
     use aruna_test_harness::jobs::read_job_record;
     use byteview::ByteView;
-    use tempfile::tempdir;
     use ulid::Ulid;
 
     async fn drain_job_batch(
@@ -746,8 +745,7 @@ mod tests {
 
     #[tokio::test]
     async fn claims_within_capacity() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let context = aruna_runner::testing::test_context(storage.clone());
         for seq in 1..=3u128 {
             insert_job(&context, &queued_record(job_id(seq as u64), 1))
@@ -769,8 +767,7 @@ mod tests {
     async fn skips_saturated_class() {
         // External slots are gone while in-process slots are free: the shared due
         // index must not claim and release the external row it cannot run.
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let context = aruna_runner::testing::test_context(storage.clone());
         let external = job_id(1);
         let mut record = queued_record(external, 1);
@@ -815,8 +812,7 @@ mod tests {
     async fn empty_budget_defers() {
         // Both classes saturated with a due row present: the caller must be told to
         // back off instead of re-arming the drain at zero.
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let context = aruna_runner::testing::test_context(storage.clone());
         let job_id = job_id(1);
         insert_job(&context, &queued_record(job_id, 1))
@@ -842,8 +838,7 @@ mod tests {
     async fn drops_foreign_rows() {
         // A due row for a job owned elsewhere is dropped, never claimed: only the
         // immutable owner may run a JobId, and the dead row must not pin the timer.
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let context = aruna_runner::testing::test_context(storage.clone());
         let foreign = job_id(1);
         insert_job(&context, &queued_record(foreign, 1))
@@ -866,8 +861,7 @@ mod tests {
 
     #[tokio::test]
     async fn expired_lease_requeued() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let context = aruna_runner::testing::test_context(storage.clone());
         let job_id = JobId::from_bytes([4u8; 16]);
         let mut record = queued_record(job_id, 1);
@@ -896,8 +890,7 @@ mod tests {
     // requeued; its lease row stays, so re-arm is floored instead of busy-looping.
     #[tokio::test]
     async fn external_lease_reconciled() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let context = aruna_runner::testing::test_context(storage.clone());
         let job_id = JobId::from_bytes([0xE1; 16]);
         let mut record = queued_record(job_id, 1);
@@ -945,8 +938,7 @@ mod tests {
 
     #[tokio::test]
     async fn future_lease_kept() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let context = aruna_runner::testing::test_context(storage.clone());
         let job_id = JobId::from_bytes([5u8; 16]);
         let mut record = queued_record(job_id, 1);
@@ -967,8 +959,7 @@ mod tests {
 
     #[tokio::test]
     async fn restore_shortens_timer() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let mut context = aruna_runner::testing::test_context(storage.clone());
         let task_handle = TaskHandle::new();
         context.task_handle = Some(task_handle.clone());
@@ -1012,8 +1003,7 @@ mod tests {
         use aruna_core::effects::StorageEffect;
         use aruna_core::events::StorageEvent;
 
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let context = aruna_runner::testing::test_context(storage.clone());
         let orphan = JobId::from_bytes([9u8; 16]);
         match storage

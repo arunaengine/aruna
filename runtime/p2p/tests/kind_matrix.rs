@@ -14,10 +14,9 @@ use aruna_core::user::id::UserId;
 use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_p2p::streams::BiStream;
 use aruna_p2p::{InboundEventHandler, NetHandle};
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use async_trait::async_trait;
 use irokle::Storage as _;
-use tempfile::tempdir;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
@@ -59,11 +58,8 @@ async fn refuses_user_sync() -> Result<(), Box<dyn std::error::Error>> {
     // The realm node knows the dialer as a User device, so document sync is refused
     // while the metadata read surface stays open: only the accept side can refuse.
     let realm_id = RealmId::from_bytes([91u8; 32]);
-    let temp_device = tempdir()?;
-    let temp_realm = tempdir()?;
-    let storage_device =
-        FjallStorage::open(temp_device.path().to_str().ok_or("invalid temp path")?)?;
-    let storage_realm = FjallStorage::open(temp_realm.path().to_str().ok_or("invalid temp path")?)?;
+    let storage_device = MemoryStorage::open();
+    let storage_realm = MemoryStorage::open();
 
     let device = NetHandle::new(
         config(realm_id, iroh::SecretKey::from_bytes(&[91u8; 32])),
@@ -127,8 +123,7 @@ async fn sync_skips_devices() -> Result<(), Box<dyn std::error::Error>> {
     // Dial-side mirror of the accept matrix: a realm node never writes a device
     // into a topic's membership and never picks one as a sync target.
     let realm_id = RealmId::from_bytes([95u8; 32]);
-    let temp_realm = tempdir()?;
-    let storage_realm = FjallStorage::open(temp_realm.path().to_str().ok_or("invalid temp path")?)?;
+    let storage_realm = MemoryStorage::open();
     let realm = NetHandle::new(
         config(realm_id, iroh::SecretKey::from_bytes(&[95u8; 32])),
         storage_realm,
@@ -179,11 +174,8 @@ async fn device_refuses_sync() -> Result<(), Box<dyn std::error::Error>> {
     // Direction matters: a device never dials sync or shard exchange, dials job
     // control for its owner's submissions, and never serves job control.
     let realm_id = RealmId::from_bytes([93u8; 32]);
-    let temp_device = tempdir()?;
-    let temp_realm = tempdir()?;
-    let storage_device =
-        FjallStorage::open(temp_device.path().to_str().ok_or("invalid temp path")?)?;
-    let storage_realm = FjallStorage::open(temp_realm.path().to_str().ok_or("invalid temp path")?)?;
+    let storage_device = MemoryStorage::open();
+    let storage_realm = MemoryStorage::open();
 
     let device = NetHandle::new(
         config(realm_id, iroh::SecretKey::from_bytes(&[93u8; 32])),

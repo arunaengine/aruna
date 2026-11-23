@@ -100,8 +100,7 @@ mod tests {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::types::{TxnId, Value};
-    use aruna_storage::storage::worker::FjallStorage;
-    use tempfile::tempdir;
+    use aruna_storage::storage::memory::MemoryStorage;
     use ulid::Ulid;
 
     use aruna_core::storage_entries::graph_lifecycle_entry;
@@ -121,8 +120,7 @@ mod tests {
 
     #[tokio::test]
     async fn lists_across_multiple() {
-        let temp = tempdir().unwrap();
-        let storage_handle = FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
+        let storage_handle = MemoryStorage::open();
         let group_id = Ulid::generate();
 
         for idx in 0..(crate::metadata::repository::LIST_METADATA_SIZE + 5) {
@@ -180,8 +178,7 @@ mod tests {
 
     #[tokio::test]
     async fn omits_deleted_lifecycle() {
-        let temp = tempdir().unwrap();
-        let storage_handle = FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
+        let storage_handle = MemoryStorage::open();
         let realm_id = RealmId([5u8; 32]);
         let group_id = Ulid::generate();
         let active_id = Ulid::generate();

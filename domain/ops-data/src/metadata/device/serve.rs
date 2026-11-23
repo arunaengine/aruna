@@ -968,10 +968,7 @@ mod tests {
     #[tokio::test]
     async fn finds_later_membership() {
         // The only matching group sits just beyond the legacy default page.
-        let dir = tempfile::tempdir().unwrap();
-        let storage =
-            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
-                .unwrap();
+        let storage = aruna_storage::storage::memory::MemoryStorage::open();
         let context = Arc::new(DriverContext {
             storage_handle: storage,
             net_handle: None,

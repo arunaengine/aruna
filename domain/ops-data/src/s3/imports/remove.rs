@@ -785,10 +785,7 @@ mod tests {
     async fn keeps_mark_stored() {
         use aruna_core::handle::Handle as _;
         use aruna_runner::driver::{DriverContext, drive};
-        let dir = tempfile::tempdir().unwrap();
-        let storage_handle =
-            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
-                .unwrap();
+        let storage_handle = aruna_storage::storage::memory::MemoryStorage::open();
         let context = DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,
@@ -850,10 +847,7 @@ mod tests {
         use aruna_core::handle::Handle as _;
         use aruna_core::structs::storage::backend_import::intent_key;
         use aruna_runner::driver::{DriverContext, drive};
-        let dir = tempfile::tempdir().unwrap();
-        let storage_handle =
-            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
-                .unwrap();
+        let storage_handle = aruna_storage::storage::memory::MemoryStorage::open();
         let context = DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,

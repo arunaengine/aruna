@@ -24,7 +24,7 @@ mod tests {
     use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
     use aruna_runner::driver::{DriverContext, drive};
     use aruna_storage::storage::handle::StorageHandle;
-    use aruna_storage::storage::worker::FjallStorage;
+    use aruna_storage::storage::memory::MemoryStorage;
     use ulid::Ulid;
 
     use aruna_core::id::NodeId;
@@ -124,8 +124,7 @@ mod tests {
 
     fn temp_context() -> (tempfile::TempDir, DriverContext) {
         let dir = tempfile::tempdir().expect("temp dir");
-        let storage =
-            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let storage = MemoryStorage::open();
         (
             dir,
             DriverContext {
@@ -266,9 +265,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_authorization_retryable() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let storage =
-            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let storage = MemoryStorage::open();
         let realm_id = RealmId([8u8; 32]);
         let owner = UserId::new(Ulid::from_bytes([1u8; 16]), realm_id);
         let group_id = Ulid::from_bytes([2u8; 16]);

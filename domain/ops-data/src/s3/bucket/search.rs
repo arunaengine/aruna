@@ -362,7 +362,6 @@ mod tests {
     use aruna_core::structs::storage::distribution::DistributionBinding;
     use aruna_core::user::id::UserId;
     use aruna_storage::storage;
-    use tempfile::tempdir;
     use ulid::Ulid;
 
     use super::*;
@@ -589,9 +588,7 @@ mod tests {
 
     #[tokio::test]
     async fn filters_permissions() {
-        let directory = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let context = DriverContext {
             storage_handle,
             net_handle: None,

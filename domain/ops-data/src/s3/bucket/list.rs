@@ -187,14 +187,11 @@ mod test {
     use aruna_runner::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use std::time::SystemTime;
-    use tempfile::tempdir;
     use ulid::Ulid;
 
     #[tokio::test]
     async fn test_list_buckets() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,

@@ -17,8 +17,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::user::id::UserId;
 use aruna_scheduler::TaskHandle;
-use aruna_storage::storage::worker::FjallStorage;
-use tempfile::tempdir;
+use aruna_storage::storage::memory::MemoryStorage;
 use ulid::Ulid;
 
 use super::job::artifacts::{ArtifactLookup, OwnedArtifactOperation};
@@ -302,8 +301,7 @@ fn refuses_shared_destination() {
 
 #[tokio::test]
 async fn dedup_lookup_matches() {
-    let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let context = DriverContext {
         storage_handle: storage.clone(),
         net_handle: None,
@@ -347,8 +345,7 @@ async fn dedup_lookup_matches() {
 
 #[tokio::test]
 async fn tombstone_preserves_gone() {
-    let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let context = DriverContext {
         storage_handle: storage.clone(),
         net_handle: None,
@@ -388,8 +385,7 @@ async fn tombstone_preserves_gone() {
 
 #[tokio::test]
 async fn report_expiry_hides() {
-    let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let context = DriverContext {
         storage_handle: storage.clone(),
         net_handle: None,
@@ -456,8 +452,7 @@ async fn report_expiry_hides() {
 
 #[tokio::test]
 async fn internal_access_hidden() {
-    let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let context = DriverContext {
         storage_handle: storage.clone(),
         net_handle: None,

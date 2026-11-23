@@ -210,7 +210,6 @@ mod tests {
     use aruna_runner::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use std::collections::BTreeSet;
-    use tempfile::tempdir;
     use ulid::Ulid;
 
     fn credential() -> UserAccess {
@@ -369,9 +368,7 @@ mod tests {
 
     #[tokio::test]
     async fn revokes_user_access() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,
@@ -448,9 +445,7 @@ mod tests {
 
     #[tokio::test]
     async fn revoke_deletes_tokens() {
-        let temp_handle = tempdir().unwrap();
-        let storage_handle =
-            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::memory::MemoryStorage::open();
         let driver_ctx = DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,

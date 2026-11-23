@@ -469,8 +469,7 @@ pub(crate) mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::storage_entries::create_event_entry;
-    use aruna_storage::storage::worker::FjallStorage;
-    use tempfile::tempdir;
+    use aruna_storage::storage::memory::MemoryStorage;
 
     pub(crate) fn test_event(event_id: Ulid, updated_at_ms: u64) -> MetadataEventRecord {
         crate::testing::metadata_event(event_id, updated_at_ms)
@@ -634,8 +633,7 @@ pub(crate) mod tests {
         let cached = resolve_raw_state(&[base.clone(), latest.clone()])
             .unwrap()
             .unwrap();
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let context = DriverContext {
             storage_handle: storage.clone(),
             net_handle: None,

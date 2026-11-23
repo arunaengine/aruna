@@ -22,7 +22,7 @@ aruna-ops-identity = { workspace = true, features = ["test-hooks"] }
 aruna-ops-work = { workspace = true, features = ["test-hooks"] }
 aruna-egress = { workspace = true }
 aruna-plugin-contract = { workspace = true }
-aruna-storage = { workspace = true }
+aruna-storage = { workspace = true, features = ["test-hooks"] }
 aruna-scheduler = { workspace = true }
 axum = { workspace = true }
 bytes = { workspace = true }

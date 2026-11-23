@@ -185,10 +185,7 @@ fn changed_archive_aborts() {
 
 #[tokio::test]
 async fn retirement_fences_promotion() {
-    let directory = tempfile::tempdir().unwrap();
-    let storage =
-        aruna_storage::storage::worker::FjallStorage::open(directory.path().to_str().unwrap())
-            .unwrap();
+    let storage = aruna_storage::storage::memory::MemoryStorage::open();
     let key = sealed().format.bucket_key().unwrap();
     let mut record = BucketKeyRecord::new(key, Ulid::nil(), [1; 32], 0);
     record.state = KeyState::Retiring;

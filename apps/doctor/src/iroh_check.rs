@@ -411,7 +411,7 @@ mod tests {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_p2p::NetHandle;
     use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
-    use aruna_storage::storage::worker::FjallStorage;
+    use aruna_storage::storage::memory::MemoryStorage;
     use aruna_wire::info::{
         InterfaceServicesStatus, InterfaceStatus, NodeCapabilityKind, NodeStatus, ServicesStatus,
     };
@@ -471,7 +471,7 @@ mod tests {
 
     async fn test_net_handle() -> (NetHandle, TempDir) {
         let temp_dir = tempdir().unwrap();
-        let storage = FjallStorage::open(temp_dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let handle = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),

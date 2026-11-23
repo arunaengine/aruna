@@ -314,10 +314,9 @@ pub(crate) mod tests {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
     use aruna_core::structs::storage::format::StoredFormat;
-    use aruna_storage::storage::worker::FjallStorage;
+    use aruna_storage::storage::memory::MemoryStorage;
     use std::collections::HashMap;
     use std::time::SystemTime;
-    use tempfile::tempdir;
 
     fn upload_operation() -> (CreateRoCrateOperation, BackendLocation) {
         upload_operation_with(None)
@@ -441,8 +440,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn reclaims_expired_upload() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let context = aruna_runner::testing::test_context(storage.clone());
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let owner = UserId::nil(realm_id);
@@ -545,8 +543,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn reads_missing_upload() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let context = aruna_runner::testing::test_context(storage.clone());
         let upload_id = Ulid::from_bytes([2u8; 16]);
         assert!(
@@ -585,8 +582,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn claim_rejects_owner() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let context = aruna_runner::testing::test_context(storage.clone());
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let owner = UserId::nil(realm_id);
@@ -628,8 +624,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn claim_rejects_expired() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let context = aruna_runner::testing::test_context(storage.clone());
         let owner = UserId::nil(RealmId::from_bytes([1u8; 32]));
         let upload_id = Ulid::from_bytes([2u8; 16]);
@@ -659,8 +654,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn deletes_claimed_upload() {
         // Cleanup deletes only when the claiming job matches; an absent upload is a no-op.
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let context = aruna_runner::testing::test_context(storage.clone());
         let owner = UserId::nil(RealmId::from_bytes([1u8; 32]));
         let upload_id = Ulid::from_bytes([2u8; 16]);

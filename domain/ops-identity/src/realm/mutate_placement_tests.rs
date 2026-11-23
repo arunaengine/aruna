@@ -21,7 +21,6 @@ use aruna_core::structured_id::PlacementHandle;
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Key, Value};
 use aruna_core::user::id::UserId;
-use tempfile::tempdir;
 
 use super::*;
 use crate::document_repository::GetConfigOperation;
@@ -30,7 +29,7 @@ use aruna_core::structs::placement::transition::{
     PlacementTransition, ProofClaim, TransitionLimits,
 };
 use aruna_runner::driver::{DriverContext, drive};
-use aruna_runner::testing::path_context;
+use aruna_runner::testing::memory_context;
 
 fn node(seed: u8) -> aruna_core::id::NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -157,8 +156,7 @@ async fn write_entries(context: &DriverContext, writes: Vec<(String, Key, Value)
 
 #[tokio::test]
 async fn strategy_binding_lifecycle() {
-    let directory = tempdir().unwrap();
-    let context = path_context(directory.path().to_str().unwrap());
+    let context = memory_context();
     let realm_id = RealmId::from_bytes([3; 32]);
     let actor = actor(realm_id);
     let initial = seed_config(&context, &actor).await;
@@ -299,8 +297,7 @@ async fn strategy_binding_lifecycle() {
 
 #[tokio::test]
 async fn node_placement_lifecycle() {
-    let directory = tempdir().unwrap();
-    let context = path_context(directory.path().to_str().unwrap());
+    let context = memory_context();
     let realm_id = RealmId::from_bytes([12; 32]);
     let actor = actor(realm_id);
     seed_config(&context, &actor).await;
@@ -334,8 +331,7 @@ async fn node_placement_lifecycle() {
 
 #[tokio::test]
 async fn rejects_reserved_label() {
-    let directory = tempdir().unwrap();
-    let context = path_context(directory.path().to_str().unwrap());
+    let context = memory_context();
     let realm_id = RealmId::from_bytes([13; 32]);
     let actor = actor(realm_id);
     seed_config(&context, &actor).await;
@@ -361,8 +357,7 @@ async fn rejects_reserved_label() {
 
 #[tokio::test]
 async fn rejects_dangling_refs() {
-    let directory = tempdir().unwrap();
-    let context = path_context(directory.path().to_str().unwrap());
+    let context = memory_context();
     let realm_id = RealmId::from_bytes([4; 32]);
     let actor = actor(realm_id);
     seed_config(&context, &actor).await;
@@ -470,8 +465,7 @@ fn group_reuses_realm() {
 
 #[tokio::test]
 async fn referenced_strategy_conflicts() {
-    let directory = tempdir().unwrap();
-    let context = path_context(directory.path().to_str().unwrap());
+    let context = memory_context();
     let realm_id = RealmId::from_bytes([5; 32]);
     let actor = actor(realm_id);
     let document = seed_config(&context, &actor).await;
@@ -490,8 +484,7 @@ async fn referenced_strategy_conflicts() {
 
 #[tokio::test]
 async fn materialized_reference_blocks() {
-    let directory = tempdir().unwrap();
-    let context = path_context(directory.path().to_str().unwrap());
+    let context = memory_context();
     let realm_id = RealmId::from_bytes([14; 32]);
     let actor = actor(realm_id);
     seed_config(&context, &actor).await;
@@ -519,8 +512,7 @@ async fn materialized_reference_blocks() {
 
 #[tokio::test]
 async fn pending_reference_blocks() {
-    let directory = tempdir().unwrap();
-    let context = path_context(directory.path().to_str().unwrap());
+    let context = memory_context();
     let realm_id = RealmId::from_bytes([15; 32]);
     let actor = actor(realm_id);
     seed_config(&context, &actor).await;
@@ -548,8 +540,7 @@ async fn pending_reference_blocks() {
 
 #[tokio::test]
 async fn missing_config_absent() {
-    let directory = tempdir().unwrap();
-    let context = path_context(directory.path().to_str().unwrap());
+    let context = memory_context();
     let realm_id = RealmId::from_bytes([11; 32]);
     let actor = actor(realm_id);
 
@@ -890,8 +881,7 @@ fn unmapped_drain_allowed() {
 
 #[tokio::test]
 async fn overlapping_transition_allowed() {
-    let directory = tempdir().unwrap();
-    let context = path_context(directory.path().to_str().unwrap());
+    let context = memory_context();
     let realm_id = RealmId::from_bytes([22; 32]);
     let actor = actor(realm_id);
     // Replica two with two nodes: every shard holds both, so draining one
@@ -912,8 +902,7 @@ async fn overlapping_transition_allowed() {
 
 #[tokio::test]
 async fn rejects_empty_holders() {
-    let directory = tempdir().unwrap();
-    let context = path_context(directory.path().to_str().unwrap());
+    let context = memory_context();
     let realm_id = RealmId::from_bytes([23; 32]);
     let actor = actor(realm_id);
     let document = seed_placement_config(&context, &actor, &[node(1), node(2)], Some(2)).await;
@@ -1326,8 +1315,7 @@ fn reports_require_roles() {
 
 #[tokio::test]
 async fn unauthorized_writes_nothing() {
-    let directory = tempdir().unwrap();
-    let context = path_context(directory.path().to_str().unwrap());
+    let context = memory_context();
     let realm_id = RealmId::from_bytes([46; 32]);
     let management = actor(realm_id);
     let seeded = seed_placement_config(&context, &management, &[node(2)], Some(2)).await;
