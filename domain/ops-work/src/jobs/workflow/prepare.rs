@@ -38,6 +38,8 @@ use aruna_core::job_request::session_of;
 use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 
 pub const NETWORK_TAG_KEY: &str = "aruna-engine.org/network";
+/// Set to `files` so a run never mounts its inputs, and so never gets an input credential.
+pub const STAGING_TAG_KEY: &str = "aruna-engine.org/staging";
 
 /// What one attempt needs of its preparation.
 #[derive(Debug, PartialEq)]
@@ -138,7 +140,8 @@ impl PrepareAttemptOperation {
     }
 
     fn mounts(&self) -> bool {
-        self.facts.as_ref().is_some_and(|facts| facts.s3_mount)
+        let files = (self.spec.tags.get(STAGING_TAG_KEY)).is_some_and(|value| value == "files");
+        !files && self.facts.as_ref().is_some_and(|facts| facts.s3_mount)
     }
 
     /// Whether the run gets a session's S3 access: a session always, a batch run inside its

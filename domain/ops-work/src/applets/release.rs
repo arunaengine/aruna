@@ -4,7 +4,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::applet::manifest::{
-    LOCKFILE, MAX_SITE_BYTES, ManifestFile, VersionManifest, content_type, lockfile_packages,
+    LOCKFILE, MAX_SITE_BYTES, ManifestFile, SOURCE_MAP, VersionManifest, content_type,
+    lockfile_packages,
 };
 use aruna_core::applet::record::{Applet, PinnedObject, VersionRef, VersionState, held_bucket};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -125,19 +126,8 @@ impl ReleaseOperation {
             .bucket
             .clone()
             .ok_or(AppletError::from(IoError::Unfinished))?;
-        let name = held_bucket(applet.group_id, applet.host_node);
-        let sha256 = hex::encode(sha2::Sha256::digest(&bytes));
-        let size = bytes.len() as u64;
-        let body = BackendStream::once(bytes);
-        let scope = (self.node.node(), &self.node.routing);
-        let write = put(
-            scope,
-            &self.auth,
-            (&name, bucket),
-            (key, size, &sha256),
-            body,
-        );
-        Ok(IoCall::child(write))
+        let held = (applet, bucket);
+        Ok(put_held((&self.node, &self.auth), held, key, bytes))
     }
 
     fn key(&self, path: &str) -> String {
@@ -171,6 +161,7 @@ impl ReleaseOperation {
                 .map(|bytes| blake3::hash(bytes).to_hex().to_string()),
             packages,
             files: (self.stored.iter())
+                .filter(|(path, _)| path != SOURCE_MAP)
                 .filter_map(|(path, object)| Some((path, object.as_ref()?)))
                 .map(|(path, object)| ManifestFile {
                     path: path.clone(),
@@ -183,7 +174,11 @@ impl ReleaseOperation {
                     size_bytes: object.size,
                 })
                 .collect(),
-            source_map: None,
+            // Only preview sessions read the source map, so it is never a served file.
+            source_map: (self.stored.iter())
+                .find(|(path, _)| path == SOURCE_MAP)
+                .and_then(|(_, object)| object.as_ref())
+                .map(pinned),
         }
         .checked()
         .map_err(|error| AppletError::Invalid(error.to_string()))?;
@@ -194,7 +189,45 @@ impl ReleaseOperation {
     }
 }
 
-fn git_error(error: GitError) -> AppletError {
+/// The exact object version `stored` names.
+pub(crate) fn pinned(stored: &StoredObject) -> PinnedObject {
+    PinnedObject {
+        node: stored.node_id,
+        bucket: stored.bucket.clone(),
+        key: stored.key.clone(),
+        version_id: stored.version_id.to_string(),
+        blake3: hex::encode(stored.blake3),
+    }
+}
+
+/// The child that writes `bytes` at `key` of the held bucket of `applet` on its host node.
+pub(crate) fn put_held(
+    (node, auth): (&GitNode, &AuthContext),
+    (applet, bucket): (&Applet, BucketInfo),
+    key: String,
+    bytes: Bytes,
+) -> IoCall {
+    let name = held_bucket(applet.group_id, applet.host_node);
+    put_named(node, auth, (&name, bucket), key, bytes)
+}
+
+/// The child that writes `bytes` at `key` of the bucket `name` on this node; callers authorize.
+pub(crate) fn put_named(
+    node: &GitNode,
+    auth: &AuthContext,
+    (name, bucket): (&str, BucketInfo),
+    key: String,
+    bytes: Bytes,
+) -> IoCall {
+    let sha256 = hex::encode(sha2::Sha256::digest(&bytes));
+    let size = bytes.len() as u64;
+    let body = BackendStream::once(bytes);
+    let scope = (node.node(), &node.routing);
+    let write = put(scope, auth, (name, bucket), (key, size, &sha256), body);
+    IoCall::child(write)
+}
+
+pub(crate) fn git_error(error: GitError) -> AppletError {
     match error {
         GitError::NotFound | GitError::BranchMissing => {
             AppletError::Invalid("the revision or folder does not exist".into())
@@ -284,13 +317,7 @@ impl Operation for ReleaseOperation {
                 let entry = VersionRef {
                     version: self.version,
                     commit: self.commit.clone(),
-                    manifest: PinnedObject {
-                        node: stored.node_id,
-                        bucket: stored.bucket,
-                        key: stored.key,
-                        version_id: stored.version_id.to_string(),
-                        blake3: hex::encode(stored.blake3),
-                    },
+                    manifest: pinned(&stored),
                     state: VersionState::Private,
                     created_by: self.auth.user_id,
                     created_at_ms: self.now_ms,
