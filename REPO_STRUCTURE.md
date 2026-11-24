@@ -31,7 +31,7 @@ They start an operation in the same way as an HTTP request does.
 
 | Folder | Holds |
 | --- | --- |
-| `apps/` | runnable binaries: node, doctor, cli, registry, compute helper |
+| `apps/` | runnable binaries: node, doctor, cli, registry, compute helper; the applet builder image |
 | `frontends/` | external client protocols and wire DTOs |
 | `domain/` | pure sans-IO models, crypto, contracts and state machines |
 | `runtime/` | async I/O execution, OS interfaces and effect backends |
@@ -43,6 +43,8 @@ They start an operation in the same way as an HTTP request does.
 | Layer | Crate | Owns |
 | --- | --- | --- |
 | Inputs | `frontends/api`, `frontends/wire` | REST, S3 and MCP transports: input checks, auth, error mapping, OpenAPI, wire DTOs |
+| Inputs | `frontends/gateway` | the stateless applet gateway (`aruna applet-gateway`): serves applet hosts through the node's edge routes |
+| Inputs | `apps/applet-builder` | the applet builder image and its starter template; no Rust crate |
 | Inputs | `apps/node`, `runtime/config` | the node binary: settings, portal assets, wiring, startup, shutdown, trigger shells |
 | Inputs | `apps/doctor`, `apps/cli`, `apps/registry` | operator tool on a stopped node; user client; standalone identifier registry |
 | Operations | `domain/ops-identity`, `domain/ops-data`, `domain/ops-work` | pure sans-IO use-case state machines in three layer crates (`aruna-ops-identity` -> `aruna-ops-data` -> `aruna-ops-work`, which also holds the trigger tables) |
