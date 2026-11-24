@@ -331,3 +331,7 @@ impl Operation for WriteChangeOperation {
         !matches!(error, AppletError::Storage(_))
     }
 }
+
+#[cfg(test)]
+#[path = "change_tests.rs"]
+mod tests;

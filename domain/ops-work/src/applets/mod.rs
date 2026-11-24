@@ -4,6 +4,7 @@
 
 pub mod change;
 pub mod create;
+pub mod reads;
 
 use aruna_core::applet::hosts::{HostRow, host_key};
 use aruna_core::applet::record::{Applet, applet_key, group_key, held_bucket};
