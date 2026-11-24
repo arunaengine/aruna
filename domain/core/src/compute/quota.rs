@@ -9,7 +9,7 @@ use crate::structs::execution::job::identity::JobId;
 use crate::structs::storage::node_info::AdvertisementEpoch;
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -174,15 +174,14 @@ pub struct ComputeDepartureReport {
     pub truncated: bool,
 }
 
-/// Merged nonterminal demand of one group across every observed snapshot.
-/// A family counts once however many publishers report it; a truncated snapshot
-/// contributes what it reports and is reported as an understated view.
+/// Merged nonterminal demand of one group across every observed snapshot. A family counts once
+/// at its largest report, since publishers may see different parts of one workflow run; a
+/// truncated snapshot contributes what it reports and is reported as an understated view.
 pub fn merge_demand<'a>(
     snapshots: impl IntoIterator<Item = &'a ComputeDemandSnapshot>,
     group_id: &GroupId,
 ) -> (ResourceTotals, bool) {
-    let mut seen: BTreeSet<([u8; 32], [u8; 32])> = BTreeSet::new();
-    let mut totals = ResourceTotals::default();
+    let mut seen: BTreeMap<([u8; 32], [u8; 32]), EffectiveResources> = BTreeMap::new();
     let mut truncated = false;
     for snapshot in snapshots {
         let Some(group) = snapshot.group(group_id) else {
@@ -192,12 +191,28 @@ pub fn merge_demand<'a>(
         };
         truncated |= group.truncated;
         for family in &group.families {
-            if seen.insert((family.submission_id.0, family.request_digest)) {
-                totals.add(&family.resources);
-            }
+            let identity = (family.submission_id.0, family.request_digest);
+            let kept = seen.entry(identity).or_insert(family.resources);
+            *kept = larger(kept, &family.resources);
         }
     }
+    let mut totals = ResourceTotals::default();
+    for resources in seen.values() {
+        totals.add(resources);
+    }
     (totals, truncated)
+}
+
+/// Each ceiling of two reports of one family at its larger value.
+fn larger(first: &EffectiveResources, second: &EffectiveResources) -> EffectiveResources {
+    EffectiveResources {
+        cpu_cores: first.cpu_cores.max(second.cpu_cores),
+        ram_bytes: first.ram_bytes.max(second.ram_bytes),
+        disk_bytes: first.disk_bytes.max(second.disk_bytes),
+        max_walltime_ms: first.max_walltime_ms.max(second.max_walltime_ms),
+        preemptible: first.preemptible && second.preemptible,
+        gpus: first.gpus.max(second.gpus),
+    }
 }
 
 /// Bounds a snapshot to `MAX_DEMAND_GROUPS` groups and `MAX_DEMAND_FAMILIES` families.
@@ -507,6 +522,20 @@ mod tests {
         assert_eq!(totals.cpu_cores, 6);
         assert!(!truncated);
         assert_eq!(merge_demand([&left], &Ulid::from_bytes([9; 16])).0.count, 0);
+    }
+
+    #[test]
+    fn merge_keeps_larger() {
+        // Two publishers that saw different parts of one run's family count its larger report.
+        let group_id = Ulid::from_bytes([1; 16]);
+        let left = snapshot(group_id, vec![family(1, 2)]);
+        let right = snapshot(group_id, vec![family(1, 6)]);
+
+        let (totals, _) = merge_demand([&left, &right], &group_id);
+
+        assert_eq!(totals.count, 1);
+        assert_eq!(totals.cpu_cores, 6);
+        assert_eq!(merge_demand([&right, &left], &group_id).0, totals);
     }
 
     #[test]

@@ -18,6 +18,7 @@ use aruna_core::structs::execution::job::family::{
     EffectiveResources, JobFamilyId, JobFamilyRecord, JobProjection, JobRecordEnvelope,
     JobRecordKind, LogicalJobState, SubmissionId,
 };
+use aruna_core::structs::execution::job::input::WORKFLOW_RUN_TAG;
 use aruna_core::structs::execution::job::record_keys::kind_prefix;
 use aruna_core::structs::execution::job::record_rows::{ProjectionCache, from_bytes};
 use aruna_core::structs::storage::node_info::AdvertisementEpoch;
@@ -135,21 +136,35 @@ impl DemandSnapshotOperation {
         }))
     }
 
-    fn keep(&mut self, group_id: GroupId, resources: EffectiveResources) {
+    /// Keeps one family's demand; the child tasks of one workflow run add up to a single family,
+    /// so a large scatter never fills the snapshot's family budget.
+    fn keep(&mut self, group_id: GroupId, resources: EffectiveResources, run: Option<&str>) {
         let Some(family) = self.family.take() else {
             return;
         };
-        let demand = DemandFamily {
-            submission_id: family.submission_id,
-            request_digest: family.request_digest,
-            resources,
+        let demand = match run {
+            Some(run) => run_family(run, resources),
+            None => DemandFamily {
+                submission_id: family.submission_id,
+                request_digest: family.request_digest,
+                resources,
+            },
         };
         let full = self.collected.len() >= MAX_DEMAND_GROUPS;
         match self.collected.get_mut(&group_id) {
-            Some((families, truncated)) => match families.len() >= MAX_DEMAND_FAMILIES {
-                true => *truncated = true,
-                false => families.push(demand),
-            },
+            Some((families, truncated)) => {
+                let same = |kept: &DemandFamily| {
+                    run.is_some() && kept.submission_id == demand.submission_id
+                };
+                match families.iter().position(same) {
+                    Some(at) => {
+                        let kept = &mut families[at];
+                        kept.resources = combined(&kept.resources, &resources);
+                    }
+                    None if families.len() >= MAX_DEMAND_FAMILIES => *truncated = true,
+                    None => families.push(demand),
+                }
+            }
             None if full => self.unnamed = true,
             None => {
                 self.collected.insert(group_id, (vec![demand], false));
@@ -220,12 +235,15 @@ impl Operation for DemandSnapshotOperation {
                 let spec = rows.iter().find_map(|(_, value)| {
                     let envelope = from_bytes::<JobRecordEnvelope>(value.as_ref()).ok()?;
                     match envelope.record {
-                        JobFamilyRecord::Spec(spec) => Some((spec.group_id, spec.resources)),
+                        JobFamilyRecord::Spec(spec) => Some(spec),
                         _ => None,
                     }
                 });
                 match spec {
-                    Some((group_id, resources)) => self.keep(group_id, resources),
+                    Some(spec) => {
+                        let run = spec.payload.tags.get(WORKFLOW_RUN_TAG);
+                        self.keep(spec.group_id, spec.resources, run.map(String::as_str))
+                    }
                     None => self.family = None,
                 }
                 self.judge()
@@ -256,6 +274,35 @@ fn nonterminal(projection: Option<&JobProjection>) -> Option<JobFamilyId> {
         | LogicalJobState::Cancelled
         | LogicalJobState::Failed
         | LogicalJobState::NotRun => None,
+    }
+}
+
+/// The one family all child tasks of workflow run `run` report as: an identity every publisher
+/// derives alike, so replicas count the run once.
+fn run_family(run: &str, resources: EffectiveResources) -> DemandFamily {
+    let identity = |part: &[u8]| {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"aruna-demand-workflow-run-v1\0");
+        hasher.update(part);
+        hasher.update(run.as_bytes());
+        *hasher.finalize().as_bytes()
+    };
+    DemandFamily {
+        submission_id: SubmissionId(identity(b"submission\0")),
+        request_digest: identity(b"request\0"),
+        resources,
+    }
+}
+
+/// The ceilings of two tasks that are queued or run side by side.
+fn combined(first: &EffectiveResources, second: &EffectiveResources) -> EffectiveResources {
+    EffectiveResources {
+        cpu_cores: first.cpu_cores.saturating_add(second.cpu_cores),
+        ram_bytes: first.ram_bytes.saturating_add(second.ram_bytes),
+        disk_bytes: first.disk_bytes.saturating_add(second.disk_bytes),
+        max_walltime_ms: first.max_walltime_ms.max(second.max_walltime_ms),
+        preemptible: first.preemptible && second.preemptible,
+        gpus: first.gpus.saturating_add(second.gpus),
     }
 }
 
