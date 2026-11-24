@@ -18,6 +18,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -110,6 +111,9 @@ struct PortalRuntimeConfig<'a> {
     landing: Option<bool>,
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     legal: &'a [LegalDocument],
+    /// Surfaces this node serves beyond the portal's defaults, like `workflows`.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    features: BTreeMap<String, bool>,
 }
 
 async fn portal_config(State(state): State<PortalState>) -> Response {
@@ -136,8 +140,21 @@ async fn portal_config(State(state): State<PortalState>) -> Response {
         login: state.login.as_ref(),
         landing: (!state.landing).then_some(false),
         legal: &state.legal,
+        features: node_features(&state.server),
     });
     ([(header::CACHE_CONTROL, NO_CACHE)], config).into_response()
+}
+
+/// The surfaces this node turns on: `workflows` when a workflow runtime is attached.
+fn node_features(state: &ServerState) -> BTreeMap<String, bool> {
+    let context = state.get_ctx();
+    let workflows =
+        (context.compute_handle.as_ref()).is_some_and(|registry| registry.workflow().is_some());
+    let mut features = BTreeMap::new();
+    if workflows {
+        features.insert("workflows".to_string(), true);
+    }
+    features
 }
 
 async fn realm_descriptor(State(state): State<PortalState>) -> Response {
@@ -561,6 +578,43 @@ mod tests {
         assert_eq!(index.status(), StatusCode::OK);
         let body = to_bytes(index.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], b"<html>portal</html>");
+    }
+
+    struct Idle;
+
+    #[async_trait::async_trait]
+    impl aruna_core::workflow::WorkflowHost for Idle {
+        async fn serve(
+            &self,
+            effect: aruna_core::workflow::WorkflowEffect,
+        ) -> aruna_core::workflow::WorkflowAnswer {
+            effect.unavailable()
+        }
+    }
+
+    #[tokio::test]
+    async fn names_workflow_feature() {
+        let (state, _dir) = setup_state().await;
+        assert!(super::node_features(&state).is_empty());
+        let mut context = (*state.get_ctx()).clone();
+        let registry =
+            aruna_compute::registry::ExecutorRegistry::new().with_workflow(Arc::new(Idle));
+        context.compute_handle = Some(Arc::new(registry));
+        let state = ServerState::new(
+            Arc::new(context),
+            state.get_realm_id(),
+            state.get_node_id(),
+            NodeCapabilities::user_node(state.get_realm_id()).unwrap(),
+            false,
+            None,
+            aruna_runner::jobs::runtime::JobsRuntime::new(),
+        )
+        .await;
+        let features = super::node_features(&state);
+        assert_eq!(
+            serde_json::to_value(&features).unwrap(),
+            serde_json::json!({"workflows": true})
+        );
     }
 
     async fn registry_url(router: Router) -> serde_json::Value {

@@ -15,6 +15,7 @@ pub mod notifications;
 pub mod plugins;
 pub mod relay;
 pub mod triggers;
+pub mod workflows;
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod tests;

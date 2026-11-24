@@ -8,3 +8,4 @@ pub mod job;
 pub mod jobs;
 pub mod runs;
 pub mod tes;
+pub mod workflow;

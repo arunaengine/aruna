@@ -115,6 +115,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(execution::job::session::router())
         .merge(execution::jobs::router())
         .merge(execution::runs::router())
+        .merge(execution::workflow::router())
         .merge(execution::job::audit::router())
         .merge(metadata::router())
         .merge(git::router())
@@ -664,6 +665,41 @@ pub(crate) mod tests {
         ),
         ("POST", "/access/groups/{id}/roles"),
         ("POST", "/compute/jobs"),
+        ("GET", "/compute/workflows"),
+        ("POST", "/compute/workflows"),
+        ("GET", "/compute/workflows/{workflow_id}"),
+        ("PATCH", "/compute/workflows/{workflow_id}"),
+        ("DELETE", "/compute/workflows/{workflow_id}"),
+        ("GET", "/compute/workflows/{workflow_id}/versions"),
+        ("POST", "/compute/workflows/{workflow_id}/versions"),
+        ("GET", "/compute/workflows/{workflow_id}/versions/{version}"),
+        (
+            "GET",
+            "/compute/workflows/{workflow_id}/versions/{version}/check",
+        ),
+        (
+            "GET",
+            "/compute/workflows/{workflow_id}/versions/{version}/schema",
+        ),
+        (
+            "GET",
+            "/compute/workflows/{workflow_id}/versions/{version}/graph",
+        ),
+        (
+            "GET",
+            "/compute/workflows/{workflow_id}/versions/{version}/tools",
+        ),
+        (
+            "POST",
+            "/compute/workflows/{workflow_id}/versions/{version}/values/validate",
+        ),
+        ("POST", "/compute/workflows/validate"),
+        ("GET", "/compute/tools"),
+        ("POST", "/compute/tools"),
+        ("GET", "/compute/tools/{tool_id}/versions/{version}"),
+        ("DELETE", "/compute/tools/{tool_id}/versions/{version}"),
+        ("POST", "/compute/tools/extract"),
+        ("POST", "/compute/tools/suggest"),
         ("POST", "/compute/jobs/{job_id}/cancel"),
         ("POST", "/compute/jobs/{job_id}/session/cells"),
         ("POST", "/compute/jobs/{job_id}/session/end"),
