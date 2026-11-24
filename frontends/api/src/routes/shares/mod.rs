@@ -9,6 +9,7 @@ use aruna_clock::unix_timestamp_secs;
 use aruna_core::password::{Kdf, PasswordHash};
 use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 use aruna_core::structs::identity::auth::{AuthContext, SessionKind};
+use aruna_core::structs::identity::features::Feature;
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use aruna_core::structs::storage::share::{
     ShareAction, ShareEvent, ShareLink, ShareMode, ShareTarget, ShareUses,
@@ -402,6 +403,7 @@ pub async fn create_share(
         )));
     }
     let (group_id, target, path) = resolve_target(&state, &auth, &request.target).await?;
+    crate::features::require(&state, Feature::Shares, Some(group_id)).await?;
     share_policies(&state, &auth, &path, &request).await?;
     let password = match request.password.as_deref() {
         Some(password) => {

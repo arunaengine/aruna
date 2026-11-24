@@ -12,6 +12,7 @@ use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::features::Feature;
 use aruna_core::structs::storage::blob::{
     BucketInfo, CONTENT_TYPE_KEY, UserAccess, object_permission_path,
 };
@@ -243,6 +244,16 @@ async fn active_link(state: &ServerState, id: Ulid, now: u64) -> ServerResult<Sh
         .map_err(|error| ServerError::InternalError(error.into()))?
         .filter(|link| link.active(now))
         .ok_or_else(unavailable)?;
+    // Visitors get a plain explanation; the link itself stays stored for when sharing returns.
+    let sharing = crate::features::require(state, Feature::Shares, Some(link.group_id)).await;
+    if let Err(ServerError::FeatureOff(..)) = sharing {
+        return Err(ServerError::Refused(
+            StatusCode::FORBIDDEN,
+            "sharing_disabled",
+            "Sharing is turned off for this group. Ask the person who sent the link.".to_string(),
+        ));
+    }
+    sharing?;
     // A deactivated creator ends every link at once.
     crate::routes::access::users::ensure_active(state, link.created_by)
         .await

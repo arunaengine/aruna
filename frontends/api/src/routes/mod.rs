@@ -166,6 +166,10 @@ pub fn rest_router(state: Arc<ServerState>) -> Router {
         ))
         .layer(from_fn_with_state(
             state.clone(),
+            crate::features::gate_middleware,
+        ))
+        .layer(from_fn_with_state(
+            state.clone(),
             crate::rate_limit::principal_middleware,
         ))
         .layer(from_fn_with_state(state.clone(), auth_middleware))

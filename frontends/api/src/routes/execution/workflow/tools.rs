@@ -27,6 +27,7 @@ use super::{catalog_error, git_input, limit, ulid, version_number};
 use crate::auth::RealmAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
+use aruna_core::structs::identity::features::Feature;
 
 /// Suggestions of one request when the caller names no limit.
 const DEFAULT_SUGGESTIONS: u32 = 20;
@@ -139,6 +140,7 @@ pub async fn create_tool(
     Json(request): Json<CreateToolRequest>,
 ) -> ServerResult<(StatusCode, Json<ToolSummary>)> {
     let group_id = ulid(&request.group_id, "group_id")?;
+    crate::features::require(&state, Feature::Workflows, Some(group_id)).await?;
     let create = CreateToolOperation::new(&auth, group_id, request.definition);
     let tool = drive(create, &state.get_ctx())
         .await
@@ -269,6 +271,7 @@ pub async fn extract_tools(
     Json(request): Json<ExtractRequest>,
 ) -> ServerResult<Json<ExtractResponse>> {
     let group_id = ulid(&request.group_id, "group_id")?;
+    crate::features::require(&state, Feature::Workflows, Some(group_id)).await?;
     let source = match request.source {
         ExtractSourceBody::Workflow { workflow } => ExtractSource::Workflow {
             workflow_id: ulid(&workflow.workflow_id, "workflow_id")?,

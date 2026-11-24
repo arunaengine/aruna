@@ -10,6 +10,7 @@ use crate::server::state::ServerState;
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::errors::AuthorizationError;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
+use aruna_core::structs::identity::features::Feature;
 use aruna_core::structs::storage::blob::{UserAccess, group_permission_path, never_expiry};
 use aruna_ops_data::s3::access::create::{CreateUserConfig, CreateUserError, CreateUserOperation};
 use aruna_ops_data::s3::access::get::{GetAccessError, GetAccessOperation};
@@ -449,6 +450,7 @@ pub async fn create_s3_credentials(
     )
     .await?;
     authorize_credential_issuance(&auth, &state, group_id, path_restrictions.as_deref()).await?;
+    crate::features::require(&state, Feature::S3Keys, Some(group_id)).await?;
     let path_restrictions = path_restrictions.as_deref().map(serialize_restrictions);
     if let Some(restrictions) = path_restrictions.as_deref()
         && aruna_core::permission_path::validate_restriction_limits(restrictions).is_err()

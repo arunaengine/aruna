@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use aruna_core::structs::execution::workflow_run::{RunOutput, RunState, WorkflowRunRecord};
+use aruna_core::structs::identity::features::Feature;
 use aruna_ops_work::workflows::runs::admit::{PinnedInput, RunRequest, StartRunOperation};
 use aruna_ops_work::workflows::runs::cancel::{CancelRunOperation, DeleteRunOperation};
 use aruna_ops_work::workflows::runs::control::{Follow, FollowRunOperation};
@@ -234,6 +235,7 @@ pub async fn start_run(
     Json(request): Json<WorkflowRunRequest>,
 ) -> ServerResult<(StatusCode, Json<WorkflowRunBody>)> {
     let request = run_request(&state, request, idempotency_key(&headers)?)?;
+    crate::features::require(&state, Feature::Workflows, Some(request.group_id)).await?;
     let node = (state.get_node_id(), state.get_realm_id());
     let start = StartRunOperation::new(&auth, node, request);
     let admitted = drive(start, &state.get_ctx())
@@ -628,8 +630,13 @@ async fn follow(
     run: &str,
     how: Follow,
 ) -> ServerResult<(StatusCode, Json<WorkflowRunBody>)> {
+    let run = run_id(run)?;
+    let read = RunSnapshotOperation::new(auth, run);
+    let snapshot = drive(read, &state.get_ctx()).await.map_err(catalog_error)?;
+    let group = Some(snapshot.record.group_id);
+    crate::features::require(state, Feature::Workflows, group).await?;
     let node = (state.get_node_id(), state.get_realm_id());
-    let follow = FollowRunOperation::new(auth, node, run_id(run)?, how);
+    let follow = FollowRunOperation::new(auth, node, run, how);
     let record = drive(follow, &state.get_ctx())
         .await
         .map_err(catalog_error)?;

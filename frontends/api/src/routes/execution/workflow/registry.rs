@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use aruna_core::structs::execution::workflow::StoredWorkflowLanguage;
+use aruna_core::structs::identity::features::Feature;
 use aruna_ops_work::workflows::import::{CreateWorkflowOperation, NewWorkflow};
 use aruna_ops_work::workflows::inspect::{Draft, ValidateDraftOperation};
 use aruna_ops_work::workflows::reads::{
@@ -147,8 +148,10 @@ pub async fn create_workflow(
     RealmAuth(auth): RealmAuth,
     Json(request): Json<CreateWorkflowRequest>,
 ) -> ServerResult<(StatusCode, Json<WorkflowCreated>)> {
+    let group_id = ulid(&request.group_id, "group_id")?;
+    crate::features::require(&state, Feature::Workflows, Some(group_id)).await?;
     let input = NewWorkflow {
-        group_id: ulid(&request.group_id, "group_id")?,
+        group_id,
         name: request.name,
         description: request.description,
         language: request.language.map(Into::into),

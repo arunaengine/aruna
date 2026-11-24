@@ -317,9 +317,17 @@ async fn refuses_bad_imports() {
         (StatusCode::BAD_REQUEST, Some("not_supported"))
     );
 
+    // Without a workflow runtime the node has the feature off.
     let offline = self::node(None).await;
-    let (status, _) = offline.create(upload(offline.group_id)).await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let (status, refused) = offline.create(upload(offline.group_id)).await;
+    assert_eq!(
+        (status, refused["error"].as_str(), refused["scope"].as_str()),
+        (
+            StatusCode::FORBIDDEN,
+            Some("feature_disabled"),
+            Some("node")
+        )
+    );
 }
 
 #[tokio::test]

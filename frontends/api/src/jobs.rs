@@ -8,7 +8,7 @@ use crate::job_service::read_owned_job;
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::compute::normalize_container_path;
-use aruna_core::compute::runtimes::MOUNT_PREFIX_TAG;
+use aruna_core::compute::runtimes::{MOUNT_PREFIX_TAG, SESSION_TAG, SESSION_TAG_NOTEBOOK};
 use aruna_core::compute::session::{SessionAnswer, SessionError, SessionRequest};
 use aruna_core::id::NodeId;
 use aruna_core::job_request::{SubmissionScope, SubmitJobError};
@@ -23,6 +23,7 @@ use aruna_core::structs::execution::job::input::{
 use aruna_core::structs::execution::job::key_wait::KeyWait;
 use aruna_core::structs::execution::job::local::{JobRecord, WorkspaceMode};
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission};
+use aruna_core::structs::identity::features::{Feature, Resolved};
 use aruna_core::structs::storage::blob::{bucket_permission_path, group_permission_path};
 use aruna_core::user::id::UserId;
 use aruna_ops_work::jobs::command::{
@@ -74,6 +75,8 @@ pub(crate) enum JobRequestError {
     JobPlanConflict(String),
     /// Standing compute quota refused the admission.
     ComputeQuotaDenied(aruna_core::compute::quota::QuotaDenied),
+    /// The feature the admission needs is off.
+    FeatureOff(Feature, Resolved),
     /// A retryable dependency did not answer.
     ServiceUnavailableReason(String),
     /// A fault that is not the caller's to fix.
@@ -92,6 +95,7 @@ impl From<JobRequestError> for ServerError {
             JobRequestError::Conflict(message) => Self::Conflict(message),
             JobRequestError::JobPlanConflict(message) => Self::JobPlanConflict(message),
             JobRequestError::ComputeQuotaDenied(denied) => Self::ComputeQuotaDenied(denied),
+            JobRequestError::FeatureOff(feature, resolved) => Self::FeatureOff(feature, resolved),
             JobRequestError::ServiceUnavailableReason(message) => {
                 Self::ServiceUnavailableReason(message)
             }
@@ -118,6 +122,7 @@ impl JobRequestError {
             ServerError::ServiceUnavailableReason(message) => {
                 Self::ServiceUnavailableReason(message)
             }
+            ServerError::FeatureOff(feature, resolved) => Self::FeatureOff(feature, resolved),
             other => Self::InternalError(other.to_string()),
         }
     }
@@ -246,6 +251,15 @@ pub(crate) async fn admit_execution(
     )
     .await
     .map_err(JobRequestError::from_server)?;
+    let notebook = command.tags.get(SESSION_TAG).map(String::as_str) == Some(SESSION_TAG_NOTEBOOK);
+    let feature = if notebook {
+        Feature::Notebooks
+    } else {
+        Feature::Runs
+    };
+    crate::features::require(state, feature, Some(group_id))
+        .await
+        .map_err(JobRequestError::from_server)?;
 
     if command.outputs.len() > MAX_EXECUTION_OUTPUTS {
         return Err(JobRequestError::BadRequest);

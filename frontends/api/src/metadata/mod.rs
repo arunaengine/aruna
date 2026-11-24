@@ -88,6 +88,7 @@ pub(crate) async fn run_create_metadata(
     payload: CreateDocumentPayload,
     message: Option<String>,
 ) -> ServerResult<MetadataRegistryRecord> {
+    crate::features::profile_create(state, group_id, &path).await?;
     let ctx = state.get_ctx();
     let create = DocumentCreate {
         group_id,

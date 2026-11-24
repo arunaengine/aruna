@@ -442,6 +442,9 @@ impl McpServer {
         if record.is_none() {
             metadata_probe(self, &auth, "replace_dataset", extras).await?;
         }
+        crate::features::profile_write(&self.state, document_id)
+            .await
+            .map_err(update_error)?;
         let normalized = crate::metadata::with_global_ids(&self.state, &input.rocrate.0)
             .await
             .map_err(server_error)?;

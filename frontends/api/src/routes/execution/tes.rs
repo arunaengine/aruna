@@ -24,6 +24,7 @@ use aruna_core::structs::execution::job::input::{
 };
 use aruna_core::structs::execution::job::local::{JobRecord, JobResultPayload, WorkspaceMode};
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
+use aruna_core::structs::identity::features::Feature;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
@@ -715,6 +716,9 @@ pub async fn create_task(
         Err(error) => return error.into_response(),
     };
     if let Err(error) = ensure_group_write(&state, &caller.auth, group_id).await {
+        return error.into_response();
+    }
+    if let Err(error) = crate::features::require(&state, Feature::Runs, Some(group_id)).await {
         return error.into_response();
     }
 
