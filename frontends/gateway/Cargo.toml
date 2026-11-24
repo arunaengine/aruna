@@ -1,0 +1,28 @@
+# Manifest of aruna-gateway, the stateless applet gateway in front of the node's edge routes.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+[package]
+name = "aruna-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+axum = { workspace = true }
+base64 = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true }
+chacha20poly1305 = { workspace = true }
+futures-util = { workspace = true }
+lru = { workspace = true }
+rand = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }

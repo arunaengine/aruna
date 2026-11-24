@@ -132,6 +132,8 @@ CRATE_TARGETS = {
     "aruna-kpabe": (),
     "aruna-kpabe-wasm": ("aruna-kpabe",),
     "aruna-wire": ("aruna-core",),
+    # The applet gateway speaks HTTP to the node and links no Aruna crate.
+    "aruna-gateway": (),
     "aruna-plugin": (),
     "aruna-plugin-fixture": ("aruna-plugin",),
     "elabftw-sync": ("aruna-plugin",),

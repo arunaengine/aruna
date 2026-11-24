@@ -10,6 +10,7 @@ members = [
     "apps/registry",
     "apps/compute-helper",
     "frontends/api",
+    "frontends/gateway",
     "frontends/wire",
     "domain/core",
     "domain/kpabe",
@@ -69,6 +70,7 @@ aruna-ops-data = { path = "domain/ops-data" }
 aruna-ops-identity = { path = "domain/ops-identity" }
 aruna-runner = { path = "runtime/runner" }
 aruna-egress = { path = "runtime/egress" }
+aruna-gateway = { path = "frontends/gateway" }
 aruna-plugin = { path = "plugins/sdk" }
 aruna-plugin-contract = { path = "domain/plugin-contract" }
 aruna-wasm-host = { path = "runtime/wasm-host", default-features = false }
