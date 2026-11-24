@@ -13,6 +13,7 @@ pub mod identity;
 pub mod intake;
 pub mod reads;
 pub mod release;
+pub mod runs;
 pub mod visits;
 
 use aruna_core::applet::hosts::{HostRow, host_key};
