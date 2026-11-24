@@ -59,6 +59,7 @@ pub enum DomainStateBody {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[schema(as = AppletStart)]
 pub enum StartBody {
     Tool { tool_id: String, version: String },
     Workflow { workflow_id: String, version: u32 },
@@ -84,6 +85,7 @@ pub struct LimitsBody {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
+#[schema(as = AppletGrants)]
 pub struct GrantsBody {
     /// Permission path patterns inside the group that the applet reads.
     pub read: Vec<String>,
@@ -106,6 +108,7 @@ pub struct GuestBody {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(as = AppletVersion)]
 pub struct VersionBody {
     pub version: u32,
     pub commit: Option<String>,

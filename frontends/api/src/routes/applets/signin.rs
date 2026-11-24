@@ -173,7 +173,7 @@ pub struct RedeemRequest {
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
-#[schema(example = json!({"applet_id": "01K8W1B3D5F7H9KMQ1S3V5X7Z2", "visitor_token": "eyJhbGciOi.example.token",
+#[schema(example = json!({"applet_id": "01K8W1B3D5F7H9KMQ1S3V5X7Z2", "visitor_token": "EXAMPLE-SESSION-TOKEN-PLACEHOLDER",
     "expires_at": 1764000000u64, "preview": false, "portal_origin": null}))]
 pub struct RedeemResponse {
     pub applet_id: String,
