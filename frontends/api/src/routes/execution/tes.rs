@@ -1337,6 +1337,13 @@ fn validate_task_shape(task: &TesTask) -> Result<&TesExecutor, TesError> {
             "reserved_tag",
         ));
     }
+    if let Some(key) = aruna_core::structs::execution::job::input::node_tag(&task.tags) {
+        return Err(TesError::coded(
+            StatusCode::BAD_REQUEST,
+            format!("tag `{key}` is reserved for workflow tasks"),
+            "reserved_tag",
+        ));
+    }
     let executor = match task.executors.as_slice() {
         [executor] => executor,
         [] => {

@@ -62,6 +62,7 @@ Native Git/LFS also accepts HTTP Basic with an Aruna bearer token as the passwor
         (name = "compute/jobs", description = "Durable background jobs"),
         (name = "compute/workflows", description = "The workflow registry: workflows, versions and their stored checks"),
         (name = "compute/tools", description = "The tool catalog of the groups, tool extraction and suggestions"),
+        (name = "compute/workflow-runs", description = "Workflow runs on this node: start, follow, tasks, cancel and delete"),
         (name = "metadata/documents", description = "Metadata document lifecycle"),
         (name = "metadata/query", description = "Metadata search and SPARQL"),
         (name = "metadata/references", description = "Metadata reference resolution"),

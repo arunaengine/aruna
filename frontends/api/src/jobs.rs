@@ -211,6 +211,11 @@ pub(crate) async fn admit_execution(
             "tag `{key}` is reserved for plugin tasks"
         )));
     }
+    if let Some(key) = aruna_core::structs::execution::job::input::node_tag(&command.tags) {
+        return Err(JobRequestError::BadRequestMessage(format!(
+            "tag `{key}` is reserved for workflow tasks"
+        )));
+    }
     let target = command.target.unwrap_or_default();
     let auth = match target {
         ExecutionTarget::Realm => {

@@ -27,7 +27,7 @@ use crate::tests::routes::{seed_group_docs, seed_realm_auth, seed_realm_config, 
 
 const CWL: &str = "cwlVersion: v1.2\nclass: CommandLineTool\nbaseCommand: echo\n";
 
-struct Scripted;
+pub(super) struct Scripted;
 
 fn scripted(kind: PreflightKind) -> Result<PreflightResult, WorkflowError> {
     Ok(match kind {
@@ -97,15 +97,15 @@ impl WorkflowHost for Scripted {
     }
 }
 
-struct Node {
+pub(super) struct Node {
     _dir: tempfile::TempDir,
-    state: Arc<ServerState>,
-    owner: AuthContext,
-    stranger: AuthContext,
-    group_id: Ulid,
+    pub(super) state: Arc<ServerState>,
+    pub(super) owner: AuthContext,
+    pub(super) stranger: AuthContext,
+    pub(super) group_id: Ulid,
 }
 
-async fn node(host: Option<Arc<dyn WorkflowHost>>) -> Node {
+pub(super) async fn node(host: Option<Arc<dyn WorkflowHost>>) -> Node {
     let dir = tempfile::tempdir().unwrap();
     let storage = aruna_storage::storage::memory::MemoryStorage::open();
     let mut context = aruna_runner::testing::test_context(storage);
@@ -143,7 +143,7 @@ async fn node(host: Option<Arc<dyn WorkflowHost>>) -> Node {
 }
 
 impl Node {
-    async fn call(
+    pub(super) async fn call(
         &self,
         auth: &AuthContext,
         method: &str,
@@ -169,13 +169,13 @@ impl Node {
         (status, value)
     }
 
-    async fn create(&self, body: Value) -> (StatusCode, Value) {
+    pub(super) async fn create(&self, body: Value) -> (StatusCode, Value) {
         self.call(&self.owner, "POST", "/compute/workflows", Some(body))
             .await
     }
 }
 
-fn upload(group_id: Ulid) -> Value {
+pub(super) fn upload(group_id: Ulid) -> Value {
     json!({"group_id": group_id.to_string(), "name": "hello", "upload": {
         "entrypoint": "hello.cwl", "files": [{"path": "hello.cwl", "content": CWL}]}})
 }
@@ -457,7 +457,7 @@ spec:
               none: {}
 ";
 
-fn coordinator_binary() -> std::path::PathBuf {
+pub(super) fn coordinator_binary() -> std::path::PathBuf {
     std::env::var_os("ARUNA_WORKFLOW_COORDINATOR_BIN")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {

@@ -1443,6 +1443,19 @@ fn rejects_plugin_tag() {
 }
 
 #[test]
+fn rejects_workflow_tag() {
+    let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
+    task.tags.insert(
+        "aruna-engine.org/workflow-run".to_string(),
+        Ulid::nil().to_string(),
+    );
+
+    let error = map_execution_spec(&task, None, ExecutionTarget::Realm).unwrap_err();
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    assert_eq!(error.code.as_deref(), Some("reserved_tag"));
+}
+
+#[test]
 fn projects_full_command() {
     // Docker runs entrypoint + command together; the projection shows both.
     let mut spec = ExecutionSpec {

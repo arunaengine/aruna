@@ -3,7 +3,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+pub mod events;
 pub mod registry;
+pub mod run_wire;
+pub mod runs;
+pub mod tasks;
 pub mod tools;
 pub mod versions;
 pub mod wire;
@@ -29,6 +33,9 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     registry::router()
         .merge(versions::router())
         .merge(tools::router())
+        .merge(runs::router())
+        .merge(tasks::router())
+        .merge(events::router())
 }
 
 fn limit(asked: Option<usize>) -> usize {
@@ -104,3 +111,7 @@ fn source_input(source: WorkflowSourceBody) -> Result<SourceInput, ServerError> 
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "run_tests.rs"]
+mod run_tests;
