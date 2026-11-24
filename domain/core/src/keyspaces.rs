@@ -637,6 +637,11 @@ pub const WORKFLOW_CACHE_KEYSPACE: &str = "workflow_task_cache";
 /// The finished RO-Crate JSON-LD of each workflow run, by run id.
 pub const WORKFLOW_CRATE_KEYSPACE: &str = "workflow_run_crates";
 
+/// Applet records by applet id, and an index row per group and applet with an empty value.
+pub const APPLETS_KEYSPACE: &str = "applets";
+/// Applet hosts and verified custom domains by normalized host name, naming their applet.
+pub const APPLET_HOSTS_KEYSPACE: &str = "applet_hosts";
+
 /// Every keyspace this crate defines, so tooling reports a missing one without
 /// maintaining its own copy of the list.
 pub const KEYSPACE_CATALOG: &[&str] = &[
@@ -955,6 +960,8 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     WORKFLOW_SOURCE_KEYSPACE,
     WORKFLOW_TOOL_KEYSPACE,
     WORKFLOW_RUN_KEYSPACE,
+    APPLETS_KEYSPACE,
+    APPLET_HOSTS_KEYSPACE,
     WORKFLOW_TASK_KEYSPACE,
     RUN_EVENT_KEYSPACE,
     RUN_LOG_KEYSPACE,

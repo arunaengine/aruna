@@ -13,6 +13,7 @@ mod sync;
 mod vault;
 mod workload;
 
+pub mod applet;
 pub mod calls;
 pub mod compute;
 pub mod effects;
