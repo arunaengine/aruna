@@ -11,6 +11,7 @@ pub mod notices;
 pub mod preview;
 pub mod records;
 pub mod review;
+pub mod runtime;
 pub mod signin;
 pub mod source;
 pub mod wire;
@@ -46,6 +47,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .merge(edge::router())
         .merge(preview::router())
         .merge(notices::router())
+        .merge(runtime::router())
         .merge(signin::router())
         .merge(node::router())
 }
