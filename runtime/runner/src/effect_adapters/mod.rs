@@ -13,6 +13,7 @@ mod session;
 pub(crate) mod shard;
 mod storage;
 pub mod task;
+mod workflow;
 
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, GroupEvent, GroupResult, NetEvent, SubOperationEvent};
@@ -224,6 +225,9 @@ pub(crate) async fn dispatch_effect_until(
             Box::pin(git::dispatch_git(*call, context, depth, deadline)).await,
         )),
         Effect::Job(effect) => Box::pin(job::dispatch_job(effect, context, depth, deadline)).await,
+        Effect::Workflow(effect) => Event::Workflow(Box::new(
+            Box::pin(workflow::dispatch_workflow(*effect, context)).await,
+        )),
     };
 
     trace!(
@@ -264,6 +268,7 @@ pub(crate) fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Delay(_) => "delay",
         Effect::Job(_) => "job",
         Effect::Git(_) => "git",
+        Effect::Workflow(_) => "workflow",
         Effect::Plugin(_) => "plugin",
     }
 }

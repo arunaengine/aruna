@@ -44,6 +44,7 @@ pub mod testing;
 pub mod time;
 pub mod types;
 pub mod user;
+pub mod workflow;
 
 pub use access::{
     admin_checks, admin_documents, audit, auth, config_authority, join_request, permission_path,

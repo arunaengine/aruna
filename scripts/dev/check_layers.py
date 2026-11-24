@@ -37,7 +37,10 @@ GROUPS = (
             "holder_choice usage_publish".split()
         ),
     ),
-    ("work and integrations", frozenset("jobs plugins assistant notifications federation harvest node".split())),
+    (
+        "work and integrations",
+        frozenset("jobs plugins assistant notifications federation harvest node workflows".split()),
+    ),
 )
 ANY_CRATE = "*"
 # Internal normal dependencies the target table (target-architecture.md section 2) allows.
@@ -52,6 +55,7 @@ CRATE_TARGETS = {
         "aruna-runner",
         "aruna-wire",
         "aruna-test-harness",
+        "aruna-workflow-contract",
     ),
     "aruna-doctor": (
         "aruna-core",
@@ -77,6 +81,7 @@ CRATE_TARGETS = {
     "aruna-ops-work": (
         "aruna-core",
         "aruna-plugin-contract",
+        "aruna-workflow-contract",
         "aruna-ops-identity",
         "aruna-ops-data",
     ),
@@ -100,6 +105,8 @@ CRATE_TARGETS = {
     "aruna-wasm-host": ("aruna-plugin-contract",),
     "aruna-plugin-contract": (),
     "aruna-workflow-contract": (),
+    # The sandboxed coordinators: their channel, warm preflight workers and run sessions.
+    "aruna-workflow": ("aruna-core", "aruna-compute", "aruna-workflow-contract"),
     "aruna-rdf-graph": ("aruna-core",),
     "aruna-egress": ("aruna-core",),
     # Test helpers that drive operations; only dev-dependencies name it.
@@ -117,7 +124,7 @@ CRATE_TARGETS = {
         "aruna-storage",
         "aruna-scheduler",
     ),
-    "aruna-core": ("aruna-kpabe",),
+    "aruna-core": ("aruna-kpabe", "aruna-workflow-contract"),
     # Host clocks and the OS random source; core and operations never reach them.
     "aruna-clock": ("aruna-core",),
     "aruna-kpabe": (),
@@ -133,7 +140,8 @@ CRATE_TARGETS = {
 # Every crate keeps its table for build dependencies; backends also for test dependencies, except
 # for the explicit dev-only storage test fixture allowance below (production edges stay forbidden).
 BACKENDS = frozenset(
-    "aruna-storage aruna-p2p aruna-blob aruna-scheduler aruna-compute aruna-wasm-host aruna-rdf-graph aruna-egress".split()
+    "aruna-storage aruna-p2p aruna-blob aruna-scheduler aruna-compute aruna-wasm-host aruna-rdf-graph aruna-egress "
+    "aruna-workflow".split()
 )
 BACKEND_DEV_TARGETS = {
     "aruna-p2p": ("aruna-storage",),

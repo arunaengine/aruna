@@ -1,0 +1,26 @@
+# Manifest of aruna-workflow: the sandboxed workflow coordinators of a node and their channel.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+[package]
+name = "aruna-workflow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aruna-compute = { workspace = true, default-features = false }
+aruna-core = { workspace = true }
+aruna-workflow-contract = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+ulid = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

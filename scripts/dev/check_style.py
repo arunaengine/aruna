@@ -39,6 +39,7 @@ SMALL_DOMAINS = {
     "apps/doctor/src/explorer": "grouped shared-prefix domain",
     "apps/doctor/src/migrate": "grouped shared-prefix domain",
     "apps/node/src/compute_setup": "coherent ownership scope",
+    "domain/core/src/workflow": "coherent ownership scope",
     "runtime/blob/src/blob/pithos": "grouped shared-prefix domain",
     "runtime/compute/src/executor/apptainer": "grouped shared-prefix domain",
     "runtime/compute/src/executor/docker": "grouped shared-prefix domain",

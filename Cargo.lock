@@ -342,6 +342,7 @@ dependencies = [
  "aruna-test-harness",
  "aruna-wasm-host",
  "aruna-wire",
+ "aruna-workflow",
  "astral_async_zip",
  "async-trait",
  "aws-sdk-s3",
@@ -414,6 +415,8 @@ dependencies = [
  "aruna-storage",
  "aruna-test-harness",
  "aruna-wire",
+ "aruna-workflow",
+ "aruna-workflow-contract",
  "astral_async_zip",
  "async-trait",
  "axum",
@@ -647,6 +650,7 @@ dependencies = [
  "aes-gcm 0.11.1",
  "argon2",
  "aruna-kpabe",
+ "aruna-workflow-contract",
  "async-trait",
  "base64 0.23.1",
  "blake3",
@@ -899,6 +903,7 @@ dependencies = [
  "aruna-scheduler",
  "aruna-storage",
  "aruna-test-harness",
+ "aruna-workflow-contract",
  "astral_async_zip",
  "async-trait",
  "axum",
@@ -1199,6 +1204,22 @@ dependencies = [
  "aruna-core",
  "serde",
  "utoipa",
+]
+
+[[package]]
+name = "aruna-workflow"
+version = "3.0.0-alpha.208"
+dependencies = [
+ "aruna-compute",
+ "aruna-core",
+ "aruna-workflow-contract",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "ulid 3.0.0",
 ]
 
 [[package]]

@@ -14,3 +14,4 @@ pub mod source_connector;
 pub mod staging;
 pub mod table;
 pub mod webhook;
+pub mod workflow;

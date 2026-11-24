@@ -30,6 +30,7 @@ members = [
     "runtime/scheduler",
     "runtime/egress",
     "runtime/wasm-host",
+    "runtime/workflow",
     "plugins/examples/elabftw",
     "plugins/examples/announcer/rust",
     "plugins/fixture",
@@ -75,6 +76,7 @@ aruna-storage = { path = "runtime/storage" }
 aruna-scheduler = { path = "runtime/scheduler" }
 aruna-test-harness = { path = "testing/harness" }
 aruna-wire = { path = "frontends/wire" }
+aruna-workflow = { path = "runtime/workflow" }
 aruna-workflow-contract = { path = "domain/workflow-contract" }
 
 # Third-party crates

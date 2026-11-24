@@ -16,6 +16,7 @@ test-hooks = ["dep:getrandom"]
 
 [dependencies]
 aruna-kpabe = { workspace = true }
+aruna-workflow-contract = { workspace = true }
 bytes = { workspace = true }
 smallvec = { workspace = true }
 ulid = { workspace = true }

@@ -614,6 +614,15 @@ pub const SHARE_USE_KEYSPACE: &str = "share_uses";
 /// Upload names claimed by running share uploads, by bucket and key, with the claim's end.
 pub const SHARE_NAME_KEYSPACE: &str = "share_upload_names";
 
+/// Workflows of the registry by workflow id, with their group, visibility and version count.
+pub const WORKFLOW_KEYSPACE: &str = "workflows";
+/// Workflow versions by workflow id and big-endian version number, with stored preflight results.
+pub const WORKFLOW_VERSION_KEYSPACE: &str = "workflow_versions";
+/// The files of each workflow version, keyed like its version row.
+pub const WORKFLOW_SOURCE_KEYSPACE: &str = "workflow_sources";
+/// Tool definitions of the catalog by tool id, version and group.
+pub const WORKFLOW_TOOL_KEYSPACE: &str = "workflow_tools";
+
 /// Every keyspace this crate defines, so tooling reports a missing one without
 /// maintaining its own copy of the list.
 pub const KEYSPACE_CATALOG: &[&str] = &[
@@ -927,6 +936,10 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     SHARE_EVENT_KEYSPACE,
     SHARE_USE_KEYSPACE,
     SHARE_NAME_KEYSPACE,
+    WORKFLOW_KEYSPACE,
+    WORKFLOW_VERSION_KEYSPACE,
+    WORKFLOW_SOURCE_KEYSPACE,
+    WORKFLOW_TOOL_KEYSPACE,
 ];
 
 /// Smallest key strictly greater than every key starting with `prefix`,

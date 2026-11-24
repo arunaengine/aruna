@@ -66,6 +66,42 @@ pub(super) fn collect(
             true => Some(compute_envelope(env)?),
             false => None,
         },
+        workflow: collect_workflow(env)?,
+    })
+}
+
+/// The workflow coordinator settings; without an image or a binary the node runs none.
+fn collect_workflow(
+    env: &dyn aruna_config::settings::SettingsEnv,
+) -> Result<aruna_workflow::WorkflowSettings, String> {
+    let defaults = aruna_workflow::WorkflowSettings::default();
+    let limits = defaults.limits;
+    let number = |name: &str| parse_number::<u64>(name, env.var(name).as_deref());
+    let seconds = |name: &str, default: std::time::Duration| {
+        parse_duration(name, env.var(name).as_deref(), default.as_secs())
+    };
+    Ok(aruna_workflow::WorkflowSettings {
+        image: parse_nonempty(env.var("ARUNA_WORKFLOW_COORDINATOR_IMAGE").as_deref()),
+        binary: parse_path(env.var("ARUNA_WORKFLOW_COORDINATOR_BIN").as_deref()),
+        preflight_workers: parse_number(
+            "ARUNA_WORKFLOW_PREFLIGHT_WORKERS",
+            env.var("ARUNA_WORKFLOW_PREFLIGHT_WORKERS").as_deref(),
+        )?
+        .unwrap_or(defaults.preflight_workers),
+        request_timeout: seconds("ARUNA_WORKFLOW_REQUEST_TIMEOUT", defaults.request_timeout)?,
+        recycle_after: number("ARUNA_WORKFLOW_PREFLIGHT_RECYCLE")?
+            .unwrap_or(defaults.recycle_after),
+        limits: aruna_workflow::ContainerLimits {
+            cpus: parse_number(
+                "ARUNA_WORKFLOW_CPUS",
+                env.var("ARUNA_WORKFLOW_CPUS").as_deref(),
+            )?
+            .unwrap_or(limits.cpus),
+            memory_bytes: number("ARUNA_WORKFLOW_MEMORY_BYTES")?.unwrap_or(limits.memory_bytes),
+            disk_bytes: number("ARUNA_WORKFLOW_DISK_BYTES")?.unwrap_or(limits.disk_bytes),
+            pids: number("ARUNA_WORKFLOW_PIDS")?.unwrap_or(limits.pids),
+            walltime: seconds("ARUNA_WORKFLOW_WALLTIME", limits.walltime)?,
+        },
     })
 }
 
@@ -610,6 +646,45 @@ mod pure_tests {
             panic!("docker was selected");
         };
         assert_eq!(docker.docker_host.as_deref(), Some("tcp://10.0.0.5:2376"));
+    }
+
+    #[test]
+    fn collects_workflow_settings() {
+        let off = collect(&BTreeMap::new()).expect("an empty map collects");
+        assert!(!off.workflow.enabled());
+        let env = BTreeMap::from([
+            (
+                "ARUNA_WORKFLOW_COORDINATOR_IMAGE".to_string(),
+                "harbor.computational.bio.uni-giessen.de/aruna/coordinator:1".to_string(),
+            ),
+            (
+                "ARUNA_WORKFLOW_PREFLIGHT_WORKERS".to_string(),
+                "4".to_string(),
+            ),
+            (
+                "ARUNA_WORKFLOW_REQUEST_TIMEOUT".to_string(),
+                "30".to_string(),
+            ),
+            (
+                "ARUNA_WORKFLOW_MEMORY_BYTES".to_string(),
+                "1073741824".to_string(),
+            ),
+            ("ARUNA_WORKFLOW_WALLTIME".to_string(), "600".to_string()),
+        ]);
+        let workflow = collect(&env)
+            .expect("the workflow settings collect")
+            .workflow;
+        assert!(workflow.enabled() && workflow.binary.is_none());
+        assert_eq!(workflow.preflight_workers, 4);
+        assert_eq!(workflow.request_timeout, Duration::from_secs(30));
+        assert_eq!(workflow.limits.memory_bytes, 1 << 30);
+        assert_eq!(workflow.limits.walltime, Duration::from_secs(600));
+        assert_eq!(
+            workflow.limits.pids,
+            aruna_workflow::ContainerLimits::default().pids
+        );
+        let zero = BTreeMap::from([("ARUNA_WORKFLOW_PIDS".to_string(), "0".to_string())]);
+        assert!(collect(&zero).is_err());
     }
 
     #[test]

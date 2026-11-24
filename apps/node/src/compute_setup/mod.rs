@@ -92,6 +92,8 @@ pub(super) struct ComputeSettings {
     /// `ARUNA_COMPUTE_S3_URL`; the public url is the fallback at build time.
     pub(super) s3_url: Option<String>,
     pub(super) envelope: Option<ResourceEnvelope>,
+    /// The workflow coordinators; off unless an image or a binary is named.
+    pub(super) workflow: aruna_workflow::WorkflowSettings,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -189,8 +191,12 @@ pub(crate) async fn build_registry(
     let session_s3 = settings.session_s3(config);
     let result = match &settings.backend {
         BackendSettings::None => {
+            // A local coordinator binary runs without a backend, for development and tests.
+            let registry = (settings.workflow.binary.is_some())
+                .then(|| with_workflow(ExecutorRegistry::new(), &settings.workflow, None))
+                .map(Arc::new);
             return Ok(ComputeSetup {
-                registry: None,
+                registry,
                 session_s3,
             });
         }
@@ -202,11 +208,18 @@ pub(crate) async fn build_registry(
         BackendSettings::Slurm(slurm) => build_slurm(settings, slurm, config).await,
     };
     let registry = match result {
-        Ok((backend, workspace)) => Some(Arc::new(ExecutorRegistry::new().with_workspace(
-            aruna_core::compute::backend::DEFAULT_BACKEND,
-            backend,
-            workspace,
-        ))),
+        Ok((backend, workspace)) => {
+            let registry = ExecutorRegistry::new().with_workspace(
+                aruna_core::compute::backend::DEFAULT_BACKEND,
+                backend.clone(),
+                workspace,
+            );
+            Some(Arc::new(with_workflow(
+                registry,
+                &settings.workflow,
+                Some(backend),
+            )))
+        }
         Err(error) if settings.optional && optional_tolerates(&error) => {
             warn!(reason = %compute_error_message(error), "Compute executor unavailable; running without compute");
             None
@@ -217,6 +230,22 @@ pub(crate) async fn build_registry(
         registry,
         session_s3,
     })
+}
+
+/// Attaches the workflow runtime the settings name, which runs its coordinators on `backend`.
+fn with_workflow(
+    registry: ExecutorRegistry,
+    settings: &aruna_workflow::WorkflowSettings,
+    backend: Option<Arc<dyn aruna_compute::executor::ExecutorBackend>>,
+) -> ExecutorRegistry {
+    match aruna_workflow::WorkflowRuntime::configured(settings, backend) {
+        Some(runtime) => registry.with_workflow(Arc::new(runtime)),
+        None if settings.enabled() => {
+            warn!("The workflow coordinator image needs a compute backend; workflows stay off");
+            registry
+        }
+        None => registry,
+    }
 }
 
 fn compute_error_message(error: ComputeBuildError) -> String {

@@ -74,6 +74,8 @@ pub enum Effect {
     Job(crate::jobs::JobEffect),
     /// One call to this node's Git store; never persisted.
     Git(Box<crate::git::GitCall>),
+    /// One call to a workflow coordinator of this node; never persisted.
+    Workflow(Box<crate::workflow::WorkflowEffect>),
 }
 
 impl Effect {

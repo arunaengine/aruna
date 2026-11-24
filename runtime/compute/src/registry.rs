@@ -12,6 +12,7 @@ use aruna_core::compute::offer::{
 };
 use aruna_core::compute::{BackendError, ExecutorCapability, ExecutorKind};
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementSubject};
+use aruna_core::workflow::WorkflowHost;
 
 use crate::executor::ExecutorBackend;
 use crate::session::SessionRegistry;
@@ -77,6 +78,8 @@ impl Registered {
 pub struct ExecutorRegistry {
     backends: BTreeMap<String, Registered>,
     sessions: Arc<SessionRegistry>,
+    /// The workflow coordinators of this node, which run on these backends or as a local binary.
+    workflow: Option<Arc<dyn WorkflowHost>>,
 }
 
 impl ExecutorRegistry {
@@ -84,7 +87,19 @@ impl ExecutorRegistry {
         Self {
             backends: BTreeMap::new(),
             sessions: Arc::new(SessionRegistry::new()),
+            workflow: None,
         }
+    }
+
+    /// Attaches the workflow runtime that answers `Effect::Workflow` on this node.
+    pub fn with_workflow(mut self, workflow: Arc<dyn WorkflowHost>) -> Self {
+        self.workflow = Some(workflow);
+        self
+    }
+
+    /// The workflow runtime of this node, when one is attached.
+    pub fn workflow(&self) -> Option<&Arc<dyn WorkflowHost>> {
+        self.workflow.as_ref()
     }
 
     /// Adds `backend` under `name` without a container-facing S3 endpoint.
