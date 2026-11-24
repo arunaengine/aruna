@@ -244,6 +244,7 @@ pub(crate) mod tests {
             "/edge/v1/applets/{applet_id}/versions/{version}/file",
         ),
         ("POST", "/edge/v1/signin/redeem"),
+        ("GET", "/system/applets"),
         ("GET", "/metadata/{document_id}/git"),
         ("GET", "/metadata/{document_id}/storage-location"),
         ("PUT", "/metadata/{document_id}/storage-location"),

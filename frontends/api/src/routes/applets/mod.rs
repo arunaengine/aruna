@@ -4,6 +4,7 @@
 
 pub mod edge;
 pub mod lifecycle;
+pub mod node;
 pub mod records;
 pub mod signin;
 pub mod source;
@@ -36,6 +37,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .merge(source::router())
         .merge(edge::router())
         .merge(signin::router())
+        .merge(node::router())
 }
 
 pub(crate) fn applet_error(error: AppletError) -> ServerError {
