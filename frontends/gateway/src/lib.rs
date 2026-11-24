@@ -4,6 +4,7 @@
 
 mod hosts;
 mod policy;
+mod session;
 pub mod settings;
 mod upstream;
 
