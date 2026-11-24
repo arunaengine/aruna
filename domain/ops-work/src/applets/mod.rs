@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+pub mod change;
 pub mod create;
 
 use aruna_core::applet::hosts::{HostRow, host_key};
