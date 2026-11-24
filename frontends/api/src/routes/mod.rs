@@ -243,7 +243,17 @@ pub(crate) mod tests {
         ("POST", "/applets/{applet_id}/drafts"),
         ("DELETE", "/applets/{applet_id}/drafts/{build_id}"),
         ("POST", "/applets/{applet_id}/drafts/{build_id}/keep"),
+        ("GET", "/applets/{applet_id}/versions/{version}/diff"),
         ("GET", "/edge/v1/hosts/{host}"),
+        (
+            "GET",
+            "/edge/v1/applets/{applet_id}/versions/{version}/source-map",
+        ),
+        ("GET", "/edge/v1/applets/{applet_id}/drafts/{build_id}/file"),
+        (
+            "GET",
+            "/edge/v1/applets/{applet_id}/drafts/{build_id}/source-map",
+        ),
         (
             "GET",
             "/edge/v1/applets/{applet_id}/versions/{version}/file",

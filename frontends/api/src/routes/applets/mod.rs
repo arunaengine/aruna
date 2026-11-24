@@ -6,7 +6,9 @@ pub mod builds;
 pub mod edge;
 pub mod lifecycle;
 pub mod node;
+pub mod preview;
 pub mod records;
+pub mod review;
 pub mod signin;
 pub mod source;
 pub mod wire;
@@ -35,9 +37,11 @@ const MAX_LIMIT: usize = 500;
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     (records::router())
         .merge(lifecycle::router())
+        .merge(review::router())
         .merge(source::router())
         .merge(builds::router())
         .merge(edge::router())
+        .merge(preview::router())
         .merge(signin::router())
         .merge(node::router())
 }
