@@ -110,6 +110,7 @@ mod tests {
         Arc::new(Answer {
             decision: Decision {
                 applet_id: applet_id.to_string(),
+                host_node: "n".to_string(),
                 custom_domain: false,
                 serving: Serving::Live,
                 version: Some(1),

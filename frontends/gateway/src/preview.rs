@@ -82,6 +82,22 @@ pub async fn source_map(gateway: &Gateway, visit: &Visit) -> Response {
     not_found(frame)
 }
 
+/// Parses an optional `version` or `build` preview pick from query parameters.
+pub(crate) fn parse_pick(
+    params: &std::collections::HashMap<String, String>,
+) -> Result<Option<Pick>, ()> {
+    let version = params.get("version").map(String::as_str);
+    match (version, params.get("build")) {
+        (Some(text), None) if text.len() <= 10 && text.bytes().all(|b| b.is_ascii_digit()) => text
+            .parse()
+            .map(|version| Some(Pick::Version(version)))
+            .map_err(|_| ()),
+        (None, Some(build)) if plain_id(build) => Ok(Some(Pick::Build(build.clone()))),
+        (None, None) => Ok(None),
+        _ => Err(()),
+    }
+}
+
 /// Reseals the preview session with the version or build to look at, or with none.
 pub fn select(gateway: &Gateway, visit: &Visit, query: Option<&str>) -> Response {
     let frame = visit.frame();
@@ -89,17 +105,8 @@ pub fn select(gateway: &Gateway, visit: &Visit, query: Option<&str>) -> Response
         return not_found(frame);
     };
     let params = query_params(query);
-    let version = params.get("version").map(String::as_str);
-    let pick = match (version, params.get("build")) {
-        (Some(text), None) if text.len() <= 10 && text.bytes().all(|b| b.is_ascii_digit()) => {
-            match text.parse() {
-                Ok(version) => Some(Pick::Version(version)),
-                Err(_) => return bare(StatusCode::BAD_REQUEST, frame),
-            }
-        }
-        (None, Some(build)) if plain_id(build) => Some(Pick::Build(build.clone())),
-        (None, None) => None,
-        _ => return bare(StatusCode::BAD_REQUEST, frame),
+    let Ok(pick) = parse_pick(&params) else {
+        return bare(StatusCode::BAD_REQUEST, frame);
     };
     let session = Session {
         pick,

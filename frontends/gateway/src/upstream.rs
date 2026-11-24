@@ -35,6 +35,8 @@ pub enum Access {
 #[derive(Clone, Debug, Deserialize)]
 pub struct Decision {
     pub applet_id: String,
+    #[serde(default)]
+    pub host_node: String,
     pub custom_domain: bool,
     pub serving: Serving,
     pub version: Option<u32>,

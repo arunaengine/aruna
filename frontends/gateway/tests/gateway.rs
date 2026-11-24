@@ -191,6 +191,7 @@ async fn sign_in(base: &str, code: &str, name: &str) -> String {
     let params: HashMap<_, _> = portal.query_pairs().into_owned().collect();
     assert_eq!(params["applet"], PRIVATE_ID);
     assert_eq!(params["host"], "private.apps.test");
+    assert_eq!(params["node"], "n");
     let state = cookie(&started, "__Host-aruna-state");
     let callback =
         |state: &str| format!("/_aruna/auth/callback?code={code}&state={state}&return=/");
@@ -287,4 +288,133 @@ async fn preview_frames_portal() {
     )
     .await;
     assert_eq!(unsigned.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn preview_frame_handshake() {
+    let base = start().await;
+    let frame = visit(
+        &base,
+        "private.apps.test",
+        "/_aruna/auth/preview-frame",
+        &[("sec-fetch-dest", "iframe")],
+    )
+    .await;
+    assert_eq!(frame.status(), StatusCode::OK);
+    assert!(
+        header(&frame, CONTENT_SECURITY_POLICY).ends_with("frame-ancestors https://portal.test")
+    );
+    assert!(frame.headers().get("x-frame-options").is_none());
+    let raw_cookie = header(&frame, SET_COOKIE);
+    assert!(raw_cookie.contains("SameSite=None; Partitioned"));
+    let state_cookie = cookie(&frame, "__Host-aruna-state");
+    let state_value = state_cookie
+        .strip_prefix("__Host-aruna-state=")
+        .expect("state cookie");
+    let html = frame.text().await.expect("html");
+    assert!(html.contains("/_aruna/auth/preview-frame.js"));
+    assert!(html.contains(&format!(r#"data-state="{state_value}""#)));
+    assert!(html.contains(r#"data-node="n""#));
+    let script = visit(
+        &base,
+        "private.apps.test",
+        "/_aruna/auth/preview-frame.js",
+        &[],
+    )
+    .await;
+    assert_eq!(script.status(), StatusCode::OK);
+    assert!(
+        script
+            .text()
+            .await
+            .expect("js")
+            .contains("aruna:preview-signin")
+    );
+    let callback =
+        format!("/_aruna/auth/callback?code=preview&state={state_value}&return=/&version=1");
+    let back = visit(
+        &base,
+        "private.apps.test",
+        &callback,
+        &[("cookie", &state_cookie), ("sec-fetch-dest", "iframe")],
+    )
+    .await;
+    assert_eq!(back.status(), StatusCode::SEE_OTHER);
+    assert_eq!(header(&back, LOCATION), "/");
+    let preview = cookie(&back, "__Host-aruna-preview");
+    assert!(!preview.is_empty());
+}
+
+#[tokio::test]
+async fn embedded_popup_signin() {
+    let base = start().await;
+    let launcher = visit(
+        &base,
+        "private.apps.test",
+        "/_aruna/auth/start?return=/runs",
+        &[("sec-fetch-dest", "iframe")],
+    )
+    .await;
+    assert_eq!(launcher.status(), StatusCode::OK);
+    let raw_frame = header(&launcher, SET_COOKIE);
+    assert!(raw_frame.contains("SameSite=None; Partitioned"));
+    let frame_cookie = cookie(&launcher, "__Host-aruna-state");
+    let state = frame_cookie
+        .strip_prefix("__Host-aruna-state=")
+        .expect("frame state");
+    let html = launcher.text().await.expect("launcher html");
+    assert!(html.contains("/_aruna/auth/popup.js"));
+    assert!(html.contains(&format!(r#"data-state="{state}""#)));
+
+    let popup_start = format!("/_aruna/auth/start?popup=1&state={state}&return=/runs");
+    let redirect = visit(&base, "private.apps.test", &popup_start, &[]).await;
+    assert_eq!(redirect.status(), StatusCode::FOUND);
+    assert_eq!(
+        header(&redirect, "cross-origin-opener-policy"),
+        "unsafe-none"
+    );
+    let portal = url::Url::parse(&header(&redirect, LOCATION)).expect("portal URL");
+    let params: HashMap<_, _> = portal.query_pairs().into_owned().collect();
+    assert_eq!(params["state"], state);
+    assert_eq!(params["node"], "n");
+    assert_eq!(params["preview"], "0");
+    let popup_cookie = cookie(&redirect, "__Host-aruna-state");
+
+    let cb = format!("/_aruna/auth/callback?code=good&state={state}&return=/runs");
+    let handoff = visit(
+        &base,
+        "private.apps.test",
+        &cb,
+        &[("cookie", &popup_cookie)],
+    )
+    .await;
+    assert_eq!(handoff.status(), StatusCode::OK);
+    assert_eq!(
+        header(&handoff, "cross-origin-opener-policy"),
+        "unsafe-none"
+    );
+    assert!(cookie(&handoff, "__Host-aruna-visitor").is_empty());
+    let handoff_body = handoff.text().await.expect("handoff html");
+    assert!(handoff_body.contains("/_aruna/auth/popup-done.js"));
+    assert!(handoff_body.contains(r#"data-code="good""#));
+
+    let redeemed = visit(
+        &base,
+        "private.apps.test",
+        &cb,
+        &[("cookie", &frame_cookie), ("sec-fetch-dest", "iframe")],
+    )
+    .await;
+    assert_eq!(redeemed.status(), StatusCode::SEE_OTHER);
+    assert_eq!(header(&redeemed, LOCATION), "/runs");
+    let visitor = cookie(&redeemed, "__Host-aruna-visitor");
+    assert!(!visitor.is_empty());
+    assert!(
+        redeemed
+            .headers()
+            .get_all(SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .any(|v| v.starts_with("__Host-aruna-visitor=") && v.contains("Partitioned"))
+    );
 }

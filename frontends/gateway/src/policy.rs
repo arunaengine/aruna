@@ -57,6 +57,14 @@ pub fn secure(headers: &mut HeaderMap, frame: Frame<'_>) {
     }
 }
 
+/// Keeps `window.opener` attached across the top-level sign-in pop-up round-trip.
+pub fn allow_opener(headers: &mut HeaderMap) {
+    headers.insert(
+        HeaderName::from_static("cross-origin-opener-policy"),
+        HeaderValue::from_static("unsafe-none"),
+    );
+}
+
 /// `text` when it is exactly a web origin, so it cannot widen or break the policy.
 pub fn origin(text: &str) -> Option<&str> {
     let parsed = url::Url::parse(text).ok()?;
