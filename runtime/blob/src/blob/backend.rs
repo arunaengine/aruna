@@ -21,7 +21,7 @@ use aruna_core::types::TxnId;
 use byteview::ByteView;
 use opendal::Operator;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, PoisonError, Weak};
 use std::time::Duration;
 
 use aruna_core::backoff::capped_backoff;
@@ -298,14 +298,23 @@ impl BlobHandler {
         ))
     }
 
-    /// The lock of one hidden bucket's counter row. Other writers of the row still conflict,
-    /// so the retry loops stay.
-    fn stats_lock(&self, backend: &BackendRef, bucket: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut locks = (self.stats_locks.lock()).expect("bucket stats locks poisoned");
-        let lock = locks
-            .entry((backend.clone(), bucket.to_string()))
-            .or_default();
-        lock.clone()
+    /// The lock of one hidden bucket's counter row, shared by all its current holders. Other
+    /// writers of the row still conflict, so the retry loops stay.
+    pub(super) fn stats_lock(
+        &self,
+        backend: &BackendRef,
+        bucket: &str,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = (self.stats_locks.lock()).unwrap_or_else(PoisonError::into_inner);
+        let key = (backend.clone(), bucket.to_string());
+        if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        // The locks of idle buckets are gone, so their entries go too.
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let lock = Arc::default();
+        locks.insert(key, Arc::downgrade(&lock));
+        lock
     }
 
     pub(super) async fn release_hidden_key(&self, key: &HiddenBlobKey) -> Result<(), BlobError> {

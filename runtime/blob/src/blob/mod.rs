@@ -11,7 +11,7 @@ use aruna_p2p::streams::BiStream;
 use bao_tree::BlockSize;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
-use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock, Weak};
 use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
@@ -62,8 +62,8 @@ enum ControlPlaneKind {
     Write,
 }
 
-/// The counter lock of each hidden bucket, by backend and bucket name.
-type BucketLocks = HashMap<(BackendRef, String), Arc<Mutex<()>>>;
+/// The counter lock of each hidden bucket in use, by backend and bucket name.
+type BucketLocks = HashMap<(BackendRef, String), Weak<Mutex<()>>>;
 
 #[derive(Clone, Debug)]
 pub struct BlobHandler {
@@ -82,7 +82,7 @@ pub struct BlobHandler {
     group_effects: Arc<StdMutex<HashMap<Ulid, group::GroupBackendUse>>>,
     reservation_active: Arc<StdMutex<HashSet<Ulid>>>,
     /// One lock per hidden bucket, so this node's reservations of its counter row queue instead
-    /// of conflicting on it.
+    /// of conflicting on it. A lock lives while a reservation holds it.
     stats_locks: Arc<StdMutex<BucketLocks>>,
     /// Hash states of in-place uploads, by provider upload id. Lost on restart, which only costs
     /// a longer read at completion.

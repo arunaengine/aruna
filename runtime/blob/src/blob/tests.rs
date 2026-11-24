@@ -1232,6 +1232,27 @@ async fn concurrent_reservations_queue() {
 }
 
 #[tokio::test]
+async fn bucket_locks_drop() {
+    // Holders of one bucket share its lock; once none holds it, the next new lock drops its
+    // entry, so idle buckets keep nothing.
+    let context = setup_blob_handle(1_000).await;
+    let handler = context.blob_handle.handler.clone();
+    let backend = BackendRef::node_default();
+    let first = handler.stats_lock(&backend, "bucket-a");
+    let second = handler.stats_lock(&backend, "bucket-a");
+    assert!(Arc::ptr_eq(&first, &second));
+    drop((first, second));
+    let other = handler.stats_lock(&backend, "bucket-b");
+    let locks = handler.stats_locks.lock().unwrap();
+    assert_eq!(locks.len(), 1);
+    let kept = locks.get(&(backend.clone(), "bucket-b".to_string()));
+    assert!(
+        kept.and_then(std::sync::Weak::upgrade)
+            .is_some_and(|lock| Arc::ptr_eq(&lock, &other))
+    );
+}
+
+#[tokio::test]
 async fn hidden_bucket_registered() {
     let context = setup_blob_handle(5).await;
 
