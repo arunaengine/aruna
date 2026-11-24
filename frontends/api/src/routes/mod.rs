@@ -12,6 +12,7 @@ use utoipa::openapi::{Components, OpenApi};
 use utoipa_axum::router::{OpenApiRouter, UtoipaMethodRouter};
 
 pub mod access;
+pub mod applets;
 pub mod assistant;
 pub mod audit;
 pub mod device;
@@ -62,6 +63,7 @@ pub mod webhooks;
 /// handler, so the runtime router and the generated document cannot diverge.
 fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new()
+        .merge(applets::router())
         .merge(audit::router())
         .merge(assistant::router())
         .merge(info::router())
@@ -220,6 +222,9 @@ pub(crate) mod tests {
     /// Runtime method/path pairs registered before REST/OpenAPI co-registration.
     /// A route added or removed without this fixture changing is a regression.
     const RUNTIME_ROUTES: &[(&str, &str)] = &[
+        ("GET", "/applets"),
+        ("POST", "/applets"),
+        ("GET", "/applets/{applet_id}"),
         ("GET", "/metadata/{document_id}/git"),
         ("GET", "/metadata/{document_id}/storage-location"),
         ("PUT", "/metadata/{document_id}/storage-location"),
