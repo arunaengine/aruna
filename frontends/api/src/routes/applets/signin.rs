@@ -9,21 +9,26 @@ use std::time::{Duration, Instant};
 
 use aruna_clock::unix_timestamp_secs;
 use aruna_core::applet::hosts::normalize_host;
+use aruna_core::applet::record::{Access, Applet, Serving};
 use aruna_core::applet::settings::visitor_marker;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission, SessionKind};
+use aruna_ops_identity::document_repository::{GetGroupConfig, GetGroupOperation};
 use aruna_ops_identity::session::create::{CreateSessionConfig, CreateSessionOperation};
+use aruna_ops_identity::users::read_document::ReadUserOperation;
 use aruna_ops_work::applets::reads::LoadAppletOperation;
+use aruna_ops_work::applets::{AppletAccessOperation, AppletError, Need};
 use aruna_runner::driver::drive;
 use axum::Json;
-use axum::extract::{Path, State};
-use axum::http::HeaderMap;
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use super::edge::{edge_auth, previewer};
+use super::wire::{AccessBody, GrantsBody};
 use super::{applet_error, applet_id, hosting};
 use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
@@ -36,6 +41,7 @@ const VISITOR_SECONDS: u64 = 3600;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new()
+        .routes(routes!(signin_info))
         .routes(routes!(signin_code))
         .routes(routes!(redeem_code))
 }
@@ -83,6 +89,160 @@ impl SigninCodes {
         let entry = self.table.lock().ok()?.remove(code)?;
         (entry.expires > Instant::now()).then_some(entry)
     }
+}
+
+#[derive(Clone, Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct SigninInfoQuery {
+    /// The applet's own host being signed into; custom domains never sign in.
+    pub host: String,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[schema(example = json!({
+    "name": "Bakta web", "slug": "bakta", "host": "bakta.apps.example.org",
+    "host_node": "f3a1b2c3d4e5f60718293a4b5c6d7e8f9091a2b3c4d5e6f708192a3b4c5d6e7f",
+    "group_id": "01JABCDEF0123456789ABCDEFG", "group_name": "Lab A", "access": "public",
+    "published_by": "Ada Lovelace",
+    "grants": {"read": [], "references": [], "start": null, "submissions": null,
+        "limits": {"cpu_cores": null, "ram_bytes": null, "walltime_ms": null, "upload_bytes": null,
+        "visitor_hourly": null, "visitor_daily": null, "applet_daily": null}},
+    "session_ttl_s": 3600
+}))]
+pub struct SigninInfoResponse {
+    pub name: String,
+    pub slug: String,
+    pub host: String,
+    pub host_node: String,
+    pub group_id: String,
+    pub group_name: String,
+    pub access: AccessBody,
+    pub published_by: Option<String>,
+    pub grants: GrantsBody,
+    pub session_ttl_s: u64,
+}
+
+async fn can_confirm(state: &ServerState, auth: &AuthContext, applet: &Applet) -> bool {
+    match applet.access {
+        Access::Public => true,
+        Access::GroupMembers => {
+            let check = AppletAccessOperation::new(auth, applet.applet_id, Need::Read);
+            drive(check, &state.get_ctx()).await.is_ok()
+        }
+        Access::Private => previewer(state, applet, Some(auth)).await,
+    }
+}
+
+async fn publisher_name(state: &ServerState, applet: &Applet) -> Option<String> {
+    let approver = applet
+        .live
+        .and_then(|version| applet.version(version))
+        .and_then(|entry| entry.approved_by)?;
+    let read = drive(ReadUserOperation::new(approver), &state.get_ctx()).await;
+    let display = read
+        .ok()
+        .map(|user| user.public_name())
+        .filter(|name| !name.is_empty());
+    Some(display.unwrap_or_else(|| approver.to_string()))
+}
+
+#[utoipa::path(
+    get,
+    path = "/applets/{applet_id}/signin-info",
+    tag = "applets",
+    summary = "Read the sign-in confirmation summary of an applet",
+    description = r#"Returns the facts the portal sign-in page shows before a visitor confirms sign-in.
+
+**Authentication**: realm bearer token without path restrictions on the applet's `host_node`.
+
+**Behavior**
+- `host` must match the applet's own host.
+- Public applets answer any signed-in realm user; group-members applets require READ on the group
+  (404 otherwise); private applets require the creator or an approver (404 otherwise).
+- Returns no versions list, source details, pending approvals or group members."#,
+    params(
+        ("applet_id" = String, Path, description = "Applet id; an unparseable id is 404"),
+        SigninInfoQuery
+    ),
+    responses(
+        (status = 200, description = "The confirmation summary", body = SigninInfoResponse),
+        (status = 400, description = "The host is not the applet's own host", body = ErrorResponse),
+        (status = 403, description = "Applets are disabled for this group or node", body = ErrorResponse),
+        (status = 404, description = "No such applet, or the caller may not see it", body = ErrorResponse),
+        (status = 409, description = "This node is not the applet's host node", body = ErrorResponse),
+        (status = 410, description = "The applet was taken down", body = ErrorResponse),
+        (status = 503, description = "The applet is paused or this node hosts no applets", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn signin_info(
+    State(state): State<Arc<ServerState>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
+    Path(id): Path<String>,
+    Query(query): Query<SigninInfoQuery>,
+) -> ServerResult<Json<SigninInfoResponse>> {
+    hosting(&state)?;
+    let id = applet_id(&id)?;
+    let load = drive(LoadAppletOperation::new(id), &state.get_ctx()).await;
+    let applet = load.map_err(applet_error)?.ok_or(ServerError::NotFound)?;
+    if applet.host_node != state.get_node_id() {
+        return Err(applet_error(AppletError::Elsewhere(applet.host_node)));
+    }
+    if normalize_host(&query.host).ok().as_deref() != Some(applet.host.as_str()) {
+        return Err(ServerError::BadRequestReason(
+            "not the applet's own host".to_string(),
+        ));
+    }
+    if !can_confirm(&state, &auth, &applet).await {
+        return Err(ServerError::NotFound);
+    }
+    match super::serving(&state, &applet).await? {
+        Serving::Live { .. } => {}
+        Serving::Preview { .. } if previewer(&state, &applet, Some(&auth)).await => {}
+        Serving::Gone | Serving::Preview { .. } => {
+            return Err(ServerError::Refused(
+                StatusCode::GONE,
+                "applet_gone",
+                "this applet was taken down".to_string(),
+            ));
+        }
+        Serving::Paused => {
+            return Err(ServerError::Refused(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "applet_paused",
+                "this applet is paused".to_string(),
+            ));
+        }
+        Serving::FeaturePaused => {
+            return Err(ServerError::Refused(
+                StatusCode::FORBIDDEN,
+                "feature_disabled",
+                "applets are disabled for this group or node".to_string(),
+            ));
+        }
+    }
+    let group_name = drive(
+        GetGroupOperation::new(GetGroupConfig {
+            group_id: applet.group_id,
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .map(|(group, _)| group.display_name)
+    .unwrap_or_else(|_| applet.group_id.to_string());
+    let published_by = publisher_name(&state, &applet).await;
+    Ok(Json(SigninInfoResponse {
+        name: applet.name,
+        slug: applet.slug,
+        host: applet.host,
+        host_node: applet.host_node.to_string(),
+        group_id: applet.group_id.to_string(),
+        group_name,
+        access: applet.access.into(),
+        published_by,
+        grants: (&applet.grants).into(),
+        session_ttl_s: VISITOR_SECONDS,
+    }))
 }
 
 #[derive(Clone, Debug, Deserialize, ToSchema)]
@@ -137,6 +297,9 @@ pub async fn signin_code(
     let id = applet_id(&id)?;
     let load = drive(LoadAppletOperation::new(id), &state.get_ctx()).await;
     let applet = load.map_err(applet_error)?.ok_or(ServerError::NotFound)?;
+    if applet.host_node != state.get_node_id() {
+        return Err(applet_error(AppletError::Elsewhere(applet.host_node)));
+    }
     if normalize_host(&body.host).ok().as_deref() != Some(applet.host.as_str()) {
         return Err(ServerError::BadRequestReason(
             "not the applet's own host".to_string(),

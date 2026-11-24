@@ -237,6 +237,7 @@ pub(crate) mod tests {
         ("GET", "/applets/{applet_id}/source"),
         ("POST", "/applets/{applet_id}/source/commits"),
         ("POST", "/applets/{applet_id}/versions"),
+        ("GET", "/applets/{applet_id}/signin-info"),
         ("POST", "/applets/{applet_id}/signin-code"),
         ("POST", "/applets/{applet_id}/builds"),
         ("GET", "/applets/{applet_id}/drafts"),

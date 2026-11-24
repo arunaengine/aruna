@@ -149,6 +149,9 @@ pub async fn host_decision(
     let host = normalize_host(&host).map_err(|_| ServerError::NotFound)?;
     let lookup = drive(HostLookupOperation::new(&host), &state.get_ctx()).await;
     let (row, applet) = lookup.map_err(applet_error)?.ok_or(ServerError::NotFound)?;
+    if applet.host_node != state.get_node_id() {
+        return Err(ServerError::NotFound);
+    }
     let serving = super::serving(&state, &applet).await?;
     let version = match serving {
         Serving::Live { version } | Serving::Preview { version } => Some(version),

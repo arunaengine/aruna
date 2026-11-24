@@ -1,6 +1,5 @@
-//! One upkeep pass over the applets this node hosts: expires drafts, prunes versions, checks
-//! custom domains again, repairs the applet accounts, refreshes the copies on the record holders,
-//! and drops counters and notices nobody reads any more.
+//! One upkeep pass over hosted applets: expires drafts, prunes versions, rechecks domains,
+//! repairs accounts, refreshes holder copies, and drops stale counters and notices.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

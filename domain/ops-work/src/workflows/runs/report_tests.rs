@@ -425,7 +425,7 @@ async fn writes_run_crate() {
     )
     .unwrap()
     .to_w3id();
-    assert_eq!(ids(&action["result"]), [arn.clone()]);
+    assert_eq!(ids(&action["result"]), std::slice::from_ref(&arn));
     let file = by_id(&stored, &arn);
     assert_eq!(file["identifier"], content_id(hash));
     assert_eq!(file["contentUrl"][0], "s3://results/hello/said.txt");
