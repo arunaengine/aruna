@@ -32,6 +32,8 @@ impl AdminDocumentState {
                 if sorted.len() != cutoffs.len() || sorted.len() > MAX_CUTOFFS {
                     return Err(AdminDocumentError::InvalidCutoffs);
                 }
+                // A node added before the history was kept would otherwise lose its interval.
+                self.keep_legacy_node(node_id);
                 self.apply_config_node(event, node_id, None);
                 self.record_membership(event, node_id, true);
                 let value = serde_json::to_string(&sorted)

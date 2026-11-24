@@ -1211,6 +1211,101 @@ fn node_history_kept() {
     assert!(again.covers(&member) && !member.covers(&again));
 }
 
+/// A realm config with a management node, a server and a user device; `legacy` drops every
+/// node history entry, as in a config written before the history was kept.
+fn nodes_state(legacy: bool) -> AdminDocumentState {
+    let mut state = realm_config_state();
+    let owner = UserId::local(Ulid::from_bytes([9; 16]), realm_id());
+    let nodes = [
+        (1, RealmNodeKind::Management),
+        (5, RealmNodeKind::Server),
+        (6, RealmNodeKind::User { owner }),
+    ];
+    for (seed, kind) in nodes {
+        let ensure = AdminDocumentOperation::ConfigNodeEnsured {
+            node_id: node(seed),
+            kind,
+        };
+        let event_id = Ulid::from_parts(1, u128::from(seed));
+        state
+            .apply_operation(&actor(node(1)), ensure, event_id)
+            .unwrap();
+    }
+    if legacy {
+        let prefix = crate::reducer::paths::NODE_HISTORY_PREFIX;
+        state
+            .user_subject_ids
+            .retain(|path, _| !path.starts_with(prefix));
+    }
+    state
+}
+
+#[test]
+fn legacy_nodes_open() {
+    // Infrastructure nodes of a legacy config keep their open interval; the backfill writes the
+    // entries their add events write now, and a rerun writes nothing.
+    use crate::structs::execution::job::membership::{Membership, membership};
+    let mut state = nodes_state(true);
+    let intervals = state.node_intervals();
+    assert_eq!(
+        intervals.len(),
+        2,
+        "a user device has no infrastructure interval"
+    );
+    for seed in [1, 5] {
+        let open = membership(node(seed), &state.clock, &intervals, &state.clock);
+        assert_eq!(open, Membership::Open, "node {seed}");
+    }
+    assert_eq!(state.keep_legacy_history(), 2);
+    assert_eq!(
+        state,
+        nodes_state(false),
+        "the backfill matches the kept history"
+    );
+    assert_eq!(state.keep_legacy_history(), 0, "a rerun writes nothing");
+    let after = state.node_intervals();
+    assert_eq!(after.len(), 2);
+    assert!(intervals.iter().all(|interval| after.contains(interval)));
+}
+
+#[test]
+fn legacy_removal_leaves() {
+    // A legacy node removed later left the realm for a record that cited it before; a device
+    // removal opens no interval.
+    use crate::structs::execution::job::membership::{Membership, membership};
+    let mut state = nodes_state(true);
+    let member = state.clock.clone();
+    for (seed, event) in [(5, 7), (6, 8)] {
+        let remove = AdminDocumentOperation::ConfigNodeRemoved {
+            node_id: node(seed),
+            cutoffs: Vec::new(),
+        };
+        let event_id = Ulid::from_parts(2, event);
+        state
+            .apply_operation(&actor(node(1)), remove, event_id)
+            .unwrap();
+    }
+    let (intervals, clock) = (state.node_intervals(), &state.clock);
+    assert_eq!(
+        membership(node(5), &member, &intervals, clock),
+        Membership::Left
+    );
+    assert_eq!(
+        membership(node(5), clock, &intervals, clock),
+        Membership::Absent
+    );
+    assert_eq!(
+        membership(node(1), clock, &intervals, clock),
+        Membership::Open
+    );
+    assert!(intervals.iter().all(|interval| interval.node_id != node(6)));
+    assert_eq!(
+        state.keep_legacy_history(),
+        1,
+        "only the remaining node is left to keep"
+    );
+}
+
 #[test]
 fn clocks_compare_componentwise() {
     use crate::admin_documents::AdminDocumentClock;
