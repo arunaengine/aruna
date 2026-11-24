@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::explorer::ExplorerError;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::sync_quarantine::{
     QUARANTINE_USAGE_KEY, SyncQuarantineRecord, SyncQuarantineUsage,
 };
@@ -36,14 +37,18 @@ pub(super) struct InfoChanges<'a> {
     pub(super) deleted: &'a [Vec<u8>],
 }
 
-/// Every quarantined node info upsert that now validates leaves the quarantine; one that is newer
-/// than the stored document is written, so a peer's advertisement an older version could not read
-/// is not lost. A rerun finds nothing.
+/// Every quarantined node info upsert of the local realm `realm_id` that now validates leaves the
+/// quarantine; one newer than the stored document is written, so a peer's advertisement an older
+/// version could not read is not lost. Without a node state nothing is recovered.
 pub(super) fn recovered_infos(
     db: &OptimisticTxDatabase,
+    realm_id: Option<RealmId>,
     stores: InfoStores<'_>,
     changes: InfoChanges<'_>,
 ) -> Result<InfoRecovery, ExplorerError> {
+    let Some(realm_id) = realm_id else {
+        return Ok(InfoRecovery::default());
+    };
     let decode = |error: aruna_core::errors::ConversionError| {
         ExplorerError::Decode(format!("quarantine usage: {error}"))
     };
@@ -62,7 +67,7 @@ pub(super) fn recovered_infos(
         let Ok(record) = SyncQuarantineRecord::from_bytes(&value) else {
             continue;
         };
-        let Some((target, document, bytes)) = quarantined_node_info(&record) else {
+        let Some((target, document, bytes)) = quarantined_node_info(&record, realm_id) else {
             continue;
         };
         recovery.scanned += 1;
@@ -90,7 +95,7 @@ pub(super) fn recovered_infos(
 #[cfg(test)]
 mod tests {
     use super::super::migrate_output;
-    use super::super::tests::{read, write};
+    use super::super::tests::{node_state, read, write};
     use aruna_core::compute::quota::{ComputeDemandSnapshot, ComputeReservationSnapshot};
     use aruna_core::document::{
         DocumentChange, DocumentChangeKind, DocumentEvent, DocumentSyncRevision, DocumentTarget,
@@ -147,57 +152,72 @@ mod tests {
         }
     }
 
-    // A peer's node info an older version quarantined is applied, its quarantine row and usage
-    // go, and a second run changes nothing.
-    #[test]
-    fn recovers_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path();
-        let realm_id = RealmId::from_bytes([3; 32]);
-        let node_id = iroh::SecretKey::from_bytes(&[6; 32]).public();
-        let target = DocumentTarget::NodeInfo { realm_id, node_id };
-        let bytes = document(node_id).to_bytes().unwrap();
+    /// A quarantine row of a node info upsert the peer published on `topic`, with `reason`.
+    fn quarantined(
+        target: &DocumentTarget,
+        topic: irokle::TopicId,
+        actor_seq: u64,
+        reason: &str,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let DocumentTarget::NodeInfo { node_id, .. } = target else {
+            panic!("a node info target");
+        };
         let event = DocumentEvent::Upsert {
-            event_id: Ulid::from_parts(1, 1),
+            event_id: Ulid::from_parts(1, u128::from(actor_seq)),
             target: target.clone(),
-            bytes: bytes.clone(),
+            bytes: document(*node_id).to_bytes().unwrap(),
             change: DocumentChange {
                 base: None,
                 current: DocumentSyncRevision {
                     generation: 1,
-                    event_id: Ulid::from_parts(1, 1),
-                    actor: node_id,
+                    event_id: Ulid::from_parts(1, u128::from(actor_seq)),
+                    actor: *node_id,
                     updated_at_ms: 1_000,
                 },
                 kind: DocumentChangeKind::Upsert,
                 placement: PlacementRef::NIL,
             },
         };
-        let topic = target.sync_topic_id(realm_id, &PlacementRef::NIL);
         let peer = irokle::PeerId::from_bytes(*node_id.as_bytes());
         let identity = SyncQuarantineIdentity {
             topic,
             actor: irokle::actor_id_for(topic, peer),
-            actor_seq: 17,
+            actor_seq,
         };
         let evidence = SyncQuarantineEvidence::from_event(&event);
-        let reason = "invalid node info document: Found a bool that wasn't 0 or 1";
         let record = SyncQuarantineRecord::new(identity, evidence, reason, 1);
-        let row = record.to_bytes().unwrap();
+        (record.storage_key(), record.to_bytes().unwrap())
+    }
+
+    /// Stores quarantine `rows` with the usage they take.
+    fn store(path: &std::path::Path, rows: Vec<(Vec<u8>, Vec<u8>)>) {
         let usage = SyncQuarantineUsage {
-            records: 1,
-            bytes: row.len() as u64,
+            records: rows.len() as u64,
+            bytes: rows.iter().map(|(_, row)| row.len() as u64).sum(),
         };
-        write(
-            path,
-            SYNC_QUARANTINE_KEYSPACE,
-            vec![(&record.storage_key()[..], row)],
-        );
+        let rows = (rows.iter()).map(|(key, row)| (&key[..], row.clone()));
+        write(path, SYNC_QUARANTINE_KEYSPACE, rows.collect());
         write(
             path,
             QUARANTINE_USAGE_KEYSPACE,
             vec![(QUARANTINE_USAGE_KEY, usage.to_bytes().unwrap())],
         );
+    }
+
+    // A peer's node info an older version quarantined is applied, its quarantine row and usage
+    // go, and a second run changes nothing.
+    #[test]
+    fn recovers_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        node_state(path);
+        let realm_id = RealmId::from_bytes([3; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[6; 32]).public();
+        let target = DocumentTarget::NodeInfo { realm_id, node_id };
+        let bytes = document(node_id).to_bytes().unwrap();
+        let topic = target.sync_topic_id(realm_id, &PlacementRef::NIL);
+        let reason = "invalid node info document: Found a bool that wasn't 0 or 1";
+        store(path, vec![quarantined(&target, topic, 17, reason)]);
 
         let database = path.to_str().unwrap();
         let output = migrate_output(database).unwrap();
@@ -222,5 +242,51 @@ mod tests {
             (0, 0)
         );
         assert_eq!(read(path, NODE_INFO_KEYSPACE), stored);
+    }
+
+    // Node info live sync refused for its publisher policy, sent on another topic or of another
+    // realm keeps its quarantine row and usage, and nothing is applied.
+    #[test]
+    fn keeps_other_rejections() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        node_state(path);
+        let realm_id = RealmId::from_bytes([3; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[6; 32]).public();
+        let target = DocumentTarget::NodeInfo { realm_id, node_id };
+        let topic = target.sync_topic_id(realm_id, &PlacementRef::NIL);
+        let decode = "invalid node info document: Found a bool that wasn't 0 or 1";
+        let policy = "shard publisher is outside the current holder set";
+        let other = RealmId::from_bytes([4; 32]);
+        let foreign = DocumentTarget::NodeInfo {
+            realm_id: other,
+            node_id,
+        };
+        let rows = vec![
+            quarantined(&target, topic, 1, policy),
+            quarantined(&target, irokle::TopicId::from_bytes([8; 32]), 2, decode),
+            quarantined(
+                &foreign,
+                foreign.sync_topic_id(other, &PlacementRef::NIL),
+                3,
+                decode,
+            ),
+        ];
+        store(path, rows);
+        let quarantine = read(path, SYNC_QUARANTINE_KEYSPACE);
+        let usage = read(path, QUARANTINE_USAGE_KEYSPACE);
+
+        let output = migrate_output(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            (
+                output.quarantined_infos_scanned,
+                output.node_infos_recovered,
+                output.quarantine_rows_cleared
+            ),
+            (0, 0, 0)
+        );
+        assert!(read(path, NODE_INFO_KEYSPACE).is_empty());
+        assert_eq!(read(path, SYNC_QUARANTINE_KEYSPACE), quarantine);
+        assert_eq!(read(path, QUARANTINE_USAGE_KEYSPACE), usage);
     }
 }

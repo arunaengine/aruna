@@ -575,8 +575,10 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     let old_infos = (stale_rows.iter())
         .find(|(_, space, _)| *space == NODE_INFO_KEYSPACE)
         .map_or(&[][..], |(_, _, keys)| &keys[..]);
+    let state = node_state(&db)?;
     let infos = quarantine::recovered_infos(
         &db,
+        state.as_ref().map(|state| state.realm_id),
         quarantine::InfoStores {
             quarantine: &quarantine_rows,
             nodes: &node_rows,
@@ -589,7 +591,8 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
             deleted: old_infos,
         },
     )?;
-    let keys = node_secret(&db)?.map(|secret| {
+    let keys = state.map(|state| {
+        let secret = state.net_secret_key;
         (
             CredentialEncryptionKey::derive(&secret),
             NodeVaultKey::derive(&secret),
@@ -858,15 +861,15 @@ fn node_documents<'k>(
     Ok((keyspace, NODE_INFO_KEYSPACE, rows.rows))
 }
 
-/// The node secret the node derives its sealing keys from at startup.
-fn node_secret(db: &OptimisticTxDatabase) -> Result<Option<[u8; 32]>, ExplorerError> {
+/// The node state, with the realm and the secret the node derives its sealing keys from.
+fn node_state(db: &OptimisticTxDatabase) -> Result<Option<PersistedNodeState>, ExplorerError> {
     let rows = db.keyspace(NODE_STATE_KEYSPACE, KeyspaceCreateOptions::default)?;
     let Some(value) = db.read_tx().get(&rows, NODE_STATE_KEY)? else {
         return Ok(None);
     };
     let state = postcard::from_bytes::<PersistedNodeState>(&value)
         .map_err(|error| decode_error(NODE_STATE_KEYSPACE, NODE_STATE_KEY, error))?;
-    Ok(Some(state.net_secret_key))
+    Ok(Some(state))
 }
 
 /// Seals plain secret rows; rows that already open with the node key stay unchanged.
