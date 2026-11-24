@@ -29,6 +29,7 @@ use utoipa_axum::routes;
 use super::{applet_error, applet_id, hosting};
 use crate::auth::bearer_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::rate_limit::LocalKey;
 use crate::server::state::ServerState;
 
 /// Bytes a version manifest may hold.
@@ -65,7 +66,7 @@ async fn visitor(state: &ServerState, headers: &HeaderMap, applet_id: Ulid) -> O
     let marker = visitor_marker(auth.realm_id, applet_id);
     let restrictions = auth.path_restrictions.as_deref()?;
     let bound = restrictions.len() == 1 && restrictions[0].pattern == marker;
-    (bound && auth.realm_id == state.get_realm_id()).then(|| AuthContext {
+    (bound && auth.realm_id == state.get_realm_id()).then_some(AuthContext {
         path_restrictions: None,
         ..auth
     })
@@ -301,8 +302,7 @@ pub async fn version_file(
         file.version_id.as_str(),
     );
     let read = read_pinned(&state, &applet, object).await?;
-    let user = aruna_core::user::id::UserId::clone(&applet.created_by);
-    let permit = crate::download::admit(&state, crate::rate_limit::LocalKey::User(user))
+    let permit = crate::download::admit(&state, LocalKey::User(applet.created_by))
         .map_err(|_| ServerError::ServiceUnavailableReason("too many downloads".to_string()))?;
     let mut response = Response::new(crate::download::body(read.blob, permit));
     let headers = response.headers_mut();

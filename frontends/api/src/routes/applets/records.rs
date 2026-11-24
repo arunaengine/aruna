@@ -70,7 +70,7 @@ pub async fn list_applets(
 ) -> ServerResult<Json<AppletPageBody>> {
     let group = group_id(&query.group_id)?;
     let after = (query.cursor.as_deref())
-        .map(|cursor| Ulid::from_string(cursor))
+        .map(Ulid::from_string)
         .transpose()
         .map_err(|_| ServerError::BadRequestReason("cursor is not a ULID".to_string()))?;
     let scope = (group, state.get_node_id());
