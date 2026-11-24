@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+pub mod lifecycle;
 pub mod records;
 pub mod wire;
 
@@ -27,7 +28,8 @@ const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 500;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    records::router()
+    (records::router())
+        .merge(lifecycle::router())
 }
 
 pub(crate) fn applet_error(error: AppletError) -> ServerError {
