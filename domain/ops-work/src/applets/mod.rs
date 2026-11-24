@@ -4,6 +4,7 @@
 
 pub mod change;
 pub mod create;
+pub mod identity;
 pub mod reads;
 pub mod release;
 

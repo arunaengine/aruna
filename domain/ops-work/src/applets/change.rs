@@ -4,18 +4,21 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::applet::hosts::{HostKind, HostRow, host_key};
+use aruna_core::applet::notices::{Notice, notice_key};
 use aruna_core::applet::record::{
-    Access, Applet, ApprovalRequest, CustomDomain, DomainState, Grants, GuestPolicy, VersionRef,
-    VersionState,
+    Access, Applet, ApprovalRequest, CustomDomain, DomainState, Draft, Grants, GuestPolicy,
+    Lifecycle, PinnedObject, VersionRef, VersionState,
 };
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
-use aruna_core::keyspaces::APPLET_HOSTS_KEYSPACE;
+use aruna_core::keyspaces::{APPLET_HOSTS_KEYSPACE, APPLETS_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::types::{Key, KeySpace, RoleId, Value};
 use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
+use super::identity::SyncIdentityOperation;
 use super::{
     AppletAccessOperation, AppletError, Need, applet_answer, host_row, read_applet, record_rows,
 };
@@ -60,6 +63,37 @@ pub enum AppletChange {
         passed: bool,
     },
     AddVersion(Box<VersionRef>),
+    /// A builder job started now; refused when the applet keeps `max` drafts already. The
+    /// draft lives `ttl_ms` from now.
+    StartBuild {
+        draft: Box<Draft>,
+        max: usize,
+        ttl_ms: u64,
+    },
+    /// A build's outputs were captured into the draft manifest `manifest`.
+    CaptureDraft {
+        build_id: Ulid,
+        manifest: PinnedObject,
+    },
+    FailDraft {
+        build_id: Ulid,
+        reason: String,
+    },
+    DropDraft {
+        build_id: Ulid,
+    },
+    /// Turns a captured draft into the private version `entry` with the same pinned files.
+    KeepDraft {
+        build_id: Ulid,
+        entry: Box<VersionRef>,
+    },
+    /// Expires drafts and drops versions beyond the kept ones.
+    Prune,
+    /// The applet's account and role as the node made them.
+    Identity {
+        account: Option<UserId>,
+        role_id: Option<RoleId>,
+    },
 }
 
 impl AppletChange {
@@ -69,6 +103,31 @@ impl AppletChange {
             Self::Approve { .. } => Need::Publish,
             _ => Need::Write,
         }
+    }
+
+    /// Whether the change can alter what an edge decided for the applet's hosts.
+    pub fn notifies(&self) -> bool {
+        matches!(
+            self,
+            Self::Approve { .. }
+                | Self::Rollback { .. }
+                | Self::Pause
+                | Self::Resume
+                | Self::TakeDown { .. }
+                | Self::Embedding { .. }
+                | Self::Guests(_)
+                | Self::RemoveDomain { .. }
+                | Self::AddVersion(_)
+                | Self::KeepDraft { .. }
+        )
+    }
+
+    /// Whether the change can turn the applet's account and role on or off.
+    pub fn moves_identity(&self) -> bool {
+        matches!(
+            self,
+            Self::Approve { .. } | Self::Pause | Self::Resume | Self::TakeDown { .. }
+        )
     }
 }
 
@@ -160,24 +219,106 @@ pub fn apply(
                 _ => {}
             }
         }
-        AppletChange::AddVersion(entry) => {
-            if applet.lifecycle == aruna_core::applet::record::Lifecycle::TakenDown {
+        AppletChange::StartBuild {
+            mut draft,
+            max,
+            ttl_ms,
+        } => {
+            if applet.lifecycle == Lifecycle::TakenDown {
                 return Err(AppletError::Conflict("the applet is taken down".into()));
             }
-            if entry.version != applet.next_version() || entry.state != VersionState::Private {
-                return Err(AppletError::Conflict("the version number is stale".into()));
+            if applet.draft_room(max) == 0 {
+                return Err(AppletError::Conflict(format!(
+                    "the applet keeps at most {max} drafts; keep or delete one first"
+                )));
             }
-            applet.versions.push(*entry);
+            draft.started_at_ms = now_ms;
+            draft.expires_at_ms = now_ms.saturating_add(ttl_ms);
+            applet.drafts.push(*draft);
+        }
+        AppletChange::CaptureDraft { build_id, manifest } => {
+            let draft = open_draft(applet, build_id)?;
+            draft.manifest = Some(manifest);
+        }
+        AppletChange::FailDraft { build_id, reason } => {
+            open_draft(applet, build_id)?.failed = Some(reason);
+        }
+        AppletChange::DropDraft { build_id } => {
+            applet.draft(build_id).ok_or(AppletError::NotFound)?;
+            applet.drafts.retain(|draft| draft.build_id != build_id);
+        }
+        AppletChange::KeepDraft { build_id, entry } => {
+            let draft = applet.draft(build_id).ok_or(AppletError::NotFound)?;
+            if draft.manifest.is_none() {
+                return Err(AppletError::Conflict(
+                    "the build has no captured outputs".into(),
+                ));
+            }
+            add_version(applet, *entry)?;
+            applet.drafts.retain(|draft| draft.build_id != build_id);
+        }
+        AppletChange::AddVersion(entry) => add_version(applet, *entry)?,
+        AppletChange::Prune => {
+            applet.retain(now_ms);
+        }
+        AppletChange::Identity { account, role_id } => {
+            applet.account = account;
+            applet.role_id = role_id;
         }
     }
     applet.revision += 1;
     Ok(moves)
 }
 
+/// The notice that makes edges drop what they cached for every host of `applet`.
+fn notice_row(
+    applet: &Applet,
+    moves: &HostMoves,
+    now_ms: u64,
+) -> Result<(KeySpace, Key, Value), AppletError> {
+    let hosts = std::iter::once(&applet.host)
+        .chain(applet.domains.iter().map(|domain| &domain.host))
+        .chain(&moves.remove)
+        .cloned()
+        .collect();
+    let notice = Notice {
+        applet_id: applet.applet_id,
+        hosts,
+    };
+    Ok((
+        APPLETS_KEYSPACE.to_string(),
+        notice_key(now_ms, applet.applet_id, applet.revision),
+        Value::from(notice.to_bytes()?),
+    ))
+}
+
+/// A draft whose build has neither outputs nor a failure yet.
+fn open_draft(applet: &mut Applet, build_id: Ulid) -> Result<&mut Draft, AppletError> {
+    let draft = (applet.drafts.iter_mut())
+        .find(|draft| draft.build_id == build_id)
+        .ok_or(AppletError::NotFound)?;
+    if draft.manifest.is_some() || draft.failed.is_some() {
+        return Err(AppletError::Conflict("the build already finished".into()));
+    }
+    Ok(draft)
+}
+
+fn add_version(applet: &mut Applet, entry: VersionRef) -> Result<(), AppletError> {
+    if applet.lifecycle == Lifecycle::TakenDown {
+        return Err(AppletError::Conflict("the applet is taken down".into()));
+    }
+    if entry.version != applet.next_version() || entry.state != VersionState::Private {
+        return Err(AppletError::Conflict("the version number is stale".into()));
+    }
+    applet.versions.push(entry);
+    Ok(())
+}
+
 #[derive(Debug, PartialEq)]
 enum ChangeStep {
     Access,
     Write,
+    Identity,
 }
 
 /// Checks the caller's rights, then applies the change in one write transaction on the host
@@ -189,6 +330,8 @@ pub struct ChangeAppletOperation {
     change: Option<AppletChange>,
     expected: Option<u64>,
     local: NodeId,
+    /// The account and role follow the record after the write.
+    identity: bool,
     step: ChangeStep,
 }
 
@@ -202,6 +345,7 @@ impl ChangeAppletOperation {
         Self {
             auth: auth.clone(),
             applet_id,
+            identity: change.moves_identity(),
             change: Some(change),
             expected,
             local,
@@ -239,7 +383,17 @@ impl Operation for ChangeAppletOperation {
                 let seed = self.applet_id.to_bytes();
                 Ok(Next::Call(IoCall::retry(write, &seed)))
             }
-            ChangeStep::Write => result.child::<Applet, AppletError>()?.map(Next::Done),
+            ChangeStep::Write => {
+                let applet = result.child::<Applet, AppletError>()??;
+                let needed = applet.account.is_some() || !applet.grants.is_empty();
+                if !(self.identity && needed) {
+                    return Ok(Next::Done(applet));
+                }
+                let sync = SyncIdentityOperation::new(&applet, (self.local, self.auth.realm_id));
+                self.step = ChangeStep::Identity;
+                Ok(Next::Call(IoCall::child(sync)))
+            }
+            ChangeStep::Identity => result.child::<Applet, AppletError>()?.map(Next::Done),
         }
     }
 
@@ -313,8 +467,12 @@ impl Operation for WriteChangeOperation {
                 "the applet changed meanwhile; read it again".into(),
             ));
         }
+        let notifies = self.change.notifies();
         let moves = apply(&mut applet, self.change.clone(), self.actor, self.now_ms)?;
         let mut writes = record_rows(&applet)?;
+        if notifies || !moves.add.is_empty() || !moves.remove.is_empty() {
+            writes.push(notice_row(&applet, &moves, self.now_ms)?);
+        }
         for host in &moves.add {
             let row = HostRow {
                 applet_id: applet.applet_id,
@@ -334,4 +492,4 @@ impl Operation for WriteChangeOperation {
 
 #[cfg(test)]
 #[path = "change_tests.rs"]
-mod tests;
+pub(crate) mod tests;

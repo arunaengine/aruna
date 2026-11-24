@@ -150,7 +150,13 @@ pub async fn request_approval(
     description = r#"Puts the pending version live with the access, grants and origins it was requested with.
 
 **Authentication**: realm bearer token without path restrictions, with WRITE on the group's held applet bucket on
-the host node: the right to publish every file of the version."#,
+the host node: the right to publish every file of the version. Approving grants also needs a
+group admin, because it makes the applet's own account.
+
+**Behavior**
+- With grants, the applet gets its own service account and one role holding exactly the
+  approved paths. Pausing or taking the applet down removes the role and deactivates the
+  account; resuming restores them. A rollback keeps the approved grants."#,
     params(("applet_id" = String, Path, description = "Applet id; an unparseable id is 404")),
     request_body = VersionAction,
     responses(
@@ -172,6 +178,10 @@ pub async fn approve(
     let read = AppletAccessOperation::new(&auth, applet, Need::Publish);
     let record = drive(read, &state.get_ctx()).await.map_err(applet_error)?;
     require_feature(&state, record.group_id).await?;
+    // Grants make the applet's own account, which only a group admin may create.
+    if (record.pending.as_ref()).is_some_and(|pending| !pending.grants.is_empty()) {
+        ensure_group_admin(&state, &auth, record.group_id).await?;
+    }
     let version = body.version;
     change(
         &state,
