@@ -201,6 +201,28 @@ impl InfoWriteOperation {
         ]
     }
 
+    /// The seeded row, or the stored one unwritten when nothing durable changed.
+    fn seeded(&self, row: Option<Value>) -> Result<InfoWritten, InfoWriteError> {
+        let Write::Seed(document) = &self.write else {
+            return Err(IoError::Unfinished.into());
+        };
+        let stored = row
+            .as_deref()
+            .and_then(|bytes| postcard::from_bytes::<NodeInfoDocument>(bytes).ok());
+        if let Some(stored) = stored
+            && durable_view(document) == durable_view(&stored)
+        {
+            return Ok(InfoWritten {
+                written: false,
+                document: Some(stored),
+            });
+        }
+        Ok(InfoWritten {
+            written: true,
+            document: Some(NodeInfoDocument::clone(document)),
+        })
+    }
+
     /// The revised row, or the stored one unwritten when there is no row or nothing durable
     /// changed.
     fn revised(
@@ -278,13 +300,11 @@ impl Operation for InfoWriteOperation {
 
     fn first(&mut self) -> Turn {
         if let Write::Seed(document) = &self.write {
-            let writes = Self::writes(document)?;
-            self.written = Some(InfoWritten {
-                written: true,
-                document: Some(NodeInfoDocument::clone(document)),
-            });
-            self.phase = Phase::Write;
-            return Ok(Next::Call(IoCall::Write(writes)));
+            let row = (
+                NODE_INFO_KEYSPACE.to_string(),
+                Key::from(node_info_key(document.node_id)),
+            );
+            return Ok(Next::Call(IoCall::Read(vec![row])));
         }
         Ok(Next::Call(IoCall::Read(self.reads())))
     }
@@ -292,16 +312,21 @@ impl Operation for InfoWriteOperation {
     fn next(&mut self, result: IoResult) -> Turn {
         match (self.phase, result) {
             (Phase::Read, IoResult::Values(values)) => {
-                let mut values = values.into_iter();
-                self.generation = revision_generation(values.next().flatten());
-                let (row, drain) = (values.next().flatten(), values.next().flatten());
-                let revised = self.revised(row, drain)?;
-                if !revised.written {
-                    return Ok(Next::Done(revised));
+                let written = match &self.write {
+                    Write::Seed(_) => self.seeded(values.into_iter().next().flatten())?,
+                    Write::Revise { .. } => {
+                        let mut values = values.into_iter();
+                        self.generation = revision_generation(values.next().flatten());
+                        let (row, drain) = (values.next().flatten(), values.next().flatten());
+                        self.revised(row, drain)?
+                    }
+                };
+                if !written.written {
+                    return Ok(Next::Done(written));
                 }
-                let document = revised.document.as_ref().ok_or(IoError::Unfinished)?;
+                let document = written.document.as_ref().ok_or(IoError::Unfinished)?;
                 let writes = Self::writes(document)?;
-                self.written = Some(revised);
+                self.written = Some(written);
                 self.phase = Phase::Write;
                 Ok(Next::Call(IoCall::Write(writes)))
             }
@@ -424,12 +449,37 @@ mod state_machine_tests {
             operation.transaction(),
             aruna_core::operation::TransactionMode::Write
         );
-        assert_eq!(operation.first(), written(&seeded));
+        let row = (
+            NODE_INFO_KEYSPACE.to_string(),
+            Key::from(node_info_key(seeded.node_id)),
+        );
+        assert_eq!(operation.first(), Ok(Next::Call(IoCall::Read(vec![row]))));
+        assert_eq!(
+            operation.next(IoResult::Values(vec![None])),
+            written(&seeded)
+        );
         let done = InfoWritten {
             written: true,
             document: Some(seeded),
         };
         assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(done)));
+    }
+
+    #[test]
+    fn seed_keeps_unchanged() {
+        // Reseeding an advertisement whose durable view matches the stored row leaves both the
+        // stored row and the owed publish marker untouched.
+        let stored = document(2);
+        let mut candidate = document(3);
+        candidate.updated_at_ms = NOW;
+        candidate.utilization.storage_bytes_used = 99;
+        let mut operation = InfoWriteOperation::seed(REALM, candidate);
+        assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Read(_)))));
+        let row = Value::from(stored.to_bytes().unwrap());
+        assert_eq!(
+            operation.next(IoResult::Values(vec![Some(row)])),
+            unwritten(Some(stored))
+        );
     }
 
     #[test]

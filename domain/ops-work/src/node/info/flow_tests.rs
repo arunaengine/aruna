@@ -1305,3 +1305,47 @@ async fn unchanged_skips_publish() {
     assert_eq!(read_outbox(&ctx).await.len(), queued + 1);
     assert_eq!(owed_row(&ctx).await, None);
 }
+
+#[tokio::test]
+async fn reseed_skips_publish() {
+    let ctx = test_ctx();
+    let realm_id = RealmId::from_bytes([19u8; 32]);
+    let local = node(1);
+    write_realm_config(&ctx, &realm_config(realm_id, &[local])).await;
+    let urls = NodeUrls {
+        api: Some("http://127.0.0.1:8080".to_string()),
+        s3: Some("http://127.0.0.1:9000".to_string()),
+    };
+    publish_node_info(&ctx, local, realm_id, urls.clone())
+        .await
+        .unwrap();
+    let seeded = node_info_row(&ctx, local).await.unwrap().unwrap();
+    let queued = read_outbox(&ctx).await.len();
+    assert_eq!(owed_row(&ctx).await, None);
+
+    // Reseeding with the same durable fields leaves the stored row unchanged and marks nothing owed.
+    seed_info_document(&ctx, local, realm_id, urls)
+        .await
+        .unwrap();
+    assert_eq!(node_info_row(&ctx, local).await.unwrap().unwrap(), seeded);
+    assert_eq!(owed_row(&ctx).await, None);
+    refresh_info_heartbeat(&ctx, local, realm_id, 1, None)
+        .await
+        .unwrap();
+    assert_eq!(read_outbox(&ctx).await.len(), queued);
+
+    // Changing a durable field (such as a public URL) writes a new revision and marks it owed.
+    let changed = NodeUrls {
+        api: Some("http://127.0.0.1:8081".to_string()),
+        s3: Some("http://127.0.0.1:9000".to_string()),
+    };
+    seed_info_document(&ctx, local, realm_id, changed)
+        .await
+        .unwrap();
+    assert!(owed_row(&ctx).await.is_some());
+    refresh_info_heartbeat(&ctx, local, realm_id, 2, None)
+        .await
+        .unwrap();
+    assert_eq!(read_outbox(&ctx).await.len(), queued + 1);
+    assert_eq!(owed_row(&ctx).await, None);
+}

@@ -321,8 +321,8 @@ mod process {
                  OPS_SOCKET_ADDRESS=127.0.0.1:{ops}\n\
                  S3_HOST=127.0.0.1:{s3}\n\
                  S3_ADDRESS=127.0.0.1:{s3}\n\
-                 API_PUBLIC_URL=http://127.0.0.1:{http}\n\
-                 S3_PUBLIC_URL=http://127.0.0.1:{s3}\n\
+                 API_PUBLIC_URL=http://127.0.0.1:8080\n\
+                 S3_PUBLIC_URL=http://127.0.0.1:9000\n\
                  REALM_DESCRIPTION=\"observability harness realm\"\n\
                  ARUNA_COMPUTE_EXECUTOR=none\n\
                  ARUNA_SHUTDOWN_GRACE_SECS=16\n\
