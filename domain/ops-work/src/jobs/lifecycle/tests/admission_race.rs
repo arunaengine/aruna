@@ -158,6 +158,11 @@ where
         match turn {
             Ok(Next::Done(answer)) => return settle(ctx, answer).await,
             Ok(Next::Call(IoCall::Child(_))) => {}
+            // A retry waits its backoff first; the wake answers it at once here.
+            Ok(Next::Call(IoCall::Delay(_))) => {
+                turn = commit.next(IoResult::Woke);
+                continue;
+            }
             Ok(other) => panic!("unexpected turn {other:?}"),
             Err(_) => return None,
         }

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{FAMILY_ALIAS_KEYSPACE, FAMILY_PROJECTION_KEYSPACE};
 use aruna_core::keyspaces::{FAMILY_RECORD_KEYSPACE, JOB_KEYSPACE};
@@ -23,6 +23,7 @@ use tracing::debug;
 
 use super::reduce::reduce_family;
 use super::{MAX_PROJECTION_RECORDS, RECORD_PAGE_SIZE, RecordStoreError};
+use crate::jobs::store::store_call::OutsideRead;
 
 /// Aliases one family may bridge into local job rows.
 const MAX_BRIDGED_ALIASES: usize = 64;
@@ -83,7 +84,7 @@ type Step = Result<Next<ProjectedFamily>, RecordStoreError>;
 
 /// A storage effect outside the operation's transaction, answered by its event.
 fn outside(effect: StorageEffect) -> Next<ProjectedFamily> {
-    Next::Call(IoCall::Effect(Box::new(Effect::Storage(effect))))
+    Next::Call(OutsideRead::call(effect))
 }
 
 impl ProjectFamilyOperation {
@@ -279,13 +280,12 @@ impl ProjectFamilyOperation {
         expected: &'static str,
         result: IoResult,
     ) -> Result<StorageEvent, RecordStoreError> {
-        let IoResult::Event(event) = result else {
+        let IoResult::Child(_) = result else {
             return Err(self.unexpected(expected, result.label()));
         };
-        match *event {
-            Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-            Event::Storage(event) => Ok(event),
-            other => Err(self.unexpected(expected, other.label())),
+        match OutsideRead::answer(result)? {
+            StorageEvent::Error { error } => Err(error.into()),
+            event => Ok(event),
         }
     }
 }

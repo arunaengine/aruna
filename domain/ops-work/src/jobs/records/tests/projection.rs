@@ -3,8 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::events::StorageEvent;
 use aruna_core::keyspaces::{FAMILY_PROJECTION_KEYSPACE, JOB_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::family::{
@@ -76,15 +75,15 @@ fn run(family: &Family, rows: &[(Key, Value)], cache: Option<Value>, local: Opti
             Err(error) => break Err(error),
         };
         let result = match call {
-            IoCall::Effect(effect) => match *effect {
-                Effect::Storage(StorageEffect::Read { key, .. }) => {
-                    IoResult::Event(Box::new(Event::Storage(StorageEvent::ReadResult {
-                        key,
-                        value: cache.clone(),
-                    })))
-                }
-                other => panic!("unexpected effect: {other:?}"),
-            },
+            // The cache is read by a child outside the transaction.
+            IoCall::Child(_) => {
+                let read = StorageEvent::ReadResult {
+                    key: Key::from(Vec::new()),
+                    value: cache.clone(),
+                };
+                let outcome = Ok::<_, aruna_core::calls::IoError>(read);
+                IoResult::Child(aruna_core::calls::ChildOutcome::new(outcome))
+            }
             IoCall::Page { limit, .. } => {
                 let page: Vec<(Key, Value)> =
                     rows.iter().skip(offset).take(limit).cloned().collect();
@@ -282,10 +281,10 @@ fn reads_cache_outside() {
         operation.transaction(),
         aruna_core::operation::TransactionMode::Write
     );
+    // A child reads the cache, so the projection's transaction does not start with it.
     assert!(matches!(
         operation.first(),
-        Ok(Next::Call(IoCall::Effect(effect)))
-            if matches!(*effect, Effect::Storage(StorageEffect::Read { txn_id: None, .. }))
+        Ok(Next::Call(IoCall::Child(_)))
     ));
     assert!(matches!(
         operation.next(IoResult::Done),

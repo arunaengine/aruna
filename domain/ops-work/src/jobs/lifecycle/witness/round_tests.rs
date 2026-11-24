@@ -84,6 +84,7 @@ fn offering(fixture: &Family, retry_after_ms: u64) -> WitnessRoundOperation {
     let mut operation = configured(fixture);
     let facts = operation.facts().unwrap();
     facts.offer = Some(OfferState {
+        launch_id: Ulid::nil(),
         target: fixture.target_id(),
         retry_after_ms,
     });

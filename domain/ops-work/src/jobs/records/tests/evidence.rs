@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, JobRecordFrame, StorageEffect};
+use aruna_core::effects::{JobRecordFrame, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::FAMILY_RECORD_KEYSPACE;
 use aruna_core::structs::execution::job::family::{
@@ -406,14 +406,10 @@ fn refuses_partial_scan() {
         .config
         .to_bytes(&actor(family.holder.public()))
         .expect("config encodes");
-    let Ok(Next::Call(IoCall::Effect(_))) = operation.first() else {
+    let Ok(Next::Call(IoCall::Child(_))) = operation.first() else {
         panic!("the realm config is read first");
     };
-    let read = Event::Storage(StorageEvent::ReadResult {
-        key: Key::from([0u8].as_slice()),
-        value: Some(Value::from(config.as_slice())),
-    });
-    let mut turn = operation.next(IoResult::Event(Box::new(read)));
+    let mut turn = operation.next(config_read(Some(config.as_slice())));
     let more = Key::from([1u8].as_slice());
     let mut pages = 0;
     let failed = loop {
@@ -446,18 +442,11 @@ fn run_calls(mut operation: AppendRecordOperation, config: Vec<u8>) -> CallsRun 
     use aruna_core::calls::{IoCall, IoResult, Next};
     use aruna_core::operation::{Operation, TransactionMode};
     assert_eq!(operation.transaction(), TransactionMode::Write);
-    let Ok(Next::Call(IoCall::Effect(effect))) = operation.first() else {
+    // A child reads the config, so the append's transaction does not start with it.
+    let Ok(Next::Call(IoCall::Child(_))) = operation.first() else {
         panic!("the realm config is read first");
     };
-    assert!(matches!(
-        *effect,
-        Effect::Storage(StorageEffect::Read { txn_id: None, .. })
-    ));
-    let read = Event::Storage(StorageEvent::ReadResult {
-        key: Key::from([0u8].as_slice()),
-        value: Some(Value::from(config.as_slice())),
-    });
-    let mut turn = operation.next(IoResult::Event(Box::new(read)));
+    let mut turn = operation.next(config_read(Some(config.as_slice())));
     let mut written = Vec::new();
     loop {
         let result = match turn {
@@ -521,12 +510,8 @@ fn refuses_without_config() {
     let family = Family::new([29u8; 32]);
     let mut operation = spec_append(&family);
     operation.first().expect("config read");
-    let missing = Event::Storage(StorageEvent::ReadResult {
-        key: Key::from([0u8].as_slice()),
-        value: None,
-    });
     assert_eq!(
-        operation.next(IoResult::Event(Box::new(missing))),
+        operation.next(config_read(None)),
         Err(RecordStoreError::RealmConfigMissing)
     );
     let mut operation = spec_append(&family);
@@ -535,4 +520,11 @@ fn refuses_without_config() {
         operation.next(IoResult::Done),
         Err(RecordStoreError::UnexpectedEvent { .. })
     ));
+}
+
+/// The answer of the realm config read child.
+fn config_read(config: Option<&[u8]>) -> aruna_core::calls::IoResult {
+    let row = config.map(Value::from);
+    let outcome = Ok::<_, crate::jobs::store::mutation_error::JobMutationError>(row);
+    aruna_core::calls::IoResult::Child(aruna_core::calls::ChildOutcome::new(outcome))
 }

@@ -9,7 +9,7 @@ pub mod here;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::compute::quota::QuotaDenied;
 use aruna_core::document::DocumentTarget;
-use aruna_core::effects::{Effect, JobRecordFrame, StorageEffect};
+use aruna_core::effects::{JobRecordFrame, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
@@ -44,6 +44,7 @@ use super::closure::closure_key;
 use super::{LifecycleError, stored_view};
 use crate::jobs::records::verify::{Evidence, FamilyView};
 use crate::jobs::records::{RECORD_PAGE_SIZE, RecordStoreError};
+use crate::jobs::store::store_call::OutsideRead;
 use aruna_core::job_request::workspace_of;
 
 /// The alias this node would mint, with the records it already signed for it.
@@ -376,27 +377,28 @@ impl Operation for AdmitSubmissionOperation {
         let config = DocumentTarget::RealmConfig {
             realm_id: self.config.realm_id,
         };
-        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Storage(
-            StorageEffect::Read {
-                key_space: config.storage_keyspace().to_string(),
-                key: config.storage_key(),
-                txn_id: None,
-            },
-        )))))
+        Ok(Next::Call(OutsideRead::call(StorageEffect::Read {
+            key_space: config.storage_keyspace().to_string(),
+            key: config.storage_key(),
+            txn_id: None,
+        })))
     }
 
     fn next(&mut self, result: IoResult) -> Step {
         match (self.state, result) {
-            (AdmitState::ReadConfig, IoResult::Event(event)) => match *event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+            (AdmitState::ReadConfig, result) => match OutsideRead::answer(result)? {
+                StorageEvent::ReadResult { value, .. } => {
                     self.view = stored_view(value, self.config.realm_id, self.family())?;
                     if self.view.is_none() {
                         return Err(LifecycleError::NotHolder);
                     }
                     self.read_tombstone()
                 }
-                Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-                other => Err(self.unexpected("realm config read", other.label())),
+                StorageEvent::Error { error } => Err(error.into()),
+                other => {
+                    let got = Event::Storage(other).label();
+                    Err(self.unexpected("realm config read", got))
+                }
             },
             (AdmitState::ReadTombstone, result) => {
                 let [tombstone] = values::<1>(result)?;
@@ -494,14 +496,11 @@ mod pure_tests {
             operation.transaction(),
             aruna_core::operation::TransactionMode::Write
         );
+        // A child reads the config, so the admission's transaction does not start with it.
         assert!(matches!(
             operation.first(),
-            Ok(Next::Call(IoCall::Effect(effect)))
-                if matches!(*effect, Effect::Storage(StorageEffect::Read { txn_id: None, .. }))
+            Ok(Next::Call(IoCall::Child(_)))
         ));
-        assert!(matches!(
-            operation.next(IoResult::Done),
-            Err(LifecycleError::UnexpectedEvent { .. })
-        ));
+        assert!(operation.next(IoResult::Done).is_err());
     }
 }

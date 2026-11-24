@@ -85,7 +85,9 @@ fn retries_stay_bounded() {
     let mut operation = CommitReceiptOperation::new(config, launch);
     calls_child(operation.first());
     for _ in 1..RESERVE_ATTEMPTS {
-        calls_child(operation.next(failed(StorageError::QueueFull)));
+        let backoff = operation.next(failed(StorageError::QueueFull));
+        assert!(matches!(backoff, Ok(Next::Call(IoCall::Delay(_)))));
+        calls_child(operation.next(IoResult::Woke));
     }
     assert_eq!(
         operation.next(failed(StorageError::QueueFull)),
@@ -100,7 +102,9 @@ fn lost_race_retries() {
     let mut operation = CommitReceiptOperation::new(config, launch);
     calls_child(operation.first());
     calls_child(operation.next(failed(StorageError::TransactionConflict)));
-    calls_child(operation.next(records(Vec::new())));
+    let backoff = operation.next(records(Vec::new()));
+    assert!(matches!(backoff, Ok(Next::Call(IoCall::Delay(_)))));
+    calls_child(operation.next(IoResult::Woke));
     calls_child(operation.next(failed(StorageError::TransactionConflict)));
 }
 

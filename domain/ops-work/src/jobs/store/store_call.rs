@@ -1,11 +1,13 @@
 //! The call forms of the job store: a store change that retries lost conflicts, and plain row
-//! reads and writes. Each is an operation, so callers drive it or run it as a typed child.
+//! reads, reads outside a transaction and writes, each an operation run as a typed child.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
 use aruna_core::rows::read_row;
@@ -204,6 +206,44 @@ impl<T: Send + std::fmt::Debug> Operation for RowRead<T> {
 
     fn next(&mut self, result: IoResult) -> Result<Next<T>, JobMutationError> {
         (self.decode)(result.value()?).map(Next::Done)
+    }
+}
+
+/// One storage read run as a child without a transaction. A storage call of a write-mode
+/// operation joins its transaction, so a read that must not conflict its writes goes here.
+#[derive(Debug, PartialEq)]
+pub(crate) struct OutsideRead(Option<StorageEffect>);
+
+impl OutsideRead {
+    pub(crate) fn call(effect: StorageEffect) -> IoCall {
+        IoCall::child(Self(Some(effect)))
+    }
+
+    /// The storage event the read answered.
+    pub(crate) fn answer(result: IoResult) -> Result<StorageEvent, IoError> {
+        result.child::<StorageEvent, IoError>()?
+    }
+}
+
+impl Operation for OutsideRead {
+    type Output = StorageEvent;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<StorageEvent>, IoError> {
+        let effect = self.0.take().ok_or(IoError::Unfinished)?;
+        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Storage(
+            effect,
+        )))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<StorageEvent>, IoError> {
+        match result.event()? {
+            Event::Storage(event) => Ok(Next::Done(event)),
+            other => Err(IoError::Unexpected {
+                expected: "a storage event",
+                got: other.label(),
+            }),
+        }
     }
 }
 
