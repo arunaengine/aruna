@@ -2,7 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+pub mod diff;
 pub mod feature;
 pub mod hosts;
+pub mod manifest;
 pub mod record;
 pub mod settings;
