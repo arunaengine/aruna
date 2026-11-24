@@ -121,9 +121,10 @@ pub struct WorkflowRunBody {
     /// files in the output bucket, and its crate is read with the run, never as a group document.
     #[serde(default)]
     pub protected: bool,
-    /// The caller may change the run: cancel, delete, resume or repeat it.
-    #[serde(default)]
-    pub writable: bool,
+    /// The caller may change the run: cancel, delete, resume or repeat it; absent when not
+    /// computed for a caller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writable: Option<bool>,
 }
 
 /// One task of a step that lists its tasks.
@@ -358,7 +359,7 @@ impl From<&WorkflowRunRecord> for WorkflowRunBody {
             workflow_name: Some(record.workflow_name.clone()),
             local_only: record.local_only,
             protected: record.protected,
-            writable: false,
+            writable: None,
         }
     }
 }
@@ -444,7 +445,7 @@ impl From<RunSnapshot> for RunSnapshotBody {
         });
         Self {
             run: WorkflowRunBody {
-                writable: snapshot.writable,
+                writable: Some(snapshot.writable),
                 ..WorkflowRunBody::from(record)
             },
             steps,

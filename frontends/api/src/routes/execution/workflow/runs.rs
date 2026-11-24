@@ -150,11 +150,13 @@ fn noted(body: &mut WorkflowRunBody, note: Option<&str>) {
 }
 
 /// A run the caller just changed, which needed WRITE on its group.
-fn written(record: &WorkflowRunRecord) -> WorkflowRunBody {
-    WorkflowRunBody {
-        writable: true,
+fn written(record: &WorkflowRunRecord, here: aruna_core::id::NodeId) -> WorkflowRunBody {
+    let mut body = WorkflowRunBody {
+        writable: Some(true),
         ..WorkflowRunBody::from(record)
-    }
+    };
+    noted(&mut body, replica_note(record, here));
+    body
 }
 
 fn idempotency_key(headers: &HeaderMap) -> Result<Option<String>, ServerError> {
@@ -241,7 +243,10 @@ pub async fn start_run(
     let admitted = drive(start, &state.get_ctx())
         .await
         .map_err(catalog_error)?;
-    Ok((StatusCode::ACCEPTED, Json(written(&admitted.record))))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(written(&admitted.record, state.get_node_id())),
+    ))
 }
 
 #[utoipa::path(
@@ -303,7 +308,7 @@ pub async fn list_runs(
         items: (page.items.iter())
             .map(|record| {
                 let mut body = WorkflowRunBody::from(record);
-                body.writable = page.writable.contains(&record.group_id);
+                body.writable = Some(page.writable.contains(&record.group_id));
                 noted(&mut body, replica_note(record, here));
                 body
             })
@@ -506,7 +511,10 @@ pub async fn cancel_run(
     Path(run): Path<String>,
 ) -> ServerResult<(StatusCode, Json<WorkflowRunBody>)> {
     let record = cancel(&state, &auth, run_id(&run)?).await?;
-    Ok((StatusCode::ACCEPTED, Json(written(&record))))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(written(&record, state.get_node_id())),
+    ))
 }
 
 /// Cancels a run and stops its running jobs here at once.
@@ -640,5 +648,8 @@ async fn follow(
     let record = drive(follow, &state.get_ctx())
         .await
         .map_err(catalog_error)?;
-    Ok((StatusCode::ACCEPTED, Json(written(&record))))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(written(&record, state.get_node_id())),
+    ))
 }

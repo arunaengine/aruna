@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use aruna_core::structs::execution::workflow_run::{RunState, WorkflowRunRecord};
+use aruna_core::structs::identity::features::Feature;
 use aruna_ops_work::workflows::runs::admit::StartRunOperation;
 use aruna_ops_work::workflows::runs::events::time_text;
 use aruna_ops_work::workflows::runs::reads::{ListRunsOperation, RunFilter, RunSnapshotOperation};
@@ -365,6 +366,7 @@ pub async fn start_run(
 ) -> WesResult<WesRunId> {
     let form = run_form(request, &state).await?;
     let request = run_request(&state, workflow_request(form)?, None)?;
+    crate::features::require(&state, Feature::Workflows, Some(request.group_id)).await?;
     let node = (state.get_node_id(), state.get_realm_id());
     let start = StartRunOperation::new(&auth, node, request);
     let admitted = drive(start, &state.get_ctx())

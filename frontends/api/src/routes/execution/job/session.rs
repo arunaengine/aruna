@@ -383,7 +383,7 @@ fn session_response(
         }),
         ended: snapshot.ended.map(|reason| SessionEndedResponse {
             reason: reason.as_str().to_string(),
-            ended_at_ms: None,
+            ended_at_ms: record.state.is_terminal().then_some(record.updated_at_ms),
         }),
     }
 }
