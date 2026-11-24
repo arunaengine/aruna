@@ -23,6 +23,7 @@ use rmcp::transport::streamable_http_server::tower::{
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+mod applets;
 mod compute;
 mod context;
 pub(crate) mod data;
@@ -65,6 +66,7 @@ impl McpServer {
     pub fn new(state: Arc<ServerState>) -> Self {
         let mut tool_router = context::toolset();
         tool_router.merge(compute::toolset());
+        tool_router.merge(applets::toolset());
         tool_router.merge(data::toolset());
         tool_router.merge(metadata::toolset());
         tool_router.merge(workflows::toolset());
