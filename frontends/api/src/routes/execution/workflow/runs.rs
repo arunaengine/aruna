@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use aruna_core::structs::execution::workflow_run::{RunOutput, RunState};
+use aruna_core::structs::execution::workflow_run::{RunOutput, RunState, WorkflowRunRecord};
 use aruna_ops_work::workflows::runs::admit::{PinnedInput, RunRequest, StartRunOperation};
 use aruna_ops_work::workflows::runs::cancel::{CancelRunOperation, DeleteRunOperation};
 use aruna_ops_work::workflows::runs::control::{Follow, FollowRunOperation};
@@ -145,8 +145,14 @@ pub(super) fn run_request(
 
 /// Shows that another node coordinates a run that has not ended, when this node holds a copy.
 fn noted(body: &mut WorkflowRunBody, note: Option<&str>) {
-    if let Some(note) = note {
-        body.error = Some(note.to_owned());
+    body.notice = note.map(str::to_owned);
+}
+
+/// A run the caller just changed, which needed WRITE on its group.
+fn written(record: &WorkflowRunRecord) -> WorkflowRunBody {
+    WorkflowRunBody {
+        writable: true,
+        ..WorkflowRunBody::from(record)
     }
 }
 
@@ -182,6 +188,10 @@ fn idempotency_key(headers: &HeaderMap) -> Result<Option<String>, ServerError> {
   `runs-<group id>-<node prefix>` and created once when it is missing.
 - `placement.site` pins every task of the run to that site; a task never falls back to
   another site.
+- A run is `protected` when a pinned input bucket of this node or the output bucket encrypts:
+  it reuses only its own tasks, keeps every task's work folder below its output prefix and
+  never publishes its crate as a group document. An encrypting input needs an encrypting output
+  bucket. The encryption of inputs held by other nodes is not known here and protects nothing.
 - The same `Idempotency-Key` header with the same request answers the run it started, never a
   second one; with another request it is a 409.
 - The run is queued as a job of this node and runs as its creator. Its progress follows on
@@ -189,7 +199,8 @@ fn idempotency_key(headers: &HeaderMap) -> Result<Option<String>, ServerError> {
 
 **Errors**
 - 400 for malformed ids, a version that is no number, values that are no object, no output, a
-  missing bucket, or a placement on another node.
+  missing bucket, an encrypting input with a plain output bucket, or a placement on another
+  node.
 - 403 without WRITE on the group's workflows or on the output, or without READ on an input.
 - 404 when the group or the version is not visible to the caller."#,
     params(("Idempotency-Key" = Option<String>, Header, description = "Starts the run once; 1 to 256 bytes")),
@@ -206,7 +217,8 @@ fn idempotency_key(headers: &HeaderMap) -> Result<Option<String>, ServerError> {
             "node_id": "4f0c9d1e2b3a495867788990aabbccddeeff00112233445566778899aabbccdd",
             "created_at": "2026-11-24T08:00:00+00:00", "finished_at": null,
             "created_by": "01K8W1A0000000000000000000", "error": null,
-            "lineage": "01K8W2A0000000000000000000", "workflow_name": "hello", "local_only": false
+            "lineage": "01K8W2A0000000000000000000", "workflow_name": "hello", "local_only": false,
+            "protected": false, "writable": true
         })),
         (status = 400, description = "An invalid request", body = ErrorResponse),
         (status = 403, description = "A missing permission", body = ErrorResponse),
@@ -227,10 +239,7 @@ pub async fn start_run(
     let admitted = drive(start, &state.get_ctx())
         .await
         .map_err(catalog_error)?;
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(WorkflowRunBody::from(&admitted.record)),
-    ))
+    Ok((StatusCode::ACCEPTED, Json(written(&admitted.record))))
 }
 
 #[utoipa::path(
@@ -254,7 +263,8 @@ pub async fn start_run(
             "node_id": "4f0c9d1e2b3a495867788990aabbccddeeff00112233445566778899aabbccdd",
             "created_at": "2026-11-24T08:00:00+00:00", "finished_at": null,
             "created_by": "01K8W1A0000000000000000000", "error": null,
-            "lineage": "01K8W2A0000000000000000000", "workflow_name": "hello", "local_only": false
+            "lineage": "01K8W2A0000000000000000000", "workflow_name": "hello", "local_only": false,
+            "protected": false, "writable": true
         }], "next_cursor": null, "total": 1
         })),
         (status = 400, description = "A malformed id, state or cursor", body = ErrorResponse)
@@ -291,6 +301,7 @@ pub async fn list_runs(
         items: (page.items.iter())
             .map(|record| {
                 let mut body = WorkflowRunBody::from(record);
+                body.writable = page.writable.contains(&record.group_id);
                 noted(&mut body, replica_note(record, here));
                 body
             })
@@ -323,6 +334,7 @@ pub async fn list_runs(
             "created_at": "2026-11-24T08:00:00+00:00", "finished_at": null,
             "created_by": "01K8W1A0000000000000000000", "error": null,
             "lineage": "01K8W2A0000000000000000000", "workflow_name": "hello", "local_only": false,
+            "protected": false, "writable": true,
             "steps": [{"step": "echo", "state": "running", "total": 2, "counts": {"queued": 0,
                 "running": 1, "succeeded": 1, "failed": 0, "cancelled": 0, "cached": 0},
                 "node_id": null, "mode": "compute_to_data", "tasks": [
@@ -477,7 +489,8 @@ pub async fn run_origin(
             "node_id": "4f0c9d1e2b3a495867788990aabbccddeeff00112233445566778899aabbccdd",
             "created_at": "2026-11-24T08:00:00+00:00", "finished_at": null,
             "created_by": "01K8W1A0000000000000000000", "error": null,
-            "lineage": "01K8W2A0000000000000000000", "workflow_name": "hello", "local_only": false
+            "lineage": "01K8W2A0000000000000000000", "workflow_name": "hello", "local_only": false,
+            "protected": false, "writable": true
         })),
         (status = 403, description = "No WRITE on the group's workflows", body = ErrorResponse),
         (status = 404, description = "Unknown, or not visible to the caller", body = ErrorResponse),
@@ -490,8 +503,18 @@ pub async fn cancel_run(
     RealmAuth(auth): RealmAuth,
     Path(run): Path<String>,
 ) -> ServerResult<(StatusCode, Json<WorkflowRunBody>)> {
+    let record = cancel(&state, &auth, run_id(&run)?).await?;
+    Ok((StatusCode::ACCEPTED, Json(written(&record))))
+}
+
+/// Cancels a run and stops its running jobs here at once.
+pub(super) async fn cancel(
+    state: &ServerState,
+    auth: &aruna_core::structs::identity::auth::AuthContext,
+    run_id: Ulid,
+) -> ServerResult<WorkflowRunRecord> {
     let node = (state.get_node_id(), state.get_realm_id());
-    let cancel = CancelRunOperation::new(&auth, run_id(&run)?, node);
+    let cancel = CancelRunOperation::new(auth, run_id, node);
     let cancelled = drive(cancel, &state.get_ctx())
         .await
         .map_err(catalog_error)?;
@@ -502,10 +525,7 @@ pub async fn cancel_run(
     if let Some(registry) = state.get_ctx().compute_handle.as_ref() {
         registry.wake_run(cancelled.record.run_id.to_string());
     }
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(WorkflowRunBody::from(&cancelled.record)),
-    ))
+    Ok(cancelled.record)
 }
 
 #[utoipa::path(
@@ -542,7 +562,8 @@ pub async fn cancel_run(
             "node_id": "4f0c9d1e2b3a495867788990aabbccddeeff00112233445566778899aabbccdd",
             "created_at": "2026-11-24T09:00:00+00:00", "finished_at": null,
             "created_by": "01K8W1A0000000000000000000", "error": null,
-            "lineage": "01K8W2A0000000000000000000", "workflow_name": "hello", "local_only": false
+            "lineage": "01K8W2A0000000000000000000", "workflow_name": "hello", "local_only": false,
+            "protected": false, "writable": true
         })),
         (status = 403, description = "No WRITE on the group's workflows", body = ErrorResponse),
         (status = 404, description = "Unknown, or not visible to the caller", body = ErrorResponse),
@@ -584,7 +605,8 @@ pub async fn resume_run(
             "node_id": "4f0c9d1e2b3a495867788990aabbccddeeff00112233445566778899aabbccdd",
             "created_at": "2026-11-24T09:00:00+00:00", "finished_at": null,
             "created_by": "01K8W1A0000000000000000000", "error": null,
-            "lineage": "01K8W2A0000000000000000000", "workflow_name": "hello", "local_only": false
+            "lineage": "01K8W2A0000000000000000000", "workflow_name": "hello", "local_only": false,
+            "protected": false, "writable": true
         })),
         (status = 403, description = "No WRITE on the group's workflows", body = ErrorResponse),
         (status = 404, description = "Unknown, or not visible to the caller", body = ErrorResponse),
@@ -611,5 +633,5 @@ async fn follow(
     let record = drive(follow, &state.get_ctx())
         .await
         .map_err(catalog_error)?;
-    Ok((StatusCode::ACCEPTED, Json(WorkflowRunBody::from(&record))))
+    Ok((StatusCode::ACCEPTED, Json(written(&record))))
 }

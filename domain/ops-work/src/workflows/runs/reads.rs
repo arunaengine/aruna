@@ -53,6 +53,8 @@ pub struct RunPage {
     pub items: Vec<WorkflowRunRecord>,
     pub next: Option<Ulid>,
     pub total: usize,
+    /// The groups of the listed runs whose runs the caller may change.
+    pub writable: BTreeSet<GroupId>,
 }
 
 /// Lists the runs of this node the caller reads, newest first, paged by run id.
@@ -115,6 +117,7 @@ impl Operation for ListRunsOperation {
                     items: Vec::new(),
                     next: None,
                     total: 0,
+                    writable: BTreeSet::new(),
                 }));
             }
             return Ok(Next::Call(IoCall::child(GroupAccessOperation::new(
@@ -129,10 +132,15 @@ impl Operation for ListRunsOperation {
         runs.sort_by_key(|(order, _)| *order);
         let after = self.after.map(Reverse);
         let (items, next, total) = page_of(runs, after.as_ref(), self.limit);
+        let writable = (access.iter())
+            .filter(|(_, access)| access.write)
+            .map(|(group, _)| *group)
+            .collect();
         Ok(Next::Done(RunPage {
             items,
             next: next.map(|Reverse(run_id)| run_id),
             total,
+            writable,
         }))
     }
 }
@@ -142,6 +150,8 @@ impl Operation for ListRunsOperation {
 pub struct RunSnapshot {
     pub record: WorkflowRunRecord,
     pub listed: BTreeMap<String, Vec<WorkflowTaskRecord>>,
+    /// The caller may change the run: cancel, delete, resume or repeat it.
+    pub writable: bool,
 }
 
 /// Reads a run for its page: the record with its step counts, and the tasks of small steps.
@@ -150,6 +160,7 @@ pub struct RunSnapshotOperation {
     auth: AuthContext,
     run_id: Ulid,
     record: Option<WorkflowRunRecord>,
+    writable: bool,
 }
 
 impl RunSnapshotOperation {
@@ -158,6 +169,7 @@ impl RunSnapshotOperation {
             auth: auth.clone(),
             run_id,
             record: None,
+            writable: false,
         }
     }
 }
@@ -173,12 +185,14 @@ impl Operation for RunSnapshotOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<RunSnapshot>, CatalogError> {
         let Some(record) = self.record.take() else {
-            let (record, _) = access_of(result)?;
+            let (record, access) = access_of(result)?;
+            self.writable = access.write;
             let small = record.steps.iter().any(|step| step.total() <= LISTED_TASKS);
             if !small {
                 return Ok(Next::Done(RunSnapshot {
                     record,
                     listed: BTreeMap::new(),
+                    writable: self.writable,
                 }));
             }
             self.record = Some(record);
@@ -196,7 +210,12 @@ impl Operation for RunSnapshotOperation {
                 listed.entry(task.step.clone()).or_default().push(task);
             }
         }
-        Ok(Next::Done(RunSnapshot { record, listed }))
+        let writable = self.writable;
+        Ok(Next::Done(RunSnapshot {
+            record,
+            listed,
+            writable,
+        }))
     }
 
     fn expected_error(error: &CatalogError) -> bool {

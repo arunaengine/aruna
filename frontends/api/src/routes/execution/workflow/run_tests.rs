@@ -182,6 +182,8 @@ async fn serves_runs() {
     let snapshot = json_of(&snapshot);
     assert_eq!(status, StatusCode::OK, "{snapshot}");
     assert_eq!(snapshot["last_event_id"], 1);
+    assert_eq!(snapshot["writable"], true);
+    assert_eq!(json_of(&page)["items"][0]["writable"], true);
     assert_eq!(snapshot["values"], json!({"message": "Hola"}));
     assert_eq!(snapshot["output"]["bucket"], "results");
     let (status, _) = send(&node, &node.stranger, ("GET", &path), &[], None).await;

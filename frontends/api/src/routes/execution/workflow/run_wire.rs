@@ -103,13 +103,27 @@ pub struct WorkflowRunBody {
     pub state: String,
     pub node_id: Option<String>,
     pub created_at: Option<String>,
+    /// When the run first turned running.
+    #[serde(default)]
+    pub started_at: Option<String>,
     pub finished_at: Option<String>,
     pub created_by: Option<String>,
+    /// Why the run failed; only a real failure.
     pub error: Option<String>,
+    /// A note of this node about the run, such as another node coordinating it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice: Option<String>,
     pub lineage: Option<String>,
     pub workflow_name: Option<String>,
     /// Only on this computer; nothing about it reached the realm yet.
     pub local_only: bool,
+    /// An input or the output bucket encrypts: the run reuses only its own tasks, keeps its task
+    /// files in the output bucket, and its crate is read with the run, never as a group document.
+    #[serde(default)]
+    pub protected: bool,
+    /// The caller may change the run: cancel, delete, resume or repeat it.
+    #[serde(default)]
+    pub writable: bool,
 }
 
 /// One task of a step that lists its tasks.
@@ -131,6 +145,12 @@ pub struct StepSummaryBody {
     pub counts: BTreeMap<String, u64>,
     pub node_id: Option<String>,
     pub mode: Option<String>,
+    /// The earliest start of a task of the step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    /// The latest end of a task, once the step has ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
     /// The tasks of a step with at most 25 of them; a wide scatter leaves them out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tasks: Option<Vec<StepTaskBody>>,
@@ -140,8 +160,9 @@ pub struct StepSummaryBody {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct RunFileBody {
     pub name: String,
-    pub bucket: String,
-    pub key: String,
+    /// Absent while the node does not know where the file is.
+    pub bucket: Option<String>,
+    pub key: Option<String>,
     pub version_id: Option<String>,
     pub node_id: Option<String>,
     pub size: Option<u64>,
@@ -328,12 +349,16 @@ impl From<&WorkflowRunRecord> for WorkflowRunBody {
             state: record.state.as_str().to_owned(),
             node_id: Some(record.node_id.to_string()),
             created_at: time_text(record.created_at_ms),
+            started_at: record.started_at_ms.and_then(time_text),
             finished_at: record.finished_at_ms.and_then(time_text),
             created_by: Some(record.created_by.to_string()),
             error: record.error.clone(),
+            notice: None,
             lineage: Some(record.lineage.to_string()),
             workflow_name: Some(record.workflow_name.clone()),
             local_only: record.local_only,
+            protected: record.protected,
+            writable: false,
         }
     }
 }
@@ -358,13 +383,16 @@ impl StepSummaryBody {
                 })
                 .collect()
         });
+        let state = step.state();
         Self {
             step: step.step.clone(),
-            state: step.state().as_str().to_owned(),
+            state: state.as_str().to_owned(),
             total: Some(step.total()),
             counts,
             node_id: node_text(step.node_id),
             mode: step.mode.clone(),
+            started_at: step.started_at_ms.and_then(time_text),
+            finished_at: (step.finished_at_ms.filter(|_| state.is_terminal())).and_then(time_text),
             tasks: listed,
         }
     }
@@ -374,8 +402,8 @@ impl From<&RunFile> for RunFileBody {
     fn from(file: &RunFile) -> Self {
         Self {
             name: file.name.clone(),
-            bucket: file.bucket.clone().unwrap_or_default(),
-            key: file.key.clone().unwrap_or_default(),
+            bucket: file.bucket.clone(),
+            key: file.key.clone(),
             version_id: file.version_id.clone(),
             node_id: node_text(file.node_id),
             size: file.size,
@@ -415,7 +443,10 @@ impl From<RunSnapshot> for RunSnapshotBody {
             status: record.provenance_status.clone(),
         });
         Self {
-            run: WorkflowRunBody::from(record),
+            run: WorkflowRunBody {
+                writable: snapshot.writable,
+                ..WorkflowRunBody::from(record)
+            },
             steps,
             values: serde_json::from_str(&record.values_json).ok(),
             inputs: (record.inputs_json.as_deref())
