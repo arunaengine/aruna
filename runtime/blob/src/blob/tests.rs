@@ -1252,6 +1252,123 @@ async fn bucket_locks_drop() {
     );
 }
 
+#[derive(Debug)]
+struct ConflictUntil {
+    inner: Arc<dyn aruna_core::handle::StoragePort>,
+    release: Arc<std::sync::atomic::AtomicBool>,
+    conflicted: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl aruna_core::handle::StoragePort for ConflictUntil {
+    async fn send_storage_effect(&self, effect: StorageEffect) -> Event {
+        if let StorageEffect::CommitTransaction { txn_id } = effect
+            && !self.release.load(std::sync::atomic::Ordering::Acquire)
+        {
+            let _ = self
+                .inner
+                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                .await;
+            self.conflicted.notify_one();
+            return Event::Storage(StorageEvent::Error {
+                error: StorageError::TransactionConflict,
+            });
+        }
+        self.inner.send_storage_effect(effect).await
+    }
+
+    async fn start_transaction(
+        &self,
+        read: bool,
+    ) -> Result<aruna_core::handle::TransactionOwner, StorageError> {
+        self.inner.start_transaction(read).await
+    }
+
+    fn config_changes(&self) -> u64 {
+        self.inner.config_changes()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backoff_releases_lock() {
+    // A retrying write drops the bucket counter lock before sleeping, so another write to the
+    // same hidden bucket finishes while the first is in backoff.
+    let context = setup_blob_handle(1_000).await;
+    let seed = BlobEffect::Write {
+        resolved: ResolvedBackend::node_default(),
+        bucket: "bucket-a".to_string(),
+        blob: stream_from_bytes(b"seed"),
+        key: "seed.bin".to_string(),
+        created_by: test_user_id(),
+        size: None,
+    };
+    let Ok(BlobEvent::WriteFinished { location: first }) =
+        context.blob_handle.send_blob_effect(seed).await.into_blob()
+    else {
+        panic!("seed write failed")
+    };
+
+    let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let conflicted = Arc::new(tokio::sync::Notify::new());
+    let mut conflicting = context.blob_handle.handler.clone();
+    conflicting.storage = Arc::new(ConflictUntil {
+        inner: context.blob_handle.handler.storage.clone(),
+        release: release.clone(),
+        conflicted: conflicted.clone(),
+    });
+    let conflicting_handle = BlobHandle {
+        handler: conflicting,
+    };
+
+    let retrying = tokio::spawn(async move {
+        let effect = BlobEffect::Write {
+            resolved: ResolvedBackend::node_default(),
+            bucket: "bucket-a".to_string(),
+            blob: stream_from_bytes(b"first"),
+            key: "first.bin".to_string(),
+            created_by: test_user_id(),
+            size: None,
+        };
+        conflicting_handle
+            .send_blob_effect(effect)
+            .await
+            .into_blob()
+    });
+
+    conflicted.notified().await;
+    let second = BlobEffect::Write {
+        resolved: ResolvedBackend::node_default(),
+        bucket: "bucket-a".to_string(),
+        blob: stream_from_bytes(b"second"),
+        key: "second.bin".to_string(),
+        created_by: test_user_id(),
+        size: None,
+    };
+    let second_result = context
+        .blob_handle
+        .send_blob_effect(second)
+        .await
+        .into_blob();
+    assert!(
+        matches!(second_result, Ok(BlobEvent::WriteFinished { .. })),
+        "same-bucket write should complete during peer backoff: {second_result:?}"
+    );
+    assert!(
+        !retrying.is_finished(),
+        "retrying write should still be awaiting backoff release"
+    );
+
+    release.store(true, std::sync::atomic::Ordering::Release);
+    let first_result = retrying.await.expect("retrying task panicked");
+    assert!(
+        matches!(first_result, Ok(BlobEvent::WriteFinished { .. })),
+        "retrying write should succeed once conflicts clear: {first_result:?}"
+    );
+    let backend = BackendRef::node_default();
+    let load = bucket_load(&context.storage_handle, &backend, &first.storage_bucket).await;
+    assert_eq!(load, 3);
+}
+
 #[tokio::test]
 async fn hidden_bucket_registered() {
     let context = setup_blob_handle(5).await;

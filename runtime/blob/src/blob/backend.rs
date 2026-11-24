@@ -323,10 +323,13 @@ impl BlobHandler {
         }
         let marker = reservation_key(key)?;
         let lock = self.stats_lock(&key.backend, &key.storage_bucket);
-        let _queued = lock.lock().await;
         let mut last_error = None;
         for attempt in 0..BUCKET_STATS_RETRIES {
-            match self.release_key_txn(key, &marker).await {
+            let outcome = {
+                let _queued = lock.lock().await;
+                self.release_key_txn(key, &marker).await
+            };
+            match outcome {
                 Ok(LoadUpdate::Applied) => return Ok(()),
                 Ok(LoadUpdate::Conflict) if attempt + 1 < BUCKET_STATS_RETRIES => {
                     tokio::time::sleep(conflict_backoff(attempt)).await;
@@ -360,13 +363,14 @@ impl BlobHandler {
         }
         let marker = reservation_key(key)?;
         let lock = self.stats_lock(backend, bucket);
-        let _queued = lock.lock().await;
         let mut last_error = None;
         for attempt in 0..BUCKET_STATS_RETRIES {
-            match self
-                .reserve_key_txn(backend, bucket, &marker, capacity)
-                .await
-            {
+            let outcome = {
+                let _queued = lock.lock().await;
+                self.reserve_key_txn(backend, bucket, &marker, capacity)
+                    .await
+            };
+            match outcome {
                 Ok(LoadUpdate::Conflict) if attempt + 1 < BUCKET_STATS_RETRIES => {
                     tokio::time::sleep(conflict_backoff(attempt)).await;
                 }
@@ -872,10 +876,13 @@ impl BlobHandler {
             return self.clear_marker(location).await;
         }
         let lock = self.stats_lock(&location.backend, &location.storage_bucket);
-        let _queued = lock.lock().await;
         let mut last_error = None;
         for attempt in 0..BUCKET_STATS_RETRIES {
-            match self.release_marker(location).await {
+            let outcome = {
+                let _queued = lock.lock().await;
+                self.release_marker(location).await
+            };
+            match outcome {
                 Ok(ReleaseUpdate::Applied) => return Ok(()),
                 Ok(ReleaseUpdate::Missing) => {
                     self.clear_active(location.ulid);
@@ -1175,13 +1182,14 @@ impl BlobHandler {
             return Ok(LoadUpdate::Applied);
         }
         let lock = self.stats_lock(backend, bucket);
-        let _queued = lock.lock().await;
 
         for attempt in 0..BUCKET_STATS_RETRIES {
-            match self
-                .try_adjust_load(backend, bucket, delta, capacity, location)
-                .await?
-            {
+            let outcome = {
+                let _queued = lock.lock().await;
+                self.try_adjust_load(backend, bucket, delta, capacity, location)
+                    .await?
+            };
+            match outcome {
                 LoadUpdate::Conflict => {}
                 outcome => return Ok(outcome),
             }
