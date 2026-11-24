@@ -11,36 +11,38 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::id::NodeId;
+use aruna_core::job_request::LABEL_TAG_PREFIX;
 use aruna_core::job_request::{SubmissionScope, SubmitJobError};
 use aruna_core::jobs::{JobEffect, JobEvent};
 use aruna_core::keyspaces::WORKFLOW_TASK_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::execution::job::family::{JobProjection, LogicalJobState};
+use aruna_core::structs::execution::job::family::{JobProjection, LogicalJobSpec, LogicalJobState};
 use aruna_core::structs::execution::job::identity::{JobId, RETENTION_MS};
 use aruna_core::structs::execution::job::input::{
     ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, OutputDestination,
-    OutputSelection, WORKFLOW_RUN_TAG, WORKFLOW_TASK_TAG,
+    OutputSelection, WORKFLOW_RUN_TAG, WORKFLOW_TASK_TAG, run_area_bucket,
 };
 use aruna_core::structs::execution::job::local::WorkspaceMode;
 use aruna_core::structs::execution::workflow_run::{
     CacheScope, RunFile, RunState, WorkflowRunRecord, WorkflowTaskRecord, named_task, task_key,
 };
 use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::storage::node_info::{LOCATION_LABEL_KEY, NODE_LABEL_KEY};
 use aruna_core::structs::storage::object_read::ObjectRangeRequest;
 use aruna_core::structs::storage::routing::NodeRouting;
 use aruna_ops_data::s3::object::get::{
     GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult,
 };
 use aruna_workflow_contract::host::{StartTask, TaskFinished, TaskOutput};
-use aruna_workflow_contract::{ContractError, HostRpcResult};
+use aruna_workflow_contract::{ArunaStepSettings, ContractError, HostRpcResult};
 use tracing::warn;
 use ulid::Ulid;
 
 use super::cache::{
     CacheEntry, CacheHit, LookupCacheOperation, StoreCacheOperation, deterministic, task_scope,
 };
-use super::data::{Target, WriteBody, WriteObjectOperation, address_of, area_of, resolve};
+use super::data::{Target, WriteBody, WriteObjectOperation, area_of, file_address, resolve};
 use super::{RunChange, RunTasksOperation, change_call, changed, creator_auth, tasks_answer};
 use crate::jobs::lifecycle::admit::here::AcceptedSubmission;
 use crate::jobs::lifecycle::cancel::CancelFamilyOperation;
@@ -105,19 +107,55 @@ fn input(path: String, source: InputSource) -> InputSelection {
     }
 }
 
-fn folder_output(folder: &str, bucket: &str, key: &str) -> OutputSelection {
+fn folder_output(folder: &str, destination: OutputDestination) -> OutputSelection {
     let folder = folder.trim_end_matches('/');
     OutputSelection {
         container_path: format!("{folder}/**"),
         path_prefix: Some(folder.to_owned()),
         destination_node_id: None,
-        destination: OutputDestination::S3 {
-            bucket: bucket.to_owned(),
-            key: key.trim_end_matches('/').to_owned(),
-        },
+        destination,
         name: None,
         description: None,
     }
+}
+
+/// The prefix of an attempt's work folder in the run area of the node that runs it.
+fn work_prefix(record: &WorkflowRunRecord, name: &str) -> String {
+    format!("{}/tasks/{name}/work", record.run_id)
+}
+
+/// The tags that pin a task to a site or a node: the task's own, else its step's, else the
+/// run's. They are required labels, so a named site or node never falls back to another.
+fn placement_tags(record: &WorkflowRunRecord, request: &StartTask) -> Vec<(String, String)> {
+    let settings = request.step_settings.as_ref();
+    site_tags(
+        request.site.clone(),
+        settings,
+        record.placement_site.clone(),
+    )
+}
+
+/// The required label tags of a site the task names, else its step's, else the run's, and of
+/// the node its step names.
+pub(crate) fn site_tags(
+    site: Option<String>,
+    settings: Option<&ArunaStepSettings>,
+    run_site: Option<String>,
+) -> Vec<(String, String)> {
+    let placement = settings.map(|settings| &settings.placement);
+    let site = site
+        .or_else(|| placement.and_then(|placement| placement.site.clone()))
+        .or(run_site);
+    let node = placement.and_then(|placement| placement.node.clone());
+    let label = |key: &str| format!("{LABEL_TAG_PREFIX}{key}");
+    let mut tags = Vec::new();
+    if let Some(site) = site.filter(|site| !site.trim().is_empty()) {
+        tags.push((label(LOCATION_LABEL_KEY), site));
+    }
+    if let Some(node) = node.filter(|node| !node.trim().is_empty()) {
+        tags.push((label(NODE_LABEL_KEY), node));
+    }
+    tags
 }
 
 /// The child job spec of one attempt: the wrapper as an inline file, the direct and staged
@@ -159,7 +197,9 @@ pub fn task_spec(
             key: target.key,
             version_id: target.version.map(|version| version.to_string()),
         };
-        inputs.push(input(path, source));
+        let mut selection = input(path, source);
+        selection.source_node_id = target.node;
+        inputs.push(selection);
     }
     let mut tags = BTreeMap::from([
         (WORKFLOW_RUN_TAG.to_owned(), record.run_id.to_string()),
@@ -168,6 +208,7 @@ pub fn task_spec(
     if request.network_allowed {
         tags.insert(NETWORK_TAG_KEY.to_owned(), "open".to_owned());
     }
+    tags.extend(placement_tags(record, request));
     let resources = &request.resources;
     Ok(ExecutionSpec {
         group_id: record.group_id,
@@ -190,13 +231,27 @@ pub fn task_spec(
                 .time_seconds
                 .map(|seconds| seconds.saturating_mul(1000)),
             preemptible: false,
+            gpus: (resources.gpus > 0).then_some(resources.gpus),
         },
         executor_constraint: None,
         backend: None,
         inputs,
+        // The control files go to the run's node, which reads them; the work folder stays in
+        // the run area of the node that runs the task.
         file_outputs: vec![
-            folder_output(control, &bucket, &format!("{folder}control")),
-            folder_output(&folders.work, &bucket, &format!("{folder}work")),
+            folder_output(
+                control,
+                OutputDestination::S3 {
+                    bucket,
+                    key: format!("{folder}control"),
+                },
+            ),
+            folder_output(
+                &folders.work,
+                OutputDestination::RunArea {
+                    prefix: work_prefix(record, &request.name),
+                },
+            ),
         ],
         workspace_outputs: Vec::new(),
         output_prefixes: Vec::new(),
@@ -218,9 +273,9 @@ fn task_record(
                 name: direct.path.clone(),
                 bucket: target.as_ref().map(|target| target.bucket.clone()),
                 key: target.as_ref().map(|target| target.key.clone()),
-                version_id: (target.and_then(|target| target.version))
+                version_id: (target.as_ref().and_then(|target| target.version))
                     .map(|version| version.to_string()),
-                node_id: None,
+                node_id: target.and_then(|target| target.node),
                 size: Some(direct.size),
                 digest: Some(direct.digest.clone()),
             }
@@ -236,8 +291,8 @@ fn task_record(
         attempt: request.attempt,
         index: None,
         child_job_id: None,
-        node_id: Some(record.node_id),
-        mode: Some("compute_to_data".to_owned()),
+        node_id: None,
+        mode: None,
         cached: false,
         cache_key: Some(task_key.to_owned()),
         deterministic: Some(deterministic(request)),
@@ -252,6 +307,39 @@ fn task_record(
         outputs: Vec::new(),
         stdout_tail: Vec::new(),
         stderr_tail: Vec::new(),
+    }
+}
+
+/// Where a child ran and how its inputs reached it: on the node that held them all, or with
+/// some of them staged from another node.
+#[derive(Clone, Debug, PartialEq)]
+struct Placed {
+    node_id: NodeId,
+    mode: &'static str,
+    staged_bytes: u64,
+}
+
+impl Placed {
+    /// The placement of the child's canonical execution; its captured inputs name the nodes
+    /// that held them when the job was admitted.
+    fn of(projection: &JobProjection, spec: &LogicalJobSpec) -> Option<Self> {
+        let execution = match projection.canonical_execution_id {
+            Some(id) => (projection.executions.iter()).find(|run| run.execution_id == id),
+            None => projection.executions.last(),
+        }?;
+        let node_id = execution.executor_node_id;
+        let staged = (spec.captured_inputs.iter()).filter(|input| input.source_node_id != node_id);
+        let (count, staged_bytes) = staged.fold((0, 0u64), |(count, sum), input| {
+            (count + 1, sum + input.bytes)
+        });
+        Some(Self {
+            node_id,
+            mode: match count {
+                0 => "compute_to_data",
+                _ => "data_to_compute",
+            },
+            staged_bytes,
+        })
     }
 }
 
@@ -289,6 +377,7 @@ pub struct RunTaskOperation {
     request: Box<StartTask>,
     task_key: String,
     scope: CacheScope,
+    placed: Option<Placed>,
     waits: u32,
     started: bool,
     now_ms: u64,
@@ -308,6 +397,7 @@ impl RunTaskOperation {
             request,
             task_key,
             scope,
+            placed: None,
             waits: 0,
             started: false,
             now_ms: 0,
@@ -322,7 +412,13 @@ impl RunTaskOperation {
     }
 
     fn record(&self, state: RunState) -> WorkflowTaskRecord {
-        task_record(&self.run, &self.request, &self.task_key, state)
+        let mut task = task_record(&self.run, &self.request, &self.task_key, state);
+        if let Some(placed) = &self.placed {
+            task.node_id = Some(placed.node_id);
+            task.mode = Some(placed.mode.to_owned());
+            task.staged_bytes = Some(placed.staged_bytes);
+        }
+        task
     }
 
     /// Queues the attempt for a child job, as no cached result can answer it.
@@ -364,6 +460,7 @@ impl RunTaskOperation {
                 key,
                 version: None,
                 owned: true,
+                node: None,
             }
         });
         let version = (file.version_id.as_deref()).and_then(|version| version.parse().ok());
@@ -377,6 +474,7 @@ impl RunTaskOperation {
             key,
             version,
             owned: false,
+            node: file.node_id,
         };
         let write = WriteObjectOperation::new(
             (self.run.clone(), self.run.node_id),
@@ -425,11 +523,10 @@ impl RunTaskOperation {
         task.stderr_tail = hit.record.stderr_tail.clone();
         let answered = (outputs.iter())
             .filter_map(|file| {
-                let version = (file.version_id.as_deref()).and_then(|version| version.parse().ok());
                 Some(TaskOutput {
                     path: file.name.clone(),
                     directory: false,
-                    address: address_of(file.bucket.as_deref()?, file.key.as_deref()?, version),
+                    address: file_address(self.run.node_id, file)?,
                     digest: None,
                     size: file.size.unwrap_or_default(),
                 })
@@ -472,10 +569,8 @@ impl RunTaskOperation {
                 for output in &mut finished.outputs {
                     let file = pinned.iter().find(|file| file.name == output.path);
                     if let Some(file) = file.filter(|file| file.version_id.is_some()) {
-                        let version = (file.version_id.as_deref()).and_then(|v| v.parse().ok());
-                        let (bucket, key) = (file.bucket.as_deref(), file.key.as_deref());
-                        if let (Some(bucket), Some(key)) = (bucket, key) {
-                            output.address = address_of(bucket, key, version);
+                        if let Some(address) = file_address(self.run.node_id, file) {
+                            output.address = address;
                         }
                         output.size = file.size.unwrap_or(output.size);
                     }
@@ -576,10 +671,14 @@ impl RunTaskOperation {
                 None
             }
         };
-        let projection = view.and_then(|(family, _)| family.projection);
-        let Some(projection) = projection else {
+        let Some((projection, spec)) =
+            view.and_then(|(family, spec)| Some((family.projection?, spec)))
+        else {
             return self.wait(job_id);
         };
+        if let Some(placed) = Placed::of(&projection, &spec) {
+            self.placed = Some(placed);
+        }
         match projection.state {
             LogicalJobState::Queued | LogicalJobState::Indeterminate => self.wait(job_id),
             LogicalJobState::Running if self.started => self.wait(job_id),
@@ -621,6 +720,36 @@ impl RunTaskOperation {
         Ok(Next::Call(IoCall::Delay(POLL_DELAY)))
     }
 
+    /// Where an output the manifest names lies: an absolute path in the control folder on the
+    /// run's node, a relative one in the run area of the node that ran the task. The child's
+    /// output records give the exact version, its size and digest.
+    fn output_file(&self, projection: &JobProjection, path: &str) -> RunFile {
+        let (bucket, folder) = attempt_folder(&self.run, &self.request.name).unwrap_or_default();
+        let (bucket, key, node) = match path.strip_prefix('/') {
+            Some(absolute) => {
+                let key = format!("{folder}control/root/{absolute}");
+                (bucket, key, self.run.node_id)
+            }
+            None => {
+                let node = (self.placed.as_ref()).map_or(self.run.node_id, |placed| placed.node_id);
+                let bucket = run_area_bucket(self.run.group_id, node);
+                let key = format!("{}/{path}", work_prefix(&self.run, &self.request.name));
+                (bucket, key, node)
+            }
+        };
+        let written = (projection.outputs.as_slice().iter())
+            .find(|object| object.bucket == bucket && object.key == key);
+        RunFile {
+            name: path.to_owned(),
+            bucket: Some(bucket),
+            key: Some(key),
+            version_id: written.map(|object| object.version_id.to_string()),
+            node_id: Some(written.map_or(node, |object| object.node_id)),
+            size: written.map(|object| object.size),
+            digest: written.and_then(|object| object.digest.clone()),
+        }
+    }
+
     /// The answer of an ended child, from the wrapper's control files where they exist and the
     /// child's own result where they do not.
     fn collected(
@@ -656,8 +785,7 @@ impl RunTaskOperation {
         let stderr = result
             .and_then(|result| result.stderr.as_ref())
             .map(|tail| tail.as_str().to_owned());
-        let (bucket, folder) = attempt_folder(&self.run, &self.request.name).unwrap_or_default();
-        let outputs: Vec<TaskOutput> = (text("manifest").unwrap_or_default().lines())
+        let manifest: Vec<(String, bool)> = (text("manifest").unwrap_or_default().lines())
             .filter_map(|line| line.split_once(' '))
             .filter(|(kind, path)| {
                 matches!(*kind, "file" | "directory")
@@ -665,18 +793,18 @@ impl RunTaskOperation {
                     && !path.contains('\0')
                     && !path.split('/').any(|part| part == "..")
             })
-            .map(|(kind, path)| {
-                let key = match path.strip_prefix('/') {
-                    Some(absolute) => format!("{folder}control/root/{absolute}"),
-                    None => format!("{folder}work/{path}"),
-                };
-                TaskOutput {
-                    path: path.to_owned(),
-                    directory: kind == "directory",
-                    address: address_of(&bucket, &key, None),
-                    digest: None,
-                    size: 0,
-                }
+            .map(|(kind, path)| (path.to_owned(), kind == "directory"))
+            .collect();
+        let files: Vec<RunFile> = (manifest.iter())
+            .map(|(path, _)| self.output_file(&projection, path))
+            .collect();
+        let outputs = (files.iter().zip(&manifest))
+            .map(|(file, (_, directory))| TaskOutput {
+                path: file.name.clone(),
+                directory: *directory,
+                address: file_address(self.run.node_id, file).unwrap_or_default(),
+                digest: None,
+                size: file.size.unwrap_or_default(),
             })
             .collect();
         let seconds = |name: &str| text(name).and_then(|value| value.parse::<f64>().ok());
@@ -703,18 +831,7 @@ impl RunTaskOperation {
         task.finished_at_ms = Some(self.now_ms);
         task.stdout_tail = finished.stdout_tail.clone();
         task.stderr_tail = finished.stderr_tail.clone();
-        task.outputs = (finished.outputs.iter())
-            .map(|output| {
-                let target = resolve(&self.run, &output.address).ok();
-                RunFile {
-                    name: output.path.clone(),
-                    bucket: target.as_ref().map(|target| target.bucket.clone()),
-                    key: target.map(|target| target.key),
-                    node_id: Some(self.run.node_id),
-                    ..RunFile::default()
-                }
-            })
-            .collect();
+        task.outputs = files;
         // Only a result with exit code 0 is kept; another one is never reused.
         if exit_code == Some(0) {
             return self.keep(task, finished);
@@ -1010,3 +1127,7 @@ impl Operation for StopTasksOperation {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "place_tests.rs"]
+mod place_tests;

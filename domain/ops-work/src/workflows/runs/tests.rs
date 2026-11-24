@@ -170,6 +170,7 @@ impl Runs {
             }),
             provenance_crate: false,
             idempotency_key: key.map(Into::into),
+            placement_site: None,
         }
     }
 
@@ -612,6 +613,7 @@ pub(super) fn sample_run() -> WorkflowRunRecord {
         resumes_run_id: None,
         repeats_run_id: None,
         cache_scope: Default::default(),
+        placement_site: None,
     }
 }
 

@@ -246,19 +246,24 @@ impl PrepareRunOperation {
 
 /// The values of a run with its pinned inputs as addresses the coordinator reads through the
 /// node, a list where the request pinned several objects for one input.
-fn run_inputs(record: &WorkflowRunRecord) -> Result<Value, CatalogError> {
+pub(crate) fn run_inputs(record: &WorkflowRunRecord) -> Result<Value, CatalogError> {
     let mut values: Map<String, Value> = crate::workflows::from_text(&record.values_json)?;
     let Some(inputs) = record.inputs_json.as_deref() else {
         return Ok(Value::Object(values));
     };
     let inputs: Map<String, Value> = crate::workflows::from_text(inputs)?;
+    // A pin another node holds names that node, so the run reads it there.
     let address = |pin: &Value| -> Option<Value> {
         let bucket = pin.get("bucket")?.as_str()?;
         let key = pin.get("key")?.as_str()?;
         let version = pin.get("version_id")?.as_str()?;
-        Some(Value::String(format!(
-            "aruna://{bucket}/{key}?version={version}"
-        )))
+        let node = (pin.get("source_node_id").and_then(Value::as_str))
+            .and_then(|node| node.parse::<NodeId>().ok())
+            .filter(|node| *node != record.node_id);
+        Some(Value::String(match node {
+            Some(node) => format!("aruna://{bucket}/{key}?version={version}&node={node}"),
+            None => format!("aruna://{bucket}/{key}?version={version}"),
+        }))
     };
     for (name, pin) in inputs {
         let value = match &pin {

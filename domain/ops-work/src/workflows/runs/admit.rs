@@ -53,6 +53,8 @@ pub struct RunRequest {
     pub output: Option<RunOutput>,
     pub provenance_crate: bool,
     pub idempotency_key: Option<String>,
+    /// The site every task of the run must run at; `None` lets each task go where it fits.
+    pub placement_site: Option<String>,
 }
 
 impl RunRequest {
@@ -224,6 +226,7 @@ impl StartRunOperation {
             resumes_run_id: self.lineage.resumes,
             repeats_run_id: self.lineage.repeats,
             cache_scope: self.lineage.cache_scope,
+            placement_site: request.placement_site.clone(),
         };
         let key = request.idempotency_key.as_ref().map(|key| {
             let row = self.key_row(key);

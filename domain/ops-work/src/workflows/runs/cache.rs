@@ -261,6 +261,11 @@ impl StoreCacheOperation {
         let Some(file) = self.pending.pop() else {
             return self.write();
         };
+        // An output the child's records name by its exact version, possibly on another node.
+        if file.version_id.is_some() {
+            self.pinned.push(file);
+            return self.next_head();
+        }
         let (Some(bucket), Some(key)) = (file.bucket.clone(), file.key.clone()) else {
             self.complete = false;
             self.pinned.push(file);

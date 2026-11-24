@@ -23,6 +23,7 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::object_read::ObjectRangeRequest;
 use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::routing::{NodeRouting, RoutingSnapshot};
+use aruna_ops_data::replication::bao_read::BaoReadOutput;
 use aruna_ops_data::s3::object::get::{
     GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult,
 };
@@ -46,6 +47,7 @@ use aruna_workflow_contract::{ContractError, DATA_CHUNK_BYTES, HostRpcResult};
 use bytes::Bytes;
 use ulid::Ulid;
 
+use super::remote::{self, RemoteReadOperation};
 use super::{RunChange, change_call, changed, creator_auth};
 use crate::workflows::CatalogError;
 
@@ -64,6 +66,15 @@ pub struct Target {
     pub version: Option<Ulid>,
     /// The object lies in the run's own area, which the run wrote itself.
     pub owned: bool,
+    /// The node that holds the exact version, when the address names one; `None` is this node.
+    pub node: Option<NodeId>,
+}
+
+impl Target {
+    /// The node that holds the object, when it is not `local`.
+    pub fn remote(&self, local: NodeId) -> Option<NodeId> {
+        self.node.filter(|node| *node != local)
+    }
 }
 
 /// The bucket and key prefix of a run's area, ending in `/`; `None` without an output bucket.
@@ -86,6 +97,25 @@ pub fn address_of(bucket: &str, key: &str, version: Option<Ulid>) -> String {
         Some(version) => format!("aruna://{bucket}/{key}?version={version}"),
         None => format!("aruna://{bucket}/{key}"),
     }
+}
+
+/// The address of an object that `node` holds, like a task output in its run area there.
+pub fn address_on(bucket: &str, key: &str, version: Option<Ulid>, node: NodeId) -> String {
+    match version {
+        Some(version) => format!("aruna://{bucket}/{key}?version={version}&node={node}"),
+        None => format!("aruna://{bucket}/{key}?node={node}"),
+    }
+}
+
+/// The address of a file of a run as seen from `local`: it names its node only when another
+/// node holds the exact version.
+pub fn file_address(local: NodeId, file: &RunFile) -> Option<String> {
+    let (bucket, key) = (file.bucket.as_deref()?, file.key.as_deref()?);
+    let version = (file.version_id.as_deref()).and_then(|version| version.parse().ok());
+    Some(match file.node_id.filter(|node| *node != local) {
+        Some(node) => address_on(bucket, key, version, node),
+        None => address_of(bucket, key, version),
+    })
 }
 
 fn denied(message: impl Into<String>) -> ContractError {
@@ -112,6 +142,7 @@ pub fn resolve(record: &WorkflowRunRecord, address: &str) -> Result<Target, Cont
             key: format!("{prefix}staging/{rest}"),
             version: None,
             owned: true,
+            node: None,
         });
     }
     let rest = (address.strip_prefix("aruna://"))
@@ -119,25 +150,36 @@ pub fn resolve(record: &WorkflowRunRecord, address: &str) -> Result<Target, Cont
         .ok_or_else(|| {
             ContractError::unsupported(format!("the address {address} is not served"))
         })?;
-    let (path, version) = match rest.split_once("?version=") {
-        Some((path, version)) => {
-            let version = Ulid::from_string(version)
-                .map_err(|_| ContractError::invalid(format!("{version} is no version id")))?;
-            (path, Some(version))
+    let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let (mut version, mut node) = (None, None);
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        match pair.split_once('=') {
+            Some(("version", text)) => {
+                let parsed = Ulid::from_string(text)
+                    .map_err(|_| ContractError::invalid(format!("{text} is no version id")))?;
+                version = Some(parsed);
+            }
+            Some(("node", text)) => {
+                let parsed = (text.parse::<NodeId>())
+                    .map_err(|_| ContractError::invalid(format!("{text} is no node id")))?;
+                node = Some(parsed);
+            }
+            _ => return Err(ContractError::invalid(format!("{address} names no object"))),
         }
-        None => (rest, None),
-    };
+    }
     let (bucket, key) = path.split_once('/').unwrap_or((path, ""));
     if bucket.is_empty() || key.split('/').any(|part| part == "..") {
         return Err(ContractError::invalid(format!("{address} names no object")));
     }
-    let owned =
-        area.is_some_and(|(area_bucket, prefix)| area_bucket == bucket && key.starts_with(&prefix));
+    let owned = node.is_none()
+        && area
+            .is_some_and(|(area_bucket, prefix)| area_bucket == bucket && key.starts_with(&prefix));
     Ok(Target {
         bucket: bucket.to_owned(),
         key: key.to_owned(),
         version,
         owned,
+        node,
     })
 }
 
@@ -272,6 +314,7 @@ enum ReadStep {
     List(Target, Box<BucketInfo>),
     Get(Target),
     Collect(Box<GetObjectResult>),
+    Remote,
 }
 
 /// Answers one stat, listing or chunk read of the coordinator as the run's creator.
@@ -484,6 +527,11 @@ impl Operation for ReadDataOperation {
             Ok(target) => target,
             Err(error) => return Self::failed(error),
         };
+        if let Some(node) = target.remote(self.node_id) {
+            let read = RemoteReadOperation::new(self.run.clone(), target, node, self.call.clone());
+            self.step = Some(ReadStep::Remote);
+            return Ok(Next::Call(IoCall::child(read)));
+        }
         let access = ObjectAccessOperation::new(
             &creator_auth(&self.run),
             self.node_id,
@@ -523,6 +571,7 @@ impl Operation for ReadDataOperation {
             ReadStep::List(target, info) => self.listed(target, *info, result),
             ReadStep::Get(target) => self.got(target, result),
             ReadStep::Collect(object) => self.collected(*object, result),
+            ReadStep::Remote => Ok(Next::Done(result.child::<HostRpcResult, CatalogError>()??)),
         }
     }
 }
@@ -572,6 +621,7 @@ pub fn delivery_target(record: &WorkflowRunRecord, path: &str) -> Result<Target,
         key,
         version: None,
         owned: false,
+        node: None,
     })
 }
 
@@ -592,6 +642,15 @@ enum WriteStep {
     ),
     Put,
     Record(Box<UploadReceipt>),
+    /// A copy whose source another node holds is read through that node.
+    Remote(
+        Box<(
+            BucketInfo,
+            Option<u64>,
+            RoutingSnapshot,
+            Option<GateContext>,
+        )>,
+    ),
 }
 
 /// Writes one object of a run as its creator: an upload's bytes into the area or a bucket the
@@ -777,6 +836,10 @@ impl Operation for WriteObjectOperation {
                     Err(error) => return Self::failed(refusal(error, &address)?),
                 };
                 match &self.body {
+                    // The holder authorizes the creator's read of its own copy.
+                    Some(WriteBody::Copy(source)) if source.remote(self.node_id).is_some() => {
+                        self.config(info)
+                    }
                     Some(WriteBody::Copy(source)) => {
                         let call = self.access(source, Permission::READ);
                         self.step = WriteStep::Source(Box::new(info));
@@ -819,6 +882,15 @@ impl Operation for WriteObjectOperation {
                 let Some(WriteBody::Copy(source)) = &self.body else {
                     return self.put((info, ceiling, routing, gate));
                 };
+                if let Some(node) = source.remote(self.node_id) {
+                    let Some(read) = remote::read_call(&self.run, source, node, (false, None))
+                    else {
+                        let message = "an object on another node is copied by its exact version";
+                        return Self::failed(ContractError::invalid(message));
+                    };
+                    self.step = WriteStep::Remote(Box::new((info, ceiling, routing, gate)));
+                    return Ok(Next::Call(read));
+                }
                 let group_id = (self.source.as_ref())
                     .map(|source| source.group_id)
                     .ok_or(IoError::Unfinished)?;
@@ -846,6 +918,14 @@ impl Operation for WriteObjectOperation {
                 self.stream = Some((object.blob, object.info.size));
                 self.put(*parts)
             }
+            WriteStep::Remote(parts) => match remote::read_answer(result)? {
+                Ok(BaoReadOutput::Stream { blob, size, .. }) => {
+                    self.stream = Some((blob, size));
+                    self.put(*parts)
+                }
+                Ok(BaoReadOutput::Metadata { .. }) => Err(IoError::Unfinished.into()),
+                Err(error) => Self::failed(error),
+            },
             WriteStep::Put => {
                 let put = result.child::<PutObjectResult, PutObjectError>()?;
                 match put {

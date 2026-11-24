@@ -4,16 +4,20 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use aruna_clock::unix_timestamp_millis;
+use aruna_core::id::NodeId;
 use aruna_core::jobs::JobRunOutcome;
 use aruna_core::structs::execution::job::local::{JobError, JobResultPayload};
 use aruna_core::structs::execution::workflow_run::{RunState, WorkflowRunRecord, WorkflowRunSpec};
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_ops_work::jobs::lifecycle::submit_external::IngressNode;
 use aruna_ops_work::jobs::node_inputs::ingress_node;
 use aruna_ops_work::workflows::runs::provenance::WriteProvenanceOperation;
 use aruna_ops_work::workflows::runs::recover::{InterruptRunOperation, Interrupted};
+use aruna_ops_work::workflows::runs::replica::ReplicateLogOperation;
 use aruna_ops_work::workflows::runs::run::{
     AnswerCallOperation, ApplyEventOperation, CallNode, Chunk, FinishRunOperation, Inbound,
     OpenUploadOperation, PrepareRunOperation, Prepared, SessionOperation, Uploads, claim_digest,
@@ -32,6 +36,8 @@ use ulid::Ulid;
 const CANCEL_GRACE: Duration = Duration::from_secs(60);
 /// Frames read ahead of the session loop.
 const FRAME_QUEUE: usize = 64;
+/// How often a running run sends its new log pages to the holders of its group's records.
+const REPLICATE_EVERY: Duration = Duration::from_secs(60);
 
 /// Runs one attempt of `spec`'s run on this node until the run ends, the job is cancelled or
 /// the node shuts down.
@@ -52,8 +58,25 @@ pub(crate) async fn run_workflow(ctx: &JobContext, spec: &WorkflowRunSpec) -> Jo
     };
     if !matches!(outcome, JobRunOutcome::Interrupted) {
         write_crate(ctx, spec).await;
+        let local = (ctx.owner_node_id, spec.realm_id);
+        replicate(ctx.driver.clone(), spec.run_id, local, Arc::default()).await;
     }
     outcome
+}
+
+/// Sends the run and its log pages from the last sent page on to the holders of the run
+/// group's records, so another node can resume the run while this one is unreachable.
+async fn replicate(
+    driver: Arc<DriverContext>,
+    run_id: Ulid,
+    local: (NodeId, RealmId),
+    sent: Arc<AtomicU32>,
+) {
+    let send = ReplicateLogOperation::new(run_id, local, sent.load(Ordering::Relaxed));
+    match drive(send, &driver).await {
+        Ok(pages) => sent.store(pages, Ordering::Relaxed),
+        Err(error) => warn!(%error, run = %run_id, "the run log was not copied"),
+    }
 }
 
 /// Writes the crate of a run that ended, once; a run that goes on is left alone. A failed
@@ -112,6 +135,8 @@ struct Session<'a> {
     run: WorkflowRunRecord,
     uploads: Uploads,
     calls: JoinSet<()>,
+    /// The log pages the holders of the run group's records got so far.
+    sent: Arc<AtomicU32>,
 }
 
 impl<'a> Session<'a> {
@@ -122,6 +147,7 @@ impl<'a> Session<'a> {
             run,
             uploads: Uploads::default(),
             calls: JoinSet::new(),
+            sent: Arc::default(),
         }
     }
 
@@ -130,6 +156,7 @@ impl<'a> Session<'a> {
         let driver = self.ctx.driver.clone();
         let reader = tokio::spawn(read_frames(driver, self.run.run_id, sender));
         let mut deadline: Option<tokio::time::Instant> = None;
+        let mut copies = tokio::time::interval(REPLICATE_EVERY);
         let outcome = loop {
             let grace = async {
                 match deadline {
@@ -161,6 +188,12 @@ impl<'a> Session<'a> {
                     }
                 },
                 Some(_) = self.calls.join_next() => {}
+                _ = copies.tick() => {
+                    let driver = self.ctx.driver.clone();
+                    let local = (self.ctx.owner_node_id, self.realm_id);
+                    let copy = replicate(driver, self.run.run_id, local, self.sent.clone());
+                    self.calls.spawn(copy);
+                }
             }
         };
         reader.abort();

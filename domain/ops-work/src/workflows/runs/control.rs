@@ -4,13 +4,19 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::errors::AuthorizationError;
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::workflow_run::{CacheScope, WorkflowRunRecord};
-use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use serde_json::Value;
 use ulid::Ulid;
+
+use aruna_ops_identity::auth::check_permissions::{
+    CheckPermissionsConfig, CheckPermissionsOperation,
+};
+use aruna_ops_identity::groups::admin_check::realm_groups_path;
 
 use super::admit::{AdmittedRun, Lineage, PinnedInput, RunRequest, StartRunOperation};
 use super::{RunAccessOperation, access_of};
@@ -33,7 +39,15 @@ pub struct FollowRunOperation {
     node: (NodeId, RealmId),
     source: Ulid,
     follow: Follow,
-    accessed: bool,
+    step: FollowStep,
+}
+
+#[derive(Debug, PartialEq)]
+enum FollowStep {
+    Access,
+    /// A copy of a run another node coordinates waits for the realm admin check.
+    Admin(Box<WorkflowRunRecord>),
+    Start,
 }
 
 impl FollowRunOperation {
@@ -43,13 +57,56 @@ impl FollowRunOperation {
             node,
             source,
             follow,
-            accessed: false,
+            step: FollowStep::Access,
         }
+    }
+
+    fn admit(
+        &mut self,
+        source: &WorkflowRunRecord,
+    ) -> Result<Next<WorkflowRunRecord>, CatalogError> {
+        let start = self.start(source)?;
+        self.step = FollowStep::Start;
+        Ok(Next::Call(IoCall::child(start)))
+    }
+
+    /// Decides on a run that has not ended. Only a copy of a run another node coordinates is
+    /// resumed here, and only by its owner or a realm admin; the copy itself never moves.
+    fn active(
+        &mut self,
+        source: WorkflowRunRecord,
+    ) -> Result<Next<WorkflowRunRecord>, CatalogError> {
+        if source.node_id == self.node.0 || self.follow != Follow::Resume {
+            return Err(CatalogError::Conflict(format!(
+                "the run is still {}",
+                source.state.as_str()
+            )));
+        }
+        if source.created_by == self.auth.user_id {
+            return self.admit(&source);
+        }
+        let check = CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context: self.auth.clone(),
+            path: realm_groups_path(&self.auth),
+            required_permission: Permission::WRITE,
+        });
+        self.step = FollowStep::Admin(Box::new(source));
+        Ok(Next::Call(IoCall::child(check)))
     }
 
     fn start(&self, source: &WorkflowRunRecord) -> Result<StartRunOperation, CatalogError> {
         let values: Value = crate::workflows::from_text(&source.values_json)?;
-        let inputs = match source.inputs_json.as_deref() {
+        let mut inputs_json = source.inputs_json.clone();
+        // Pins the run's own node held name it once the run continues on another node.
+        if let Some(text) = inputs_json
+            .as_deref()
+            .filter(|_| source.node_id != self.node.0)
+        {
+            let mut inputs: Value = crate::workflows::from_text(text)?;
+            held_by(&mut inputs, source.node_id);
+            inputs_json = Some(crate::workflows::to_text(&inputs)?);
+        }
+        let inputs = match inputs_json.as_deref() {
             Some(text) => pins_of(&crate::workflows::from_text(text)?)?,
             None => Vec::new(),
         };
@@ -59,10 +116,11 @@ impl FollowRunOperation {
             version: source.version,
             values,
             inputs,
-            inputs_json: source.inputs_json.clone(),
+            inputs_json,
             output: source.output.clone(),
             provenance_crate: source.provenance_crate,
             idempotency_key: None,
+            placement_site: source.placement_site.clone(),
         };
         let lineage = match self.follow {
             Follow::Resume => Lineage {
@@ -79,6 +137,22 @@ impl FollowRunOperation {
             },
         };
         Ok(StartRunOperation::new(&self.auth, self.node, request).in_lineage(lineage))
+    }
+}
+
+/// Names `node` as the holder of every pin that names none.
+fn held_by(inputs: &mut Value, node: NodeId) {
+    let pins = (inputs.as_object_mut().into_iter()).flat_map(|inputs| inputs.values_mut());
+    for value in pins {
+        let listed: Vec<&mut Value> = match value {
+            Value::Array(items) => items.iter_mut().collect(),
+            other => vec![other],
+        };
+        for pin in listed.into_iter().filter_map(Value::as_object_mut) {
+            if !pin.get("source_node_id").is_some_and(Value::is_string) {
+                pin.insert("source_node_id".into(), Value::String(node.to_string()));
+            }
+        }
     }
 }
 
@@ -125,19 +199,27 @@ impl Operation for FollowRunOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<WorkflowRunRecord>, CatalogError> {
-        if !std::mem::replace(&mut self.accessed, true) {
-            let (source, _) = access_of(result)?;
-            if source.state.is_active() {
-                return Err(CatalogError::Conflict(format!(
-                    "the run is still {}",
-                    source.state.as_str()
-                )));
+        match std::mem::replace(&mut self.step, FollowStep::Start) {
+            FollowStep::Access => {
+                let (source, _) = access_of(result)?;
+                match source.state.is_active() {
+                    true => self.active(source),
+                    false => self.admit(&source),
+                }
             }
-            let start = self.start(&source)?;
-            return Ok(Next::Call(IoCall::child(start)));
+            FollowStep::Admin(source) => {
+                let allowed = result.child::<bool, AuthorizationError>()?;
+                match allowed {
+                    Ok(true) => self.admit(&source),
+                    Ok(false) => Err(CatalogError::Forbidden),
+                    Err(error) => Err(CatalogError::Storage(error.to_string())),
+                }
+            }
+            FollowStep::Start => {
+                let admitted = result.child::<AdmittedRun, CatalogError>()??;
+                Ok(Next::Done(admitted.record))
+            }
         }
-        let admitted = result.child::<AdmittedRun, CatalogError>()??;
-        Ok(Next::Done(admitted.record))
     }
 
     fn expected_error(error: &CatalogError) -> bool {
