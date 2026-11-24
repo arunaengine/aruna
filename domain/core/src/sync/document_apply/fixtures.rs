@@ -142,3 +142,75 @@ pub(super) fn failed<T: Any + Send + Debug + PartialEq>(error: ApplyError) -> Io
 pub(super) fn checked(validation: AdminEventValidation) -> IoResult {
     child((validation, None::<Arc<ConfigSnapshot>>))
 }
+
+/// The node info target of `node_id` in the test realm.
+pub(super) fn info_target(node_id: crate::id::NodeId) -> DocumentTarget {
+    DocumentTarget::NodeInfo {
+        realm_id: realm(),
+        node_id,
+    }
+}
+
+/// A node info upsert `node()` published as its `seq`th event, with its transport identity.
+pub(super) fn info_upsert(
+    seq: u64,
+    node_id: crate::id::NodeId,
+) -> (
+    crate::structs::sync_quarantine::SyncQuarantineIdentity,
+    DocumentEvent,
+) {
+    use crate::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision};
+    use crate::structs::storage::node_info::{NodeInfoDocument, NodeUrls, NodeUtilization};
+    let target = info_target(node_id);
+    let topic = target.sync_topic_id(realm(), &PlacementRef::NIL);
+    let peer = irokle::PeerId::from_bytes(*node().as_bytes());
+    let identity = crate::structs::sync_quarantine::SyncQuarantineIdentity {
+        topic,
+        actor: irokle::actor_id_for(topic, peer),
+        actor_seq: seq,
+    };
+    let utilization = NodeUtilization {
+        storage_bytes_used: seq,
+        documents_held: None,
+        load_permille: None,
+        heartbeat_at_ms: seq,
+        download_slots: None,
+        storage_capacity_bytes: None,
+    };
+    let document = NodeInfoDocument {
+        node_id,
+        executors: Vec::new(),
+        labels: Default::default(),
+        urls: NodeUrls {
+            api: None,
+            s3: None,
+        },
+        utilization,
+        updated_at_ms: seq,
+        epoch: Default::default(),
+        compute_draining: false,
+        leaving: false,
+        demand: Default::default(),
+        reservation: Default::default(),
+    };
+    let event_id = Ulid::from_parts(seq, 1);
+    let change = DocumentChange {
+        base: None,
+        current: DocumentSyncRevision {
+            generation: 1,
+            event_id,
+            actor: node(),
+            updated_at_ms: seq,
+        },
+        kind: DocumentChangeKind::Upsert,
+        placement: PlacementRef::NIL,
+    };
+    let bytes = document.to_bytes().expect("node info encodes");
+    let event = DocumentEvent::Upsert {
+        event_id,
+        target,
+        bytes,
+        change,
+    };
+    (identity, event)
+}

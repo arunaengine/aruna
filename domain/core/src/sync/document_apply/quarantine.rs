@@ -12,11 +12,13 @@ use super::{ApplyError, Step, invalid};
 use crate::document::DocumentTarget;
 use crate::keyspaces::{QUARANTINE_USAGE_KEYSPACE, SYNC_QUARANTINE_KEYSPACE};
 use crate::row_plan::{NeedsRows, PlanRows, PlanStop, Planned, RowPlan};
+use crate::structs::identity::realm::RealmId;
 use crate::structs::sync_quarantine::{
     QUARANTINE_USAGE_KEY, SyncQuarantineCapacity, SyncQuarantineError, SyncQuarantineIdentity,
     SyncQuarantineInput, SyncQuarantineRecord, SyncQuarantineUsage, SyncRejection,
     build_quarantine_entries, quarantine_usage_entry,
 };
+use crate::sync_checks::quarantined_node_info;
 use crate::types::{Key, KeySpace};
 
 /// Evidence rows for permanently rejected events, chained through the usage total and
@@ -104,14 +106,22 @@ pub fn quarantine_entries(
 /// The rows a change deletes and writes.
 type RowChanges = (Vec<(KeySpace, Key)>, Vec<Row>);
 
-/// Deletes the quarantine rows of earlier node info upserts the publisher of `identity` sent on
-/// its topic for `target`: a later one applied, so their evidence is obsolete. The usage row
+/// Whether the applied node info upsert of `plan` makes `record` obsolete: an earlier upsert of
+/// the same publisher and target, rejected only for a payload this version reads. A rejected
+/// delete or a policy refusal is never obsolete.
+pub(super) fn superseded_by(record: &SyncQuarantineRecord, plan: &SupersededInfoPlan) -> bool {
+    let (earlier, later) = (record.identity, plan.identity);
+    let recovered = quarantined_node_info(record, plan.realm_id);
+    earlier.topic == later.topic
+        && earlier.actor == later.actor
+        && earlier.actor_seq < later.actor_seq
+        && recovered.is_some_and(|(target, ..)| target == plan.target)
+}
+
+/// Deletes the quarantine rows the node info upsert of `plan` made obsolete. The usage row
 /// releases them; no such row changes nothing.
-fn superseded_info(
-    rows: &mut PlanRows,
-    identity: SyncQuarantineIdentity,
-    target: &DocumentTarget,
-) -> Step<RowChanges> {
+fn superseded_info(rows: &mut PlanRows, plan: &SupersededInfoPlan) -> Step<RowChanges> {
+    let identity = plan.identity;
     let publisher = [
         identity.topic.as_bytes().as_slice(),
         identity.actor.as_bytes().as_slice(),
@@ -124,7 +134,7 @@ fn superseded_info(
         let Ok(record) = SyncQuarantineRecord::from_bytes(value.as_ref()) else {
             continue;
         };
-        if record.identity.actor_seq < identity.actor_seq && record.target() == Some(target) {
+        if superseded_by(&record, plan) {
             deletes.push((SYNC_QUARANTINE_KEYSPACE.to_string(), key));
             (records, bytes) = (records + 1, bytes + value.len() as u64);
         }
@@ -148,20 +158,29 @@ fn superseded_info(
 }
 
 /// Drops the quarantine rows an applied node info upsert made obsolete, with their usage, in one
-/// write transaction; the node info apply itself runs without one.
+/// write transaction; the node info apply itself runs without one. Answers whether the upsert's
+/// document is the stored one, so the batch drops its own obsolete rejections too.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SupersededInfoPlan {
     pub identity: SyncQuarantineIdentity,
     pub target: DocumentTarget,
+    pub realm_id: RealmId,
+    /// The applied document.
+    pub bytes: Vec<u8>,
 }
 
 impl RowPlan for SupersededInfoPlan {
-    type Output = ();
+    type Output = bool;
     type Error = ApplyError;
 
-    fn plan(&self, rows: &mut PlanRows) -> Step<Planned<()>> {
-        let (deletes, writes) = superseded_info(rows, self.identity, &self.target)?;
-        Ok(Planned::changes((), deletes, writes))
+    /// An equal or older document that wrote nothing leaves every row.
+    fn plan(&self, rows: &mut PlanRows) -> Step<Planned<bool>> {
+        let stored = rows.read(self.target.storage_keyspace(), self.target.storage_key())?;
+        if stored.as_ref().map(|value| value.as_ref()) != Some(self.bytes.as_slice()) {
+            return Ok(Planned::output(false));
+        }
+        let (deletes, writes) = superseded_info(rows, self)?;
+        Ok(Planned::changes(true, deletes, writes))
     }
 }
 
