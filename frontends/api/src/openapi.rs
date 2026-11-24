@@ -85,6 +85,7 @@ Native Git/LFS also accepts HTTP Basic with an Aruna bearer token as the passwor
         (name = "access/service-accounts", description = "Service accounts of a group"),
         (name = "access/sessions", description = "User bearer sessions"),
         (name = "tes", description = "GA4GH TES v1.1 task execution facade"),
+        (name = "wes", description = "GA4GH WES v1.1 facade over the workflow runs of this node"),
         (name = "access/tokens", description = "Bearer token revocation"),
         (name = "access/users", description = "User operations"),
         (name = "access/devices", description = "User device administration")

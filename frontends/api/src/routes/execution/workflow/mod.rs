@@ -12,6 +12,7 @@ pub mod runs;
 pub mod tasks;
 pub mod tools;
 pub mod versions;
+pub mod wes;
 pub mod wire;
 
 use std::sync::Arc;
@@ -40,6 +41,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .merge(tasks::router())
         .merge(reports::router())
         .merge(events::router())
+        .merge(wes::router())
 }
 
 fn limit(asked: Option<usize>) -> usize {
