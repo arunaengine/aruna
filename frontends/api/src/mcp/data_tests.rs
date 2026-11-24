@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::mcp::caller;
 
 fn body(result: CallToolResult) -> serde_json::Value {
     assert_eq!(result.is_error, Some(true));
@@ -529,15 +530,6 @@ mod distributed {
         let head = drive(HeadObjectOperation::new(input), &node.context).await;
         assert!(head.is_err(), "nothing is stored on the relaying member");
     }
-}
-
-fn caller(auth: &AuthContext) -> http::request::Parts {
-    let (mut parts, ()) = http::Request::new(()).into_parts();
-    parts.extensions.insert(Some(auth.clone()));
-    parts
-        .extensions
-        .insert(None::<crate::auth::ValidatedBearer>);
-    parts
 }
 
 // The bucket list shows what the bucket search shows: a public bucket of another group joins
