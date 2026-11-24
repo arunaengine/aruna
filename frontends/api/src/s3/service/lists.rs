@@ -187,7 +187,7 @@ pub(super) async fn list_objects_v2(
 
     let mut response = S3Response::new(ListObjectsV2Output {
         name: Some(bucket),
-        prefix: prefix.map(&encode_field),
+        prefix: prefix.map(encode_field),
         max_keys: Some(i32::try_from(max_keys).unwrap_or(i32::MAX)),
         key_count: Some(i32::try_from(key_count).unwrap_or(i32::MAX)),
         continuation_token: requested_continuation_token,
@@ -195,9 +195,9 @@ pub(super) async fn list_objects_v2(
         next_continuation_token,
         contents: Some(contents),
         common_prefixes: Some(common_prefixes),
-        delimiter: delimiter.map(&encode_field),
+        delimiter: delimiter.map(encode_field),
         encoding_type: req.input.encoding_type,
-        start_after: start_after.map(&encode_field),
+        start_after: start_after.map(encode_field),
         ..Default::default()
     });
     forward::reads::mark_stale(&mut response.headers, &stale);
@@ -344,19 +344,19 @@ pub(super) async fn list_objects(
             result_token.as_ref(),
             contents.is_empty(),
         )
-        .map(&encode_field),
+        .map(encode_field),
     };
 
     let mut response = S3Response::new(ListObjectsOutput {
         name: Some(bucket),
-        prefix: prefix.map(&encode_field),
-        marker: marker.map(&encode_field),
+        prefix: prefix.map(encode_field),
+        marker: marker.map(encode_field),
         max_keys: Some(i32::try_from(max_keys).unwrap_or(i32::MAX)),
         is_truncated: Some(is_truncated),
         next_marker,
         contents: Some(contents),
         common_prefixes: Some(common_prefixes),
-        delimiter: delimiter.map(&encode_field),
+        delimiter: delimiter.map(encode_field),
         encoding_type: req.input.encoding_type,
         ..Default::default()
     });

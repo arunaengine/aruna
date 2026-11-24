@@ -369,13 +369,13 @@ pub(super) fn list_uploads_output(
 
     S3Response::new(ListMultipartUploadsOutput {
         bucket: Some(input.bucket),
-        prefix: input.prefix.map(&encode_field),
-        delimiter: input.delimiter.map(&encode_field),
-        key_marker: input.key_marker.map(&encode_field),
+        prefix: input.prefix.map(encode_field),
+        delimiter: input.delimiter.map(encode_field),
+        key_marker: input.key_marker.map(encode_field),
         upload_id_marker: input.upload_id_marker,
         max_uploads: Some(i32::try_from(max_uploads).unwrap_or(i32::MAX)),
         is_truncated: Some(result.is_truncated),
-        next_key_marker: result.next_key_marker.map(&encode_field),
+        next_key_marker: result.next_key_marker.map(encode_field),
         next_upload_id_marker: result
             .next_upload_marker
             .map(|upload_id| upload_id.to_string()),
@@ -471,13 +471,13 @@ impl ArunaS3Service {
 
         S3Response::new(ListObjectVersionsOutput {
             name: Some(input.bucket),
-            prefix: input.prefix.map(&encode_field),
-            delimiter: input.delimiter.map(&encode_field),
-            key_marker: input.key_marker.map(&encode_field),
+            prefix: input.prefix.map(encode_field),
+            delimiter: input.delimiter.map(encode_field),
+            key_marker: input.key_marker.map(encode_field),
             version_id_marker: input.version_id_marker,
             max_keys: Some(i32::try_from(max_keys).unwrap_or(i32::MAX)),
             is_truncated: Some(result.is_truncated),
-            next_key_marker: result.next_key_marker.map(&encode_field),
+            next_key_marker: result.next_key_marker.map(encode_field),
             next_version_id_marker: result
                 .next_version_marker
                 .map(|version_id| version_id.to_string()),

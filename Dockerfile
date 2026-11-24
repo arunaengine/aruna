@@ -3,12 +3,12 @@
 # SPDX-License-Identifier: MIT or Apache-2.0
 
 # iroh-doctor does not depend on this repository, so source changes keep this stage cached.
-FROM rust:1.97.1-trixie@sha256:1bcff4befb740599103a2c7cb51058e14479b2e35e3a34a3f0dc4ede09927488 AS iroh
+FROM rust:1.99.1-trixie@sha256:8a4e90c7946b74626488b1446f712c0fe0ed1a596cbd3d871684bc9c5433ae07 AS iroh
 RUN cargo install --locked --version 0.101.0 --root /iroh iroh-doctor
 
 # glibc, not musl: musl's `cmsghdr` is 4-byte aligned, so noq-udp's receive
 # timestamp decode trips its alignment assertion and aborts the process.
-FROM rust:1.97.1-trixie@sha256:1bcff4befb740599103a2c7cb51058e14479b2e35e3a34a3f0dc4ede09927488 AS builder
+FROM rust:1.99.1-trixie@sha256:8a4e90c7946b74626488b1446f712c0fe0ed1a596cbd3d871684bc9c5433ae07 AS builder
 WORKDIR /build
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 # mold and clang back `.cargo/config.toml`, which only applies to the gnu target.

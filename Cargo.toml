@@ -44,7 +44,7 @@ version = "3.0.0-alpha.210"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/arunaengine/aruna"
-rust-version = "1.97.1"
+rust-version = "1.99.1"
 
 [workspace.dependencies]
 argon2 = { version = "0.6.0", default-features = false, features = ["alloc", "zeroize"] }
