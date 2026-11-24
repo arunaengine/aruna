@@ -238,6 +238,11 @@ pub(crate) mod tests {
         ("POST", "/applets/{applet_id}/source/commits"),
         ("POST", "/applets/{applet_id}/versions"),
         ("POST", "/applets/{applet_id}/signin-code"),
+        ("POST", "/applets/{applet_id}/builds"),
+        ("GET", "/applets/{applet_id}/drafts"),
+        ("POST", "/applets/{applet_id}/drafts"),
+        ("DELETE", "/applets/{applet_id}/drafts/{build_id}"),
+        ("POST", "/applets/{applet_id}/drafts/{build_id}/keep"),
         ("GET", "/edge/v1/hosts/{host}"),
         (
             "GET",

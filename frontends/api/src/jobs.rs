@@ -130,7 +130,7 @@ impl JobRequestError {
     }
 
     /// Categorizes an admission refusal from the job store.
-    fn from_submit(error: SubmitJobError) -> Self {
+    pub(crate) fn from_submit(error: SubmitJobError) -> Self {
         match error {
             SubmitJobError::JobPlanConflict { existing_job_id } => Self::JobPlanConflict(format!(
                 "idempotency key already bound to job {existing_job_id}"

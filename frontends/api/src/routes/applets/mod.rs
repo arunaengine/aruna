@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+pub mod builds;
 pub mod edge;
 pub mod lifecycle;
 pub mod node;
@@ -35,6 +36,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     (records::router())
         .merge(lifecycle::router())
         .merge(source::router())
+        .merge(builds::router())
         .merge(edge::router())
         .merge(signin::router())
         .merge(node::router())
