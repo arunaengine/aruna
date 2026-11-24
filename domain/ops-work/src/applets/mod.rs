@@ -15,6 +15,7 @@ pub mod reads;
 pub mod release;
 pub mod replica;
 pub mod runs;
+pub mod upkeep;
 pub mod visits;
 
 use aruna_core::applet::hosts::{HostRow, host_key};
