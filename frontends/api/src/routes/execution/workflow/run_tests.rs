@@ -253,6 +253,105 @@ async fn serves_runs() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+/// Starts a WES run with a `multipart/form-data` body, as WES clients send it.
+async fn send_form(
+    node: &Node,
+    auth: &AuthContext,
+    fields: &[(&str, String)],
+) -> (StatusCode, Value) {
+    let (router, _) = super::router().split_for_parts();
+    let mut body = String::new();
+    for (name, value) in fields {
+        body.push_str(&format!(
+            "--edge\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+        ));
+    }
+    body.push_str("--edge--\r\n");
+    let request = Request::builder()
+        .method("POST")
+        .uri("/ga4gh/wes/v1/runs")
+        .header(header::CONTENT_TYPE, "multipart/form-data; boundary=edge")
+        .body(Body::from(body))
+        .unwrap();
+    let router = router
+        .layer(Extension(Some(auth.clone())))
+        .layer(Extension(Option::<ValidatedBearer>::None))
+        .with_state(node.state.clone());
+    let response = router.oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+// WES starts runs of registered versions from form fields or JSON, lists and reads them in WES
+// states, and cancels them; errors come in the WES shape.
+#[tokio::test]
+async fn serves_wes_runs() {
+    let node = node(Some(Arc::new(Scripted))).await;
+    let workflow_id = workflow(&node).await;
+    let owner = node.owner.clone();
+    let parameters = json!({"group_id": node.group_id.to_string(),
+        "output": {"bucket": "results", "prefix": "hello/"}});
+    let url = format!("{workflow_id}/versions/1");
+    let fields = [
+        ("workflow_url", url.clone()),
+        ("workflow_params", json!({"message": "Hola"}).to_string()),
+        ("workflow_type", "CWL".to_owned()),
+        ("workflow_engine_parameters", parameters.to_string()),
+    ];
+    let (status, started) = send_form(&node, &owner, &fields).await;
+    assert_eq!(status, StatusCode::OK, "{started}");
+    let run_id = started["run_id"].as_str().unwrap().to_owned();
+    let (status, refused) = send_form(&node, &owner, &fields[1..]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(refused["status_code"], 400);
+
+    let start = ("POST", "/ga4gh/wes/v1/runs");
+    let body = json!({"workflow_url": url, "workflow_params": {"message": "Ciao"},
+        "workflow_engine_parameters": parameters});
+    let (status, text) = send(&node, &owner, start, &[], Some(body)).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+
+    let (status, list) = send(
+        &node,
+        &owner,
+        ("GET", "/ga4gh/wes/v1/runs?page_size=1"),
+        &[],
+        None,
+    )
+    .await;
+    let list = json_of(&list);
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(list["runs"][0]["state"], "QUEUED");
+    assert!(!list["next_page_token"].as_str().unwrap().is_empty());
+    let path = format!("/ga4gh/wes/v1/runs/{run_id}");
+    let (status, log) = send(&node, &owner, ("GET", &path), &[], None).await;
+    let log = json_of(&log);
+    assert_eq!(status, StatusCode::OK, "{log}");
+    assert_eq!(log["request"]["workflow_url"], url.as_str());
+    assert_eq!(
+        log["request"]["workflow_params"],
+        json!({"message": "Hola"})
+    );
+    let (status, _) = send(&node, &node.stranger, ("GET", &path), &[], None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, _) = send(
+        &node,
+        &owner,
+        ("POST", &format!("{path}/cancel")),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, state) = send(&node, &owner, ("GET", &format!("{path}/status")), &[], None).await;
+    assert_eq!(json_of(&state)["state"], "CANCELED");
+}
+
 #[tokio::test]
 async fn refuses_bad_runs() {
     let node = node(Some(Arc::new(Scripted))).await;

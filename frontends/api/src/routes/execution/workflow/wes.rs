@@ -7,21 +7,22 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use aruna_core::structs::execution::workflow_run::{RunState, WorkflowRunRecord};
+use aruna_ops_work::workflows::runs::admit::StartRunOperation;
 use aruna_ops_work::workflows::runs::events::time_text;
 use aruna_ops_work::workflows::runs::reads::{ListRunsOperation, RunFilter, RunSnapshotOperation};
 use aruna_runner::driver::drive;
 use axum::Json;
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::extract::{FromRequest, Multipart, Path, Query, Request, State};
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use super::run_wire::RunFileBody;
-use super::runs::run_id;
+use super::run_wire::{RunFileBody, WorkflowRunRequest};
+use super::runs::{cancel, run_id, run_request};
 use super::{catalog_error, limit, ulid};
 use crate::auth::RealmAuth;
 use crate::error::ServerError;
@@ -33,9 +34,10 @@ const WES_VERSION: &str = "1.1.0";
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new()
         .routes(routes!(service_info))
-        .routes(routes!(list_runs))
+        .routes(routes!(list_runs, start_run))
         .routes(routes!(get_run))
         .routes(routes!(run_status))
+        .routes(routes!(cancel_run))
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -66,6 +68,30 @@ pub struct WesServiceInfo {
     default_parameters: Vec<Value>,
     system_state_counts: BTreeMap<String, u64>,
     tags: BTreeMap<String, String>,
+}
+
+/// A WES run request, as form fields or as one JSON object.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+pub struct WesRunRequest {
+    /// A registered workflow version: `<workflow_id>/versions/<version>`, optionally behind the
+    /// node's url of that version.
+    pub workflow_url: String,
+    /// The run's values, an object or its JSON text.
+    #[schema(value_type = Option<Object>)]
+    pub workflow_params: Option<Value>,
+    pub workflow_type: Option<String>,
+    pub workflow_type_version: Option<String>,
+    #[schema(value_type = Option<Object>)]
+    pub tags: Option<Value>,
+    /// `group_id`, `output`, `inputs`, `placement` and `provenance` as `POST
+    /// /compute/workflow-runs` takes them, an object or its JSON text.
+    #[schema(value_type = Option<Object>)]
+    pub workflow_engine_parameters: Option<Value>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct WesRunId {
+    run_id: String,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -288,6 +314,68 @@ pub async fn list_runs(
 }
 
 #[utoipa::path(
+    post,
+    path = "/ga4gh/wes/v1/runs",
+    tag = "wes",
+    summary = "Start a workflow run",
+    description = r#"Starts a run of a registered workflow version on this node, like `POST /compute/workflow-runs`.
+
+**Authentication**: realm bearer token with WRITE on the group's workflows.
+
+**Behavior**
+- The body is `multipart/form-data` as WES defines it, or one JSON object with the same fields.
+- `workflow_url` names `<workflow_id>/versions/<version>`, optionally behind the node's url of
+  that version; nothing is fetched from it.
+- `workflow_params` are the run's values. `workflow_engine_parameters` carries `group_id`,
+  `output`, `inputs`, `placement` and `provenance` as `POST /compute/workflow-runs` takes them.
+- `workflow_type`, `workflow_type_version` and `tags` are accepted and not checked; the
+  registered version decides the language.
+
+**Errors**
+- 400 for a `workflow_url` that names no version, a `workflow_attachment`, a missing `group_id`,
+  or any request `POST /compute/workflow-runs` refuses.
+- 403 and 404 as for `POST /compute/workflow-runs`."#,
+    request_body(content = WesRunRequest, description = "The run request, as form fields or as one JSON object", example = json!({
+        "workflow_url": "01K8W1B3D5F7H9KMQ1S3V5X7Z2/versions/1",
+        "workflow_params": {"message": "Hola"}, "workflow_type": "CWL",
+        "workflow_type_version": "v1.2",
+        "workflow_engine_parameters": {"group_id": "01JABCDEF0123456789ABCDEFG",
+            "output": {"bucket": "results", "prefix": "hello/"}}
+    })),
+    responses(
+        (status = 200, description = "The run started", body = WesRunId, example = json!({
+            "run_id": "01K8W2A0000000000000000000"
+        })),
+        (status = 400, description = "An invalid request", body = WesErrorBody, example = json!({
+            "msg": "workflow_url names no workflow version", "status_code": 400
+        })),
+        (status = 403, description = "A missing permission", body = WesErrorBody, example = json!({
+            "msg": "Forbidden", "status_code": 403
+        })),
+        (status = 404, description = "The group or version is not visible", body = WesErrorBody, example = json!({
+            "msg": "Not found", "status_code": 404
+        }))
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn start_run(
+    State(state): State<Arc<ServerState>>,
+    RealmAuth(auth): RealmAuth,
+    request: Request,
+) -> WesResult<WesRunId> {
+    let form = run_form(request, &state).await?;
+    let request = run_request(&state, workflow_request(form)?, None)?;
+    let node = (state.get_node_id(), state.get_realm_id());
+    let start = StartRunOperation::new(&auth, node, request);
+    let admitted = drive(start, &state.get_ctx())
+        .await
+        .map_err(catalog_error)?;
+    Ok(Json(WesRunId {
+        run_id: admitted.record.run_id.to_string(),
+    }))
+}
+
+#[utoipa::path(
     get,
     path = "/ga4gh/wes/v1/runs/{run_id}",
     tag = "wes",
@@ -368,6 +456,132 @@ pub async fn run_status(
     }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/ga4gh/wes/v1/runs/{run_id}/cancel",
+    tag = "wes",
+    summary = "Cancel a workflow run",
+    description = r#"Cancels a run that has not ended, like `POST /compute/workflow-runs/{run_id}/cancel`.
+
+**Authentication**: realm bearer token with WRITE on the group's workflows.
+
+**Behavior**
+- The run turns `CANCELING` and then `CANCELED` once its tasks stopped; an ended run stays as it
+  is."#,
+    params(("run_id" = String, Path, description = "Run id, as a 26-character ULID")),
+    responses(
+        (status = 200, description = "The cancel was asked for", body = WesRunId, example = json!({
+            "run_id": "01K8W2A0000000000000000000"
+        })),
+        (status = 403, description = "The caller reads the run but may not change it", body = WesErrorBody, example = json!({
+            "msg": "Forbidden", "status_code": 403
+        })),
+        (status = 404, description = "Unknown, or not visible to the caller", body = WesErrorBody, example = json!({
+            "msg": "Not found", "status_code": 404
+        }))
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn cancel_run(
+    State(state): State<Arc<ServerState>>,
+    RealmAuth(auth): RealmAuth,
+    Path(run): Path<String>,
+) -> WesResult<WesRunId> {
+    let record = cancel(&state, &auth, run_id(&run)?).await?;
+    Ok(Json(WesRunId {
+        run_id: record.run_id.to_string(),
+    }))
+}
+
+/// The run request of a WES body: form fields, or one JSON object.
+async fn run_form(request: Request, state: &Arc<ServerState>) -> Result<WesRunRequest, WesError> {
+    let content_type = (request.headers().get(header::CONTENT_TYPE))
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    if !content_type.starts_with("multipart/form-data") {
+        let Json(form) = Json::<WesRunRequest>::from_request(request, state)
+            .await
+            .map_err(|error| ServerError::BadRequestReason(error.body_text()))?;
+        return Ok(form);
+    }
+    let bad = |error: String| WesError(ServerError::BadRequestReason(error));
+    let mut multipart = Multipart::from_request(request, state)
+        .await
+        .map_err(|error| bad(error.body_text()))?;
+    let mut form = WesRunRequest::default();
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| bad(e.body_text()))?
+    {
+        let name = field.name().unwrap_or_default().to_owned();
+        if name == "workflow_attachment" {
+            return Err(bad(
+                "workflow_attachment is not supported: register the workflow first".into(),
+            ));
+        }
+        let text = field.text().await.map_err(|error| bad(error.body_text()))?;
+        let value = || Some(Value::String(text.clone()));
+        match name.as_str() {
+            "workflow_url" => form.workflow_url = text.clone(),
+            "workflow_params" => form.workflow_params = value(),
+            "workflow_type" => form.workflow_type = Some(text.clone()),
+            "workflow_type_version" => form.workflow_type_version = Some(text.clone()),
+            "tags" => form.tags = value(),
+            "workflow_engine_parameters" => form.workflow_engine_parameters = value(),
+            _ => {}
+        }
+    }
+    Ok(form)
+}
+
+/// An object given as is or as its JSON text; absent is an empty object.
+fn object_of(value: Option<Value>, name: &str) -> Result<Map<String, Value>, ServerError> {
+    let value = match value {
+        Some(Value::String(text)) if text.trim().is_empty() => return Ok(Map::new()),
+        Some(Value::String(text)) => serde_json::from_str(&text)
+            .map_err(|_| ServerError::BadRequestReason(format!("{name} is no JSON object")))?,
+        Some(value) => value,
+        None => return Ok(Map::new()),
+    };
+    match value {
+        Value::Object(object) => Ok(object),
+        _ => Err(ServerError::BadRequestReason(format!(
+            "{name} is no JSON object"
+        ))),
+    }
+}
+
+/// The workflow run request a WES request asks for.
+fn workflow_request(form: WesRunRequest) -> Result<WorkflowRunRequest, ServerError> {
+    let parts: Vec<&str> = form
+        .workflow_url
+        .trim_end_matches('/')
+        .rsplit('/')
+        .collect();
+    let [version, "versions", workflow_id, ..] = parts.as_slice() else {
+        return Err(ServerError::BadRequestReason(
+            "workflow_url names no workflow version".into(),
+        ));
+    };
+    let mut request = object_of(
+        form.workflow_engine_parameters,
+        "workflow_engine_parameters",
+    )?;
+    if !request.contains_key("group_id") {
+        return Err(ServerError::BadRequestReason(
+            "workflow_engine_parameters needs a group_id".into(),
+        ));
+    }
+    let values = object_of(form.workflow_params, "workflow_params")?;
+    request.insert("workflow_id".into(), json!(workflow_id));
+    request.insert("version".into(), json!(version));
+    request.insert("values".into(), Value::Object(values));
+    serde_json::from_value(Value::Object(request))
+        .map_err(|error| ServerError::BadRequestReason(error.to_string()))
+}
+
 /// The WES view of a run.
 fn run_log(record: &WorkflowRunRecord) -> WesRunLog {
     let mut parameters = json!({"group_id": record.group_id.to_string()});
@@ -401,3 +615,7 @@ fn run_log(record: &WorkflowRunRecord) -> WesRunLog {
             .collect(),
     }
 }
+
+#[cfg(test)]
+#[path = "wes_tests.rs"]
+mod tests;

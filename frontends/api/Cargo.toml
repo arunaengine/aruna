@@ -57,7 +57,7 @@ tokio-rustls = { workspace = true }
 webpki-roots = { workspace = true }
 
 # REST
-axum = { workspace = true }
+axum = { workspace = true, features = ["multipart"] }
 byteview = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }
