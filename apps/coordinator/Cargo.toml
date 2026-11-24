@@ -1,0 +1,55 @@
+# Manifest of aruna-coordinator: runs uwe workflows for a node over a framed byte channel.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+[package]
+name = "aruna-coordinator"
+version = "3.0.0-alpha.208"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/arunaengine/aruna"
+rust-version = "1.99.1"
+publish = false
+# One test binary: each one links all of uwe.
+autotests = false
+
+# A workspace of its own: uwe-rs turns on `serde_json/preserve_order` and needs Unix, which
+# must not reach the node's workspace.
+[workspace]
+
+[dependencies]
+aruna-workflow-contract = { path = "../../domain/workflow-contract" }
+executor = { git = "https://github.com/arunaengine/uwe-rs", rev = "a278b311c1bbc367d4b10381f95b025acf901764" }
+run-crate = { git = "https://github.com/arunaengine/uwe-rs", rev = "a278b311c1bbc367d4b10381f95b025acf901764" }
+run-database = { git = "https://github.com/arunaengine/uwe-rs", rev = "a278b311c1bbc367d4b10381f95b025acf901764" }
+run-page = { git = "https://github.com/arunaengine/uwe-rs", rev = "a278b311c1bbc367d4b10381f95b025acf901764" }
+storage = { git = "https://github.com/arunaengine/uwe-rs", rev = "a278b311c1bbc367d4b10381f95b025acf901764" }
+task-model = { git = "https://github.com/arunaengine/uwe-rs", rev = "a278b311c1bbc367d4b10381f95b025acf901764" }
+tool-definition = { git = "https://github.com/arunaengine/uwe-rs", rev = "a278b311c1bbc367d4b10381f95b025acf901764" }
+uwe = { git = "https://github.com/arunaengine/uwe-rs", rev = "a278b311c1bbc367d4b10381f95b025acf901764" }
+wir = { git = "https://github.com/arunaengine/uwe-rs", rev = "a278b311c1bbc367d4b10381f95b025acf901764" }
+workflow-graph = { git = "https://github.com/arunaengine/uwe-rs", rev = "a278b311c1bbc367d4b10381f95b025acf901764" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+tempfile = "3.27.0"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["io-std", "io-util", "macros", "rt-multi-thread", "sync"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+tokio = { version = "1.54.1", features = ["io-util", "macros", "rt-multi-thread", "sync", "time"] }
+
+[[test]]
+name = "session"
+path = "tests/session.rs"
+
+# Matches uwe-rs: line tables only, so that test binaries stay small.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.test]
+debug = false
