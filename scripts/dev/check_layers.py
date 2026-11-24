@@ -39,7 +39,9 @@ GROUPS = (
     ),
     (
         "work and integrations",
-        frozenset("jobs plugins assistant notifications federation harvest node workflows".split()),
+        frozenset(
+            "jobs plugins assistant notifications federation harvest node workflows applets".split()
+        ),
     ),
 )
 ANY_CRATE = "*"
