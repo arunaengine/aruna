@@ -1,4 +1,5 @@
-//! Process entry: installs the crypto provider, dispatches helpers and runs the node.
+//! Process entry: installs the crypto provider, dispatches helpers and the applet gateway, and
+//! runs the node.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -20,6 +21,9 @@ fn main() {
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("install rustls ring crypto provider");
+    if std::env::args().nth(1).as_deref() == Some("applet-gateway") {
+        std::process::exit(run_gateway());
+    }
     if let Some(code) = aruna_compute::executor::dispatch_helper() {
         std::process::exit(code);
     }
@@ -41,6 +45,40 @@ fn main() {
         std::process::exit(if result.is_ok() { 0 } else { 1 });
     }
     start_runtime();
+}
+
+/// The `applet-gateway` mode: serves applet hosts in front of the nodes and never starts one.
+fn run_gateway() -> i32 {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("aruna: {error}");
+            return 1;
+        }
+    };
+    runtime.block_on(async {
+        if let Err(error) = dotenv_optional(dotenvy::dotenv()) {
+            eprintln!("aruna: {error}");
+            return 1;
+        }
+        init_tracing();
+        let settings = aruna_gateway::settings::Settings::from_env();
+        let result = match settings {
+            Ok(settings) => aruna_gateway::run(settings).await,
+            Err(error) => Err(error),
+        };
+        shutdown_tracing();
+        match result {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("aruna: {error}");
+                1
+            }
+        }
+    })
 }
 
 /// Stack of each runtime worker thread; deep node futures overflow the smaller default.

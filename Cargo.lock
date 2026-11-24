@@ -329,6 +329,7 @@ dependencies = [
  "aruna-config",
  "aruna-core",
  "aruna-egress",
+ "aruna-gateway",
  "aruna-kpabe",
  "aruna-ops-data",
  "aruna-ops-identity",
