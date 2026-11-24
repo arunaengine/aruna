@@ -1202,6 +1202,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aruna-workflow-contract"
+version = "3.0.0-alpha.208"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "asn1-rs"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

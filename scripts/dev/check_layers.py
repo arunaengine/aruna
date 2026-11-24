@@ -99,6 +99,7 @@ CRATE_TARGETS = {
     "aruna-compute": ("aruna-core", "aruna-clock"),
     "aruna-wasm-host": ("aruna-plugin-contract",),
     "aruna-plugin-contract": (),
+    "aruna-workflow-contract": (),
     "aruna-rdf-graph": ("aruna-core",),
     "aruna-egress": ("aruna-core",),
     # Test helpers that drive operations; only dev-dependencies name it.
@@ -142,7 +143,9 @@ BACKEND_DEV_TARGETS = {
 # crates; the operations crates reach only lower ones, in tests as well.
 LAYERS = ("domain", "runtime", "frontends", "apps", "plugins", "testing")
 OPS_ORDER = ("aruna-ops-identity", "aruna-ops-data", "aruna-ops-work")
-RUNTIME_FOUNDATIONS = frozenset({"aruna-core", "aruna-kpabe", "aruna-plugin-contract"})
+RUNTIME_FOUNDATIONS = frozenset(
+    {"aruna-core", "aruna-kpabe", "aruna-plugin-contract", "aruna-workflow-contract"}
+)
 RUNTIME_EXTRAS = {"aruna-config": ("aruna-wire",)}
 FRONTEND_RUNTIME = frozenset({"aruna-clock", "aruna-runner"})
 API_SRC = "frontends/api/src/"
