@@ -169,11 +169,16 @@ impl StartRunOperation {
     }
 
     /// Checks READ on the next pinned input this node holds; inputs of other nodes are read
-    /// there when a task stages them.
+    /// there when a task stages them, as the unrestricted creator, so a restricted caller may
+    /// name only inputs of this node.
     fn next_input(&mut self, view: VersionView) -> AdmitNext {
         let local = self.node.0;
+        let restricted = self.auth.path_restrictions.is_some();
         while let Some(input) = self.pending.pop() {
             if input.source_node_id.is_some_and(|node| node != local) {
+                if restricted {
+                    return Err(CatalogError::Forbidden);
+                }
                 continue;
             }
             let access = ObjectAccessOperation::new(

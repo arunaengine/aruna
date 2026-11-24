@@ -660,11 +660,15 @@ pub async fn list_jobs(
     summary = "Submit a container execution job",
     description = r#"Accepts a container execution job for asynchronous execution and returns the id to poll.
 
-**Authentication**: realm bearer token with WRITE on the target group's data; a path-restricted
-(delegated) token is refused. An existing workspace bucket and every bucket an output names
-additionally need WRITE on that bucket, which must belong to the same group.
+**Authentication**: realm bearer token with WRITE on the target group's data. An existing
+workspace bucket and every bucket an output names additionally need WRITE on that bucket, which
+must belong to the same group.
 
 **Behavior**
+- A path-restricted (delegated) token must name the group's data path on this node exactly with
+  WRITE. It may use no workspace, output prefixes or `local` target, and every input and output
+  must be an object of the group on this node inside its restrictions: READ for inputs, WRITE for
+  outputs.
 - A 2xx means the request is durably admitted into its replicated submission family and queued,
   never that it started, finished or produced outputs.
 - The job is not anchored to one node: any node that reduced the family answers for it, and
@@ -828,7 +832,7 @@ additionally need WRITE on that bucket, which must belong to the same group.
         ),
         (status = 400, description = "Malformed group id, empty image, out-of-range resources, an invalid or duplicated input, output or container path, an output without a `bucket` while `workspace.mode` is `none`, a workspace or output bucket that does not exist or belongs to another group, `target` `local` on a node that serves no device plane, or a local run naming an input this device cannot read", body = ErrorResponse),
         (status = 409, description = "The idempotency key is bound to a different plan, the composition conflicts on a staged key under `collision_policy` `reject`, the active RO-Crate job limit is reached, or this device's compute plane is paused, absent or already at its run ceiling, which is counted in the admitting transaction so two submissions cannot both pass it. A quota refusal carries the exact scope, dimension and numbers in `quota`; a demand view that understates the group is refused like an exceeded cap, with `observed` at the limit", body = ErrorResponse),
-        (status = 403, description = "The token is path-restricted, the caller lacks WRITE on the group, on the named existing workspace bucket or on a bucket an output writes into, or a local run was requested by someone other than this device's owner", body = ErrorResponse),
+        (status = 403, description = "A path-restricted token outside its scope (no exact group marker, a workspace, or an input or output outside its restrictions or on another node), the caller lacks WRITE on the group, on the named existing workspace bucket or on a bucket an output writes into, or a local run was requested by someone other than this device's owner", body = ErrorResponse),
         (status = 503, description = "Retryable, and the caller may submit again with the same idempotency key: no family holder could admit the request, the demand view could not be read or kept moving under three reads, three admission transactions in a row lost to a concurrent submission of the same group, or the id clock is unhealthy. A device submission whose referenced inputs sit on no holder of its family answers the same 503 and retrying does not clear it; submit from a node that holds the inputs, or replicate them first", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))

@@ -48,7 +48,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::auth::require_owner;
-use crate::auth::{ValidatedBearer, require_unrestricted_auth};
+use crate::auth::{ValidatedBearer, require_realm_auth, require_unrestricted_auth};
 use crate::error::ServerError;
 use crate::forwarded::{DirectOrigin, external_base_url};
 use crate::routes::execution::jobs::ExecutionTarget;
@@ -565,11 +565,14 @@ pub async fn service_info(
     description = r#"Accepts a task for asynchronous execution and returns the id to poll.
 
 **Authentication**: realm bearer token, or HTTP Basic with an access key and secret issued by this
-node; a path-restricted credential is refused. The caller needs WRITE on the target group. Basic
-authentication takes the group from the credential and refuses an `aruna-engine.org/group` tag
-naming a different one; a bearer token requires that tag.
+node. The caller needs WRITE on the target group. Basic authentication takes the group from the
+credential and refuses an `aruna-engine.org/group` tag naming a different one; a bearer token
+requires that tag.
 
 **Behavior**
+- A path-restricted credential must name the group's data path on this node exactly and may use
+  no workspace; every input and output must be an object of the group on this node inside its
+  restrictions (READ for inputs, WRITE for outputs).
 - 200 means the task was durably accepted and queued, never that it started or finished.
 - State runs `QUEUED`, `INITIALIZING`, `RUNNING`, then `COMPLETE`, `EXECUTOR_ERROR`,
   `SYSTEM_ERROR` or `CANCELED`; `CANCELING` shows while a cancellation is in flight and `UNKNOWN`
@@ -695,7 +698,7 @@ pub async fn create_task(
     headers: HeaderMap,
     Json(task): Json<TesTask>,
 ) -> Response {
-    let caller = match authenticate_tes(&state, auth, &headers).await {
+    let caller = match authenticate_tes(&state, auth, &headers, true).await {
         Ok(caller) => caller,
         Err(error) => return error.into_response(),
     };
@@ -727,6 +730,19 @@ pub async fn create_task(
         Err(error) => return error.into_response(),
     };
     let workspace_mode = target_modes(target).1;
+
+    if caller.auth.path_restrictions.is_some()
+        && let Err(error) = crate::jobs::restricted_scope(
+            &state,
+            &caller.auth,
+            &spec,
+            None,
+            aruna_core::request_policy::PolicyRequestExtras::rest(),
+        )
+        .await
+    {
+        return TesError::from_server(ServerError::from(error)).into_response();
+    }
 
     if target == ExecutionTarget::Local {
         let config = LocalExecutionConfig {
@@ -921,7 +937,7 @@ pub async fn get_task(
     Path(id): Path<String>,
     Query(query): Query<ViewQuery>,
 ) -> Response {
-    let caller = match authenticate_tes(&state, auth, &headers).await {
+    let caller = match authenticate_tes(&state, auth, &headers, false).await {
         Ok(caller) => caller,
         Err(error) => return error.into_response(),
     };
@@ -1096,7 +1112,7 @@ pub async fn list_tasks(
     RawQuery(raw_query): RawQuery,
     Query(query): Query<ListTasksQuery>,
 ) -> Response {
-    let caller = match authenticate_tes(&state, auth, &headers).await {
+    let caller = match authenticate_tes(&state, auth, &headers, false).await {
         Ok(caller) => caller,
         Err(error) => return error.into_response(),
     };
@@ -1210,7 +1226,7 @@ pub async fn cancel_task(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    let caller = match authenticate_tes(&state, auth, &headers).await {
+    let caller = match authenticate_tes(&state, auth, &headers, false).await {
         Ok(caller) => caller,
         Err(error) => return error.into_response(),
     };
@@ -2114,13 +2130,20 @@ struct TesCaller {
     credential_group: Option<Ulid>,
 }
 
+/// The caller of a TES route; only task creation lets a path-restricted caller in, as
+/// `restricted_scope` then bounds what it may start.
 async fn authenticate_tes(
     state: &ServerState,
     auth: Option<AuthContext>,
     headers: &HeaderMap,
+    restricted: bool,
 ) -> Result<TesCaller, TesError> {
+    let realm_auth = |auth: AuthContext| match restricted {
+        true => require_realm_auth(state, Some(auth)),
+        false => require_unrestricted_auth(state, Some(auth)),
+    };
     if let Some(auth) = auth {
-        let auth = require_unrestricted_auth(state, Some(auth)).map_err(TesError::from_server)?;
+        let auth = realm_auth(auth).map_err(TesError::from_server)?;
         return Ok(TesCaller {
             auth,
             credential_group: None,
@@ -2188,15 +2211,12 @@ async fn authenticate_tes(
     }
 
     let credential_group = access.group_id;
-    let auth = require_unrestricted_auth(
-        state,
-        Some(AuthContext {
-            user_id: access.user_identity,
-            realm_id: state.get_realm_id(),
-            path_restrictions: access.path_restrictions,
-            session: None,
-        }),
-    )
+    let auth = realm_auth(AuthContext {
+        user_id: access.user_identity,
+        realm_id: state.get_realm_id(),
+        path_restrictions: access.path_restrictions,
+        session: None,
+    })
     .map_err(TesError::from_server)?;
     Ok(TesCaller {
         auth,

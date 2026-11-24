@@ -364,6 +364,20 @@ mod tests {
         assert!(check(&elsewhere, Permission::WRITE));
     }
 
+    // The exact group data path is the marker that lets a restricted token run work in a group;
+    // it grants no child path, and a subtree pattern never names the group root itself.
+    #[test]
+    fn marker_matches_exactly() {
+        let marker = "/r/g/G/data/n1";
+        assert!(permission_pattern_matches(marker, marker));
+        assert!(!permission_pattern_matches(marker, "/r/g/G/data/n1/b/key"));
+        assert!(!permission_pattern_matches("/r/g/G/data/n1/**", marker));
+        assert!(permission_pattern_matches(
+            "/r/g/G/data/n1/**",
+            "/r/g/G/data/n1/b"
+        ));
+    }
+
     #[test]
     fn binds_aligned_wildcards() {
         use super::bind_wildcards;

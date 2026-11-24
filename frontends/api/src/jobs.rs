@@ -18,13 +18,15 @@ use aruna_core::structs::execution::job::family::MAX_EXECUTION_OUTPUTS;
 use aruna_core::structs::execution::job::identity::{JobId, JobState};
 use aruna_core::structs::execution::job::input::{
     CollisionPolicy, CompositionError, ComputeResources, ExecutionSpec, InputMode, InputSelection,
-    InputSource, OutputDestination, OutputSelection, WorkspaceOutput,
+    InputSource, OutputDestination, OutputSelection, WorkspaceOutput, run_area_bucket,
 };
 use aruna_core::structs::execution::job::key_wait::KeyWait;
 use aruna_core::structs::execution::job::local::{JobRecord, WorkspaceMode};
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission};
 use aruna_core::structs::identity::features::{Feature, Resolved};
-use aruna_core::structs::storage::blob::{bucket_permission_path, group_permission_path};
+use aruna_core::structs::storage::blob::{
+    bucket_permission_path, group_permission_path, object_permission_path,
+};
 use aruna_core::user::id::UserId;
 use aruna_ops_work::jobs::command::{
     AcceptedExecution, CollisionPolicy as CommandCollisionPolicy, ExecutionInput, ExecutionOutput,
@@ -44,7 +46,7 @@ use aruna_ops_work::jobs::route::JobRouteError;
 use aruna_ops_work::jobs::session::SessionOperation;
 use ulid::Ulid;
 
-use crate::auth::{ValidatedBearer, require_owner, require_unrestricted_auth};
+use crate::auth::{ValidatedBearer, require_owner, require_realm_auth};
 use crate::error::ServerError;
 use crate::error::ServerResult;
 use crate::server::state::ServerState;
@@ -223,8 +225,10 @@ pub(crate) async fn admit_execution(
     }
     let target = command.target.unwrap_or_default();
     let auth = match target {
+        // A path-restricted token passes only with the exact group marker below and
+        // every input and output inside its restrictions, checked by `restricted_scope`.
         ExecutionTarget::Realm => {
-            require_unrestricted_auth(state, auth).map_err(JobRequestError::from_server)?
+            require_realm_auth(state, auth).map_err(JobRequestError::from_server)?
         }
         ExecutionTarget::Local => local_auth(state, auth).await?,
     };
@@ -327,6 +331,9 @@ pub(crate) async fn admit_execution(
         output_prefixes,
         collision_policy: collision_policy(command.collision_policy),
     };
+    if auth.path_restrictions.is_some() {
+        restricted_scope(state, &auth, &spec, workspace_bucket.as_deref(), extras).await?;
+    }
     let accepted = match target {
         ExecutionTarget::Local => {
             local_submit(state, &auth, spec, command.idempotency_key, workspace_mode).await?
@@ -546,6 +553,28 @@ async fn validate_owned_bucket(
     bucket: &str,
     extras: PolicyRequestExtras,
 ) -> Result<(), JobRequestError> {
+    ensure_group_bucket(state, group_id, bucket).await?;
+    // A restricted caller may hold WRITE on a folder only; `restricted_scope` checks each object.
+    if auth.path_restrictions.is_some() {
+        return Ok(());
+    }
+    crate::auth::ensure_permission_with(
+        state,
+        auth,
+        bucket_permission_path(state.get_realm_id(), group_id, state.get_node_id(), bucket),
+        Permission::WRITE,
+        extras,
+    )
+    .await
+    .map_err(JobRequestError::from_server)
+}
+
+/// The bucket exists and belongs to `group_id`; anything else is a bad request.
+async fn ensure_group_bucket(
+    state: &ServerState,
+    group_id: Ulid,
+    bucket: &str,
+) -> Result<(), JobRequestError> {
     let info = match drive(
         GetBucketOperation::new(bucket.to_string()),
         &state.get_ctx(),
@@ -559,15 +588,64 @@ async fn validate_owned_bucket(
     if info.group_id != group_id {
         return Err(JobRequestError::BadRequest);
     }
-    crate::auth::ensure_permission_with(
-        state,
-        auth,
-        bucket_permission_path(state.get_realm_id(), group_id, state.get_node_id(), bucket),
-        Permission::WRITE,
-        extras,
-    )
-    .await
-    .map_err(JobRequestError::from_server)
+    Ok(())
+}
+
+/// What a path-restricted caller may start: no workspace, and every input and output on this
+/// node, in the execution group, and inside its restrictions as an exact object path.
+pub(crate) async fn restricted_scope(
+    state: &ServerState,
+    auth: &AuthContext,
+    spec: &ExecutionSpec,
+    workspace: Option<&str>,
+    extras: PolicyRequestExtras,
+) -> Result<(), JobRequestError> {
+    if workspace.is_some() || !spec.workspace_outputs.is_empty() || !spec.output_prefixes.is_empty()
+    {
+        return Err(JobRequestError::Forbidden);
+    }
+    let (realm, node, group) = (state.get_realm_id(), state.get_node_id(), spec.group_id);
+    let mut checks = Vec::new();
+    for input in &spec.inputs {
+        // Inputs of another node are resolved there as the unrestricted submitter.
+        let InputSource::S3 { bucket, key, .. } = &input.source else {
+            return Err(JobRequestError::Forbidden);
+        };
+        if input.source_node_id.is_some_and(|other| other != node) {
+            return Err(JobRequestError::Forbidden);
+        }
+        ensure_group_bucket(state, group, bucket).await?;
+        let path = object_permission_path(realm, group, node, bucket, key);
+        checks.push((path, Permission::READ));
+    }
+    for output in &spec.file_outputs {
+        if output
+            .destination_node_id
+            .is_some_and(|other| other != node)
+        {
+            return Err(JobRequestError::Forbidden);
+        }
+        let path = match &output.destination {
+            OutputDestination::S3 { bucket, key } => {
+                object_permission_path(realm, group, node, bucket, key)
+            }
+            OutputDestination::RunArea { prefix } => {
+                object_permission_path(realm, group, node, &run_area_bucket(group, node), prefix)
+            }
+        };
+        // A wildcard output writes many keys below its destination.
+        let path = match output.path_prefix {
+            Some(_) => format!("{path}/**"),
+            None => path,
+        };
+        checks.push((path, Permission::WRITE));
+    }
+    for (path, permission) in checks {
+        crate::auth::ensure_permission_with(state, auth, path, permission, extras.clone())
+            .await
+            .map_err(JobRequestError::from_server)?;
+    }
+    Ok(())
 }
 
 /// Canonical absolute container path or 400.

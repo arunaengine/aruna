@@ -956,3 +956,48 @@ async fn keeps_newest_attempt() {
         ("world", 11, true)
     );
 }
+
+// A path-restricted token starts a run only with the exact workflow marker, and never names an
+// input of another node, which would be staged later as the unrestricted creator.
+#[tokio::test]
+async fn restricted_needs_marker() {
+    use aruna_core::structs::identity::auth::{PathRestriction, Permission};
+    use aruna_core::structs::storage::blob::bucket_permission_path;
+
+    let runs = runs().await;
+    let (realm_id, group) = (runs.fixture.alice.realm_id, runs.fixture.group_a);
+    let results = bucket_permission_path(realm_id, group, runs.fixture.node, "results");
+    let restricted = |patterns: Vec<String>| {
+        let mut auth = runs.fixture.alice.clone();
+        let restrictions = (patterns.into_iter())
+            .map(|pattern| PathRestriction {
+                pattern,
+                permission: Permission::WRITE,
+            })
+            .collect();
+        auth.path_restrictions = Some(restrictions);
+        auth
+    };
+    let request = || runs.request(None, json!({"message": "Hola"}));
+    let folder_only = restricted(vec![format!("{results}/**")]);
+    let refused = runs.start(&folder_only, request()).await;
+    assert_eq!(refused.unwrap_err(), CatalogError::NotFound);
+
+    let marked = restricted(vec![
+        crate::workflows::workflow_path(realm_id, group),
+        format!("{results}/**"),
+    ]);
+    let admitted = runs.start(&marked, request()).await;
+    assert!(admitted.is_ok(), "{admitted:?}");
+
+    let mut remote = request();
+    remote.inputs.push(super::admit::PinnedInput {
+        name: "reads".into(),
+        bucket: "results".into(),
+        key: "reads.fastq".into(),
+        version_id: Ulid::from_bytes([4; 16]),
+        source_node_id: Some(aruna_ops_identity::testing::node(8)),
+    });
+    let elsewhere = runs.start(&marked, remote).await;
+    assert_eq!(elsewhere.unwrap_err(), CatalogError::Forbidden);
+}
