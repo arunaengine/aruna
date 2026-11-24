@@ -90,6 +90,7 @@ impl AdminOperationFamily {
             | AdminDocumentOperation::ConfigFederationSet { .. }
             | AdminDocumentOperation::ConfigPortalSet { .. }
             | AdminDocumentOperation::ConfigReplicasSet { .. }
+            | AdminDocumentOperation::ConfigFeaturesSet { .. }
             | AdminDocumentOperation::NodeNameSet { .. }
             | AdminDocumentOperation::NodePlaceSet { .. }
             | AdminDocumentOperation::MergeCoordinatorSet { .. }
@@ -671,6 +672,7 @@ pub fn config_mutation_allowed(op: &AdminDocumentOperation) -> bool {
             | AdminDocumentOperation::ConfigFederationSet { .. }
             | AdminDocumentOperation::ConfigPortalSet { .. }
             | AdminDocumentOperation::ConfigReplicasSet { .. }
+            | AdminDocumentOperation::ConfigFeaturesSet { .. }
             | AdminDocumentOperation::NodeNameSet { .. }
             | AdminDocumentOperation::NodePlaceSet { .. }
             | AdminDocumentOperation::ConfigTokenRevoked { .. }

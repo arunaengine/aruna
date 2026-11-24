@@ -4,6 +4,7 @@
 
 pub mod admin_audit;
 pub mod auth;
+pub mod features;
 pub mod group;
 pub mod group_delete;
 pub mod identifier;

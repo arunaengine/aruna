@@ -100,6 +100,7 @@ pub fn realm_config_roundtrip() {
         secrets: Vec::new(),
         plugins: Vec::new(),
         installs: Vec::new(),
+        features: BTreeMap::new(),
     };
     let actor = Actor {
         node_id: iroh::SecretKey::from_bytes(&[14u8; 32]).public(),
@@ -127,7 +128,7 @@ fn config_digest_changes() {
 fn config_bytes_canonical() {
     // Pins the canonical wire form. Postcard is positional, so the field
     // occupies a fixed slot that a shorter encoding cannot satisfy.
-    const ENCODED: &str = "01010101010101010101010101010101010101010101010101010101010101010300000001020001026e300101ac023c00006e5500010300000000000000001a3032303831303430473230383130343047323038313034304732000000000000000000000000a0f8fa05e0a712b0ea01000000000000000000e0a712c0ee6d000000000000000000";
+    const ENCODED: &str = "01010101010101010101010101010101010101010101010101010101010101010300000001020001026e300101ac023c00006e5500010300000000000000001a3032303831303430473230383130343047323038313034304732000000000000000000000000a0f8fa05e0a712b0ea01000000000000000000e0a712c0ee6d00000000000000000000";
     let mut config = RealmConfigDocument::new(RealmId([1u8; 32]), Vec::new(), 3);
     config.family_strategy_id = Ulid::from_bytes([2u8; 16]);
 
@@ -221,6 +222,17 @@ fn digest_ignores_revocations() {
 
     assert!(revoked.token_revoked(&crate::auth::bearer_token_hash("token"), 1_000));
     assert_eq!(config.digest().unwrap(), revoked.digest().unwrap());
+}
+
+#[test]
+fn digest_ignores_features() {
+    let config = RealmConfigDocument::new(RealmId([5u8; 32]), Vec::new(), 3);
+    let mut changed = config.clone();
+    changed.features.insert(
+        crate::structs::identity::features::Feature::Shares,
+        crate::structs::identity::features::FeatureMode::ForcedOff,
+    );
+    assert_eq!(config.digest().unwrap(), changed.digest().unwrap());
 }
 
 #[test]
@@ -719,6 +731,7 @@ pub fn replication_resolution() {
         secrets: Vec::new(),
         plugins: Vec::new(),
         installs: Vec::new(),
+        features: BTreeMap::new(),
     };
 
     assert_eq!(document.replication_factor_for(other_group_id, None), 3);
@@ -1129,6 +1142,7 @@ fn rejects_missing_compute() {
         &config.secrets,
         &config.plugins,
         &config.installs,
+        &config.features,
     ))
     .expect("tail encodes");
     assert!(encoded.ends_with(&tail));
