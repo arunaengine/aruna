@@ -345,5 +345,6 @@ fn outbound_unavailable(effect: &OutboundEffect) -> OutboundEvent {
                 "this node sends no connection requests".to_string(),
             )),
         },
+        OutboundEffect::Dns(_) => OutboundEvent::DnsAnswered { result: Err(error) },
     }
 }

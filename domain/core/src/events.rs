@@ -1275,7 +1275,8 @@ impl Event {
                     MemberAnswered,
                     ConnectionAnswered,
                     SmtpChecked,
-                    AddressChecked
+                    AddressChecked,
+                    DnsAnswered
                 }
             ),
         }

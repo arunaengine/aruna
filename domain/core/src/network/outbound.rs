@@ -46,6 +46,23 @@ pub enum OutboundEffect {
     CheckSmtp(Box<SmtpSettings>),
     /// Checks the format of one mail address.
     CheckAddress(String),
+    /// Reads the TXT values and addresses DNS publishes for a custom domain check.
+    Dns(Box<DnsQuery>),
+}
+
+/// One DNS read: the TXT values of `txt` and the A and AAAA addresses of each of `hosts`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsQuery {
+    pub txt: String,
+    pub hosts: Vec<String>,
+}
+
+/// What DNS published; a name that does not resolve has an empty list.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DnsAnswer {
+    pub txt: Vec<String>,
+    /// The addresses of each host of the query, in its order.
+    pub addresses: Vec<Vec<std::net::IpAddr>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +122,10 @@ pub enum OutboundEvent {
     },
     AddressChecked {
         valid: bool,
+    },
+    /// The answer to an [`OutboundEffect::Dns`]; an error means nothing could be asked.
+    DnsAnswered {
+        result: Result<DnsAnswer, OutboundError>,
     },
 }
 

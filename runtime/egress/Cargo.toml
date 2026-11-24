@@ -15,6 +15,7 @@ aruna-core = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 futures-util = { workspace = true }
+iroh = { workspace = true }
 lettre = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
@@ -26,5 +27,4 @@ ulid = { workspace = true }
 
 [dev-dependencies]
 http = { workspace = true }
-iroh = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

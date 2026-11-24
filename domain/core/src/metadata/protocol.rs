@@ -768,6 +768,14 @@ pub enum MetadataTransportMessage {
     RunLogStored {
         result: Result<u32, MetadataReadError>,
     },
+    /// An applet's host node hands a holder of the group's records a copy of the applet.
+    StoreApplet {
+        applet: Box<crate::applet::record::Applet>,
+    },
+    /// The revision of the copy the holder now keeps.
+    AppletStored {
+        result: Result<u64, MetadataReadError>,
+    },
 }
 
 /// PKCS8 PEM of the realm signing key; Debug never prints it.
@@ -1304,6 +1312,8 @@ pub fn transport_message_kind(message: &MetadataTransportMessage) -> &'static st
         MetadataTransportMessage::SubmissionClaimAnswered { .. } => "submission_claim_answered",
         MetadataTransportMessage::StoreRunLog { .. } => "store_run_log",
         MetadataTransportMessage::RunLogStored { .. } => "run_log_stored",
+        MetadataTransportMessage::StoreApplet { .. } => "store_applet",
+        MetadataTransportMessage::AppletStored { .. } => "applet_stored",
     }
 }
 
