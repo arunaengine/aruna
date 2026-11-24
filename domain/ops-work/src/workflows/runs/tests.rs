@@ -60,18 +60,31 @@ const CWL: &str = "cwlVersion: v1.2\nclass: CommandLineTool\nbaseCommand: echo\n
 /// A coordinator that answers preflight requests like the catalog tests and plays a scripted
 /// run: it hands out queued frames and keeps every message the node sent.
 #[derive(Default)]
-struct RunHost {
+pub(super) struct RunHost {
     frames: Mutex<VecDeque<CoordinatorToHost>>,
     sent: Mutex<Vec<HostToCoordinator>>,
+    opened: Mutex<Vec<(String, aruna_workflow_contract::CoordinatorMode)>>,
+    closed: Mutex<Vec<String>>,
 }
 
 impl RunHost {
-    fn script(&self, frames: Vec<CoordinatorToHost>) {
+    pub(super) fn script(&self, frames: Vec<CoordinatorToHost>) {
         self.frames.lock().unwrap().extend(frames);
     }
 
-    fn sent(&self) -> Vec<HostToCoordinator> {
+    pub(super) fn sent(&self) -> Vec<HostToCoordinator> {
         self.sent.lock().unwrap().clone()
+    }
+
+    /// The sessions opened so far with their modes, and the sessions closed.
+    pub(super) fn sessions(
+        &self,
+    ) -> (
+        Vec<(String, aruna_workflow_contract::CoordinatorMode)>,
+        Vec<String>,
+    ) {
+        let opened = self.opened.lock().unwrap().clone();
+        (opened, self.closed.lock().unwrap().clone())
     }
 }
 
@@ -80,7 +93,10 @@ impl WorkflowHost for RunHost {
     async fn serve(&self, effect: WorkflowEffect) -> WorkflowAnswer {
         match effect {
             WorkflowEffect::Preflight(kind) => WorkflowAnswer::Preflight(answer(kind)),
-            WorkflowEffect::Open { .. } => WorkflowAnswer::Opened(Ok(())),
+            WorkflowEffect::Open { session, mode, .. } => {
+                self.opened.lock().unwrap().push((session, mode));
+                WorkflowAnswer::Opened(Ok(()))
+            }
             WorkflowEffect::Send { message, .. } => {
                 self.sent.lock().unwrap().push(message);
                 WorkflowAnswer::Sent(Ok(()))
@@ -88,18 +104,21 @@ impl WorkflowHost for RunHost {
             WorkflowEffect::Receive { .. } => {
                 WorkflowAnswer::Received(Ok(self.frames.lock().unwrap().pop_front()))
             }
-            WorkflowEffect::Close { .. } => WorkflowAnswer::Closed(Ok(())),
+            WorkflowEffect::Close { session } => {
+                self.closed.lock().unwrap().push(session);
+                WorkflowAnswer::Closed(Ok(()))
+            }
         }
     }
 }
 
-struct Runs {
-    fixture: Fixture,
-    host: Arc<RunHost>,
-    workflow_id: Ulid,
+pub(super) struct Runs {
+    pub(super) fixture: Fixture,
+    pub(super) host: Arc<RunHost>,
+    pub(super) workflow_id: Ulid,
 }
 
-async fn runs() -> Runs {
+pub(super) async fn runs() -> Runs {
     let mut fixture = fixture().await;
     let host = Arc::new(RunHost::default());
     let registry = ExecutorRegistry::new().with_workflow(host.clone());
@@ -135,7 +154,7 @@ async fn runs() -> Runs {
 }
 
 impl Runs {
-    fn request(&self, key: Option<&str>, values: Value) -> RunRequest {
+    pub(super) fn request(&self, key: Option<&str>, values: Value) -> RunRequest {
         RunRequest {
             group_id: self.fixture.group_a,
             workflow_id: self.workflow_id,
@@ -154,7 +173,7 @@ impl Runs {
         }
     }
 
-    fn serving(
+    pub(super) fn serving(
         &self,
     ) -> (
         aruna_core::id::NodeId,
@@ -163,7 +182,7 @@ impl Runs {
         (self.fixture.node, self.fixture.alice.realm_id)
     }
 
-    async fn start(
+    pub(super) async fn start(
         &self,
         auth: &aruna_core::structs::identity::auth::AuthContext,
         request: RunRequest,
@@ -172,7 +191,7 @@ impl Runs {
         drive(start, &self.fixture.context).await
     }
 
-    async fn started(&self) -> WorkflowRunRecord {
+    pub(super) async fn started(&self) -> WorkflowRunRecord {
         let request = self.request(None, json!({"message": "Hola"}));
         self.start(&self.fixture.alice, request)
             .await
@@ -180,7 +199,7 @@ impl Runs {
             .record
     }
 
-    async fn prepare(&self, record: &WorkflowRunRecord) -> Prepared {
+    pub(super) async fn prepare(&self, record: &WorkflowRunRecord) -> Prepared {
         let spec = aruna_core::structs::execution::workflow_run::WorkflowRunSpec {
             run_id: record.run_id,
             group_id: record.group_id,
@@ -191,7 +210,7 @@ impl Runs {
         drive(prepare, &self.fixture.context).await.unwrap()
     }
 
-    fn call_node(&self) -> CallNode {
+    pub(super) fn call_node(&self) -> CallNode {
         let (node_id, realm_id) = self.serving();
         CallNode {
             node_id,
@@ -208,7 +227,7 @@ impl Runs {
 
     /// Plays the scripted frames the way the node's session loop does, until the run ends or
     /// the script runs out.
-    async fn play(&self, record: &WorkflowRunRecord) -> Option<WorkflowRunRecord> {
+    pub(super) async fn play(&self, record: &WorkflowRunRecord) -> Option<WorkflowRunRecord> {
         let context = &self.fixture.context;
         let run_id = record.run_id;
         loop {
@@ -248,15 +267,15 @@ impl Runs {
     }
 }
 
-fn call(call_id: u64, request: HostRpcRequest) -> CoordinatorToHost {
+pub(super) fn call(call_id: u64, request: HostRpcRequest) -> CoordinatorToHost {
     CoordinatorToHost::RpcRequest { call_id, request }
 }
 
-fn event(seq: u64, event: LiveWorkflowEvent) -> CoordinatorToHost {
+pub(super) fn event(seq: u64, event: LiveWorkflowEvent) -> CoordinatorToHost {
     CoordinatorToHost::LiveEvent { seq, event }
 }
 
-fn task(state: TaskState, exit_code: Option<i32>) -> LiveWorkflowEvent {
+pub(super) fn task(state: TaskState, exit_code: Option<i32>) -> LiveWorkflowEvent {
     LiveWorkflowEvent::TaskChanged(TaskChange {
         task_id: 1,
         name: "echo-1-1".into(),
@@ -272,7 +291,7 @@ fn task(state: TaskState, exit_code: Option<i32>) -> LiveWorkflowEvent {
     })
 }
 
-fn log_calls() -> Vec<CoordinatorToHost> {
+pub(super) fn log_calls() -> Vec<CoordinatorToHost> {
     vec![
         call(
             1,
@@ -556,7 +575,7 @@ fn changed_task(record: &WorkflowRunRecord, state: RunState) -> WorkflowTaskReco
     )
 }
 
-fn sample_run() -> WorkflowRunRecord {
+pub(super) fn sample_run() -> WorkflowRunRecord {
     WorkflowRunRecord {
         run_id: Ulid::from_bytes([3; 16]),
         realm_id: aruna_core::structs::identity::realm::RealmId([5; 32]),
@@ -590,10 +609,13 @@ fn sample_run() -> WorkflowRunRecord {
         claim_token_digest: None,
         attempts: 1,
         steps: Vec::new(),
+        resumes_run_id: None,
+        repeats_run_id: None,
+        cache_scope: Default::default(),
     }
 }
 
-fn start_task() -> StartTask {
+pub(super) fn start_task() -> StartTask {
     StartTask {
         task_key_seed: "{\"command\":\"echo hi\"}".into(),
         step_id: "echo".into(),
@@ -636,7 +658,7 @@ fn start_task() -> StartTask {
     }
 }
 
-fn child<T, E>(result: Result<T, E>) -> IoResult
+pub(super) fn child<T, E>(result: Result<T, E>) -> IoResult
 where
     T: Send + std::fmt::Debug + PartialEq + 'static,
     E: Send + std::fmt::Debug + PartialEq + 'static,
@@ -644,7 +666,7 @@ where
     IoResult::Child(ChildOutcome::new(result))
 }
 
-fn ingress() -> IngressNode {
+pub(super) fn ingress() -> IngressNode {
     let node = aruna_ops_identity::testing::node(3);
     IngressNode {
         local: node,
@@ -758,7 +780,10 @@ fn waits_for_quota() {
     let mut task = RunTaskOperation::new(run.clone(), ingress(), Box::new(start_task()));
     task.stamp(5);
     task.first().unwrap();
-    let queued = task.next(IoResult::Values(vec![None])).unwrap();
+    let lookup = task.next(IoResult::Values(vec![None])).unwrap();
+    assert!(matches!(lookup, Next::Call(IoCall::Child(_))));
+    let miss = Ok::<Option<super::cache::CacheHit>, CatalogError>(None);
+    let queued = task.next(child(miss)).unwrap();
     assert!(matches!(queued, Next::Call(IoCall::Child(_))));
     let submit = task
         .next(child(Ok::<_, CatalogError>(run.clone())))

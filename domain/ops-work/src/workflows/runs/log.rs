@@ -1,5 +1,5 @@
 //! The paged run log of a run, kept apart from the job family: appends in sequence order with a
-//! head row, and the read of every page, which a later attempt replays.
+//! head row, and the reads of every page of a run or of its lineage, which later runs replay.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -194,4 +194,84 @@ impl Operation for LoadLogOperation {
 /// The answer of a [`LoadLogOperation`] child.
 pub(crate) fn pages_answer(result: IoResult) -> Result<Vec<RunLogPage>, CatalogError> {
     result.child::<Vec<RunLogPage>, CatalogError>()?
+}
+
+#[derive(Debug, PartialEq)]
+enum LineageStep {
+    Run,
+    Log(Option<Ulid>),
+}
+
+/// The log pages of a run and of every earlier run in its lineage, the oldest run first.
+/// By default it walks only resumed runs; `including_repeats` also follows repeated runs for
+/// explanations like `why`. A run that was deleted ends the chain.
+#[derive(Debug, PartialEq)]
+pub struct LineageLogOperation {
+    next: Ulid,
+    include_repeats: bool,
+    seen: Vec<Ulid>,
+    runs: Vec<Vec<RunLogPage>>,
+    step: LineageStep,
+}
+
+impl LineageLogOperation {
+    pub fn new(run_id: Ulid) -> Self {
+        Self {
+            next: run_id,
+            include_repeats: false,
+            seen: Vec::new(),
+            runs: Vec::new(),
+            step: LineageStep::Run,
+        }
+    }
+
+    pub fn including_repeats(run_id: Ulid) -> Self {
+        Self {
+            include_repeats: true,
+            ..Self::new(run_id)
+        }
+    }
+
+    fn done(&mut self) -> Result<Next<Vec<RunLogPage>>, CatalogError> {
+        let runs = std::mem::take(&mut self.runs);
+        Ok(Next::Done(runs.into_iter().rev().flatten().collect()))
+    }
+}
+
+impl Operation for LineageLogOperation {
+    type Output = Vec<RunLogPage>;
+    type Error = CatalogError;
+
+    fn first(&mut self) -> Result<Next<Vec<RunLogPage>>, CatalogError> {
+        self.seen.push(self.next);
+        Ok(Next::Call(super::read_run(self.next)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Vec<RunLogPage>>, CatalogError> {
+        match std::mem::replace(&mut self.step, LineageStep::Run) {
+            LineageStep::Run => {
+                let Some(record) = super::run_answer(result)? else {
+                    return self.done();
+                };
+                let earlier = match self.include_repeats {
+                    true => record.resumes_run_id.or(record.repeats_run_id),
+                    false => record.resumes_run_id,
+                };
+                self.step = LineageStep::Log(earlier);
+                Ok(Next::Call(IoCall::child(LoadLogOperation::new(
+                    record.run_id,
+                ))))
+            }
+            LineageStep::Log(resumes) => {
+                self.runs.push(pages_answer(result)?);
+                match resumes.filter(|run_id| !self.seen.contains(run_id)) {
+                    Some(run_id) => {
+                        self.next = run_id;
+                        self.first()
+                    }
+                    None => self.done(),
+                }
+            }
+        }
+    }
 }

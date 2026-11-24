@@ -632,6 +632,10 @@ pub const RUN_EVENT_KEYSPACE: &str = "workflow_run_events";
 pub const RUN_LOG_KEYSPACE: &str = "workflow_run_logs";
 /// The run each idempotency key started, by group, caller and key.
 pub const RUN_IDEMPOTENCY_KEYSPACE: &str = "workflow_run_keys";
+/// Reusable task results by scope namespace and task key; a newer result replaces an older one.
+pub const WORKFLOW_CACHE_KEYSPACE: &str = "workflow_task_cache";
+/// The finished RO-Crate JSON-LD of each workflow run, by run id.
+pub const WORKFLOW_CRATE_KEYSPACE: &str = "workflow_run_crates";
 
 /// Every keyspace this crate defines, so tooling reports a missing one without
 /// maintaining its own copy of the list.
@@ -955,6 +959,8 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     RUN_EVENT_KEYSPACE,
     RUN_LOG_KEYSPACE,
     RUN_IDEMPOTENCY_KEYSPACE,
+    WORKFLOW_CACHE_KEYSPACE,
+    WORKFLOW_CRATE_KEYSPACE,
 ];
 
 /// Smallest key strictly greater than every key starting with `prefix`,

@@ -1,20 +1,32 @@
-//! Workflow runs on one node: admission, the coordinator session, child tasks, data calls, the
-//! paged run log, the event stream, cancellation and the reads the portal makes.
+//! Workflow runs on one node: admission, resume and repeat, the coordinator session, child tasks
+//! and their cache, data calls, the run log, events, cancellation, reports and the run crate.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod admit;
+pub mod cache;
 pub mod cancel;
+pub mod control;
 pub mod data;
 pub mod events;
 pub mod log;
+pub mod provenance;
 pub mod reads;
 pub mod recover;
+pub mod reports;
 pub mod run;
 pub mod tasks;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "cache_tests.rs"]
+mod cache_tests;
+
+#[cfg(test)]
+#[path = "report_tests.rs"]
+mod report_tests;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id::NodeId;
@@ -138,6 +150,11 @@ pub enum RunChange {
     Delivered {
         file: RunFile,
         origin: Option<RunOrigin>,
+    },
+    /// How the publication of the run's crate ended, and its document once published.
+    Provenance {
+        status: String,
+        document_id: Option<Ulid>,
     },
 }
 
@@ -289,6 +306,14 @@ fn change_run(
             record.parent_job_id = Some(job_id);
             Ok(())
         }
+        RunChange::Provenance {
+            status,
+            document_id,
+        } => {
+            record.provenance_status = Some(status);
+            record.provenance_document_id = document_id.or(record.provenance_document_id);
+            Ok(())
+        }
         RunChange::Task(_) => Ok(()),
     }
 }
@@ -355,6 +380,7 @@ fn keep_known(task: &mut WorkflowTaskRecord, old: &WorkflowTaskRecord) {
     task.index = task.index.or(old.index);
     task.mode = task.mode.take().or_else(|| old.mode.clone());
     task.cache_key = task.cache_key.take().or_else(|| old.cache_key.clone());
+    task.deterministic = task.deterministic.or(old.deterministic);
     task.error = task.error.take().or_else(|| old.error.clone());
     let lists = [
         (&mut task.inputs, &old.inputs),

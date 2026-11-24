@@ -13,7 +13,8 @@ use aruna_core::structs::execution::job::identity::RETENTION_MS;
 use aruna_core::structs::execution::job::input::JobPayload;
 use aruna_core::structs::execution::job::local::{WorkspaceMode, user_dedup_key};
 use aruna_core::structs::execution::workflow_run::{
-    RunKeyRecord, RunOutput, RunState, WorkflowRunRecord, WorkflowRunSpec, run_key, run_key_row,
+    CacheScope, RunKeyRecord, RunOutput, RunState, WorkflowRunRecord, WorkflowRunSpec, run_key,
+    run_key_row,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
@@ -77,6 +78,16 @@ impl RunRequest {
     }
 }
 
+/// Where a new run stands in a lineage: the run it resumes or repeats, and its cache scope.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Lineage {
+    /// The first run of the lineage; `None` starts a new one with the run itself.
+    pub first: Option<Ulid>,
+    pub resumes: Option<Ulid>,
+    pub repeats: Option<Ulid>,
+    pub cache_scope: CacheScope,
+}
+
 /// A run the caller started, and whether this request created it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdmittedRun {
@@ -104,6 +115,7 @@ pub struct StartRunOperation {
     auth: AuthContext,
     node: (NodeId, RealmId),
     request: RunRequest,
+    lineage: Lineage,
     pending: Vec<PinnedInput>,
     ids: IdMint,
     now_ms: u64,
@@ -119,10 +131,17 @@ impl StartRunOperation {
             node,
             pending: request.inputs.clone(),
             request,
+            lineage: Lineage::default(),
             ids: IdMint::default(),
             now_ms: 0,
             step: AdmitStep::Group,
         }
+    }
+
+    /// Starts the run in an existing lineage, as a resume or a repeat does.
+    pub fn in_lineage(mut self, lineage: Lineage) -> Self {
+        self.lineage = lineage;
+        self
     }
 
     fn key_row(&self, key: &str) -> Key {
@@ -181,7 +200,7 @@ impl StartRunOperation {
             workflow_id: request.workflow_id,
             workflow_name: view.workflow.name.clone(),
             version: request.version,
-            lineage: run_id,
+            lineage: self.lineage.first.unwrap_or(run_id),
             state: RunState::Queued,
             node_id: self.node.0,
             created_by: self.auth.user_id,
@@ -202,6 +221,9 @@ impl StartRunOperation {
             claim_token_digest: None,
             attempts: 0,
             steps: Vec::new(),
+            resumes_run_id: self.lineage.resumes,
+            repeats_run_id: self.lineage.repeats,
+            cache_scope: self.lineage.cache_scope,
         };
         let key = request.idempotency_key.as_ref().map(|key| {
             let row = self.key_row(key);

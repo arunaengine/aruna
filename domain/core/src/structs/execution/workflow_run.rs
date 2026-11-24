@@ -1,5 +1,5 @@
 //! Records of workflow runs on one node: the run, its tasks, its event stream rows, its paged run
-//! log and its idempotency index, with their storage keys and codecs.
+//! log, its idempotency index and the task cache, with their storage keys and codecs.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -103,6 +103,47 @@ pub struct RunFile {
     pub digest: Option<String>,
 }
 
+/// Which runs may reuse a task result: the run itself, its group, or the whole realm.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheScope {
+    /// Only the run that made the result; no other run reuses it.
+    Run,
+    #[default]
+    Group,
+    /// Off unless a run asks for it; a hit from another group never names its producer.
+    Realm,
+}
+
+impl CacheScope {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Run => "run",
+            Self::Group => "group",
+            Self::Realm => "realm",
+        }
+    }
+}
+
+/// One reusable result of a task that ended with exit code 0, under a scope's namespace.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowCacheRecord {
+    pub task_key: String,
+    /// `run:<run_id>`, `group:<group_id>` or `realm`.
+    pub scope_namespace: String,
+    pub exit_code: i32,
+    /// The outputs by their task path, each pinned to the version the task wrote.
+    pub outputs: Vec<RunFile>,
+    pub stdout_tail: Vec<u8>,
+    pub stderr_tail: Vec<u8>,
+    pub created_at_ms: u64,
+    pub producer_group_id: GroupId,
+    pub producer_run_id: Ulid,
+    /// No network, every input by content and a pinned image.
+    pub deterministic: bool,
+    pub has_secrets: bool,
+}
+
 /// One object version a run names as its origin.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunOrigin {
@@ -202,6 +243,11 @@ pub struct WorkflowRunRecord {
     pub attempts: u32,
     /// The task counts of each step, in the order the steps first appeared.
     pub steps: Vec<StepRecord>,
+    /// The run this run resumes; finished tasks of its lineage are not run again.
+    pub resumes_run_id: Option<Ulid>,
+    /// The run this run repeats from the same sources, values and images.
+    pub repeats_run_id: Option<Ulid>,
+    pub cache_scope: CacheScope,
 }
 
 /// One task of a run, with the state of its newest attempt.
@@ -222,6 +268,8 @@ pub struct WorkflowTaskRecord {
     pub mode: Option<String>,
     pub cached: bool,
     pub cache_key: Option<String>,
+    /// The task runs without network, reads every input by content and names a pinned image.
+    pub deterministic: Option<bool>,
     pub staged_bytes: Option<u64>,
     pub cpu_seconds: Option<f64>,
     pub max_rss_bytes: Option<u64>,
@@ -270,7 +318,8 @@ postcard_codec!(
     WorkflowTaskRecord,
     RunEventRecord,
     RunKeyRecord,
-    LogHead
+    LogHead,
+    WorkflowCacheRecord
 );
 
 /// A run log page as JSON, since its entries carry uwe's changes as free JSON.
@@ -330,6 +379,14 @@ pub fn run_key_row(group_id: GroupId, created_by: UserId, key: &str) -> Key {
     Key::from(row)
 }
 
+/// The row of a cached task result: the namespace with its length first, then the task key.
+pub fn cache_row(namespace: &str, task_key: &str) -> Key {
+    let mut row = (namespace.len() as u32).to_be_bytes().to_vec();
+    row.extend_from_slice(namespace.as_bytes());
+    row.extend_from_slice(task_key.as_bytes());
+    Key::from(row)
+}
+
 fn numbered(run_id: Ulid, number: &[u8]) -> Key {
     let mut key = run_id.to_bytes().to_vec();
     key.extend_from_slice(number);
@@ -355,9 +412,9 @@ mod tests {
     fn orders_event_keys() {
         let run = Ulid::from_bytes([1; 16]);
         assert!(event_key(run, 2) < event_key(run, 10));
-        assert!(event_key(run, 7).starts_with(&run_prefix(run)));
+        assert!(event_key(run, 7).starts_with(run_prefix(run)));
         let other = Ulid::from_bytes([2; 16]);
-        assert!(!task_key(other, 1).starts_with(&run_prefix(run)));
+        assert!(!task_key(other, 1).starts_with(run_prefix(run)));
     }
 
     #[test]
@@ -370,6 +427,8 @@ mod tests {
         );
         assert!(named_task("run-1-1") >= 1 << 63);
         assert_eq!(named_task("x"), named_task("x"));
+        assert_ne!(cache_row("group:a", "bc"), cache_row("group:ab", "c"));
+        assert_eq!(cache_row("realm", "k"), cache_row("realm", "k"));
     }
 
     #[test]

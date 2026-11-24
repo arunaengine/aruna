@@ -24,7 +24,7 @@ use aruna_workflow_contract::message::{
     RunStartPayload, TaskChange, TaskState,
 };
 use aruna_workflow_contract::preflight::{
-    ComposedLowering, RunLogEntry, SourceFile, WorkflowLanguage, WorkflowSource,
+    ComposedLowering, RunLogEntry, RunLogPage, SourceFile, WorkflowLanguage, WorkflowSource,
 };
 use aruna_workflow_contract::settings::ArunaStepSettings;
 use aruna_workflow_contract::{ContractError, PreflightKind, PreflightResult};
@@ -35,7 +35,7 @@ use super::data::{
     DataCall, ReadDataOperation, Target, WriteBody, WriteObjectOperation, delivery_target, resolve,
     upload_target,
 };
-use super::log::{AppendLogOperation, LoadLogOperation, pages_answer};
+use super::log::{AppendLogOperation, LineageLogOperation, LoadLogOperation, pages_answer};
 use super::tasks::{RunTaskOperation, StopTasksOperation};
 use super::{RunChange, change_call, changed, creator_auth};
 use crate::jobs::lifecycle::submit_external::IngressNode;
@@ -59,11 +59,11 @@ pub fn session_name(run_id: Ulid) -> String {
     format!("run-{run_id}")
 }
 
-fn workflow_call(effect: WorkflowEffect) -> IoCall {
+pub(crate) fn workflow_call(effect: WorkflowEffect) -> IoCall {
     IoCall::Effect(Box::new(Effect::Workflow(Box::new(effect))))
 }
 
-fn workflow_answer(result: IoResult) -> Result<WorkflowAnswer, CatalogError> {
+pub(crate) fn workflow_answer(result: IoResult) -> Result<WorkflowAnswer, CatalogError> {
     match result.event()? {
         Event::Workflow(answer) => Ok(*answer),
         _ => Err(crate::workflows::unexpected("Event::Workflow")),
@@ -96,8 +96,9 @@ enum PrepareStep {
     Version,
     Tools(Box<VersionView>),
     Lower(Box<VersionView>),
-    Log(Box<Start>),
-    Open(Box<(Start, Vec<aruna_workflow_contract::preflight::RunLogPage>)>),
+    Lineage(Box<Start>),
+    Log(Box<(Start, Vec<RunLogPage>)>),
+    Open(Box<(Start, Vec<RunLogPage>, Option<String>)>),
     Send,
     Running,
     Failed(String),
@@ -188,21 +189,43 @@ impl PrepareRunOperation {
         self.load_log(start)
     }
 
+    /// Loads the run log of a resumed lineage first, then the run's own log.
     fn load_log(&mut self, start: Start) -> PrepareNext {
-        self.step = PrepareStep::Log(Box::new(start));
+        if let Some(source) = self.record()?.resumes_run_id {
+            self.step = PrepareStep::Lineage(Box::new(start));
+            let lineage = LineageLogOperation::new(source);
+            return Ok(Next::Call(IoCall::child(lineage)));
+        }
+        self.own_log(start, Vec::new())
+    }
+
+    fn own_log(&mut self, start: Start, lineage: Vec<RunLogPage>) -> PrepareNext {
+        self.step = PrepareStep::Log(Box::new((start, lineage)));
         Ok(Next::Call(IoCall::child(LoadLogOperation::new(
             self.spec.run_id,
         ))))
     }
 
+    /// The run a coordinator resumes: this run after an earlier attempt, or else the run it
+    /// resumes; `None` without any log.
+    fn resume_of(&self, lineage: &[RunLogPage], own: &[RunLogPage]) -> Option<String> {
+        let record = self.record.as_ref()?;
+        match (own.is_empty(), record.resumes_run_id) {
+            (false, _) => Some(record.run_id.to_string()),
+            (true, Some(source)) if !lineage.is_empty() => Some(source.to_string()),
+            _ => None,
+        }
+    }
+
     fn payload(
         &self,
         start: Start,
-        pages: Vec<aruna_workflow_contract::preflight::RunLogPage>,
+        pages: Vec<RunLogPage>,
+        resume: Option<String>,
     ) -> Result<RunStartPayload, CatalogError> {
         let record = self.record()?;
         let inputs = run_inputs(record)?;
-        let resume = (!pages.is_empty()).then(|| record.run_id.to_string());
+        let namespace = super::cache::namespaces(record, record.cache_scope).pop();
         Ok(RunStartPayload {
             source: start.source,
             entrypoint: start.entrypoint,
@@ -210,7 +233,7 @@ impl PrepareRunOperation {
             inputs,
             params: Map::new(),
             pinned_images: start.images,
-            cache_namespace: Some(format!("group:{}", record.group_id)),
+            cache_namespace: namespace,
             resume_lineage: resume,
             secret_names: Vec::new(),
             network_isolated: false,
@@ -335,10 +358,17 @@ impl Operation for PrepareRunOperation {
                 Err(WorkflowError::Refused(refusal)) => self.fail(refusal.to_string()),
                 Err(error) => Err(refused(error)),
             },
-            PrepareStep::Log(start) => {
-                let pages = pages_answer(result)?;
+            PrepareStep::Lineage(start) => {
+                let lineage = pages_answer(result)?;
+                self.own_log(*start, lineage)
+            }
+            PrepareStep::Log(parts) => {
+                let (start, mut pages) = *parts;
+                let own = pages_answer(result)?;
+                let resume = self.resume_of(&pages, &own);
+                pages.extend(own);
                 let session = session_name(self.spec.run_id);
-                self.step = PrepareStep::Open(Box::new((*start, pages)));
+                self.step = PrepareStep::Open(Box::new((start, pages, resume)));
                 Ok(Next::Call(workflow_call(WorkflowEffect::Open {
                     session,
                     mode: CoordinatorMode::Run,
@@ -354,8 +384,8 @@ impl Operation for PrepareRunOperation {
                     }
                     _ => return Err(crate::workflows::unexpected("WorkflowAnswer::Opened")),
                 }
-                let (start, pages) = *parts;
-                let payload = self.payload(start, pages)?;
+                let (start, pages, resume) = *parts;
+                let payload = self.payload(start, pages, resume)?;
                 self.step = PrepareStep::Send;
                 Ok(Next::Call(workflow_call(WorkflowEffect::Send {
                     session: session_name(self.spec.run_id),
@@ -547,7 +577,9 @@ impl AnswerCallOperation {
                 )))))
             }
             HostRpcRequest::StartTask(task) => {
-                self.child(RunTaskOperation::new(run, self.node.ingress.clone(), task))
+                let routing = self.node.routing.clone();
+                let task = RunTaskOperation::new(run, self.node.ingress.clone(), task);
+                self.child(task.routing(routing))
             }
             HostRpcRequest::CancelTask { name } => {
                 self.child(StopTasksOperation::new(run, serving, Some(name)))
@@ -800,6 +832,7 @@ pub fn changed_task(run_id: Ulid, change: &TaskChange) -> WorkflowTaskRecord {
         mode: None,
         cached: change.cached || change.state == TaskState::Reused,
         cache_key: None,
+        deterministic: None,
         staged_bytes: None,
         cpu_seconds: None,
         max_rss_bytes: None,

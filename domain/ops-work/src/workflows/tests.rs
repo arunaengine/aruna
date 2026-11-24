@@ -214,7 +214,7 @@ pub(super) struct Fixture {
     pub(super) bob: AuthContext,
     pub(super) stranger: AuthContext,
     pub(super) group_a: Ulid,
-    group_b: Ulid,
+    pub(super) group_b: Ulid,
 }
 
 pub(super) async fn write(context: &DriverContext, space: &str, key: Vec<u8>, value: Vec<u8>) {

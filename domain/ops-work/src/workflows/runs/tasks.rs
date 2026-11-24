@@ -1,5 +1,5 @@
-//! Runs the tasks of a workflow run as keyed child execution jobs: one attempt is one child,
-//! submitted once or adopted after a restart, waited for, and read back from the run's area.
+//! Runs the tasks of a workflow run: an attempt is answered from the task cache, or runs as one
+//! keyed child job, submitted once or adopted after a restart, and read back from the run's area.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -24,10 +24,11 @@ use aruna_core::structs::execution::job::input::{
 };
 use aruna_core::structs::execution::job::local::WorkspaceMode;
 use aruna_core::structs::execution::workflow_run::{
-    RunFile, RunState, WorkflowRunRecord, WorkflowTaskRecord, named_task, task_key,
+    CacheScope, RunFile, RunState, WorkflowRunRecord, WorkflowTaskRecord, named_task, task_key,
 };
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::object_read::ObjectRangeRequest;
+use aruna_core::structs::storage::routing::NodeRouting;
 use aruna_ops_data::s3::object::get::{
     GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult,
 };
@@ -36,7 +37,10 @@ use aruna_workflow_contract::{ContractError, HostRpcResult};
 use tracing::warn;
 use ulid::Ulid;
 
-use super::data::{address_of, area_of, resolve};
+use super::cache::{
+    CacheEntry, CacheHit, LookupCacheOperation, StoreCacheOperation, deterministic, task_scope,
+};
+use super::data::{Target, WriteBody, WriteObjectOperation, address_of, area_of, resolve};
 use super::{RunChange, RunTasksOperation, change_call, changed, creator_auth, tasks_answer};
 use crate::jobs::lifecycle::admit::here::AcceptedSubmission;
 use crate::jobs::lifecycle::cancel::CancelFamilyOperation;
@@ -236,6 +240,7 @@ fn task_record(
         mode: Some("compute_to_data".to_owned()),
         cached: false,
         cache_key: Some(task_key.to_owned()),
+        deterministic: Some(deterministic(request)),
         staged_bytes: None,
         cpu_seconds: None,
         max_rss_bytes: None,
@@ -250,9 +255,19 @@ fn task_record(
     }
 }
 
+/// A foreign cache hit whose outputs are copied into the run's area one by one.
+#[derive(Debug, PartialEq)]
+struct Copying {
+    hit: CacheHit,
+    pending: Vec<RunFile>,
+    copied: Vec<RunFile>,
+}
+
 #[derive(Debug, PartialEq)]
 enum TaskStep {
     Stored,
+    Lookup,
+    Copy(Box<Copying>, RunFile),
     Queued,
     Submit,
     Adopted(JobId),
@@ -260,6 +275,7 @@ enum TaskStep {
     Wait(JobId),
     Started(JobId),
     Control(Box<JobProjection>),
+    Pin(Box<(WorkflowTaskRecord, TaskFinished)>),
     Finished(Box<TaskFinished>),
 }
 
@@ -269,8 +285,10 @@ enum TaskStep {
 pub struct RunTaskOperation {
     run: WorkflowRunRecord,
     node: IngressNode,
+    routing: NodeRouting,
     request: Box<StartTask>,
     task_key: String,
+    scope: CacheScope,
     waits: u32,
     started: bool,
     now_ms: u64,
@@ -282,11 +300,14 @@ type TaskNext = Result<Next<HostRpcResult>, CatalogError>;
 impl RunTaskOperation {
     pub fn new(run: WorkflowRunRecord, node: IngressNode, request: Box<StartTask>) -> Self {
         let task_key = task_key_of(&request.task_key_seed);
+        let scope = task_scope(&run, &request);
         Self {
             run,
             node,
+            routing: NodeRouting::default(),
             request,
             task_key,
+            scope,
             waits: 0,
             started: false,
             now_ms: 0,
@@ -294,8 +315,178 @@ impl RunTaskOperation {
         }
     }
 
+    /// The node's routing, which a copy of a foreign cache hit writes with.
+    pub fn routing(mut self, routing: NodeRouting) -> Self {
+        self.routing = routing;
+        self
+    }
+
     fn record(&self, state: RunState) -> WorkflowTaskRecord {
         task_record(&self.run, &self.request, &self.task_key, state)
+    }
+
+    /// Queues the attempt for a child job, as no cached result can answer it.
+    fn queue(&mut self) -> TaskNext {
+        let task = self.record(RunState::Queued);
+        self.change(task, TaskStep::Queued)
+    }
+
+    fn found(&mut self, hit: Option<CacheHit>) -> TaskNext {
+        let Some(hit) = hit else {
+            return self.queue();
+        };
+        if !hit.foreign {
+            let outputs = hit.record.outputs.clone();
+            return self.reuse(&hit, outputs);
+        }
+        let pending = hit.record.outputs.iter().rev().cloned().collect();
+        let copying = Copying {
+            hit,
+            pending,
+            copied: Vec::new(),
+        };
+        self.copy_next(copying)
+    }
+
+    /// Copies the next output of a foreign hit to where this attempt would have written it.
+    fn copy_next(&mut self, mut copying: Copying) -> TaskNext {
+        let Some(file) = copying.pending.pop() else {
+            let outputs = std::mem::take(&mut copying.copied);
+            return self.reuse(&copying.hit, outputs);
+        };
+        let target = attempt_folder(&self.run, &self.request.name).map(|(bucket, folder)| {
+            let key = match file.name.strip_prefix('/') {
+                Some(absolute) => format!("{folder}control/root/{absolute}"),
+                None => format!("{folder}work/{}", file.name),
+            };
+            Target {
+                bucket,
+                key,
+                version: None,
+                owned: true,
+            }
+        });
+        let version = (file.version_id.as_deref()).and_then(|version| version.parse().ok());
+        let (Some(target), Some(bucket), Some(key)) =
+            (target, file.bucket.clone(), file.key.clone())
+        else {
+            return self.queue();
+        };
+        let source = Target {
+            bucket,
+            key,
+            version,
+            owned: false,
+        };
+        let write = WriteObjectOperation::new(
+            (self.run.clone(), self.run.node_id),
+            self.routing.clone(),
+            target,
+            WriteBody::Copy(source),
+        );
+        self.step = TaskStep::Copy(Box::new(copying), file);
+        Ok(Next::Call(IoCall::child(write)))
+    }
+
+    fn copied(&mut self, mut copying: Copying, file: RunFile, result: IoResult) -> TaskNext {
+        let receipt = match result.child::<HostRpcResult, CatalogError>()? {
+            Ok(HostRpcResult::UploadAck {
+                receipt: Some(receipt),
+                ..
+            }) => receipt,
+            // A copy that fails leaves the hit unused; the task runs as if nothing was cached.
+            other => {
+                warn!(run = %self.run.run_id, task = %self.request.name, ?other, "a cached output was not copied");
+                return self.queue();
+            }
+        };
+        let target = resolve(&self.run, &receipt.address).ok();
+        copying.copied.push(RunFile {
+            name: file.name,
+            bucket: target.as_ref().map(|target| target.bucket.clone()),
+            key: target.map(|target| target.key),
+            version_id: receipt.version,
+            node_id: Some(self.run.node_id),
+            size: Some(receipt.size),
+            digest: file.digest,
+        });
+        self.copy_next(copying)
+    }
+
+    /// Answers the attempt with a cached result. The task record and its events name only the
+    /// outputs this run reads, never the run, group or user that made them.
+    fn reuse(&mut self, hit: &CacheHit, outputs: Vec<RunFile>) -> TaskNext {
+        let mut task = self.record(RunState::Succeeded);
+        task.cached = true;
+        task.exit_code = Some(hit.record.exit_code);
+        task.started_at_ms = Some(self.now_ms);
+        task.finished_at_ms = Some(self.now_ms);
+        task.stdout_tail = hit.record.stdout_tail.clone();
+        task.stderr_tail = hit.record.stderr_tail.clone();
+        let answered = (outputs.iter())
+            .filter_map(|file| {
+                let version = (file.version_id.as_deref()).and_then(|version| version.parse().ok());
+                Some(TaskOutput {
+                    path: file.name.clone(),
+                    directory: false,
+                    address: address_of(file.bucket.as_deref()?, file.key.as_deref()?, version),
+                    digest: None,
+                    size: file.size.unwrap_or_default(),
+                })
+            })
+            .collect();
+        task.outputs = outputs;
+        let finished = TaskFinished {
+            exit_code: Some(hit.record.exit_code),
+            outputs: answered,
+            stdout_tail: hit.record.stdout_tail.clone(),
+            stderr_tail: hit.record.stderr_tail.clone(),
+            ..TaskFinished::default()
+        };
+        self.change(task, TaskStep::Finished(Box::new(finished)))
+    }
+
+    /// Keeps the result of a successful attempt in the cache of its scope, with its outputs
+    /// pinned to the versions it wrote.
+    fn keep(&mut self, task: WorkflowTaskRecord, finished: TaskFinished) -> TaskNext {
+        let entry = CacheEntry {
+            task_key: self.task_key.clone(),
+            outputs: task.outputs.clone(),
+            stdout_tail: task.stdout_tail.clone(),
+            stderr_tail: task.stderr_tail.clone(),
+            deterministic: deterministic(&self.request),
+            has_secrets: !self.request.secret_placeholders.is_empty(),
+        };
+        let store = StoreCacheOperation::new(&self.run, self.scope, entry);
+        self.step = TaskStep::Pin(Box::new((task, finished)));
+        Ok(Next::Call(IoCall::child(store)))
+    }
+
+    fn pinned(
+        &mut self,
+        (mut task, mut finished): (WorkflowTaskRecord, TaskFinished),
+        result: IoResult,
+    ) -> TaskNext {
+        match result.child::<Vec<RunFile>, CatalogError>()? {
+            Ok(pinned) => {
+                for output in &mut finished.outputs {
+                    let file = pinned.iter().find(|file| file.name == output.path);
+                    if let Some(file) = file.filter(|file| file.version_id.is_some()) {
+                        let version = (file.version_id.as_deref()).and_then(|v| v.parse().ok());
+                        let (bucket, key) = (file.bucket.as_deref(), file.key.as_deref());
+                        if let (Some(bucket), Some(key)) = (bucket, key) {
+                            output.address = address_of(bucket, key, version);
+                        }
+                        output.size = file.size.unwrap_or(output.size);
+                    }
+                }
+                task.outputs = pinned;
+            }
+            Err(error) => {
+                warn!(%error, run = %self.run.run_id, task = %self.request.name, "a task result was not cached");
+            }
+        }
+        self.change(task, TaskStep::Finished(Box::new(finished)))
     }
 
     fn change(&mut self, task: WorkflowTaskRecord, step: TaskStep) -> TaskNext {
@@ -508,8 +699,8 @@ impl RunTaskOperation {
         let mut task = self.record(state);
         task.child_job_id = Some(projection.canonical_job_id);
         task.exit_code = exit_code;
-        task.finished_at_ms = Some(self.now_ms);
         task.started_at_ms = finished.started.map(|seconds| (seconds * 1000.0) as u64);
+        task.finished_at_ms = Some(self.now_ms);
         task.stdout_tail = finished.stdout_tail.clone();
         task.stderr_tail = finished.stderr_tail.clone();
         task.outputs = (finished.outputs.iter())
@@ -524,6 +715,10 @@ impl RunTaskOperation {
                 }
             })
             .collect();
+        // Only a result with exit code 0 is kept; another one is never reused.
+        if exit_code == Some(0) {
+            return self.keep(task, finished);
+        }
         self.change(task, TaskStep::Finished(Box::new(finished)))
     }
 }
@@ -559,11 +754,22 @@ impl Operation for RunTaskOperation {
                 match adopted {
                     Some(job_id) => self.poll(job_id),
                     None => {
-                        let task = self.record(RunState::Queued);
-                        self.change(task, TaskStep::Queued)
+                        let lookup =
+                            LookupCacheOperation::new(&self.run, self.scope, &self.task_key);
+                        self.step = TaskStep::Lookup;
+                        Ok(Next::Call(IoCall::child(lookup)))
                     }
                 }
             }
+            TaskStep::Lookup => match result.child::<Option<CacheHit>, CatalogError>()? {
+                Ok(hit) => self.found(hit),
+                Err(error) => {
+                    warn!(%error, run = %self.run.run_id, "the task cache was not read");
+                    self.queue()
+                }
+            },
+            TaskStep::Copy(copying, file) => self.copied(*copying, file, result),
+            TaskStep::Pin(parts) => self.pinned(*parts, result),
             TaskStep::Queued => {
                 if !matches!(result, IoResult::Woke) {
                     changed(result)?;

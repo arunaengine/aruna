@@ -6,7 +6,8 @@
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    RUN_EVENT_KEYSPACE, RUN_LOG_KEYSPACE, WORKFLOW_RUN_KEYSPACE, WORKFLOW_TASK_KEYSPACE,
+    RUN_EVENT_KEYSPACE, RUN_LOG_KEYSPACE, WORKFLOW_CRATE_KEYSPACE, WORKFLOW_RUN_KEYSPACE,
+    WORKFLOW_TASK_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::identity::JobId;
@@ -191,7 +192,8 @@ impl Operation for CancelRunOperation {
     }
 }
 
-/// Deletes an ended run: its row first, so it is gone at once, then its tasks, events and log.
+/// Deletes an ended run: its row first, so it is gone at once, then its tasks, events, log and
+/// stored crate.
 #[derive(Debug, PartialEq)]
 pub struct DeleteRunOperation {
     auth: AuthContext,
@@ -206,6 +208,7 @@ impl DeleteRunOperation {
             auth: auth.clone(),
             run_id,
             spaces: vec![
+                WORKFLOW_CRATE_KEYSPACE.to_string(),
                 RUN_LOG_KEYSPACE.to_string(),
                 RUN_EVENT_KEYSPACE.to_string(),
                 WORKFLOW_TASK_KEYSPACE.to_string(),

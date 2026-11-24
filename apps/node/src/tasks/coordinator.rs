@@ -12,6 +12,7 @@ use aruna_core::structs::execution::job::local::{JobError, JobResultPayload};
 use aruna_core::structs::execution::workflow_run::{RunState, WorkflowRunRecord, WorkflowRunSpec};
 use aruna_ops_work::jobs::lifecycle::submit_external::IngressNode;
 use aruna_ops_work::jobs::node_inputs::ingress_node;
+use aruna_ops_work::workflows::runs::provenance::WriteProvenanceOperation;
 use aruna_ops_work::workflows::runs::recover::{InterruptRunOperation, Interrupted};
 use aruna_ops_work::workflows::runs::run::{
     AnswerCallOperation, ApplyEventOperation, CallNode, Chunk, FinishRunOperation, Inbound,
@@ -43,11 +44,24 @@ pub(crate) async fn run_workflow(ctx: &JobContext, spec: &WorkflowRunSpec) -> Jo
         prepared = drive(prepare, &ctx.driver) => prepared,
     };
     wake(&ctx.driver, spec.run_id);
-    match prepared {
+    let outcome = match prepared {
         Ok(Prepared::Ready(record)) => Session::new(ctx, spec, *record).run().await,
         Ok(Prepared::Ended(state)) => ended(spec.run_id, state, None),
         // The run waits for the next attempt, or fails on the last one, never stays planning.
         Err(error) => Session::interrupt(ctx, spec.run_id, error.to_string()).await,
+    };
+    if !matches!(outcome, JobRunOutcome::Interrupted) {
+        write_crate(ctx, spec).await;
+    }
+    outcome
+}
+
+/// Writes the crate of a run that ended, once; a run that goes on is left alone. A failed
+/// publication is recorded on the run, so this only warns.
+async fn write_crate(ctx: &JobContext, spec: &WorkflowRunSpec) {
+    let write = WriteProvenanceOperation::new(spec.run_id, (ctx.owner_node_id, spec.realm_id));
+    if let Err(error) = drive(write, &ctx.driver).await {
+        warn!(%error, run = %spec.run_id, "the run crate was not written");
     }
 }
 
