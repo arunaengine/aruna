@@ -57,6 +57,16 @@ impl Run {
 /// Answers one projection's calls: `rows` are the stored family records, `cache` the stored
 /// cache row, and `local` the job row every alias read answers with.
 fn run(family: &Family, rows: &[(Key, Value)], cache: Option<Value>, local: Option<Value>) -> Run {
+    run_fenced(family, rows, [cache.clone(), cache], local)
+}
+
+/// As `run`, with the cache row the read outside and the read inside the transaction find.
+fn run_fenced(
+    family: &Family,
+    rows: &[(Key, Value)],
+    [cache, inside]: [Option<Value>; 2],
+    local: Option<Value>,
+) -> Run {
     let mut operation = ProjectFamilyOperation::new(ProjectFamilyConfig {
         family: FamilyRef::Family(family.family()),
         now_ms: 3_100,
@@ -92,6 +102,14 @@ fn run(family: &Family, rows: &[(Key, Value)], cache: Option<Value>, local: Opti
                     rows: page,
                     next: None,
                 }
+            }
+            // The rebuild reads the cache again in its transaction.
+            IoCall::Read(reads)
+                if reads
+                    .first()
+                    .is_some_and(|(space, _)| space == FAMILY_PROJECTION_KEYSPACE) =>
+            {
+                IoResult::Values(vec![inside.clone()])
             }
             IoCall::Read(reads) => {
                 bridged = true;
@@ -266,6 +284,35 @@ fn old_version_rebuilds() {
     let rebuilt = discarded.cache_row().expect("cache row written");
     assert_eq!(rebuilt.version, PROJECTION_CACHE_VERSION);
     assert_eq!(rebuilt.revision, 1);
+}
+
+#[test]
+fn rechecks_cache_revision() {
+    // A rebuild reads the cache again in its transaction: one another rebuild published since
+    // the read outside answers as it is, and a newer stale one sets the revision that follows.
+    let family = Family::new([7u8; 32]);
+    let records = family.run(1, 0, PhysicalExecutionState::Succeeded);
+    let stored = rows(&records, records.len());
+    let stale = |revision| ProjectionCache {
+        revision,
+        ..ProjectionCache::invalidated(None)
+    };
+    let published = ProjectionCache {
+        revision: 4,
+        stale: false,
+        projection: reduce_family(family.family(), &records).expect("records reduce"),
+        ..stale(4)
+    };
+    let caches = [Some(encoded(&stale(3))), Some(encoded(&published))];
+    let fresh = run_fenced(&family, &stored, caches, None);
+    assert!(fresh.projected().cached);
+    assert_eq!(fresh.projected().revision, 4);
+    assert!(fresh.writes.is_empty());
+
+    let caches = [Some(encoded(&stale(3))), Some(encoded(&stale(4)))];
+    let rebuilt = run_fenced(&family, &stored, caches, None);
+    assert_eq!(rebuilt.cache_row().expect("cache row written").revision, 5);
+    assert_eq!(rebuilt.projected().revision, 5);
 }
 
 #[test]

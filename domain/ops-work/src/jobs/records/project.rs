@@ -8,6 +8,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{FAMILY_ALIAS_KEYSPACE, FAMILY_PROJECTION_KEYSPACE};
 use aruna_core::keyspaces::{FAMILY_RECORD_KEYSPACE, JOB_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::values;
 use aruna_core::structs::execution::job::family::{
     JobFamilyId, JobProjection, JobRecordEnvelope, JobRecordKey, LogicalJobState,
 };
@@ -57,8 +58,8 @@ pub struct ProjectedFamily {
     pub cached: bool,
 }
 
-/// Reads the cache outside any transaction; a rebuild pages, bridges and caches the family in
-/// one write transaction, which the runner opens at the first row call and commits on success.
+/// Reads the cache outside any transaction; a rebuild reads it again, pages, bridges and caches
+/// the family in one write transaction, which the runner opens at its first row call.
 #[derive(Debug, PartialEq)]
 pub struct ProjectFamilyOperation {
     config: ProjectFamilyConfig,
@@ -75,6 +76,8 @@ pub struct ProjectFamilyOperation {
 enum ProjectState {
     ResolveAlias,
     ReadCache,
+    /// Reads the cache again in the rebuild's transaction, so the revision it derives is fenced.
+    Recheck,
     Page,
     ReadJobs,
     Write,
@@ -116,6 +119,29 @@ impl ProjectFamilyOperation {
             key: family_prefix(&family),
             txn_id: None,
         }))
+    }
+
+    /// Keeps the cache `value` holds; a fresh one answers without a rebuild.
+    fn keep_cache(&mut self, value: Option<Value>) -> Option<Step> {
+        self.cache = value
+            .as_ref()
+            .and_then(|value| ProjectionCache::decode(value));
+        let fresh = (self.cache.as_ref()).is_some_and(|cache| !cache.stale && !self.config.rebuild);
+        if !fresh {
+            return None;
+        }
+        self.projection = (self.cache.as_ref()).and_then(|cache| cache.projection.clone());
+        Some(self.settle(true))
+    }
+
+    fn recheck(&mut self) -> Step {
+        let family = self.family()?;
+        self.state = ProjectState::Recheck;
+        let cache = (
+            FAMILY_PROJECTION_KEYSPACE.to_string(),
+            family_prefix(&family),
+        );
+        Ok(Next::Call(IoCall::Read(vec![cache])))
     }
 
     fn page(&mut self) -> Step {
@@ -336,28 +362,23 @@ impl Operation for ProjectFamilyOperation {
                 other => Err(self.unexpected("alias scan", Event::Storage(other).label())),
             },
             ProjectState::ReadCache => match self.outside_event("projection cache read", result)? {
-                StorageEvent::ReadResult { value, .. } => {
-                    self.cache = value
-                        .as_ref()
-                        .and_then(|value| ProjectionCache::decode(value));
-                    let fresh = self
-                        .cache
-                        .as_ref()
-                        .is_some_and(|cache| !cache.stale && !self.config.rebuild);
-                    if fresh {
-                        self.projection = self
-                            .cache
-                            .as_ref()
-                            .and_then(|cache| cache.projection.clone());
-                        return self.settle(true);
-                    }
-                    self.page()
-                }
+                StorageEvent::ReadResult { value, .. } => match self.keep_cache(value) {
+                    Some(step) => step,
+                    None => self.recheck(),
+                },
                 other => {
                     let got = Event::Storage(other).label();
                     Err(self.unexpected("projection cache read", got))
                 }
             },
+            // Another rebuild may have published since the read outside the transaction.
+            ProjectState::Recheck => {
+                let [value] = values::<1>(result)?;
+                match self.keep_cache(value) {
+                    Some(step) => step,
+                    None => self.page(),
+                }
+            }
             ProjectState::Page => match result {
                 IoResult::Page { rows, .. } => match self.keep_page(rows)? {
                     true => self.page(),
