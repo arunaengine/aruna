@@ -83,7 +83,7 @@ async fn durable_rearm_loop(
         restore_sync_timers(&context, &task_handle).await;
         restore_usage_timer(&context.storage_handle, &task_handle).await;
         restore_watch_interest(&context, &task_handle).await;
-        restore_info_timer(&task_handle).await;
+        restore_info_timer(&task_handle, aruna_core::heartbeat::INFO_PUBLISH_INTERVAL).await;
         restore_notification_outbox(&context, &task_handle, None).await;
         if let Err(error) = drive(ProjectionTimerOperation::new(), &context).await {
             warn!(%error, "Failed to scan metadata pending projection markers");
@@ -327,7 +327,8 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        restore_info_timer(&task_handle).await;
+        // The start seeds the document as owed; its first tick publishes it at once.
+        restore_info_timer(&task_handle, Duration::ZERO).await;
         if stopped() {
             return;
         }
@@ -453,12 +454,12 @@ async fn restore_outbox_timer(context: &DriverContext) {
     }
 }
 
-/// Arms the periodic node-info heartbeat at startup. `ShortenTimer` (never `ResetTimer`) so the
-/// durable-queue re-arm loop cannot push the deadline forward past the handler's own re-arm.
-async fn restore_info_timer(task_handle: &TaskHandle) {
+/// Arms the node-info heartbeat to fire within `after`. `ShortenTimer` (never `ResetTimer`) so
+/// the durable-queue re-arm loop cannot push the deadline forward past the handler's own re-arm.
+async fn restore_info_timer(task_handle: &TaskHandle, after: Duration) {
     let effect = Effect::Task(TaskEffect::ShortenTimer {
         key: TaskKey::PublishNodeInfo,
-        after: aruna_core::heartbeat::INFO_PUBLISH_INTERVAL,
+        after,
     });
     if let Event::Task(TaskEvent::Error { message, .. }) = task_handle.send_effect(effect).await {
         warn!(message = %message, "Failed to arm node info heartbeat timer");
@@ -590,6 +591,24 @@ mod stop_tests {
             panic!("the probe is answered");
         };
         (holder, after)
+    }
+
+    // The start arms the node info heartbeat at once, so the document seeded as owed is published
+    // without waiting an interval; the periodic rearm never pushes that deadline back.
+    #[tokio::test(start_paused = true)]
+    async fn info_published_promptly() {
+        use aruna_core::heartbeat::INFO_PUBLISH_INTERVAL;
+        use aruna_runner::testing::RecordingTaskHandler;
+        let task_handle = TaskHandle::new();
+        let (seen_tx, mut seen_rx) = tokio::sync::mpsc::channel(1);
+        let handler = Arc::new(RecordingTaskHandler { seen: seen_tx });
+        task_handle.set_inbound_handler(handler).await;
+        let started = tokio::time::Instant::now();
+        restore_info_timer(&task_handle, Duration::ZERO).await;
+        restore_info_timer(&task_handle, INFO_PUBLISH_INTERVAL).await;
+        assert_eq!(seen_rx.recv().await, Some(TaskKey::PublishNodeInfo));
+        let waited = started.elapsed();
+        assert!(waited < INFO_PUBLISH_INTERVAL, "fired after {waited:?}");
     }
 
     // A stored renewal that restoration has not armed yet keeps its due time: it is armed at once
