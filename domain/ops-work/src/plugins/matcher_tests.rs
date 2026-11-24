@@ -148,6 +148,43 @@ async fn bound_and_stale() {
 }
 
 #[tokio::test]
+async fn concurrent_journal_matched() {
+    // Uploads journal rows while the matcher runs: no page conflicts, and each event is
+    // forwarded exactly once.
+    const EVENTS: u64 = 120;
+    let fixture = Fixture::new().await;
+    let install = installed(&fixture).await;
+    let (local, config) = (fixture.actor.node_id, config(&fixture).await);
+    let written = std::cell::Cell::new(false);
+    let writer = async {
+        for index in 1..=EVENTS {
+            let mut event = created(&install, &format!("D{index:03}")).0;
+            (event.journaled_ms, event.anchor_ms) = (index, index);
+            journal(&fixture, &event).await;
+            tokio::task::yield_now().await;
+        }
+        written.set(true);
+    };
+    let matcher = async {
+        let mut matched = 0;
+        loop {
+            let done = written.get();
+            let bounds = (EVENTS + 10, 1_000);
+            let read = match_journal(&fixture.ctx, &config, local, bounds).await;
+            matched += read.expect("a page never loses a conflict to new rows");
+            if done && pending(&fixture).await == 0 {
+                return matched;
+            }
+            tokio::task::yield_now().await;
+        }
+    };
+    let ((), matched) = tokio::join!(writer, matcher);
+    assert_eq!(matched, EVENTS as usize);
+    let expected: Vec<String> = (1..=EVENTS).map(|index| format!("D{index:03}")).collect();
+    assert_eq!(forwarded(&fixture, &install).await, expected);
+}
+
+#[tokio::test]
 async fn user_node_clears() {
     let fixture = Fixture::new().await;
     let install = installed(&fixture).await;
@@ -312,22 +349,26 @@ fn counting_pages() {
 
 #[test]
 fn user_pending_dropped() {
+    let event = plain_event(5);
+    let pending = journal_key(PENDING_ROW, 5, Ulid::from_parts(3, 3));
+    let gone = journal_key(PENDING_ROW, 5, Ulid::from_parts(3, 4));
     let mut plan = MatchPage {
         targets: Vec::new(),
         keep: false,
         now_ms: 9,
         bound: 2,
+        keys: vec![pending.clone(), gone],
         phase: MatchPhase::Reading,
     };
-    assert!(matches!(
-        plan.first().unwrap(),
-        Next::Call(IoCall::Page { .. })
-    ));
-    let event = plain_event(5);
-    let pending = journal_key(PENDING_ROW, 5, Ulid::from_parts(3, 3));
-    let rows = vec![(pending.clone(), event.to_bytes().unwrap())];
-    // A user node keeps no journal: nothing to count, no gap to read and no row to write.
-    let Next::Call(IoCall::Delete(keys)) = plan.next(page_result(rows, None)).unwrap() else {
+    // Only the scanned keys are read, so a row journaled meanwhile cannot conflict the page.
+    let Next::Call(IoCall::Read(reads)) = plan.first().unwrap() else {
+        panic!("the page reads its scanned keys");
+    };
+    assert_eq!(reads.len(), 2);
+    // A user node keeps no journal: nothing to count, no gap to read and no row to write. A row
+    // another page matched meanwhile is gone and is skipped.
+    let values = IoResult::Values(vec![Some(event.to_bytes().unwrap().into()), None]);
+    let Next::Call(IoCall::Delete(keys)) = plan.next(values).unwrap() else {
         panic!("the pending, kept and source rows go");
     };
     assert_eq!(keys.len(), 3);
@@ -336,31 +377,43 @@ fn user_pending_dropped() {
         (EVENT_JOURNAL_KEYSPACE.to_string(), pending.into())
     );
     assert_eq!(plan.next(IoResult::Done).unwrap(), Next::Done(1));
-    // An empty page reads nothing more.
-    let mut empty = MatchPage {
-        targets: Vec::new(),
-        keep: true,
-        now_ms: 9,
-        bound: 2,
-        phase: MatchPhase::Reading,
-    };
+    // Keys that are all gone read nothing more.
+    let mut empty = match_page((&[], true), 9, 2, vec![vec![PENDING_ROW, 1]]);
+    assert!(matches!(empty.first(), Ok(Next::Call(IoCall::Read(_)))));
     assert_eq!(
-        empty.next(page_result(Vec::new(), None)).unwrap(),
+        empty.next(IoResult::Values(vec![None])).unwrap(),
         Next::Done(0)
     );
 }
 
 #[test]
 fn journal_reads_pages() {
+    let rows = |count: usize| -> Rows {
+        (0..count)
+            .map(|index| (vec![PENDING_ROW, index as u8], Vec::new()))
+            .collect()
+    };
     let mut matching = MatchJournal::new((Vec::new(), true), 5, 9);
-    assert!(matches!(matching.first(), Ok(Next::Call(IoCall::Child(_)))));
-    let full = child_result(Ok::<usize, StoreError>(JOURNAL_PAGE));
-    let again = matching.next(full);
-    assert!(matches!(again, Ok(Next::Call(IoCall::Child(_)))));
-    let last = child_result(Ok::<usize, StoreError>(3));
-    assert_eq!(matching.next(last), Ok(Next::Done(JOURNAL_PAGE + 3)));
+    // Each page is scanned outside the transaction, then matched as a child.
+    assert!(matches!(
+        matching.first(),
+        Ok(Next::Call(IoCall::Page { .. }))
+    ));
+    let full = matching.next(page_result(rows(JOURNAL_PAGE), None));
+    assert!(matches!(full, Ok(Next::Call(IoCall::Child(_)))));
+    let again = matching.next(child_result(Ok::<usize, StoreError>(JOURNAL_PAGE)));
+    assert!(matches!(again, Ok(Next::Call(IoCall::Page { .. }))));
+    let last = matching.next(page_result(rows(3), None));
+    assert!(matches!(last, Ok(Next::Call(IoCall::Child(_)))));
+    let done = matching.next(child_result(Ok::<usize, StoreError>(3)));
+    assert_eq!(done, Ok(Next::Done(JOURNAL_PAGE + 3)));
     let mut failed = MatchJournal::new((Vec::new(), true), 5, 9);
+    let _ = failed.first();
+    let _ = failed.next(page_result(rows(1), None));
     let error = StoreError::Message("down".into());
     let refused = failed.next(child_result(Err::<usize, _>(error.clone())));
     assert_eq!(refused, Err(error));
+    let mut idle = MatchJournal::new((Vec::new(), true), 5, 9);
+    let _ = idle.first();
+    assert_eq!(idle.next(page_result(Vec::new(), None)), Ok(Next::Done(0)));
 }

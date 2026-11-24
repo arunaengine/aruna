@@ -287,12 +287,18 @@ impl RangeSearchOperation {
         (range_id, through): (Ulid, String),
         mut pending: VecDeque<Candidate>,
     ) -> RangeTurn {
-        let Some(candidate) = pending.pop_front() else {
-            return self.through_known(range_id, through, false);
-        };
-        let call = self.walk.check.begin(&self.input, &candidate.hit);
-        self.step = RangeStep::ThroughCheck(range_id, through, pending, Some(candidate));
-        Ok(Next::Call(call))
+        while let Some(candidate) = pending.pop_front() {
+            match self.walk.check.begin(&self.input, &candidate.hit)? {
+                Checked::Call(call) => {
+                    let candidate = Some(candidate);
+                    self.step = RangeStep::ThroughCheck(range_id, through, pending, candidate);
+                    return Ok(Next::Call(call));
+                }
+                Checked::Decided(true) => return self.through_known(range_id, through, true),
+                Checked::Decided(false) => {}
+            }
+        }
+        self.through_known(range_id, through, false)
     }
 
     fn through_known(&mut self, range_id: Ulid, through: String, shown: bool) -> RangeTurn {
@@ -456,7 +462,7 @@ impl Operation for RangeSearchOperation {
             RangeStep::Keys => {
                 let found = result.child::<Vec<Candidate>, SearchObjectsError>()??;
                 self.walk.add(found);
-                let turn = self.walk.advance(&self.input);
+                let turn = self.walk.advance(&self.input)?;
                 self.walked(turn)
             }
             RangeStep::Walk => {

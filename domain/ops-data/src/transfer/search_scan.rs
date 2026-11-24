@@ -24,15 +24,15 @@ use aruna_core::structs::storage::blob::{
     VersionKey, object_permission_path,
 };
 use aruna_core::structs::storage::replication::W3idIdentifier;
-use aruna_core::types::{Key, Value};
+use aruna_core::types::{GroupId, Key, Value};
 
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
-use aruna_ops_identity::auth::check_permissions::{
-    CheckPermissionsConfig, CheckPermissionsOperation,
-};
 use aruna_ops_identity::auth::enforcement::{PolicyBulkOperation, PolicyEvaluators};
 use aruna_ops_identity::auth::error::PolicyEnforcementError;
+use aruna_ops_identity::auth::permission_rules::{
+    PermissionRules, PermissionRulesConfig, PermissionRulesOperation,
+};
 
 #[path = "index_search.rs"]
 mod index_search;
@@ -117,21 +117,27 @@ enum Checked {
 #[derive(Debug, Default, PartialEq)]
 enum CheckWait {
     #[default]
-    Permission,
+    Rules,
     Policy(String),
 }
 
 /// Whether the caller may read a hit: group READ on its full object path, token path
-/// restrictions and the request policies of its group, each loaded once.
+/// restrictions and the request policies of its group. Rules and policies of a group are each
+/// loaded once, so the hits of one group are decided in memory.
 #[derive(Debug, Default, PartialEq)]
 struct HitCheck {
+    rules: HashMap<GroupId, PermissionRules>,
     evaluators: PolicyEvaluators,
     path: String,
     wait: CheckWait,
 }
 
 impl HitCheck {
-    fn begin(&mut self, input: &SearchObjectsInput, hit: &SearchNodeHit) -> IoCall {
+    fn begin(
+        &mut self,
+        input: &SearchObjectsInput,
+        hit: &SearchNodeHit,
+    ) -> Result<Checked, SearchObjectsError> {
         self.path = object_permission_path(
             input.realm_id,
             hit.hit.group_id,
@@ -139,12 +145,16 @@ impl HitCheck {
             &hit.hit.bucket,
             &hit.hit.key,
         );
-        self.wait = CheckWait::Permission;
-        IoCall::child(CheckPermissionsOperation::new(CheckPermissionsConfig {
+        if let Some(rules) = self.rules.get(&hit.hit.group_id) {
+            let allowed = rules.allows(&self.path, &Permission::READ);
+            return self.permitted(input, hit, allowed);
+        }
+        self.wait = CheckWait::Rules;
+        let rules = PermissionRulesOperation::new(PermissionRulesConfig {
             auth_context: input.auth.clone(),
             path: self.path.clone(),
-            required_permission: Permission::READ,
-        }))
+        });
+        Ok(Checked::Call(IoCall::child(rules)))
     }
 
     fn answer(
@@ -153,23 +163,49 @@ impl HitCheck {
         hit: &SearchNodeHit,
         result: IoResult,
     ) -> Result<Checked, SearchObjectsError> {
-        let scope = (input.realm_id, hit.hit.group_id);
         match std::mem::take(&mut self.wait) {
-            CheckWait::Permission => {
-                if !(result.child::<bool, AuthorizationError>()?).unwrap_or(false) {
-                    return Ok(Checked::Decided(false));
+            // A failed collection denies this hit as a failed check did; the next hit reads again.
+            CheckWait::Rules => match result.child::<PermissionRules, AuthorizationError>()? {
+                Ok(rules) => {
+                    let allowed = rules.allows(&self.path, &Permission::READ);
+                    self.rules.insert(hit.hit.group_id, rules);
+                    self.permitted(input, hit, allowed)
                 }
-                if !self.evaluators.contains_key(&scope) {
-                    self.wait = CheckWait::Policy(self.path.clone());
-                    let bulk = PolicyBulkOperation::new(vec![scope]);
-                    return Ok(Checked::Call(IoCall::child(bulk)));
-                }
-            }
+                Err(_) => Ok(Checked::Decided(false)),
+            },
             CheckWait::Policy(_) => {
                 let loaded = result.child::<PolicyEvaluators, PolicyEnforcementError>()??;
                 self.evaluators.extend(loaded);
+                self.decide(input, hit)
             }
         }
+    }
+
+    /// Past the group rules: the group's request policies, loaded once, decide the hit.
+    fn permitted(
+        &mut self,
+        input: &SearchObjectsInput,
+        hit: &SearchNodeHit,
+        allowed: bool,
+    ) -> Result<Checked, SearchObjectsError> {
+        if !allowed {
+            return Ok(Checked::Decided(false));
+        }
+        let scope = (input.realm_id, hit.hit.group_id);
+        if !self.evaluators.contains_key(&scope) {
+            self.wait = CheckWait::Policy(self.path.clone());
+            let bulk = PolicyBulkOperation::new(vec![scope]);
+            return Ok(Checked::Call(IoCall::child(bulk)));
+        }
+        self.decide(input, hit)
+    }
+
+    fn decide(
+        &mut self,
+        input: &SearchObjectsInput,
+        hit: &SearchNodeHit,
+    ) -> Result<Checked, SearchObjectsError> {
+        let scope = (input.realm_id, hit.hit.group_id);
         let request = policy_request_with(
             &self.path,
             &Permission::READ,
@@ -209,13 +245,24 @@ impl HitWalk {
         self.pending.extend(candidates);
     }
 
-    fn advance(&mut self, input: &SearchObjectsInput) -> WalkTurn {
-        let Some(candidate) = self.pending.pop_front() else {
-            return WalkTurn::Drained;
-        };
-        let call = self.check.begin(input, &candidate.hit);
-        self.current = Some(candidate);
-        WalkTurn::Call(call)
+    /// Decides candidates in memory while their group's rules and policies are loaded, and
+    /// stops at the first that needs a read or at a full page.
+    fn advance(&mut self, input: &SearchObjectsInput) -> Result<WalkTurn, SearchObjectsError> {
+        while let Some(candidate) = self.pending.pop_front() {
+            match self.check.begin(input, &candidate.hit)? {
+                Checked::Call(call) => {
+                    self.current = Some(candidate);
+                    return Ok(WalkTurn::Call(call));
+                }
+                Checked::Decided(false) => {}
+                Checked::Decided(true) => {
+                    if let Some(full) = self.accept(input, candidate) {
+                        return Ok(full);
+                    }
+                }
+            }
+        }
+        Ok(WalkTurn::Drained)
     }
 
     fn answer(
@@ -229,28 +276,32 @@ impl HitWalk {
                 self.current = Some(candidate);
                 Ok(WalkTurn::Call(call))
             }
-            Checked::Decided(false) => Ok(self.advance(input)),
-            Checked::Decided(true) => Ok(self.accept(input, candidate)),
+            Checked::Decided(false) => self.advance(input),
+            Checked::Decided(true) => match self.accept(input, candidate) {
+                Some(full) => Ok(full),
+                None => self.advance(input),
+            },
         }
     }
 
-    fn accept(&mut self, input: &SearchObjectsInput, candidate: Candidate) -> WalkTurn {
+    /// Adds an authorized candidate to the page; `Some` once the page is full.
+    fn accept(&mut self, input: &SearchObjectsInput, candidate: Candidate) -> Option<WalkTurn> {
         if candidate.changed {
             self.changed.push(candidate.hit.cursor_key);
             if self.changed.len() >= CHANGED_PAGE_CAP {
-                return WalkTurn::Full(self.changed.last().cloned());
+                return Some(WalkTurn::Full(self.changed.last().cloned()));
             }
-            return self.advance(input);
+            return None;
         }
         self.visible.push(candidate.hit);
         let limit = input.limit.clamp(1, SEARCH_MAX_LIMIT);
         if self.visible.len() <= limit {
-            return self.advance(input);
+            return None;
         }
         let next = (self.visible.get(limit - 1)).map(|hit| hit.cursor_key.clone());
         self.visible.truncate(limit);
         changed_until(&mut self.changed, next.as_deref());
-        WalkTurn::Full(next)
+        Some(WalkTurn::Full(next))
     }
 }
 
@@ -811,7 +862,7 @@ impl Operation for SearchObjectsOperation {
                 self.distributed = batch.distributed;
                 self.next_start = batch.next_start;
                 self.walk.add(batch.candidates);
-                let turn = self.walk.advance(&self.input);
+                let turn = self.walk.advance(&self.input)?;
                 self.walked(turn)
             }
             SearchStep::Walk => {
