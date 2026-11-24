@@ -217,6 +217,7 @@ pub struct ServerState {
     applets: Arc<aruna_core::applet::settings::AppletSettings>,
     started: (SystemTime, Instant),
     archive_links: Arc<crate::routes::storage::archive::ArchiveLinks>,
+    signin_codes: Arc<crate::routes::applets::signin::SigninCodes>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -332,6 +333,7 @@ impl ServerState {
             applets: Arc::default(),
             started: (SystemTime::now(), Instant::now()),
             archive_links: Arc::default(),
+            signin_codes: Arc::default(),
         };
         state
             .identity
@@ -400,6 +402,10 @@ impl ServerState {
     }
 
     /// The unredeemed archive download links of this node.
+    pub(crate) fn signin_codes(&self) -> &crate::routes::applets::signin::SigninCodes {
+        &self.signin_codes
+    }
+
     pub(crate) fn archive_links(&self) -> &crate::routes::storage::archive::ArchiveLinks {
         &self.archive_links
     }
