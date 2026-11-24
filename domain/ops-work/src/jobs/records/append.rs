@@ -82,6 +82,8 @@ pub struct AppendOutcome {
 pub struct AppendRecordOperation {
     config: AppendRecordConfig,
     view: Option<FamilyView>,
+    /// The realm config row the view came from, read again in the transaction as its fence.
+    config_row: Option<Value>,
     stored: BTreeMap<JobRecordKey, JobRecordEnvelope>,
     retained: Vec<(JobRecordKey, PendingRecord)>,
     cache: Option<ProjectionCache>,
@@ -116,6 +118,7 @@ impl AppendRecordOperation {
         Self {
             config,
             view: None,
+            config_row: None,
             stored: BTreeMap::new(),
             retained: Vec::new(),
             cache: None,
@@ -177,6 +180,7 @@ impl AppendRecordOperation {
     }
 
     fn keep_view(&mut self, value: Option<Value>) -> Result<(), RecordStoreError> {
+        self.config_row.clone_from(&value);
         let Some(value) = value else {
             return Err(RecordStoreError::RealmConfigMissing);
         };
@@ -205,12 +209,22 @@ impl AppendRecordOperation {
         if let Some(group_id) = self.spec_group() {
             reads.push(aruna_ops_identity::groups::fence::group_fence_key(group_id));
         }
+        let config = DocumentTarget::RealmConfig {
+            realm_id: self.config.realm_id,
+        };
+        reads.push((config.storage_keyspace().to_string(), config.storage_key()));
         Ok(Next::Call(IoCall::Read(reads)))
     }
 
     /// Keeps the candidate's own row, the projection cache and the family tombstone, and checks
-    /// that a spec's group still accepts writes.
-    fn keep_row(&mut self, values: Vec<Option<Value>>) -> Result<(), RecordStoreError> {
+    /// that a spec's group still accepts writes and the realm config is the one read first.
+    fn keep_row(&mut self, mut values: Vec<Option<Value>>) -> Result<(), RecordStoreError> {
+        // A membership change since the view was read reruns the append on the new one; a
+        // later change conflicts this transaction's read of the row.
+        let config = values.pop().ok_or(RecordStoreError::EvidenceIncomplete)?;
+        if config != self.config_row {
+            return Err(StorageError::TransactionConflict.into());
+        }
         let mut values = values.into_iter();
         let row = values
             .next()
