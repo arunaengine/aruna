@@ -185,11 +185,10 @@ async fn respond(
     let top_load = headers
         .get("sec-fetch-dest")
         .is_some_and(|dest| dest == "document");
-    if decision.guests && !decision.guests_in_frames && top_load && html {
-        if let Some(marker) = set_cookie(TOP, "1", TOP_SECONDS, Site::Strict) {
-            out.append(SET_COOKIE, marker);
-            out.insert(CACHE_CONTROL, HeaderValue::from_static("private, no-cache"));
-        }
+    let marked = decision.guests && !decision.guests_in_frames && top_load && html;
+    if let Some(marker) = set_cookie(TOP, "1", TOP_SECONDS, Site::Strict).filter(|_| marked) {
+        out.append(SET_COOKIE, marker);
+        out.insert(CACHE_CONTROL, HeaderValue::from_static("private, no-cache"));
     }
     policy::secure(out, frame);
     response
