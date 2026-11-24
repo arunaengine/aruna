@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+pub mod edge;
 pub mod lifecycle;
 pub mod records;
 pub mod source;
@@ -32,6 +33,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     (records::router())
         .merge(lifecycle::router())
         .merge(source::router())
+        .merge(edge::router())
 }
 
 pub(crate) fn applet_error(error: AppletError) -> ServerError {
