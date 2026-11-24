@@ -1,5 +1,5 @@
-//! MCP tools that let an agent create an applet, edit and release its source, and ask for
-//! approval. Agents never approve: every version they make stays private.
+//! MCP tools that let an agent create an applet, edit, build and release its source, keep build
+//! drafts, and ask for approval. Agents never approve: every version they make stays private.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{JsonPayload, McpServer, request_auth, server_error};
 use crate::auth::{RealmAuth, UnrestrictedAuth};
-use crate::routes::applets::{lifecycle, node, records, source, wire};
+use crate::routes::applets::{builds, lifecycle, node, records, source, wire};
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct CreateInput {
@@ -76,6 +76,13 @@ pub struct ApprovalInput {
     /// Exact https origins that may frame the applet.
     #[serde(default)]
     pub origins: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct DraftInput {
+    pub applet_id: String,
+    /// The build id applet_build or applet_drafts answered.
+    pub build_id: String,
 }
 
 fn payload<T: Serialize>(value: T) -> Result<Json<JsonPayload>, CallToolResult> {
@@ -241,6 +248,128 @@ impl McpServer {
         .await
         .map_err(server_error)?;
         payload(released.1.0)
+    }
+
+    #[tool(
+        description = "Build a folder of the applet source in the node's curated builder, without network or credentials, into a draft that only the creator and approvers can preview. Drafts are limited in number and expire; applet_drafts shows the room left. Call applet_drafts until the build is no longer building, then capture it there.",
+        annotations(read_only_hint = false, destructive_hint = false)
+    )]
+    pub async fn applet_build(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<ReleaseInput>,
+    ) -> Result<Json<JsonPayload>, CallToolResult> {
+        let auth = request_auth(&parts)?;
+        let bearer = super::compute::request_bearer(&parts);
+        let body = source::ReleaseRequest {
+            revision: input.revision,
+            root: input.root,
+        };
+        let started = builds::start_build(
+            State(self.state.clone()),
+            UnrestrictedAuth(auth),
+            axum::Extension(bearer),
+            Path(input.applet_id),
+            axum::Json(body),
+        )
+        .await
+        .map_err(server_error)?;
+        payload(started.1.0)
+    }
+
+    #[tool(
+        description = "List the applet's drafts with their state, expiry and the number of builds that may still start. A draft that finished building is captured here, so its state reads ready or failed.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    pub async fn applet_drafts(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<AppletInput>,
+    ) -> Result<Json<JsonPayload>, CallToolResult> {
+        let auth = request_auth(&parts)?;
+        let listed = builds::list_drafts(
+            State(self.state.clone()),
+            UnrestrictedAuth(auth.clone()),
+            Path(input.applet_id.clone()),
+        )
+        .await
+        .map_err(server_error)?
+        .0;
+        let building = (listed.drafts.iter())
+            .filter(|draft| draft.state == builds::DraftState::Building)
+            .map(|draft| draft.build_id.clone())
+            .collect::<Vec<_>>();
+        // A finished build is captured on the way; one still running stays building.
+        for build_id in building {
+            let body = builds::CaptureRequest { build_id };
+            let captured = builds::capture_draft(
+                State(self.state.clone()),
+                UnrestrictedAuth(auth.clone()),
+                Path(input.applet_id.clone()),
+                axum::Json(body),
+            )
+            .await;
+            match captured {
+                Ok(_) | Err(crate::error::ServerError::Conflict(_)) => {}
+                Err(error) => return Err(server_error(error)),
+            }
+        }
+        let listed = builds::list_drafts(
+            State(self.state.clone()),
+            UnrestrictedAuth(auth),
+            Path(input.applet_id),
+        )
+        .await
+        .map_err(server_error)?;
+        payload(listed.0)
+    }
+
+    #[tool(
+        description = "Keep a ready draft as the next private version with exactly the files the build made, without building again. Ask for approval of that version afterwards.",
+        annotations(read_only_hint = false, destructive_hint = false)
+    )]
+    pub async fn applet_keep_draft(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<DraftInput>,
+    ) -> Result<Json<JsonPayload>, CallToolResult> {
+        let auth = request_auth(&parts)?;
+        let kept = builds::keep_draft(
+            State(self.state.clone()),
+            UnrestrictedAuth(auth),
+            Path((input.applet_id, input.build_id)),
+        )
+        .await
+        .map_err(server_error)?;
+        payload(kept.1.0)
+    }
+
+    #[tool(
+        description = "Delete a draft to free its room. A running build keeps running until its job ends.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true
+        )
+    )]
+    pub async fn applet_delete_draft(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<DraftInput>,
+    ) -> Result<Json<JsonPayload>, CallToolResult> {
+        let auth = request_auth(&parts)?;
+        builds::delete_draft(
+            State(self.state.clone()),
+            UnrestrictedAuth(auth),
+            Path((input.applet_id, input.build_id)),
+        )
+        .await
+        .map_err(server_error)?;
+        payload(serde_json::json!({ "deleted": true }))
     }
 
     #[tool(
