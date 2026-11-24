@@ -477,3 +477,7 @@ pub fn pseudonym(salt: &[u8; 32], user: &UserId) -> String {
     let hash = blake3::keyed_hash(salt, &user.to_bytes());
     hex::encode(&hash.as_bytes()[..16])
 }
+
+#[cfg(test)]
+#[path = "record_tests.rs"]
+pub(crate) mod tests;
