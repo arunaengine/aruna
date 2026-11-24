@@ -8,6 +8,7 @@ pub mod change;
 pub mod create;
 pub mod domains;
 pub mod draft;
+pub mod feed;
 pub mod identity;
 pub mod reads;
 pub mod release;

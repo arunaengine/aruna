@@ -258,6 +258,7 @@ pub(crate) mod tests {
             "GET",
             "/edge/v1/applets/{applet_id}/drafts/{build_id}/source-map",
         ),
+        ("GET", "/edge/v1/notices"),
         (
             "GET",
             "/edge/v1/applets/{applet_id}/versions/{version}/file",

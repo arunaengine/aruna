@@ -7,6 +7,7 @@ pub mod domains;
 pub mod edge;
 pub mod lifecycle;
 pub mod node;
+pub mod notices;
 pub mod preview;
 pub mod records;
 pub mod review;
@@ -44,6 +45,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .merge(domains::router())
         .merge(edge::router())
         .merge(preview::router())
+        .merge(notices::router())
         .merge(signin::router())
         .merge(node::router())
 }
@@ -77,7 +79,7 @@ pub(crate) fn hosting(state: &ServerState) -> ServerResult<&HostingSettings> {
     })
 }
 
-async fn realm_config(state: &ServerState) -> ServerResult<RealmConfigDocument> {
+pub(super) async fn realm_config(state: &ServerState) -> ServerResult<RealmConfigDocument> {
     drive(
         GetConfigOperation::new(state.get_realm_id()),
         &state.get_ctx(),
