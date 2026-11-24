@@ -10,8 +10,10 @@ pub mod domains;
 pub mod draft;
 pub mod feed;
 pub mod identity;
+pub mod intake;
 pub mod reads;
 pub mod release;
+pub mod visits;
 
 use aruna_core::applet::hosts::{HostRow, host_key};
 use aruna_core::applet::record::{Applet, applet_key, group_key, held_bucket};
@@ -42,6 +44,9 @@ pub enum AppletError {
     Invalid(String),
     #[error("{0}")]
     Conflict(String),
+    /// A visitor, a guest or the whole applet used up a cap.
+    #[error("{0}")]
+    Limited(String),
     /// Another node decides about this applet; writes go there.
     #[error("the applet is hosted on node {0}")]
     Elsewhere(NodeId),

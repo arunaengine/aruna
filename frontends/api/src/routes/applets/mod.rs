@@ -56,6 +56,11 @@ pub(crate) fn applet_error(error: AppletError) -> ServerError {
         AppletError::Forbidden => ServerError::Forbidden,
         AppletError::Invalid(reason) => ServerError::BadRequestReason(reason),
         AppletError::Conflict(reason) => ServerError::Conflict(reason),
+        AppletError::Limited(reason) => ServerError::Refused(
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            "applet_limited",
+            reason,
+        ),
         AppletError::Elsewhere(node) => ServerError::Conflict(format!(
             "the applet is hosted on node {node}; send changes there"
         )),
