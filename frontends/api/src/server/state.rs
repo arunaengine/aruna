@@ -465,7 +465,7 @@ impl ServerState {
     }
 
     /// Features off on this node: the operator's list, `workflows` without a workflow runtime
-    /// and `applets`, which no node hosts yet.
+    /// and `applets` when this node is not configured to host applets.
     pub fn disabled_features(&self) -> BTreeSet<Feature> {
         let mut off = (*self.disabled_features).clone();
         let context = self.get_ctx();
@@ -473,7 +473,9 @@ impl ServerState {
         if !compute.is_some_and(|registry| registry.workflow().is_some()) {
             off.insert(Feature::Workflows);
         }
-        off.insert(Feature::Applets);
+        if self.applets.hosting.is_none() {
+            off.insert(Feature::Applets);
+        }
         off
     }
 

@@ -5,7 +5,6 @@
 
 use std::sync::Arc;
 
-use aruna_core::applet::feature::feature_on;
 use aruna_core::applet::hosts::{HostKind, normalize_host};
 use aruna_core::applet::manifest::VersionManifest;
 use aruna_core::applet::record::{Access, Applet, PinnedObject, Serving, VersionState};
@@ -146,13 +145,7 @@ pub async fn host_decision(
     let host = normalize_host(&host).map_err(|_| ServerError::NotFound)?;
     let lookup = drive(HostLookupOperation::new(&host), &state.get_ctx()).await;
     let (row, applet) = lookup.map_err(applet_error)?.ok_or(ServerError::NotFound)?;
-    let config = drive(
-        aruna_ops_identity::document_repository::GetConfigOperation::new(state.get_realm_id()),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(|error| ServerError::ServiceUnavailableReason(error.to_string()))?;
-    let serving = applet.serving(feature_on(&config, applet.group_id), true);
+    let serving = super::serving(&state, &applet).await?;
     let version = match serving {
         Serving::Live { version } | Serving::Preview { version } => Some(version),
         _ => None,

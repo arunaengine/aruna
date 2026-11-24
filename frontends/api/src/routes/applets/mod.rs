@@ -12,9 +12,9 @@ pub mod wire;
 
 use std::sync::Arc;
 
-use aruna_core::applet::feature::feature_on;
 use aruna_core::applet::record::{Applet, Serving};
 use aruna_core::applet::settings::HostingSettings;
+use aruna_core::structs::identity::features::{Feature, resolve};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::types::GroupId;
 use aruna_ops_identity::document_repository::GetConfigOperation;
@@ -78,24 +78,26 @@ async fn realm_config(state: &ServerState) -> ServerResult<RealmConfigDocument> 
     .map_err(|error| ServerError::ServiceUnavailableReason(error.to_string()))
 }
 
-/// Whether the applets feature is on for `group_id`.
+/// Whether the applets feature is on for `group_id` on this node.
 pub(crate) async fn realm_feature(state: &ServerState, group_id: GroupId) -> ServerResult<bool> {
-    Ok(feature_on(&realm_config(state).await?, group_id))
+    let config = realm_config(state).await?;
+    Ok(resolve(
+        &config,
+        &state.disabled_features(),
+        Feature::Applets,
+        Some(&group_id),
+    )
+    .on)
 }
 
 /// Refuses work on applets of `group_id` while the applets feature is off for it.
 pub(crate) async fn require_feature(state: &ServerState, group_id: GroupId) -> ServerResult<()> {
-    match realm_feature(state, group_id).await? {
-        true => Ok(()),
-        false => Err(ServerError::Conflict(
-            "applets are switched off for this group".to_string(),
-        )),
-    }
+    crate::features::require(state, Feature::Applets, Some(group_id)).await
 }
 
 /// What the edge serves for `applet` now, from the feature state and this node's hosting.
 pub(crate) async fn serving(state: &ServerState, applet: &Applet) -> ServerResult<Serving> {
-    let feature = feature_on(&realm_config(state).await?, applet.group_id);
+    let feature = realm_feature(state, applet.group_id).await?;
     Ok(applet.serving(feature, state.applet_settings().hosting.is_some()))
 }
 
