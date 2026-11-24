@@ -1,0 +1,27 @@
+{
+  "name": "aruna-applet",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build --configLoader runner"
+  },
+  "dependencies": {
+    "@lucide/vue": "1.38.0",
+    "@tanstack/vue-table": "9.3.1",
+    "echarts": "6.1.0",
+    "maplibre-gl": "6.19.0",
+    "papaparse": "5.7.0",
+    "reka-ui": "2.11.0",
+    "three": "0.187.0",
+    "vue": "3.5.42"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "4.3.3",
+    "@vitejs/plugin-vue": "6.0.11",
+    "tailwindcss": "4.3.3",
+    "typescript": "6.0.3",
+    "vite": "8.2.2"
+  }
+}
