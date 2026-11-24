@@ -26,7 +26,7 @@ use super::reports::{
     TaskWhyOperation,
 };
 use super::run::{ApplyEventOperation, FinishRunOperation};
-use super::tests::{Runs, runs, task};
+use super::tests::{Runs, encrypt, runs, task};
 use super::{ChangeRunOperation, RunChange, RunTasksOperation};
 use crate::workflows::CatalogError;
 use crate::workflows::tests::write;
@@ -436,6 +436,33 @@ async fn writes_run_crate() {
     assert_eq!(task["@type"], "CreateAction");
     let hidden = RunCrateOperation::new(&runs.fixture.stranger, run.run_id);
     assert_eq!(drive(hidden, context).await, Err(CatalogError::NotFound));
+}
+
+// The crate of a protected run stays beside the run, readable with it, and is never published
+// as a document of its group.
+#[tokio::test]
+async fn keeps_protected_crate() {
+    let runs = runs().await;
+    let context = &runs.fixture.context;
+    encrypt(&runs, "results").await;
+    let mut request = runs.request(None, json!({"message": "Hola"}));
+    request.provenance_crate = true;
+    let run = runs
+        .start(&runs.fixture.alice, request)
+        .await
+        .unwrap()
+        .record;
+    assert!(run.protected);
+    let run = ended_run(&runs, run, false).await;
+    let write = WriteProvenanceOperation::new(run.run_id, runs.serving());
+    let written = drive(write, context).await.unwrap();
+    assert_eq!(
+        written.provenance_status.as_deref(),
+        Some(status::PROTECTED)
+    );
+    assert_eq!(written.provenance_document_id, None);
+    let stored = RunCrateOperation::new(&runs.fixture.alice, run.run_id);
+    assert!(drive(stored, context).await.is_ok());
 }
 
 // A run that asked for no crate gets none written, but a reader still gets one built for it.

@@ -666,6 +666,8 @@ pub mod status {
     pub const WRITTEN: &str = "written";
     /// Kept on this node only, for a run that has not reached the realm.
     pub const LOCAL: &str = "local";
+    /// Kept beside the protected run only, readable with the run, never as a group document.
+    pub const PROTECTED: &str = "protected";
     pub const FAILED: &str = "failed";
     /// The run's creator may not write metadata documents of the group.
     pub const DENIED: &str = "denied";
@@ -812,6 +814,9 @@ impl Operation for WriteProvenanceOperation {
                 result.done()?;
                 if record.local_only {
                     return self.record(status::LOCAL, None);
+                }
+                if record.protected {
+                    return self.record(status::PROTECTED, None);
                 }
                 let mint = DocumentMintOperation::job(
                     self.actor(&record),

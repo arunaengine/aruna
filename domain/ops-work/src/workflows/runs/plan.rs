@@ -189,6 +189,8 @@ impl PlanRunOperation {
             repeats_run_id: None,
             cache_scope: CacheScope::Group,
             placement_site: request.placement_site.clone(),
+            protected: false,
+            started_at_ms: None,
         }
     }
 

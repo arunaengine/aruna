@@ -210,6 +210,17 @@ pub fn task_spec(
     }
     tags.extend(placement_tags(record, request));
     let resources = &request.resources;
+    let work = match record.protected {
+        // A protected run keeps its work files in its encrypted output bucket, never in the
+        // plain run area of the node that runs the task.
+        true => OutputDestination::S3 {
+            bucket: bucket.clone(),
+            key: format!("{folder}work"),
+        },
+        false => OutputDestination::RunArea {
+            prefix: work_prefix(record, &request.name),
+        },
+    };
     Ok(ExecutionSpec {
         group_id: record.group_id,
         name: Some(request.name.clone()),
@@ -236,8 +247,8 @@ pub fn task_spec(
         executor_constraint: None,
         backend: None,
         inputs,
-        // The control files go to the run's node, which reads them; the work folder stays in
-        // the run area of the node that runs the task.
+        // The control files go to the run's node, which reads them; the work folder of an open
+        // run stays in the run area of the node that runs the task.
         file_outputs: vec![
             folder_output(
                 control,
@@ -246,12 +257,7 @@ pub fn task_spec(
                     key: format!("{folder}control"),
                 },
             ),
-            folder_output(
-                &folders.work,
-                OutputDestination::RunArea {
-                    prefix: work_prefix(record, &request.name),
-                },
-            ),
+            folder_output(&folders.work, work),
         ],
         workspace_outputs: Vec::new(),
         output_prefixes: Vec::new(),
@@ -728,6 +734,10 @@ impl RunTaskOperation {
         let (bucket, key, node) = match path.strip_prefix('/') {
             Some(absolute) => {
                 let key = format!("{folder}control/root/{absolute}");
+                (bucket, key, self.run.node_id)
+            }
+            None if self.run.protected => {
+                let key = format!("{folder}work/{path}");
                 (bucket, key, self.run.node_id)
             }
             None => {

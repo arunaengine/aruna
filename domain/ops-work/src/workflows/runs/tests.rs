@@ -10,18 +10,20 @@ use aruna_compute::registry::ExecutorRegistry;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::compute::quota::{QuotaDenied, QuotaDimension, QuotaScope};
 use aruna_core::job_request::SubmitJobError;
-use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+use aruna_core::keyspaces::{BUCKET_ENCRYPTION_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::execution::job::input::{
-    InputMode, InputSelection, InputSource, WORKFLOW_RUN_TAG, WORKFLOW_TASK_TAG, node_tag,
+    InputMode, InputSelection, InputSource, OutputDestination, WORKFLOW_RUN_TAG, WORKFLOW_TASK_TAG,
+    node_tag,
 };
 use aruna_core::structs::execution::job::local::WorkspaceMode;
 use aruna_core::structs::execution::workflow_run::{
-    RunOutput, RunState, WorkflowRunRecord, WorkflowTaskRecord,
+    CacheScope, RunOutput, RunState, WorkflowRunRecord, WorkflowTaskRecord,
 };
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
+use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode};
 use aruna_core::structs::storage::routing::NodeRouting;
 use aruna_core::workflow::{WorkflowAnswer, WorkflowEffect, WorkflowHost};
 use aruna_runner::driver::drive;
@@ -36,7 +38,7 @@ use aruna_workflow_contract::preflight::RunLogEntry;
 use serde_json::{Value, json};
 use ulid::Ulid;
 
-use super::admit::{AdmittedRun, RunRequest, StartRunOperation};
+use super::admit::{AdmittedRun, PinnedInput, RunRequest, StartRunOperation};
 use super::cancel::{CancelRunOperation, DeleteRunOperation};
 use super::data::{area_of, resolve};
 use super::events::ReadEventsOperation;
@@ -362,6 +364,65 @@ async fn admits_once() {
     assert_eq!(events, vec![(1, "run".to_owned())]);
 }
 
+/// Marks `bucket` as encrypting, the way enabling bucket encryption stores it.
+pub(super) async fn encrypt(runs: &Runs, bucket: &str) {
+    let settings = BucketEncryption {
+        mode: EncryptionMode::VaultLocked,
+        bucket_id: Some(Ulid::from_bytes([30; 16])),
+        key_generation: 1,
+        ..BucketEncryption::default()
+    };
+    let (context, key) = (&runs.fixture.context, bucket.as_bytes().to_vec());
+    write(
+        context,
+        BUCKET_ENCRYPTION_KEYSPACE,
+        key,
+        settings.to_bytes().unwrap(),
+    )
+    .await;
+}
+
+// An encrypting input needs an encrypting output; such a run is protected, reuses only its own
+// tasks and keeps its work files in its own area of the output bucket.
+#[tokio::test]
+async fn protects_encrypted_runs() {
+    let runs = runs().await;
+    let (context, group, alice) = (
+        &runs.fixture.context,
+        runs.fixture.group_a,
+        &runs.fixture.alice,
+    );
+    aruna_runner::testing::seed_bucket(context, "secret", group, alice.user_id, Vec::new()).await;
+    encrypt(&runs, "secret").await;
+    let mut request = runs.request(None, json!({"message": "Hola"}));
+    request.inputs.push(PinnedInput {
+        name: "reads".into(),
+        bucket: "secret".into(),
+        key: "a.txt".into(),
+        version_id: Ulid::from_bytes([31; 16]),
+        source_node_id: None,
+    });
+    let refused = runs.start(alice, request.clone()).await;
+    assert!(
+        matches!(refused, Err(CatalogError::Invalid(_))),
+        "{refused:?}"
+    );
+    let open = runs.started().await;
+    assert!(!open.protected);
+
+    encrypt(&runs, "results").await;
+    let run = runs.start(alice, request).await.unwrap().record;
+    assert!(run.protected);
+    assert_eq!(run.cache_scope, CacheScope::Run);
+    let spec = task_spec(&run, &start_task(), "key").unwrap();
+    let (bucket, area) = area_of(&run).unwrap();
+    let work = OutputDestination::S3 {
+        bucket,
+        key: format!("{area}tasks/run-7-1/work"),
+    };
+    assert_eq!(spec.file_outputs[1].destination, work);
+}
+
 // A whole run: the session starts, the log is stored before each acknowledgement, live events
 // change the records and the stream, and the reported end closes the run.
 #[tokio::test]
@@ -614,6 +675,8 @@ pub(super) fn sample_run() -> WorkflowRunRecord {
         repeats_run_id: None,
         cache_scope: Default::default(),
         placement_site: None,
+        protected: false,
+        started_at_ms: None,
     }
 }
 

@@ -128,12 +128,14 @@ impl FollowRunOperation {
                 resumes: Some(source.run_id),
                 repeats: None,
                 cache_scope: source.cache_scope,
+                protected: source.protected,
             },
             Follow::Repeat => Lineage {
                 first: Some(source.lineage),
                 resumes: None,
                 repeats: Some(source.run_id),
                 cache_scope: CacheScope::Run,
+                protected: source.protected,
             },
         };
         Ok(StartRunOperation::new(&self.auth, self.node, request).in_lineage(lineage))

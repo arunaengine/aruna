@@ -164,6 +164,12 @@ pub struct StepRecord {
     pub cached: u64,
     pub node_id: Option<NodeId>,
     pub mode: Option<String>,
+    /// The earliest start of a task of the step.
+    #[serde(default)]
+    pub started_at_ms: Option<u64>,
+    /// The latest end of a task of the step.
+    #[serde(default)]
+    pub finished_at_ms: Option<u64>,
 }
 
 impl StepRecord {
@@ -251,6 +257,13 @@ pub struct WorkflowRunRecord {
     /// The site the request placed the run's tasks at; a task names no other site.
     #[serde(default)]
     pub placement_site: Option<String>,
+    /// An input or the output bucket encrypts: the run reuses no other run's tasks, keeps its task
+    /// files in the output bucket and publishes no group document of its crate.
+    #[serde(default)]
+    pub protected: bool,
+    /// When the run first turned running.
+    #[serde(default)]
+    pub started_at_ms: Option<u64>,
 }
 
 /// One task of a run, with the state of its newest attempt.

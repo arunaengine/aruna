@@ -282,6 +282,9 @@ fn change_run(
                 return Ok(());
             }
             record.state = state;
+            if state == RunState::Running && record.started_at_ms.is_none() {
+                record.started_at_ms = Some(now_ms);
+            }
             if state.is_terminal() {
                 record.finished_at_ms = Some(now_ms);
                 record.error = error;
@@ -355,6 +358,11 @@ fn change_task(
     if task.cached && !counted.is_some_and(|old| old.cached) {
         step.cached += 1;
     }
+    step.started_at_ms = match (step.started_at_ms, task.started_at_ms) {
+        (Some(known), Some(started)) => Some(known.min(started)),
+        (known, started) => known.or(started),
+    };
+    step.finished_at_ms = step.finished_at_ms.max(task.finished_at_ms);
     step.node_id = task.node_id.or(step.node_id);
     step.mode = task.mode.clone().or(step.mode.take());
     let step = step.clone();

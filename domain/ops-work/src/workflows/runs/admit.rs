@@ -7,7 +7,9 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::job_request::{SubmitJobError, SubmitJobResult};
-use aruna_core::keyspaces::{RUN_IDEMPOTENCY_KEYSPACE, WORKFLOW_RUN_KEYSPACE};
+use aruna_core::keyspaces::{
+    BUCKET_ENCRYPTION_KEYSPACE, RUN_IDEMPOTENCY_KEYSPACE, WORKFLOW_RUN_KEYSPACE,
+};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::execution::job::identity::RETENTION_MS;
 use aruna_core::structs::execution::job::input::JobPayload;
@@ -18,6 +20,7 @@ use aruna_core::structs::execution::workflow_run::{
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::types::{GroupId, Key};
 use byteview::ByteView;
 use serde_json::Value;
@@ -88,6 +91,8 @@ pub struct Lineage {
     pub resumes: Option<Ulid>,
     pub repeats: Option<Ulid>,
     pub cache_scope: CacheScope,
+    /// The earlier run was protected, so this one is too.
+    pub protected: bool,
 }
 
 /// A run the caller started, and whether this request created it.
@@ -105,6 +110,7 @@ enum AdmitStep {
     Existing(Box<VersionView>, [u8; 32]),
     Inputs(Box<VersionView>),
     Output(Box<VersionView>),
+    Encryption(Box<VersionView>),
     Record,
     Submit(Box<WorkflowRunRecord>),
     Job(Box<WorkflowRunRecord>),
@@ -180,7 +186,7 @@ impl StartRunOperation {
             return Ok(Next::Call(IoCall::child(access)));
         }
         let Some(output) = self.request.output.clone() else {
-            return self.record(view);
+            return self.encryption(view);
         };
         let access = ObjectAccessOperation::new(
             &self.auth,
@@ -192,7 +198,50 @@ impl StartRunOperation {
         Ok(Next::Call(IoCall::child(access)))
     }
 
-    fn record(&mut self, view: VersionView) -> AdmitNext {
+    /// Reads whether the pinned inputs this node holds and the output bucket encrypt. Inputs of
+    /// other nodes are not readable here, so they never make a run protected.
+    fn encryption(&mut self, view: VersionView) -> AdmitNext {
+        let local = self.node.0;
+        let mut buckets: Vec<&str> = (self.request.inputs.iter())
+            .filter(|input| input.source_node_id.is_none_or(|node| node == local))
+            .map(|input| input.bucket.as_str())
+            .collect();
+        buckets.sort_unstable();
+        buckets.dedup();
+        let output = self
+            .request
+            .output
+            .as_ref()
+            .map(|output| output.bucket.as_str());
+        let rows = (buckets.into_iter().chain(output))
+            .map(|bucket| {
+                let key = Key::from(bucket.as_bytes().to_vec());
+                (BUCKET_ENCRYPTION_KEYSPACE.to_string(), key)
+            })
+            .collect();
+        self.step = AdmitStep::Encryption(Box::new(view));
+        Ok(Next::Call(IoCall::Read(rows)))
+    }
+
+    /// Protects a run with an encrypting input or output; an encrypting input needs an
+    /// encrypting output bucket, so its results never land in plain storage.
+    fn protection(&self, result: IoResult) -> Result<bool, CatalogError> {
+        let mut encrypted = Vec::new();
+        for row in result.values()? {
+            let settings = BucketEncryption::from_row(row.as_deref())
+                .map_err(|error| CatalogError::Storage(error.to_string()))?;
+            encrypted.push(settings.is_encrypted());
+        }
+        let output = encrypted.pop().unwrap_or(false);
+        if encrypted.contains(&true) && !output {
+            return Err(CatalogError::Invalid(
+                "an input bucket encrypts, so the output bucket must encrypt too".into(),
+            ));
+        }
+        Ok(self.lineage.protected || output || encrypted.contains(&true))
+    }
+
+    fn record(&mut self, view: VersionView, protected: bool) -> AdmitNext {
         let run_id = self.ids.mint(self.now_ms);
         let request = &self.request;
         let record = WorkflowRunRecord {
@@ -225,8 +274,13 @@ impl StartRunOperation {
             steps: Vec::new(),
             resumes_run_id: self.lineage.resumes,
             repeats_run_id: self.lineage.repeats,
-            cache_scope: self.lineage.cache_scope,
+            cache_scope: match protected {
+                true => CacheScope::Run,
+                false => self.lineage.cache_scope,
+            },
             placement_site: request.placement_site.clone(),
+            protected,
+            started_at_ms: None,
         };
         let key = request.idempotency_key.as_ref().map(|key| {
             let row = self.key_row(key);
@@ -353,7 +407,11 @@ impl Operation for StartRunOperation {
                     }
                     other => other,
                 })?;
-                self.record(*view)
+                self.encryption(*view)
+            }
+            AdmitStep::Encryption(view) => {
+                let protected = self.protection(result)?;
+                self.record(*view, protected)
             }
             AdmitStep::Record => {
                 let admitted = result.child::<AdmittedRun, CatalogError>()??;
