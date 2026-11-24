@@ -1272,6 +1272,20 @@ impl Operation for CompleteUploadOperation {
             calls.push(IoCall::child(RollbackWrite::new(location)));
         }
         for work in works {
+            if let BlobCleanupWork::ReconcileWrite {
+                location,
+                owner: WriteOwner::Upload { upload_id },
+            } = work
+            {
+                let keep = KeepUploadTarget {
+                    upload_id,
+                    attempt_ms: self.input.now_ms,
+                    location,
+                    written: false,
+                };
+                calls.push(IoCall::child(keep));
+                continue;
+            }
             match work.to_bytes() {
                 Ok(value) => {
                     let key = cleanup_key(&work, self.ids.mint(self.now_ms));
@@ -1380,6 +1394,77 @@ impl Operation for MarkCompleting {
     }
 }
 
+/// Records an in-place upload's cleanup row only while the upload still exists and no successor
+/// took the lease or replaced the target's cleanup owner.
+#[derive(Debug, PartialEq)]
+struct KeepUploadTarget {
+    upload_id: Ulid,
+    attempt_ms: u64,
+    location: BackendLocation,
+    written: bool,
+}
+
+impl Operation for KeepUploadTarget {
+    type Output = ();
+    type Error = CompleteUploadError;
+
+    fn first(&mut self) -> Result<Next<()>, CompleteUploadError> {
+        let upload = self.upload_id.to_bytes().to_vec().into();
+        let cleanup = self.location.ulid.to_bytes().to_vec().into();
+        Ok(Next::Call(IoCall::Read(vec![
+            (UPLOAD_KEYSPACE.to_string(), upload),
+            (BLOB_CLEANUP_KEYSPACE.to_string(), cleanup),
+        ])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, CompleteUploadError> {
+        if self.written {
+            result.done()?;
+            return Ok(Next::Done(()));
+        }
+        let [upload, cleanup] = <[_; 2]>::try_from(result.values()?)
+            .map_err(|_| CompleteUploadError::InvalidOperationState)?;
+        let Some(value) = upload else {
+            return Ok(Next::Done(()));
+        };
+        let record = MultipartUpload::from_bytes(value.as_ref())?;
+        if record.status == MultipartUploadStatus::Completing
+            && record.completing_since_ms != Some(self.attempt_ms)
+        {
+            return Ok(Next::Done(()));
+        }
+        if let Some(existing) = cleanup.as_deref()
+            && !matches!(
+                BlobCleanupWork::from_bytes(existing),
+                Ok(BlobCleanupWork::ReconcileWrite {
+                    owner: WriteOwner::Upload { upload_id },
+                    ..
+                }) if upload_id == self.upload_id
+            )
+        {
+            return Ok(Next::Done(()));
+        }
+        let work = BlobCleanupWork::ReconcileWrite {
+            location: self.location.clone(),
+            owner: WriteOwner::Upload {
+                upload_id: self.upload_id,
+            },
+        };
+        let key = cleanup_key(&work, self.location.ulid);
+        let row = (
+            BLOB_CLEANUP_KEYSPACE.to_string(),
+            key,
+            work.to_bytes()?.into(),
+        );
+        self.written = true;
+        Ok(Next::Call(IoCall::Write(vec![row])))
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+}
+
 #[derive(Debug, PartialEq)]
 enum ReopenStep {
     ReadRecord,
@@ -1411,7 +1496,9 @@ impl ReopenUpload {
             return Ok(Next::Done(()));
         };
         let mut record = MultipartUpload::from_bytes(value.as_ref())?;
-        if record.completing_since_ms != Some(self.input.now_ms) {
+        if record.status != MultipartUploadStatus::Completing
+            || record.completing_since_ms != Some(self.input.now_ms)
+        {
             return Ok(Next::Done(()));
         }
         record.status = MultipartUploadStatus::Open;

@@ -505,7 +505,7 @@ fn uncertain_keeps_object() {
 
 #[test]
 fn conflict_keeps_object() {
-    // The in-place object is the only copy of its parts, so a refused finalize keeps it.
+    // The in-place object is fenced against current ownership before writing its upload row.
     let input = finalize_input();
     let target = composed_location(Ulid::from_bytes([5u8; 16]));
     let mut operation = finalize_waiting(in_place_record(&input, &target), target.clone());
@@ -516,15 +516,106 @@ fn conflict_keeps_object() {
         .next(finalize_answer(Err(conflict.into())))
         .unwrap_err();
 
+    let calls = operation.abort();
+    assert!(matches!(
+        calls.as_slice(),
+        [IoCall::Child(_), IoCall::Child(_)]
+    ));
+    assert!(cleanup_works(&calls).is_empty());
+
+    let mut keep = KeepUploadTarget {
+        upload_id: input.upload_id,
+        attempt_ms: input.now_ms,
+        location: target.clone(),
+        written: false,
+    };
+    assert_eq!(keep.transaction(), TransactionMode::Write);
+    assert!(matches!(keep.first(), Ok(Next::Call(IoCall::Read(_)))));
+    let mut record = open_upload_record(&input);
+    record.status = MultipartUploadStatus::Open;
+    let open = Value::from(record.to_bytes().unwrap());
+    let turn = keep.next(IoResult::Values(vec![Some(open.clone()), None]));
+    let Ok(Next::Call(call)) = turn else {
+        panic!("expected cleanup write");
+    };
     assert_eq!(
-        cleanup_works(&operation.abort()),
+        cleanup_works(&[call]),
         [BlobCleanupWork::ReconcileWrite {
-            location: target,
+            location: target.clone(),
             owner: WriteOwner::Upload {
                 upload_id: input.upload_id,
             },
         }]
     );
+
+    // A deleted upload, successor blob owner, or takeover lease must not be overwritten.
+    let mut gone = KeepUploadTarget {
+        upload_id: input.upload_id,
+        attempt_ms: input.now_ms,
+        location: target.clone(),
+        written: false,
+    };
+    assert!(matches!(
+        gone.next(IoResult::Values(vec![None, None])),
+        Ok(Next::Done(()))
+    ));
+    let published = Value::from(
+        BlobCleanupWork::ReconcileWrite {
+            location: target.clone(),
+            owner: WriteOwner::Blob {
+                blake3: [7u8; 32],
+                realm_id: input.realm_id,
+                ttl_ms: RoCrateLimits::default().holder_ttl_ms,
+                announce: true,
+            },
+        }
+        .to_bytes()
+        .unwrap(),
+    );
+    let mut owned = KeepUploadTarget {
+        upload_id: input.upload_id,
+        attempt_ms: input.now_ms,
+        location: target.clone(),
+        written: false,
+    };
+    assert!(matches!(
+        owned.next(IoResult::Values(vec![Some(open), Some(published)])),
+        Ok(Next::Done(()))
+    ));
+    let mut takeover = open_upload_record(&input);
+    takeover.status = MultipartUploadStatus::Completing;
+    takeover.completing_since_ms = Some(input.now_ms + 1);
+    let mut taken = KeepUploadTarget {
+        upload_id: input.upload_id,
+        attempt_ms: input.now_ms,
+        location: target,
+        written: false,
+    };
+    assert!(matches!(
+        taken.next(IoResult::Values(vec![
+            Some(Value::from(takeover.to_bytes().unwrap())),
+            None
+        ])),
+        Ok(Next::Done(()))
+    ));
+}
+
+#[test]
+fn aborting_never_reopens() {
+    // An abort keeps the old completing timestamp; failed finalize must not reopen it to Open.
+    let input = finalize_input();
+    let mut record = open_upload_record(&input);
+    record.status = MultipartUploadStatus::Aborting;
+    record.completing_since_ms = Some(input.now_ms);
+    let mut reopen = ReopenUpload {
+        input,
+        plan: None,
+        reclaim_pending: false,
+        recheck_pending: false,
+        step: ReopenStep::ReadRecord,
+    };
+    let row = Some(Value::from(record.to_bytes().unwrap()));
+    assert!(matches!(reopen.record_read(row), Ok(Next::Done(()))));
 }
 
 #[test]
