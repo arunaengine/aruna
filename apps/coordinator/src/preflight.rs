@@ -15,7 +15,7 @@ use aruna_workflow_contract::{ContractError, PreflightKind, PreflightResult};
 use executor::MemoryJournal;
 use run_database::{MemoryStore, RunReader};
 use serde_json::{Map, Value, json};
-use tool_definition::{Definition, InputPort, Ranking, Shape, Supply};
+use tool_definition::{Condition, Definition, Evidence, Fact, InputPort, Ranking, Shape, Supply};
 use uwe::application::Policy;
 use uwe::forms::{Form, ValidationResponse};
 use uwe::run::{Run, RunRequest, SecretValues};
@@ -346,6 +346,22 @@ fn suggest_tools(
     };
     let suggestions = match direction {
         SuggestDirection::Followers => {
+            let mut facts = Vec::with_capacity(port.conditions.len());
+            for item in port.conditions {
+                let fact = match serde_json::from_value::<Fact>(item.clone()) {
+                    Ok(fact) => fact,
+                    Err(_) => {
+                        let condition: Condition = serde_json::from_value(item)
+                            .map_err(|error| invalid("conditions", error))?;
+                        Fact {
+                            condition,
+                            holds: true,
+                            evidence: Evidence::Asserted,
+                        }
+                    }
+                };
+                facts.push(fact);
+            }
             let supply = Supply {
                 kind: serde_json::from_value(port.kind).map_err(|error| invalid("kind", error))?,
                 shape: Shape {
@@ -354,8 +370,7 @@ fn suggest_tools(
                     per_sample: false,
                 },
                 formats: port.formats,
-                facts: serde_json::from_value(Value::Array(port.conditions))
-                    .map_err(|error| invalid("conditions", error))?,
+                facts,
             };
             library.suggest_followers(&supply, &ranking)
         }

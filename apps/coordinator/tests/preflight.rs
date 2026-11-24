@@ -362,6 +362,16 @@ async fn suggests_catalog_tools() {
         };
         assert_eq!(suggestions.len(), 1);
     }
+    // Bare Condition values (as the portal sends) also work for Followers alongside full Facts.
+    let mut with_condition = suggest(SuggestDirection::Followers, 10);
+    if let PreflightKind::SuggestTools { conditions, .. } = &mut with_condition {
+        *conditions = vec![json!("indexed")];
+    }
+    let result = host.preflight(with_condition).await;
+    assert!(
+        matches!(result, Ok(PreflightResult::SuggestTools { suggestions }) if !suggestions.is_empty()),
+        "bare conditions work for followers"
+    );
     let mut wrong = suggest(SuggestDirection::Followers, 1);
     if let PreflightKind::SuggestTools { kind, .. } = &mut wrong {
         *kind = json!("folder");
