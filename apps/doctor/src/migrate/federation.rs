@@ -165,6 +165,7 @@ impl From<LegacyConfig> for RealmConfigDocument {
             secrets: Vec::new(),
             plugins: Vec::new(),
             installs: Vec::new(),
+            features: BTreeMap::new(),
         }
     }
 }
@@ -179,6 +180,7 @@ mod tests {
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
     use aruna_core::realm_vault::RealmVaultRecord;
     use aruna_core::structs::execution::email::RealmEmailProfile;
+    use aruna_core::structs::identity::features::{Feature, FeatureMode};
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, ReplicaQuota};
     use ed25519_dalek::{Signer as _, SigningKey};
     use reqwest::Url;
@@ -262,10 +264,11 @@ mod tests {
             Vec::<aruna_core::secrets::SecretRecord>::new(),
             Vec::<aruna_core::plugins::PublishedPlugin>::new(),
             Vec::<aruna_core::plugin_installs::PluginInstall>::new(),
+            BTreeMap::<Feature, FeatureMode>::new(),
         );
         let secrets = postcard::to_allocvec(&secrets).unwrap();
         // The config ends with federation, portal features, replica quota, email, vault, secrets,
-        // plugins and installs.
+        // plugins, installs and the feature policy.
         let tail = 1 + features.len() + replicas.len() + secrets.len();
         let head = &unfederated[..unfederated.len() - tail];
         let federation = postcard::to_allocvec(&Some(old_federation(&key, realm_id))).unwrap();
