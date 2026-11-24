@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -14,6 +14,7 @@ use aruna_core::listener::{HostRoutes, MAX_BODY_SIZE, S3ServerTimeouts, cors_all
 use aruna_core::persistence::{CACHE_BYTES, FjallPersistPolicy};
 use aruna_core::search::MetadataSearchStorage;
 use aruna_core::structs::execution::job::input::RoCrateLimits;
+use aruna_core::structs::identity::features::Feature;
 use aruna_core::structs::identity::realm::OidcProviderConfig;
 use aruna_core::structs::storage::backends::{BackendsFile, NodeBackendsConfig};
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BlobTimeoutConfig};
@@ -116,6 +117,8 @@ pub struct Settings {
     pub realm_description: String,
     pub portal: PortalConfig,
     pub assistant_proxy: bool,
+    /// Features `ARUNA_DISABLED_FEATURES` turns off on this node; nothing turns them on here.
+    pub disabled_features: BTreeSet<Feature>,
     pub node_labels: BTreeMap<String, String>,
     pub node_location: Option<String>,
     pub node_weight: Option<u32>,
@@ -336,6 +339,7 @@ pub fn read_settings_from(env: &dyn SettingsEnv) -> Result<Settings, SetupError>
     let oidc_providers = load_oidc_providers(env)?;
     let portal = portal_config_env(env)?;
     let assistant_proxy = assistant_proxy_env(env)?;
+    let disabled_features = disabled_features_env(env)?;
     // The SPA is served from another origin than the API, so it cannot reach a
     // relative API path and needs the advertised one.
     if matches!(portal, PortalConfig::Artifact { .. }) && api_public_url.is_none() {
@@ -392,6 +396,7 @@ pub fn read_settings_from(env: &dyn SettingsEnv) -> Result<Settings, SetupError>
         realm_description,
         portal,
         assistant_proxy,
+        disabled_features,
         node_labels,
         node_location,
         node_weight,
@@ -930,6 +935,21 @@ fn assistant_proxy_env(env: &dyn SettingsEnv) -> Result<bool, SetupError> {
             "expected enabled or disabled",
         )),
     }
+}
+
+/// A comma-separated list of feature keys; an unknown key fails the start.
+fn disabled_features_env(env: &dyn SettingsEnv) -> Result<BTreeSet<Feature>, SetupError> {
+    const KEY: &str = "ARUNA_DISABLED_FEATURES";
+    let Some(value) = optional_nonempty_env(env, KEY)? else {
+        return Ok(BTreeSet::new());
+    };
+    (value.split(',').map(str::trim))
+        .filter(|name| !name.is_empty())
+        .map(|name| {
+            Feature::from_name(name)
+                .ok_or_else(|| invalid_config_value(KEY, name, "expected a feature key"))
+        })
+        .collect()
 }
 
 fn mcp_env(env: &dyn SettingsEnv) -> Result<bool, SetupError> {
@@ -1520,6 +1540,19 @@ mod tests {
         assert_eq!(
             invalid_key(parse(&[("EVENT_RECORDING", "maybe")]).unwrap_err()),
             "EVENT_RECORDING"
+        );
+    }
+
+    #[test]
+    fn parses_disabled_features() {
+        assert!(parse(&[]).unwrap().disabled_features.is_empty());
+        let list = [("ARUNA_DISABLED_FEATURES", " shares, s3-keys ,,")];
+        let expected = BTreeSet::from([Feature::Shares, Feature::S3Keys]);
+        assert_eq!(parse(&list).unwrap().disabled_features, expected);
+        let unknown = [("ARUNA_DISABLED_FEATURES", "shares,compute")];
+        assert_eq!(
+            invalid_key(parse(&unknown).unwrap_err()),
+            "ARUNA_DISABLED_FEATURES"
         );
     }
 

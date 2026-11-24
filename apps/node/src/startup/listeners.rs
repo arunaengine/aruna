@@ -310,6 +310,7 @@ async fn bind_all(
     .with_metrics(metrics.clone())
     .with_rocrate_limits(config.rocrate_limits.clone())
     .with_assistant_proxy(config.assistant_proxy)
+    .with_disabled_features(config.disabled_features.clone())
     .with_import_roots(served_roots(&config.blob_backends))
     .with_trusted_proxies(config.trusted_proxies.clone())
     .with_rate_limits(aruna_api::rate_limit::ApiRateLimits::new(

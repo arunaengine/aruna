@@ -108,6 +108,9 @@ pub struct Config {
     pub realm_description: String,
     pub portal: PortalConfig,
     pub assistant_proxy: bool,
+    /// Features the operator turned off on this node.
+    pub disabled_features:
+        std::collections::BTreeSet<aruna_core::structs::identity::features::Feature>,
     pub startup_mode: StartupMode,
     pub node_state: PersistedNodeState,
     pub node_labels: BTreeMap<String, String>,
@@ -291,6 +294,7 @@ pub async fn resolve_config<H: Handle>(
         realm_description,
         portal,
         assistant_proxy,
+        disabled_features,
         node_labels,
         node_location,
         node_weight,
@@ -454,6 +458,7 @@ pub async fn resolve_config<H: Handle>(
         realm_description,
         portal,
         assistant_proxy,
+        disabled_features,
         startup_mode,
         node_state,
         node_labels,
