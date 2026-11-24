@@ -86,6 +86,7 @@ impl CreateAppletOperation {
             access: Access::Private,
             live: None,
             versions: Vec::new(),
+            drafts: Vec::new(),
             grants: Grants::default(),
             embedding: Embedding::default(),
             guests: None,

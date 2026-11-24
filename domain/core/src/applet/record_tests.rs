@@ -43,6 +43,7 @@ pub(crate) fn applet() -> Applet {
         access: Access::Private,
         live: None,
         versions: vec![version(1, VersionState::Private)],
+        drafts: Vec::new(),
         grants: Grants::default(),
         embedding: Embedding::default(),
         guests: None,
@@ -201,4 +202,29 @@ fn pseudonyms_differ() {
     assert_ne!(pseudonym(&salt, &user(1)), pseudonym(&salt, &user(2)));
     assert_ne!(pseudonym(&salt, &user(1)), pseudonym(&[2; 32], &user(1)));
     assert_eq!(pseudonym(&salt, &user(1)).len(), 32);
+}
+
+#[test]
+fn drafts_expire_counted() {
+    let mut applet = applet();
+    let draft = |seed: u8, expires_at_ms: u64| Draft {
+        build_id: Ulid::from_bytes([seed; 16]),
+        job_id: Ulid::from_bytes([seed; 16]),
+        commit: "c".into(),
+        started_by: user(1),
+        started_at_ms: 0,
+        expires_at_ms,
+        manifest: None,
+        failed: None,
+    };
+    applet.drafts = vec![draft(1, 10), draft(2, 20)];
+    assert_eq!(applet.draft_room(6), 4);
+    assert_eq!(applet.draft_room(1), 0);
+    let expired = applet.expire_drafts(10);
+    assert_eq!(expired.len(), 1);
+    assert!(applet.draft(Ulid::from_bytes([1; 16])).is_none());
+    assert!(applet.draft(Ulid::from_bytes([2; 16])).is_some());
+    let guest = guest_pseudonym(&[1; 32], "203.0.113.7");
+    assert_eq!(guest.len(), 32);
+    assert_ne!(guest, guest_pseudonym(&[2; 32], "203.0.113.7"));
 }

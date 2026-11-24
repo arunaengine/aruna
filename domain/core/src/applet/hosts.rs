@@ -2,6 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::net::IpAddr;
+
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -94,6 +96,13 @@ pub fn verify_value(nonce: &str) -> String {
     format!("aruna-applet={nonce}")
 }
 
+/// Whether DNS proves a custom domain: its `_aruna-verify` TXT names `nonce`, and the domain
+/// resolves to at least one address of the applet host, through a CNAME or flattened records.
+pub fn domain_proven(txt: &[String], nonce: &str, (domain, own): (&[IpAddr], &[IpAddr])) -> bool {
+    let value = verify_value(nonce);
+    txt.iter().any(|entry| entry.trim() == value) && domain.iter().any(|ip| own.contains(ip))
+}
+
 /// One embedding origin: `https://host[:port]`, lower case, and never the applet's own host.
 pub fn embedding_origin(raw: &str, own_hosts: &[&str]) -> Result<String, HostError> {
     let raw = raw.trim();
@@ -170,6 +179,19 @@ mod tests {
             Err(HostError::Domain)
         );
         assert_eq!(verify_name("bakta.lab.org"), "_aruna-verify.bakta.lab.org");
+    }
+
+    #[test]
+    fn domains_need_both() {
+        let (here, elsewhere): (IpAddr, IpAddr) = (
+            "192.0.2.1".parse().unwrap(),
+            "198.51.100.1".parse().unwrap(),
+        );
+        let txt = vec!["other".to_string(), verify_value("ab")];
+        assert!(domain_proven(&txt, "ab", (&[elsewhere, here], &[here])));
+        assert!(!domain_proven(&txt, "cd", (&[here], &[here])));
+        assert!(!domain_proven(&txt, "ab", (&[elsewhere], &[here])));
+        assert!(!domain_proven(&txt, "ab", (&[], &[])));
     }
 
     #[test]

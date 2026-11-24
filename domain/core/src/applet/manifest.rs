@@ -15,6 +15,8 @@ use crate::id::NodeId;
 pub const MAX_SITE_BYTES: u64 = 256 << 20;
 /// The lockfile the curated builder writes.
 pub const LOCKFILE: &str = "package-lock.json";
+/// The builder's source map; a manifest keeps it apart from the served files.
+pub const SOURCE_MAP: &str = "aruna-source-map.json";
 
 /// One served file, pinned to an exact object version in the held deployment area.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,6 +29,19 @@ pub struct ManifestFile {
     pub blake3: String,
     pub content_type: String,
     pub size_bytes: u64,
+}
+
+impl ManifestFile {
+    /// The exact object version this file serves.
+    pub fn pinned(&self) -> crate::applet::record::PinnedObject {
+        crate::applet::record::PinnedObject {
+            node: self.node,
+            bucket: self.bucket.clone(),
+            key: self.key.clone(),
+            version_id: self.version_id.clone(),
+            blake3: self.blake3.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

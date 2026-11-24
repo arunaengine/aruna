@@ -14,7 +14,7 @@ fn node() -> NodeId {
     iroh::SecretKey::from_bytes(&[1; 32]).public()
 }
 
-fn version(number: u32) -> VersionRef {
+pub(crate) fn version(number: u32) -> VersionRef {
     VersionRef {
         version: number,
         commit: Some("abc".into()),
@@ -32,7 +32,7 @@ fn version(number: u32) -> VersionRef {
     }
 }
 
-fn applet() -> Applet {
+pub(crate) fn applet() -> Applet {
     Applet {
         applet_id: Ulid::from_bytes([3; 16]),
         group_id: Ulid::from_bytes([4; 16]),
@@ -45,6 +45,7 @@ fn applet() -> Applet {
         access: Access::Private,
         live: None,
         versions: Vec::new(),
+        drafts: Vec::new(),
         grants: Grants::default(),
         embedding: Embedding::default(),
         guests: None,

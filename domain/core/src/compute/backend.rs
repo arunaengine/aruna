@@ -83,6 +83,10 @@ pub struct DeclaredCapabilities {
     pub multi_container: bool,
     pub services: bool,
     pub ingress: bool,
+    /// Every container runs inside a kernel sandbox such as gVisor or a micro VM.
+    pub sandbox: bool,
+    /// The operator lets work that applet visitors and guests start run here.
+    pub public_work: bool,
 }
 
 /// Suitability per workload kind as written; a missing key takes the kind default.

@@ -6,5 +6,7 @@ pub mod diff;
 pub mod feature;
 pub mod hosts;
 pub mod manifest;
+pub mod notices;
 pub mod record;
 pub mod settings;
+pub mod usage;

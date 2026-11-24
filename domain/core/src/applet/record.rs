@@ -83,6 +83,21 @@ pub struct VersionRef {
     pub approved_by: Option<UserId>,
 }
 
+/// A build preview: a builder job's output, shown only to previewers until it is kept or expires.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Draft {
+    /// Names the held bucket folder of the build's sources and outputs.
+    pub build_id: Ulid,
+    pub job_id: Ulid,
+    pub commit: String,
+    pub started_by: UserId,
+    pub started_at_ms: u64,
+    pub expires_at_ms: u64,
+    /// The draft manifest, once the build's outputs are captured.
+    pub manifest: Option<PinnedObject>,
+    pub failed: Option<String>,
+}
+
 /// What an applet starts on behalf of its visitors.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StartGrant {
@@ -119,6 +134,16 @@ pub struct Grants {
     /// Where submissions go; each visitor writes below its own pseudonym folder.
     pub submissions: Option<Folder>,
     pub limits: Limits,
+}
+
+impl Grants {
+    /// Whether the applet reads, starts and receives nothing, so it needs no account.
+    pub fn is_empty(&self) -> bool {
+        self.read.is_empty()
+            && self.references.is_empty()
+            && self.start.is_none()
+            && self.submissions.is_none()
+    }
 }
 
 /// Exact `https://` parent origins allowed to frame the applet.
@@ -205,6 +230,7 @@ pub struct Applet {
     pub access: Access,
     pub live: Option<u32>,
     pub versions: Vec<VersionRef>,
+    pub drafts: Vec<Draft>,
     pub grants: Grants,
     pub embedding: Embedding,
     pub guests: Option<GuestPolicy>,
@@ -258,6 +284,24 @@ impl Applet {
 
     pub fn version(&self, version: u32) -> Option<&VersionRef> {
         self.versions.iter().find(|entry| entry.version == version)
+    }
+
+    pub fn draft(&self, build_id: Ulid) -> Option<&Draft> {
+        self.drafts.iter().find(|draft| draft.build_id == build_id)
+    }
+
+    /// How many more drafts fit below `max`, counting running builds.
+    pub fn draft_room(&self, max: usize) -> usize {
+        max.saturating_sub(self.drafts.len())
+    }
+
+    /// Drops the drafts whose lifetime ended at `now_ms` and answers them.
+    pub fn expire_drafts(&mut self, now_ms: u64) -> Vec<Draft> {
+        let (expired, kept) = std::mem::take(&mut self.drafts)
+            .into_iter()
+            .partition(|draft| draft.expires_at_ms <= now_ms);
+        self.drafts = kept;
+        expired
     }
 
     /// The number the next version gets.
@@ -414,8 +458,9 @@ impl Applet {
         dropped
     }
 
-    /// The paths the applet's own role holds: READ on what it reads and WRITE below the
-    /// submission folder; never a group root, so it cannot start work through the job routes.
+    /// The paths the applet's own role holds: READ on what it reads, WRITE below the submission
+    /// folder and, only with a granted start, WRITE on the exact group path, which admits a run
+    /// but grants nothing below it. The account has no credential; only the node acts as it.
     pub fn role_paths(&self, realm_id: RealmId, node: NodeId) -> Vec<(String, Permission)> {
         let grants = &self.grants;
         let mut paths: Vec<(String, Permission)> = (grants.read.iter())
@@ -428,7 +473,35 @@ impl Applet {
                 object_permission_path(realm_id, self.group_id, node, &folder.bucket, prefix);
             paths.push((format!("{path}/**"), Permission::WRITE));
         }
+        if grants.start.is_some() {
+            let group =
+                crate::structs::storage::blob::group_permission_path(realm_id, self.group_id, node);
+            paths.push((group, Permission::WRITE));
+        }
         paths
+    }
+
+    /// Drops expired drafts and the versions [`Applet::prune`] drops; answers whether anything
+    /// went.
+    pub fn retain(&mut self, now_ms: u64) -> bool {
+        let expired = !self.expire_drafts(now_ms).is_empty();
+        let pruned = !self.prune().is_empty();
+        expired || pruned
+    }
+
+    /// Whether the applet's account should be active with its role: a live applet with grants.
+    pub fn wants_account(&self) -> bool {
+        self.lifecycle == Lifecycle::Live && !self.grants.is_empty()
+    }
+
+    /// Who the applet's account and role act for: the approver of the live version, else the
+    /// approver of the newest approved version.
+    pub fn granter(&self) -> Option<UserId> {
+        let live = self.live.and_then(|live| self.version(live));
+        let newest = (self.versions.iter())
+            .filter(|entry| entry.approved_by.is_some())
+            .max_by_key(|entry| entry.version);
+        live.or(newest).and_then(|entry| entry.approved_by)
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
@@ -457,6 +530,11 @@ pub fn applet_key(applet_id: Ulid) -> Key {
     Key::from(row)
 }
 
+/// The prefix of every applet record row.
+pub fn record_prefix() -> Key {
+    Key::from(vec![RECORD_ROW])
+}
+
 /// The group index row that lists `applet_id` under `group_id`; its value is empty.
 pub fn group_key(group_id: GroupId, applet_id: Ulid) -> Key {
     let mut row = vec![GROUP_ROW];
@@ -476,6 +554,14 @@ pub fn group_prefix(group_id: GroupId) -> Key {
 pub fn pseudonym(salt: &[u8; 32], user: &UserId) -> String {
     let hash = blake3::keyed_hash(salt, &user.to_bytes());
     hex::encode(&hash.as_bytes()[..16])
+}
+
+/// A guest's folder name from the id the edge gave it, keyed like [`pseudonym`].
+pub fn guest_pseudonym(salt: &[u8; 32], guest: &str) -> String {
+    let mut hasher = blake3::Hasher::new_keyed(salt);
+    hasher.update(b"guest:");
+    hasher.update(guest.as_bytes());
+    hex::encode(&hasher.finalize().as_bytes()[..16])
 }
 
 #[cfg(test)]
