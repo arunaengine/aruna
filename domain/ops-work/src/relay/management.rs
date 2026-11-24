@@ -71,6 +71,7 @@ pub const RELAYED_ROUTES: &[(&str, &str)] = &[
     ("PUT", "/plugin-installs/{id}/version"),
     ("PUT", "/system/realm/admins/{user_id}"),
     ("PUT", "/system/realm/email"),
+    ("PUT", "/system/realm/features"),
     ("PUT", "/system/realm/federation"),
     ("PUT", "/system/realm/oidc-providers/{id}"),
     ("PUT", "/system/realm/portal-features"),

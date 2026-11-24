@@ -19,6 +19,7 @@ pub mod drs;
 pub mod email_profile;
 pub mod emails;
 pub mod execution;
+pub mod features;
 pub mod federation;
 pub mod git;
 pub mod hooks;
@@ -139,6 +140,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(hooks::router())
         .merge(policies::router())
         .merge(portal::router())
+        .merge(features::router())
         .merge(oidc_providers::router())
         .merge(promotion::router())
         .merge(realm_admins::router())
@@ -494,6 +496,8 @@ pub(crate) mod tests {
         ("GET", "/system/realm/federation"),
         ("GET", "/system/realm/placement"),
         ("GET", "/system/realm/portal-features"),
+        ("GET", "/system/realm/features"),
+        ("GET", "/system/realm/features/effective"),
         ("GET", "/system/usage"),
         ("GET", "/compute/jobs"),
         ("DELETE", "/compute/jobs/{job_id}"),
@@ -861,6 +865,7 @@ pub(crate) mod tests {
         ("PUT", "/system/realm/oidc-providers/{id}"),
         ("PUT", "/system/realm/admins/{user_id}"),
         ("PUT", "/system/realm/portal-features"),
+        ("PUT", "/system/realm/features"),
         ("PUT", "/system/realm/quota"),
         ("PUT", "/metadata/{document_id}/rocrate"),
         (
