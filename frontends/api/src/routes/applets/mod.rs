@@ -4,6 +4,7 @@
 
 pub mod lifecycle;
 pub mod records;
+pub mod source;
 pub mod wire;
 
 use std::sync::Arc;
@@ -30,6 +31,7 @@ const MAX_LIMIT: usize = 500;
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     (records::router())
         .merge(lifecycle::router())
+        .merge(source::router())
 }
 
 pub(crate) fn applet_error(error: AppletError) -> ServerError {
