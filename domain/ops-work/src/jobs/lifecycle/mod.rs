@@ -36,6 +36,7 @@ pub mod offer;
 pub mod outbox;
 mod output_policies;
 pub mod plan;
+pub mod preview;
 pub mod remote_inputs;
 pub mod report;
 pub mod reservation;

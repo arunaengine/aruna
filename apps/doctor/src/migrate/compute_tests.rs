@@ -171,6 +171,7 @@ fn spec_row() -> Vec<u8> {
         disk_bytes: 0,
         max_walltime_ms: 60_000,
         preemptible: false,
+        gpus: 0,
     };
     let job_id = JobId::from_bytes([5u8; 16]);
     let spec = LogicalJobSpec {
@@ -279,6 +280,7 @@ fn deletes_unnamed_jobs() {
             disk_bytes: 0,
             max_walltime_ms: 1,
             preemptible: false,
+            gpus: 0,
         },
         created_at_ms: 1,
         subject_generation: 1,

@@ -16,7 +16,7 @@ use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::rows::{decode, values};
 use aruna_core::structs::execution::job::family::JobFamilyId;
 use aruna_core::structs::execution::job::input::{
-    ExecutionSpec, InputSource, OutputDestination, TagError, named_install, tagged,
+    ExecutionSpec, InputSource, OutputDestination, TagError, named_install, run_area_bucket, tagged,
 };
 use aruna_core::structs::identity::auth::Permission as Access;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -84,9 +84,16 @@ pub fn screen_targets(
         InputSource::Inline { .. } => None,
     });
     let outputs = (spec.file_outputs.iter()).map(|output| {
-        let OutputDestination::S3 { bucket, key } = &output.destination;
         let node = output.destination_node_id.unwrap_or(ingress);
-        let path = object_permission_path(realm_id, spec.group_id, node, bucket, key);
+        let path = match &output.destination {
+            OutputDestination::S3 { bucket, key } => {
+                object_permission_path(realm_id, spec.group_id, node, bucket, key)
+            }
+            OutputDestination::RunArea { prefix } => {
+                let bucket = run_area_bucket(spec.group_id, node);
+                object_permission_path(realm_id, spec.group_id, node, &bucket, prefix)
+            }
+        };
         (Permission::JobsRun, path)
     });
     inputs.chain(outputs).collect()

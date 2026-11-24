@@ -1522,6 +1522,7 @@ fn map_task_resources(task: &TesTask) -> Result<ComputeResources, TesError> {
             .as_ref()
             .and_then(|resources| resources.preemptible)
             .unwrap_or(false),
+        gpus: None,
     })
 }
 
@@ -1899,11 +1900,14 @@ fn project_task(
         .file_outputs
         .iter()
         .map(|output| {
-            let OutputDestination::S3 { bucket, key } = &output.destination;
+            let url = match &output.destination {
+                OutputDestination::S3 { bucket, key } => format!("s3://{bucket}/{key}"),
+                OutputDestination::RunArea { prefix } => format!("run-area://{prefix}"),
+            };
             TesOutput {
                 name: output.name.clone(),
                 description: output.description.clone(),
-                url: Some(format!("s3://{bucket}/{key}")),
+                url: Some(url),
                 path: output.container_path.clone(),
                 path_prefix: output.path_prefix.clone(),
                 kind: TesFileType::File,

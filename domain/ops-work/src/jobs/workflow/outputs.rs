@@ -17,9 +17,7 @@ use aruna_core::id::NodeId;
 use aruna_core::jobs::{JobEffect, JobEvent};
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::family::MAX_EXECUTION_OUTPUTS;
-use aruna_core::structs::execution::job::input::{
-    ExecutionSpec, OutputDestination, OutputSelection,
-};
+use aruna_core::structs::execution::job::input::{ExecutionSpec, OutputSelection};
 use aruna_core::structs::execution::job::local::{
     AttemptControl, JobError, JobRecord, OutputObject,
 };
@@ -130,6 +128,8 @@ pub struct PutOutputOperation {
     scope: Arc<CaptureScope>,
     output: OutputSelection,
     destination_node: NodeId,
+    /// The bucket and key the output lands in, bound before the capture.
+    target: (String, String),
     version_id: Ulid,
     execution_id: Ulid,
     inherited: Vec<PlacementPolicyRef>,
@@ -148,7 +148,7 @@ impl PutOutputOperation {
     fn new(
         scope: Arc<CaptureScope>,
         output: OutputSelection,
-        destination_node: NodeId,
+        (destination_node, bucket, key): (NodeId, String, String),
         (version_id, execution_id): (Ulid, Ulid),
         inherited: Vec<PlacementPolicyRef>,
     ) -> Self {
@@ -156,6 +156,7 @@ impl PutOutputOperation {
             scope,
             output,
             destination_node,
+            target: (bucket, key),
             version_id,
             execution_id,
             inherited,
@@ -181,8 +182,7 @@ impl PutOutputOperation {
     }
 
     fn destination(&self) -> (&str, &str) {
-        let OutputDestination::S3 { bucket, key } = &self.output.destination;
-        (bucket, key)
+        (&self.target.0, &self.target.1)
     }
 
     fn read_config(&mut self) -> PutNext {
@@ -537,6 +537,8 @@ pub(super) fn input_refs(
 
 #[derive(Debug, PartialEq)]
 enum CaptureStep {
+    /// The group's run area bucket on this node is created when it is missing.
+    Area,
     Resolve(OutputSelection),
     Hint(String),
     Reserve,
@@ -552,6 +554,8 @@ type CaptureNext = Result<Next<Vec<OutputObject>>, JobError>;
 #[derive(Debug, PartialEq)]
 pub struct CaptureOutputsOperation {
     scope: Arc<CaptureScope>,
+    /// The run area bucket the declared outputs were bound to, which may not exist yet.
+    area: Option<String>,
     declared: VecDeque<OutputSelection>,
     selections: Vec<OutputSelection>,
     destinations: Vec<(NodeId, String, String)>,
@@ -567,9 +571,12 @@ pub struct CaptureOutputsOperation {
 
 impl CaptureOutputsOperation {
     pub fn new(scope: CaptureScope) -> Self {
-        let declared = scope.spec.file_outputs.iter().cloned().collect();
+        let mut bound = ExecutionSpec::clone(&scope.spec);
+        let area = bound.bind_run_areas(scope.run.node_id);
+        let declared = bound.file_outputs.into_iter().collect();
         Self {
             scope: Arc::new(scope),
+            area,
             declared,
             selections: Vec::new(),
             destinations: Vec::new(),
@@ -698,7 +705,7 @@ impl CaptureOutputsOperation {
         let put = PutOutputOperation::new(
             self.scope.clone(),
             output,
-            node,
+            (node, bucket, key),
             (version_id, execution_id),
             self.inherited.clone(),
         );
@@ -715,11 +722,33 @@ impl Operation for CaptureOutputsOperation {
     }
 
     fn first(&mut self) -> CaptureNext {
-        self.resolve_next()
+        let Some(bucket) = self.area.clone() else {
+            return self.resolve_next();
+        };
+        let run = &self.scope.run;
+        let info = BucketInfo {
+            group_id: run.group_id,
+            created_at: SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms),
+            created_by: run.user_id,
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Off,
+            distribution: None,
+        };
+        let create = CreateBucketOperation::new(bucket, info);
+        self.call(CaptureStep::Area, IoCall::child(create))
     }
 
     fn next(&mut self, result: IoResult) -> CaptureNext {
         match std::mem::replace(&mut self.step, CaptureStep::Put) {
+            CaptureStep::Area => match result.child::<BucketInfo, CreateBucketError>()? {
+                Ok(_) | Err(CreateBucketError::BucketAlreadyExists) => self.resolve_next(),
+                Err(error) => Err(JobError::retryable(format!(
+                    "the run area bucket was not created: {error}"
+                ))),
+            },
             CaptureStep::Resolve(output) => {
                 let mut matched = match compute_answer(result)? {
                     ComputeAnswer::Outputs(matched) => {

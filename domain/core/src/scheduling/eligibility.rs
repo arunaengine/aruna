@@ -192,7 +192,9 @@ pub fn screen(request: &PlanRequest, candidate: &TargetCandidate) -> Option<Reje
     if !labels_match(request, &candidate.capability.subject) {
         return Some(RejectionVerdict::RequiredLabels);
     }
-    if !candidate.capability.limits.fits(&request.resources) {
+    if !candidate.capability.limits.fits(&request.resources)
+        || request.resources.gpus > candidate.capability.declared.gpus
+    {
         return Some(RejectionVerdict::Resources);
     }
     if protected(request)

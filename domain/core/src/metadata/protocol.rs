@@ -757,6 +757,17 @@ pub enum MetadataTransportMessage {
     LaunchClosureAnswered {
         answer: crate::jobs::LaunchClosureAnswer,
     },
+    /// The run node hands a holder of the run group's records the run and its log pages from
+    /// `first_page` on, each encoded as one stored page row, so another node can resume it.
+    StoreRunLog {
+        run: Box<crate::structs::execution::workflow_run::WorkflowRunRecord>,
+        first_page: u32,
+        pages: Vec<Vec<u8>>,
+    },
+    /// The pages the holder now keeps of the run.
+    RunLogStored {
+        result: Result<u32, MetadataReadError>,
+    },
 }
 
 /// PKCS8 PEM of the realm signing key; Debug never prints it.
@@ -1291,6 +1302,8 @@ pub fn transport_message_kind(message: &MetadataTransportMessage) -> &'static st
         MetadataTransportMessage::ExportAnswer { .. } => "export_answer",
         MetadataTransportMessage::QuerySubmissionClaim { .. } => "query_submission_claim",
         MetadataTransportMessage::SubmissionClaimAnswered { .. } => "submission_claim_answered",
+        MetadataTransportMessage::StoreRunLog { .. } => "store_run_log",
+        MetadataTransportMessage::RunLogStored { .. } => "run_log_stored",
     }
 }
 

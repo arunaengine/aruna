@@ -144,6 +144,9 @@ pub struct EffectiveResources {
     pub disk_bytes: u64,
     pub max_walltime_ms: u64,
     pub preemptible: bool,
+    /// Zero asks for no GPU.
+    #[serde(default)]
+    pub gpus: u32,
 }
 
 /// Immutable logical admission committed with the spec. Later quota convergence

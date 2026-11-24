@@ -137,7 +137,22 @@ pub struct InputSelection {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OutputDestination {
-    S3 { bucket: String, key: String },
+    S3 {
+        bucket: String,
+        key: String,
+    },
+    /// Below `prefix` in the group's run area on the node that executes the job, which the
+    /// executing node binds when it captures the output; it is never pinned at admission.
+    RunArea {
+        prefix: String,
+    },
+}
+
+/// The run area bucket of `group_id` on `node_id`: one reusable bucket per group and node,
+/// owned by the group and named the same on every retry.
+pub fn run_area_bucket(group_id: GroupId, node_id: NodeId) -> String {
+    let node = hex::encode(&node_id.as_bytes()[..6]);
+    format!("runs-{}-{node}", group_id.to_string().to_lowercase())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -171,6 +186,8 @@ pub struct ComputeResources {
     pub disk_bytes: Option<u64>,
     pub max_walltime_ms: Option<u64>,
     pub preemptible: bool,
+    #[serde(default)]
+    pub gpus: Option<u32>,
 }
 
 /// Tags only the plugin host sets, on the jobs of plugin tasks; every job ingress refuses them.
@@ -834,6 +851,24 @@ impl ExecutionSpec {
                 description: None,
             });
         }
+    }
+
+    /// Binds every run area output to the group's run area bucket on `node_id`, the node that
+    /// executes the job, and names that bucket when there was one.
+    pub fn bind_run_areas(&mut self, node_id: NodeId) -> Option<String> {
+        let bucket = run_area_bucket(self.group_id, node_id);
+        let mut bound = false;
+        for output in &mut self.file_outputs {
+            if let OutputDestination::RunArea { prefix } = &output.destination {
+                output.destination = OutputDestination::S3 {
+                    bucket: bucket.clone(),
+                    key: prefix.trim_matches('/').to_owned(),
+                };
+                output.destination_node_id = Some(node_id);
+                bound = true;
+            }
+        }
+        bound.then_some(bucket)
     }
 }
 

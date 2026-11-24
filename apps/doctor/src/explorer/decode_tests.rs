@@ -245,6 +245,7 @@ fn decodes_compute_rows() {
             disk_bytes: 2048,
             max_walltime_ms: 60_000,
             preemptible: false,
+            gpus: 0,
         },
         created_at_ms: 21,
         subject_generation: 3,

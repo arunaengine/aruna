@@ -29,6 +29,7 @@ pub(crate) fn execution_spec() -> ExecutionSpec {
             disk_bytes: None,
             max_walltime_ms: None,
             preemptible: false,
+            gpus: None,
         },
         executor_constraint: None,
         backend: None,

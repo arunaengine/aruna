@@ -8,7 +8,7 @@ use aruna_core::id::NodeId;
 use aruna_core::jobs::SubmissionRefusal;
 use aruna_core::structs::execution::job::family::SubmissionId;
 use aruna_core::structs::execution::job::input::{
-    CapturedInput, ExecutionSpec, InputContent, InputSelection, object_count,
+    CapturedInput, ExecutionSpec, InputContent, InputSelection, OutputDestination, object_count,
 };
 use aruna_core::structs::execution::job::local::WorkspaceMode;
 use aruna_core::structs::identity::auth::AuthContext;
@@ -133,7 +133,9 @@ pub(super) fn is_device(config: &RealmConfigDocument, node_id: NodeId) -> bool {
 /// its results.
 pub(super) fn pin_outputs(spec: &mut ExecutionSpec, node_id: NodeId) {
     for output in &mut spec.file_outputs {
-        output.destination_node_id = Some(node_id);
+        if let OutputDestination::S3 { .. } = output.destination {
+            output.destination_node_id = Some(node_id);
+        }
     }
     let (mode, bucket) = job_request::workspace_of(spec);
     if mode == WorkspaceMode::Existing
@@ -364,7 +366,10 @@ pub(super) fn forwarded_request_fits(request: &SubmissionRequest, ingress: NodeI
         && spec
             .file_outputs
             .iter()
-            .all(|output| output.destination_node_id == Some(ingress))
+            .all(|output| match output.destination {
+                OutputDestination::S3 { .. } => output.destination_node_id == Some(ingress),
+                OutputDestination::RunArea { .. } => output.destination_node_id.is_none(),
+            })
         && (job_request::workspace_of(spec).0 != WorkspaceMode::Existing
             || spec.workspace_outputs.is_empty())
 }

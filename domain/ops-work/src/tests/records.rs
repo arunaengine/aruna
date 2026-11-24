@@ -119,6 +119,7 @@ impl Family {
             disk_bytes: 2048,
             max_walltime_ms: 60_000,
             preemptible: false,
+            gpus: 0,
         };
         LogicalJobSpec {
             submission_id: self.submission_id,

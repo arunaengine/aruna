@@ -30,6 +30,7 @@ fn reservation(seed: u8) -> JobReservationRecord {
             disk_bytes: 0,
             max_walltime_ms: 0,
             preemptible: false,
+            gpus: 0,
         },
         created_at_ms: 1,
         subject_generation: 0,

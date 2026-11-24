@@ -1160,6 +1160,7 @@ mod tests {
             disk_bytes: 0,
             max_walltime_ms: 1_000,
             preemptible: false,
+            gpus: 0,
         };
         let mut planning = round(&config, &spec, &[]);
         planning.now_ms = 10_000;

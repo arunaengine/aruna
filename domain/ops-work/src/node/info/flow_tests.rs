@@ -617,6 +617,7 @@ fn spec_record(realm_id: RealmId, family: JobFamilyId, group_id: Ulid) -> JobRec
         disk_bytes: 2_048,
         max_walltime_ms: 60_000,
         preemptible: false,
+        gpus: 0,
     };
     let job_id = aruna_core::structs::execution::job::identity::JobId::from_bytes([9u8; 16]);
     let origin = node(1);
@@ -737,6 +738,7 @@ async fn write_reservation(ctx: &DriverContext, execution_id: Ulid, cpu: u32) {
             disk_bytes: 0,
             max_walltime_ms: 1_000,
             preemptible: false,
+            gpus: 0,
         },
         created_at_ms: 5,
         subject_generation: 1,
@@ -879,6 +881,7 @@ async fn merges_group_demand() {
             disk_bytes: 2_048,
             max_walltime_ms: 60_000,
             preemptible: false,
+            gpus: 0,
         },
     };
     let own = DemandFamily {

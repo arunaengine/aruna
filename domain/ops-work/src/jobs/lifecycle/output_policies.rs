@@ -33,16 +33,15 @@ type OutputsNext = Result<Next<Vec<PlacementPolicyRef>>, SubmitJobError>;
 
 impl OutputPoliciesOperation {
     pub(super) fn new(spec: &ExecutionSpec, local: NodeId) -> Self {
-        let misplaced = spec
-            .file_outputs
-            .iter()
-            .any(|output| output.destination_node_id != Some(local));
-        let mut buckets: BTreeSet<String> = spec
-            .file_outputs
-            .iter()
-            .map(|output| {
-                let OutputDestination::S3 { bucket, .. } = &output.destination;
-                bucket.clone()
+        // A run area output binds where the job executes, so only named buckets are read here.
+        let misplaced = (spec.file_outputs.iter()).any(|output| match &output.destination {
+            OutputDestination::S3 { .. } => output.destination_node_id != Some(local),
+            OutputDestination::RunArea { .. } => output.destination_node_id.is_some(),
+        });
+        let mut buckets: BTreeSet<String> = (spec.file_outputs.iter())
+            .filter_map(|output| match &output.destination {
+                OutputDestination::S3 { bucket, .. } => Some(bucket.clone()),
+                OutputDestination::RunArea { .. } => None,
             })
             .collect();
         let (mode, workspace) = job_request::workspace_of(spec);

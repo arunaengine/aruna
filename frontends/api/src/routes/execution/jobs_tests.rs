@@ -59,6 +59,7 @@ fn family_report_fixture() -> FamilyReport {
         disk_bytes: 0,
         max_walltime_ms: 1_000,
         preemptible: false,
+        gpus: 0,
     };
     let payload = ExecutionSpec {
         group_id: Ulid::from_bytes([6u8; 16]),

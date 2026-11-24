@@ -6,7 +6,9 @@ use std::collections::HashMap;
 
 use aruna_core::compute::BackendError;
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::execution::job::input::{InputMode, InputSelection, InputSource};
+use aruna_core::structs::execution::job::input::{
+    InputMode, InputSelection, InputSource, OutputDestination, run_area_bucket,
+};
 use aruna_core::structs::execution::job::local::OutputCommitIntent;
 use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
 use aruna_core::structs::storage::format::StoredFormat;
@@ -67,6 +69,41 @@ fn spec_with(selection: OutputSelection) -> ExecutionSpec {
 
 fn capture_of(selection: OutputSelection, until_stop: bool) -> CaptureOutputsOperation {
     CaptureOutputsOperation::new(scope_of(spec_with(selection), until_stop))
+}
+
+// A run area output binds to the group's one run area bucket on the executing node, which is
+// created when it is missing and reused by every later job of the group.
+#[test]
+fn binds_run_area() {
+    let area = OutputSelection {
+        container_path: PATH.to_string(),
+        path_prefix: None,
+        destination_node_id: None,
+        destination: OutputDestination::RunArea {
+            prefix: "run-1/tasks/a/work/".to_string(),
+        },
+        name: None,
+        description: None,
+    };
+    let bucket = run_area_bucket(spec().group_id, node());
+    let mut capture = capture_of(area.clone(), false);
+    let created = capture.first();
+    assert!(is_child(&created), "{created:?}");
+    let exists = Err::<BucketInfo, _>(CreateBucketError::BucketAlreadyExists);
+    let hint = capture.next(child(exists)).unwrap();
+    let read = GetBucketOperation::new(bucket.clone());
+    assert_eq!(hint, Next::Call(IoCall::child(read)));
+    let missing = Err::<BucketInfo, _>(GetBucketError::NotFound);
+    let reserve = capture.next(child(missing)).unwrap();
+    let key = "run-1/tasks/a/work".to_string();
+    assert_eq!(reserve, reserve_call(vec![(node(), bucket.clone(), key)]));
+
+    let mut later = spec_with(area);
+    later.name = Some("a later task".to_string());
+    let later = CaptureOutputsOperation::new(scope_of(later, false));
+    assert_eq!(later.area, Some(bucket));
+    let elsewhere = run_area_bucket(spec().group_id, other_node());
+    assert_ne!(later.area, Some(elsewhere));
 }
 
 fn reserve_call(destinations: Vec<(NodeId, String, String)>) -> Next<Vec<OutputObject>> {
@@ -139,7 +176,8 @@ fn put_call(until_stop: bool) -> IoCall {
     let selection = output(PATH, node());
     let scope = Arc::new(scope_of(spec_with(selection.clone()), until_stop));
     let ids = (version(), execution());
-    let put = PutOutputOperation::new(scope, selection, node(), ids, Vec::new());
+    let target = (node(), "out".to_string(), "a.txt".to_string());
+    let put = PutOutputOperation::new(scope, selection, target, ids, Vec::new());
     IoCall::child(put)
 }
 
@@ -321,7 +359,8 @@ fn put_to(destination_node: NodeId) -> PutOutputOperation {
     let selection = output(PATH, destination_node);
     let scope = Arc::new(scope_of(spec_with(selection.clone()), true));
     let ids = (version(), execution());
-    let mut put = PutOutputOperation::new(scope, selection, destination_node, ids, Vec::new());
+    let target = (destination_node, "out".to_string(), "a.txt".to_string());
+    let mut put = PutOutputOperation::new(scope, selection, target, ids, Vec::new());
     put.stamp(NOW);
     put
 }

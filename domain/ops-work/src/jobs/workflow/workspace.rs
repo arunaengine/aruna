@@ -101,14 +101,25 @@ pub(super) fn capture_cancelled() -> JobError {
     JobError::retryable("output capture cancelled")
 }
 
+/// The bucket and key of an output; a run area output names none before the executing node
+/// binds it.
+pub(super) fn s3_destination(selection: &OutputSelection) -> Result<(&str, &str), JobError> {
+    match &selection.destination {
+        OutputDestination::S3 { bucket, key } => Ok((bucket, key)),
+        OutputDestination::RunArea { .. } => Err(JobError::permanent(
+            "a run area output was not bound to the executing node",
+        )),
+    }
+}
+
 pub(super) fn destination_of(
     selection: &OutputSelection,
 ) -> Result<(NodeId, String, String), JobError> {
-    let OutputDestination::S3 { bucket, key } = &selection.destination;
+    let (bucket, key) = s3_destination(selection)?;
     let node_id = selection
         .destination_node_id
         .ok_or_else(|| JobError::permanent("output destination endpoint is missing"))?;
-    Ok((node_id, bucket.clone(), key.clone()))
+    Ok((node_id, bucket.to_owned(), key.to_owned()))
 }
 
 /// One selection per destination object: a file several globs match is captured once,
@@ -119,8 +130,12 @@ pub(super) fn distinct_selections(
     let mut sources: HashMap<(Option<NodeId>, String, String), String> = HashMap::new();
     let mut distinct = Vec::with_capacity(selections.len());
     for selection in selections {
-        let OutputDestination::S3 { bucket, key } = &selection.destination;
-        let target = (selection.destination_node_id, bucket.clone(), key.clone());
+        let (bucket, key) = s3_destination(&selection)?;
+        let target = (
+            selection.destination_node_id,
+            bucket.to_owned(),
+            key.to_owned(),
+        );
         match sources.get(&target) {
             Some(source) if *source == selection.container_path => {}
             Some(source) => {
@@ -158,7 +173,7 @@ pub(super) fn expand_selection(
             output.container_path
         )));
     }
-    let OutputDestination::S3 { bucket, key } = &output.destination;
+    let (bucket, key) = s3_destination(output)?;
     matched
         .into_iter()
         .filter(|path| {
@@ -175,7 +190,7 @@ pub(super) fn expand_selection(
                 path_prefix: None,
                 destination_node_id: output.destination_node_id,
                 destination: OutputDestination::S3 {
-                    bucket: bucket.clone(),
+                    bucket: bucket.to_owned(),
                     key: format!("{}/{suffix}", key.trim_end_matches('/')),
                 },
                 name: output.name.clone(),

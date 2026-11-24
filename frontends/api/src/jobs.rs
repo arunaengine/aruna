@@ -303,6 +303,7 @@ pub(crate) async fn admit_execution(
             disk_bytes: None,
             max_walltime_ms: command.max_walltime_ms,
             preemptible: false,
+            gpus: None,
         },
         executor_constraint: command.executor_constraint,
         backend: command.backend,
@@ -696,7 +697,9 @@ pub(crate) fn native_outputs(
 pub(crate) fn output_buckets(workspace: Option<&str>, outputs: &[OutputSelection]) -> Vec<String> {
     let mut buckets: Vec<String> = workspace.map(str::to_string).into_iter().collect();
     for output in outputs {
-        let OutputDestination::S3 { bucket, .. } = &output.destination;
+        let OutputDestination::S3 { bucket, .. } = &output.destination else {
+            continue;
+        };
         if !buckets.contains(bucket) {
             buckets.push(bucket.clone());
         }

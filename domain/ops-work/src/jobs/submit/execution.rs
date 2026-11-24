@@ -64,6 +64,14 @@ pub(crate) fn validate_execution(
                 .to_string(),
         ));
     }
+    // Only a workflow run's tasks write into a group's run area.
+    let run_area = (spec.file_outputs.iter())
+        .any(|output| matches!(output.destination, OutputDestination::RunArea { .. }));
+    if run_area && !spec.tags.contains_key(WORKFLOW_RUN_TAG) {
+        return Err(SubmitJobError::InvalidWorkspace(
+            "run area outputs are for workflow tasks only".to_string(),
+        ));
+    }
     // One bound governs declaration, expansion, the local result, and the
     // immutable output record, so a valid success is always publishable.
     if spec.file_outputs.len() + spec.workspace_outputs.len() > MAX_EXECUTION_OUTPUTS {
@@ -112,9 +120,9 @@ pub(crate) fn validate_execution(
         .file_outputs
         .iter()
         .filter(|output| !aruna_core::compute::has_wildcard(&output.container_path))
-        .map(|output| {
-            let OutputDestination::S3 { bucket, key } = &output.destination;
-            (bucket.as_str(), key.as_str())
+        .map(|output| match &output.destination {
+            OutputDestination::S3 { bucket, key } => (bucket.as_str(), key.as_str()),
+            OutputDestination::RunArea { prefix } => ("run area", prefix.as_str()),
         });
     for (bucket, key) in explicit.chain(workspace) {
         if !destinations.insert((bucket, key)) {

@@ -1914,6 +1914,7 @@ async fn store_site(
             disk_bytes: 0,
             max_walltime_ms: 1_000,
             preemptible: false,
+            gpus: 0,
         },
         created_at_ms: 1,
         subject_generation: generation,

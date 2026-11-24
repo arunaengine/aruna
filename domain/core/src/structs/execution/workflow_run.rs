@@ -248,6 +248,9 @@ pub struct WorkflowRunRecord {
     /// The run this run repeats from the same sources, values and images.
     pub repeats_run_id: Option<Ulid>,
     pub cache_scope: CacheScope,
+    /// The site the request placed the run's tasks at; a task names no other site.
+    #[serde(default)]
+    pub placement_site: Option<String>,
 }
 
 /// One task of a run, with the state of its newest attempt.

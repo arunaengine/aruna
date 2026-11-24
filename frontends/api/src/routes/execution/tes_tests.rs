@@ -715,7 +715,9 @@ fn adds_nextflow_output() {
     task.inputs[0].path = "/work/.command.run".to_string();
     task.inputs[0].url = Some("s3://src/work/ef/.command.run".to_string());
     let output = env_glob(&task).expect("the wrapper input marks a Nextflow task");
-    let OutputDestination::S3 { key, .. } = output.destination;
+    let OutputDestination::S3 { key, .. } = output.destination else {
+        panic!("a Nextflow output names its object");
+    };
     assert_eq!(key, "work/ef");
 }
 
@@ -1031,6 +1033,7 @@ fn family_fixture() -> aruna_ops_work::jobs::lifecycle::report::FamilyReport {
         disk_bytes: 0,
         max_walltime_ms: 1_000,
         preemptible: false,
+        gpus: 0,
     };
     let mut payload = ExecutionSpec {
         group_id: Ulid::from_bytes([6u8; 16]),

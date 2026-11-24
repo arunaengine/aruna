@@ -103,6 +103,7 @@ pub(crate) fn request(inputs: Vec<ResolvedInput>) -> PlanRequest {
             disk_bytes: 2_048,
             max_walltime_ms: 60_000,
             preemptible: false,
+            gpus: 0,
         },
         group_id: Ulid::from_bytes([3u8; 16]),
         executor_constraint: None,

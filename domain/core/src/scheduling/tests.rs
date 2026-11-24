@@ -155,6 +155,31 @@ fn local_copy_wins() {
 }
 
 #[test]
+fn follows_bulk_input() {
+    // Two inputs on two nodes: the task lands with the larger one and stages the smaller.
+    let (bulk, small) = (node(2), node(3));
+    let mib = 1 << 20;
+    let mut large = resolved_input("large", 1);
+    (large.bytes, large.holders) = (100 * mib, vec![holder(bulk, "eu")]);
+    let mut little = resolved_input("small", 2);
+    (little.bytes, little.holders) = (mib, vec![holder(small, "eu")]);
+    let plan_request = request(vec![large, little]);
+
+    let selection = selected(
+        &plan_request,
+        vec![candidate(bulk, "docker"), candidate(small, "docker")],
+        &config(vec![link("eu", "eu", 10_000_000)]),
+    );
+
+    assert_eq!(selection.target.node_id, bulk);
+    assert_eq!(selection.score.transfer_bytes, mib);
+    let staged: Vec<_> = (selection.inputs.iter())
+        .map(|input| (input.destination_key.as_str(), input.source_node_id))
+        .collect();
+    assert_eq!(staged, [("large", None), ("small", Some(small))]);
+}
+
+#[test]
 fn cheapest_holder_wins() {
     // The cheapest directional link decides which legal holder is staged from.
     let target = node(2);
@@ -278,6 +303,29 @@ fn envelope_rejects_target() {
     let outcome = plan(&plan_request, vec![small], &config(Vec::new()));
     assert!(outcome.selected.is_none() && !outcome.retryable);
     assert_eq!(verdict(&outcome, target), RejectionVerdict::Resources);
+}
+
+#[test]
+fn screens_gpu_count() {
+    // A request for more GPUs than a backend declares never lands there.
+    let (bare, gpu) = (node(2), node(3));
+    let mut with_gpus = candidate(gpu, "docker");
+    with_gpus.capability.declared.gpus = 2;
+    refresh_digest(&mut with_gpus);
+    let mut plan_request = request(Vec::new());
+    plan_request.resources.gpus = 2;
+    let candidates = vec![candidate(bare, "docker"), with_gpus.clone()];
+
+    let outcome = plan(&plan_request, candidates, &config(Vec::new()));
+    let chosen = outcome
+        .selected
+        .as_ref()
+        .map(|chosen| chosen.target.node_id);
+    assert_eq!(chosen, Some(gpu));
+    assert_eq!(verdict(&outcome, bare), RejectionVerdict::Resources);
+    plan_request.resources.gpus = 3;
+    let outcome = plan(&plan_request, vec![with_gpus], &config(Vec::new()));
+    assert_eq!(verdict(&outcome, gpu), RejectionVerdict::Resources);
 }
 
 #[test]

@@ -27,6 +27,7 @@ use crate::jobs::node_inputs::{ingress_node, launch_node};
 use crate::jobs::records::pages::{PageReadError, ServePageOperation};
 use crate::jobs::records::transport::{ServeLaunchOperation, ServeRecordOperation};
 use crate::plugins::peer::{AnswerPeer, PeerAnswer as PluginAnswer};
+use crate::workflows::runs::replica::StoreReplicaOperation;
 use aruna_ops_data::metadata::serve::forwards::needs_view;
 use aruna_ops_data::metadata::serve::{ServeNode, ServeRequestOperation, ServedReply};
 
@@ -84,6 +85,8 @@ enum Asked {
     Claim,
     Inputs,
     Page,
+    /// The run's node hands this holder a copy of a run and its log pages.
+    RunLog,
     Serve,
 }
 
@@ -187,6 +190,14 @@ impl MetadataPeerOperation {
                 let serve = ServePageOperation::new(self.local.1, peer, submission, digest);
                 self.ask(Asked::Page, serve)
             }
+            Message::StoreRunLog {
+                run,
+                first_page,
+                pages,
+            } => {
+                let store = StoreReplicaOperation::new(peer, self.local, run, first_page, pages);
+                self.ask(Asked::RunLog, store)
+            }
             message => {
                 let serving = ServeNode {
                     local: serving,
@@ -260,6 +271,9 @@ impl Operation for MetadataPeerOperation {
                     page: page.ok().flatten(),
                 }
             }
+            Asked::RunLog => Message::RunLogStored {
+                result: result.child::<u32, MetadataReadError>()?,
+            },
             Asked::Serve => {
                 let served = result.child::<ServedReply, IoError>()?;
                 let reject = |error: IoError| (Message::Reject(error.to_string()), None);

@@ -157,6 +157,29 @@ mod tests {
     }
 
     #[test]
+    fn leaves_run_area() {
+        // A run area output stays unbound at ingress: the node that executes the task binds it
+        // to its own run area, so the output never travels to the ingress node.
+        let mut spec = payload();
+        spec.file_outputs.push(OutputSelection {
+            container_path: "/work/**".to_string(),
+            path_prefix: Some("/work".to_string()),
+            destination_node_id: None,
+            destination: OutputDestination::RunArea {
+                prefix: "run/tasks/a/work".to_string(),
+            },
+            name: None,
+            description: None,
+        });
+        pin_outputs(&mut spec, node(1));
+        assert_eq!(spec.file_outputs[0].destination_node_id, None);
+        use crate::jobs::lifecycle::output_policies::OutputPoliciesOperation;
+        let mut policies = OutputPoliciesOperation::new(&spec, node(1));
+        let answered = aruna_core::operation::Operation::first(&mut policies);
+        assert!(matches!(answered, Ok(aruna_core::calls::Next::Done(refs)) if refs.is_empty()));
+    }
+
+    #[test]
     fn keeps_reference_shape() {
         // A device holds none of the objects it names, so a well-formed absent
         // reference passes while a malformed one is still refused here.
