@@ -159,6 +159,17 @@ pub(super) fn info_upsert(
     crate::structs::sync_quarantine::SyncQuarantineIdentity,
     DocumentEvent,
 ) {
+    info_upsert_epoch(seq, node_id, Default::default())
+}
+
+pub(super) fn info_upsert_epoch(
+    seq: u64,
+    node_id: crate::id::NodeId,
+    epoch: crate::structs::storage::node_info::AdvertisementEpoch,
+) -> (
+    crate::structs::sync_quarantine::SyncQuarantineIdentity,
+    DocumentEvent,
+) {
     use crate::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision};
     use crate::structs::storage::node_info::{NodeInfoDocument, NodeUrls, NodeUtilization};
     let target = info_target(node_id);
@@ -187,7 +198,7 @@ pub(super) fn info_upsert(
         },
         utilization,
         updated_at_ms: seq,
-        epoch: Default::default(),
+        epoch,
         compute_draining: false,
         leaving: false,
         demand: Default::default(),

@@ -253,10 +253,13 @@ pub fn quarantined_node_info(
     }
     let event = record.decoded_event()?;
     let target = event.target();
-    let topic = target.sync_topic_id(realm_id, &event.placement());
     let local =
         matches!(target, DocumentTarget::NodeInfo { realm_id: own, .. } if *own == realm_id);
-    if !local || topic != record.identity.topic {
+    if !local {
+        return None;
+    }
+    let topic = target.sync_topic_id(realm_id, &event.placement());
+    if topic != record.identity.topic {
         return None;
     }
     shared_verdict(record.identity.topic, record.identity.actor, &event).ok()?;

@@ -13,6 +13,7 @@ use crate::document::DocumentTarget;
 use crate::keyspaces::{QUARANTINE_USAGE_KEYSPACE, SYNC_QUARANTINE_KEYSPACE};
 use crate::row_plan::{NeedsRows, PlanRows, PlanStop, Planned, RowPlan};
 use crate::structs::identity::realm::RealmId;
+use crate::structs::storage::node_info::NodeInfoDocument;
 use crate::structs::sync_quarantine::{
     QUARANTINE_USAGE_KEY, SyncQuarantineCapacity, SyncQuarantineError, SyncQuarantineIdentity,
     SyncQuarantineInput, SyncQuarantineRecord, SyncQuarantineUsage, SyncRejection,
@@ -107,15 +108,21 @@ pub fn quarantine_entries(
 type RowChanges = (Vec<(KeySpace, Key)>, Vec<Row>);
 
 /// Whether the applied node info upsert of `plan` makes `record` obsolete: an earlier upsert of
-/// the same publisher and target, rejected only for a payload this version reads. A rejected
-/// delete or a policy refusal is never obsolete.
+/// the same publisher and target, rejected only for a payload this version reads, whose epoch
+/// does not supersede the stored document. A rejected delete, policy refusal or newer epoch stays.
 pub(super) fn superseded_by(record: &SyncQuarantineRecord, plan: &SupersededInfoPlan) -> bool {
     let (earlier, later) = (record.identity, plan.identity);
-    let recovered = quarantined_node_info(record, plan.realm_id);
+    let Ok(current) = NodeInfoDocument::from_bytes(&plan.bytes) else {
+        return false;
+    };
+    let Some((target, rejected, _)) = quarantined_node_info(record, plan.realm_id) else {
+        return false;
+    };
     earlier.topic == later.topic
         && earlier.actor == later.actor
         && earlier.actor_seq < later.actor_seq
-        && recovered.is_some_and(|(target, ..)| target == plan.target)
+        && target == plan.target
+        && !rejected.supersedes(&current)
 }
 
 /// Deletes the quarantine rows the node info upsert of `plan` made obsolete. The usage row

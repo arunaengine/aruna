@@ -6,8 +6,8 @@ use ulid::Ulid;
 
 use super::super::fixtures::{
     actor, batch_event, check_plan, checked, child, config_target, config_topic, failed,
-    info_target, info_upsert, node, realm, run_event, signature, single_event, snapshot_event,
-    wrapped,
+    info_target, info_upsert, info_upsert_epoch, node, realm, run_event, signature, single_event,
+    snapshot_event, wrapped,
 };
 use super::*;
 use crate::calls::IoError;
@@ -262,6 +262,42 @@ fn drops_obsolete_rejections() {
         assert_eq!(outcome.rejections.len(), kept);
         assert_eq!(outcome.rejections.last(), given.last());
     }
+
+    // A byte-identical replay at a higher sequence keeps a newer-epoch pending rejection.
+    use crate::structs::storage::node_info::AdvertisementEpoch;
+    let epoch = |step| AdvertisementEpoch {
+        membership_generation: 1,
+        publisher_generation: step,
+        observed_at_ms: step,
+    };
+    let (newer_id, newer_event) = info_upsert_epoch(3, node(), epoch(10));
+    let newer_rej = SyncRejection::new(newer_id, newer_event, decode);
+    let (mut replay_id, replay_event) = info_upsert_epoch(1, node(), epoch(5));
+    replay_id.actor_seq = 5;
+    let replay = BatchEvent {
+        event: replay_event,
+        actor: replay_id.actor,
+        actor_seq: replay_id.actor_seq,
+        publisher_allowed: true,
+    };
+    let mut batch = ApplyBatchOperation::new(
+        replay_id.topic,
+        realm(),
+        vec![replay],
+        vec![newer_rej.clone()],
+    );
+    assert!(matches!(batch.first(), Ok(Next::Call(IoCall::Child(_)))));
+    let outcome = ApplyOutcome::Applied {
+        target: info_target(node()),
+        tombstone: None,
+        git_document: None,
+    };
+    assert!(matches!(
+        batch.next(child(outcome)),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    let outcome = done(batch.next(child(true)));
+    assert_eq!(outcome.rejections, vec![newer_rej]);
 }
 
 #[test]
