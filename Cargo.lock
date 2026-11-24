@@ -343,6 +343,7 @@ dependencies = [
  "aruna-wasm-host",
  "aruna-wire",
  "aruna-workflow",
+ "aruna-workflow-contract",
  "astral_async_zip",
  "async-trait",
  "aws-sdk-s3",

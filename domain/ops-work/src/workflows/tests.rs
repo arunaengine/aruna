@@ -75,7 +75,7 @@ fn reverse_tool(address: &str) -> Value {
     })
 }
 
-fn answer(kind: PreflightKind) -> Result<PreflightResult, WorkflowError> {
+pub(super) fn answer(kind: PreflightKind) -> Result<PreflightResult, WorkflowError> {
     let broken = |source: &aruna_workflow_contract::preflight::WorkflowSource| {
         source.files.iter().any(|file| file.content == b"broken")
     };
@@ -206,18 +206,18 @@ impl WorkflowHost for Scripted {
     }
 }
 
-struct Fixture {
-    context: DriverContext,
+pub(super) struct Fixture {
+    pub(super) context: DriverContext,
     host: Arc<Scripted>,
-    node: NodeId,
-    alice: AuthContext,
-    bob: AuthContext,
-    stranger: AuthContext,
-    group_a: Ulid,
+    pub(super) node: NodeId,
+    pub(super) alice: AuthContext,
+    pub(super) bob: AuthContext,
+    pub(super) stranger: AuthContext,
+    pub(super) group_a: Ulid,
     group_b: Ulid,
 }
 
-async fn write(context: &DriverContext, space: &str, key: Vec<u8>, value: Vec<u8>) {
+pub(super) async fn write(context: &DriverContext, space: &str, key: Vec<u8>, value: Vec<u8>) {
     let effect = StorageEffect::Write {
         key_space: space.into(),
         key: key.into(),
@@ -231,7 +231,7 @@ async fn write(context: &DriverContext, space: &str, key: Vec<u8>, value: Vec<u8
     );
 }
 
-async fn fixture() -> Fixture {
+pub(super) async fn fixture() -> Fixture {
     let mut context =
         aruna_runner::testing::test_context(aruna_storage::storage::memory::MemoryStorage::open());
     let host = Arc::new(Scripted::default());
@@ -306,7 +306,7 @@ async fn fixture() -> Fixture {
     }
 }
 
-fn upload(content: &str) -> SourceInput {
+pub(super) fn upload(content: &str) -> SourceInput {
     SourceInput::Upload {
         files: vec![SourceFile {
             path: "hello.cwl".into(),
@@ -317,7 +317,7 @@ fn upload(content: &str) -> SourceInput {
     }
 }
 
-fn new_workflow(group_id: Ulid, name: &str, source: SourceInput) -> NewWorkflow {
+pub(super) fn new_workflow(group_id: Ulid, name: &str, source: SourceInput) -> NewWorkflow {
     NewWorkflow {
         group_id,
         name: name.into(),
@@ -329,7 +329,7 @@ fn new_workflow(group_id: Ulid, name: &str, source: SourceInput) -> NewWorkflow 
 }
 
 impl Fixture {
-    async fn create(
+    pub(super) async fn create(
         &self,
         auth: &AuthContext,
         input: NewWorkflow,

@@ -40,6 +40,7 @@ aruna-plugin-contract = { workspace = true }
 aruna-wasm-host = { workspace = true, features = ["runtime"] }
 aruna-scheduler = { workspace = true }
 aruna-workflow = { workspace = true }
+aruna-workflow-contract = { workspace = true }
 irokle = { workspace = true }
 
 # The rest

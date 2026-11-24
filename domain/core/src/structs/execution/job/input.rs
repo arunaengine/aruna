@@ -182,6 +182,21 @@ pub const PLUGIN_WORK_TAG: &str = "aruna-engine.org/plugin-work";
 /// The container file the node reads into the work's report; never exported.
 pub const PLUGIN_REPORT_TAG: &str = "aruna-engine.org/plugin-report";
 
+/// Tags only the node sets, on the child jobs of a workflow run; every job ingress refuses them.
+/// The run a child job belongs to; such a child may carry inline inputs and writes no run crate.
+pub const WORKFLOW_RUN_TAG: &str = "aruna-engine.org/workflow-run";
+/// The task key of a workflow child job.
+pub const WORKFLOW_TASK_TAG: &str = "aruna-engine.org/workflow-task";
+
+/// The first tag of `tags` only the node sets: a plugin task tag or a workflow tag.
+pub fn node_tag(tags: &BTreeMap<String, String>) -> Option<&str> {
+    plugin_tag(tags).or_else(|| {
+        tags.keys()
+            .find(|key| *key == WORKFLOW_RUN_TAG || *key == WORKFLOW_TASK_TAG)
+            .map(String::as_str)
+    })
+}
+
 /// The first tag of `tags` only the plugin host may set.
 pub fn plugin_tag(tags: &BTreeMap<String, String>) -> Option<&str> {
     tags.keys()
@@ -878,6 +893,9 @@ pub enum JobPayload {
     /// One native work of a plugin install. Safe to requeue: each action writes a version id
     /// minted once, and its attempts check the install again.
     PluginWork(PluginWorkSpec),
+    /// One workflow run on this node. Safe to requeue: an attempt replays the stored run log and
+    /// adopts the keyed child jobs of earlier attempts.
+    WorkflowRun(Box<crate::structs::execution::workflow_run::WorkflowRunSpec>),
 }
 
 impl ExecutionSpec {
@@ -906,6 +924,7 @@ impl JobPayload {
             Self::CopyObject(spec) => Some(spec.group_id),
             Self::BackendImport(spec) => Some(spec.group_id),
             Self::PluginWork(spec) => Some(spec.group_id),
+            Self::WorkflowRun(spec) => Some(spec.group_id),
             Self::Probe { .. }
             | Self::WriteRunCrate { .. }
             | Self::TerminalCleanup { .. }
@@ -937,6 +956,7 @@ impl JobPayload {
             JobPayload::WebhookDelivery(_) => "webhook_delivery",
             JobPayload::EmailDelivery(_) => "email_delivery",
             JobPayload::PluginWork(_) => "plugin_work",
+            JobPayload::WorkflowRun(_) => "workflow_run",
         }
     }
 
@@ -952,6 +972,7 @@ impl JobPayload {
             JobPayload::Harvest(_) => "records",
             JobPayload::StoragePurge(_) | JobPayload::StoragePurgeFiles(_) => "entries",
             JobPayload::CopyObject(_) | JobPayload::PluginWork(_) => "bytes",
+            JobPayload::WorkflowRun(_) => "tasks",
             JobPayload::MintPersistentId(_)
             | JobPayload::WriteRunCrate { .. }
             | JobPayload::TerminalCleanup { .. }
@@ -980,7 +1001,8 @@ impl JobPayload {
             | JobPayload::BackendImport(_)
             | JobPayload::WebhookDelivery(_)
             | JobPayload::EmailDelivery(_)
-            | JobPayload::PluginWork(_) => JobExecutionClass::InProcess,
+            | JobPayload::PluginWork(_)
+            | JobPayload::WorkflowRun(_) => JobExecutionClass::InProcess,
             JobPayload::Execution(_) => JobExecutionClass::ExternalAttempt,
         }
     }
@@ -1014,6 +1036,7 @@ impl JobPayload {
                     | JobPayload::WebhookDelivery(_)
                     | JobPayload::EmailDelivery(_)
                     | JobPayload::PluginWork(_)
+                    | JobPayload::WorkflowRun(_)
             )
     }
 

@@ -11,7 +11,8 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::family::MAX_EXECUTION_OUTPUTS;
 use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::execution::job::input::{
-    ExecutionSpec, InputSource, JobPayload, MAX_INLINE_BYTES, OutputDestination, plugin_tag,
+    ExecutionSpec, InputSource, JobPayload, MAX_INLINE_BYTES, OutputDestination, WORKFLOW_RUN_TAG,
+    plugin_tag,
 };
 use aruna_core::structs::execution::job::local::{LocalAdmission, WorkspaceMode, user_dedup_key};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -50,15 +51,17 @@ pub(crate) fn validate_execution(
             input.dest_key
         )));
     }
-    // Only the plugin host writes bytes into a spec, and only a few.
+    // Only the plugin host and workflow runs write bytes into a spec, and only a few.
     let inline = (spec.inputs.iter()).filter_map(|input| match &input.source {
         InputSource::Inline { bytes } => Some(bytes.len()),
         InputSource::S3 { .. } => None,
     });
     let (count, bytes) = inline.fold((0, 0usize), |(count, sum), len| (count + 1, sum + len));
-    if (count > 0 && plugin_tag(&spec.tags).is_none()) || bytes > MAX_INLINE_BYTES {
+    let tagged = plugin_tag(&spec.tags).is_some() || spec.tags.contains_key(WORKFLOW_RUN_TAG);
+    if (count > 0 && !tagged) || bytes > MAX_INLINE_BYTES {
         return Err(SubmitJobError::InvalidWorkspace(
-            "inline inputs are for plugin tasks only, at most 64 KiB together".to_string(),
+            "inline inputs are for plugin and workflow tasks only, at most 64 KiB together"
+                .to_string(),
         ));
     }
     // One bound governs declaration, expansion, the local result, and the

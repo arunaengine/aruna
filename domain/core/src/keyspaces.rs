@@ -622,6 +622,16 @@ pub const WORKFLOW_VERSION_KEYSPACE: &str = "workflow_versions";
 pub const WORKFLOW_SOURCE_KEYSPACE: &str = "workflow_sources";
 /// Tool definitions of the catalog by tool id, version and group.
 pub const WORKFLOW_TOOL_KEYSPACE: &str = "workflow_tools";
+/// Workflow runs of this node by run id.
+pub const WORKFLOW_RUN_KEYSPACE: &str = "workflow_runs";
+/// The tasks of each workflow run by run id and big-endian task number.
+pub const WORKFLOW_TASK_KEYSPACE: &str = "workflow_tasks";
+/// The event stream rows of each run by run id and big-endian sequence.
+pub const RUN_EVENT_KEYSPACE: &str = "workflow_run_events";
+/// The run log pages of each run by run id and big-endian page number, outside the job family.
+pub const RUN_LOG_KEYSPACE: &str = "workflow_run_logs";
+/// The run each idempotency key started, by group, caller and key.
+pub const RUN_IDEMPOTENCY_KEYSPACE: &str = "workflow_run_keys";
 
 /// Every keyspace this crate defines, so tooling reports a missing one without
 /// maintaining its own copy of the list.
@@ -940,6 +950,11 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     WORKFLOW_VERSION_KEYSPACE,
     WORKFLOW_SOURCE_KEYSPACE,
     WORKFLOW_TOOL_KEYSPACE,
+    WORKFLOW_RUN_KEYSPACE,
+    WORKFLOW_TASK_KEYSPACE,
+    RUN_EVENT_KEYSPACE,
+    RUN_LOG_KEYSPACE,
+    RUN_IDEMPOTENCY_KEYSPACE,
 ];
 
 /// Smallest key strictly greater than every key starting with `prefix`,

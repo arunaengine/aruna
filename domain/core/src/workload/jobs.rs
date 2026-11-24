@@ -56,6 +56,7 @@ pub enum JobKind {
     WebhookDelivery,
     EmailDelivery,
     PluginWork,
+    WorkflowRun,
 }
 
 impl JobKind {
@@ -77,6 +78,7 @@ impl JobKind {
             Self::WebhookDelivery => "webhook_delivery",
             Self::EmailDelivery => "email_delivery",
             Self::PluginWork => "plugin_work",
+            Self::WorkflowRun => "workflow_run",
         }
     }
 
@@ -111,6 +113,7 @@ impl From<&JobPayload> for JobKind {
             JobPayload::WebhookDelivery(_) => Self::WebhookDelivery,
             JobPayload::EmailDelivery(_) => Self::EmailDelivery,
             JobPayload::PluginWork(_) => Self::PluginWork,
+            JobPayload::WorkflowRun(_) => Self::WorkflowRun,
         }
     }
 }
@@ -271,6 +274,7 @@ impl RunningJobView {
             JobPayload::WebhookDelivery(_) => (None, None),
             JobPayload::EmailDelivery(_) => (None, None),
             JobPayload::PluginWork(spec) => (None, Some(spec.group_id)),
+            JobPayload::WorkflowRun(spec) => (None, Some(spec.group_id)),
         };
         Self {
             kind: JobKind::from(&record.payload),

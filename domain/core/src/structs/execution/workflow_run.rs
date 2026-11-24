@@ -1,0 +1,402 @@
+//! Records of workflow runs on one node: the run, its tasks, its event stream rows, its paged run
+//! log and its idempotency index, with their storage keys and codecs.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use aruna_workflow_contract::preflight::RunLogPage;
+use serde::{Deserialize, Serialize};
+use ulid::Ulid;
+
+use crate::errors::ConversionError;
+use crate::id::NodeId;
+use crate::structs::execution::job::identity::JobId;
+use crate::structs::identity::realm::RealmId;
+use crate::types::{GroupId, Key};
+use crate::user::id::UserId;
+
+/// What the run job of a workflow run carries; the run record holds everything else.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowRunSpec {
+    pub run_id: Ulid,
+    pub group_id: GroupId,
+    pub created_by: UserId,
+    pub realm_id: RealmId,
+}
+
+/// The state of a run, or of one of its tasks or steps, as the portal names it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunState {
+    #[default]
+    Queued,
+    Planning,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelling,
+    Cancelled,
+    Unknown,
+}
+
+impl RunState {
+    pub const ALL: [RunState; 8] = [
+        Self::Queued,
+        Self::Planning,
+        Self::Running,
+        Self::Succeeded,
+        Self::Failed,
+        Self::Cancelling,
+        Self::Cancelled,
+        Self::Unknown,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Planning => "planning",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelling => "cancelling",
+            Self::Cancelled => "cancelled",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|state| state.as_str() == text)
+    }
+
+    /// A run in this state changes no more.
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
+    }
+
+    /// A run in this state may still change, so it cannot be deleted.
+    pub const fn is_active(self) -> bool {
+        matches!(
+            self,
+            Self::Queued | Self::Planning | Self::Running | Self::Cancelling
+        )
+    }
+}
+
+/// Where a run writes its results; its task files go below `prefix` too.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunOutput {
+    pub bucket: String,
+    pub prefix: String,
+    pub node_id: Option<NodeId>,
+    /// The dataset the portal asked for, as JSON text.
+    pub dataset_json: Option<String>,
+}
+
+/// One file a run or a task read or wrote.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunFile {
+    pub name: String,
+    pub bucket: Option<String>,
+    pub key: Option<String>,
+    pub version_id: Option<String>,
+    pub node_id: Option<NodeId>,
+    pub size: Option<u64>,
+    pub digest: Option<String>,
+}
+
+/// One object version a run names as its origin.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunOrigin {
+    pub bucket: String,
+    pub key: String,
+    pub version_id: String,
+}
+
+/// How many tasks of one step are in each state, kept with the run so a read needs no scan.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepRecord {
+    pub step: String,
+    pub queued: u64,
+    pub running: u64,
+    pub succeeded: u64,
+    pub failed: u64,
+    pub cancelled: u64,
+    pub cached: u64,
+    pub node_id: Option<NodeId>,
+    pub mode: Option<String>,
+}
+
+impl StepRecord {
+    pub fn total(&self) -> u64 {
+        self.queued + self.running + self.succeeded + self.failed + self.cancelled
+    }
+
+    /// Moves one task out of `old` and into `new`; `None` leaves a side out.
+    pub fn count(&mut self, old: Option<RunState>, new: Option<RunState>) {
+        if let Some(slot) = old.and_then(|state| self.slot(state)) {
+            *slot = slot.saturating_sub(1);
+        }
+        if let Some(slot) = new.and_then(|state| self.slot(state)) {
+            *slot += 1;
+        }
+    }
+
+    fn slot(&mut self, state: RunState) -> Option<&mut u64> {
+        match state {
+            RunState::Queued | RunState::Planning => Some(&mut self.queued),
+            RunState::Running | RunState::Cancelling => Some(&mut self.running),
+            RunState::Succeeded => Some(&mut self.succeeded),
+            RunState::Failed => Some(&mut self.failed),
+            RunState::Cancelled => Some(&mut self.cancelled),
+            RunState::Unknown => None,
+        }
+    }
+
+    /// The state of the step as a whole: running while any task waits or runs.
+    pub fn state(&self) -> RunState {
+        match self {
+            step if step.running > 0 => RunState::Running,
+            step if step.queued > 0 && step.total() > step.queued => RunState::Running,
+            step if step.queued > 0 => RunState::Queued,
+            step if step.failed > 0 => RunState::Failed,
+            step if step.cancelled > 0 => RunState::Cancelled,
+            step if step.succeeded > 0 => RunState::Succeeded,
+            _ => RunState::Unknown,
+        }
+    }
+}
+
+/// One workflow run of a group on this node.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowRunRecord {
+    pub run_id: Ulid,
+    /// The realm the run was admitted in, which its permission checks name.
+    pub realm_id: RealmId,
+    pub group_id: GroupId,
+    pub workflow_id: Ulid,
+    pub workflow_name: String,
+    pub version: u32,
+    /// The first run of the lineage this run belongs to; a new lineage starts with the run.
+    pub lineage: Ulid,
+    pub state: RunState,
+    pub node_id: NodeId,
+    pub created_by: UserId,
+    pub created_at_ms: u64,
+    pub finished_at_ms: Option<u64>,
+    pub error: Option<String>,
+    pub values_json: String,
+    /// The pinned inputs of the request, as JSON text.
+    pub inputs_json: Option<String>,
+    pub output: Option<RunOutput>,
+    /// The files the run delivered to its output.
+    pub outputs: Vec<RunFile>,
+    pub provenance_crate: bool,
+    pub provenance_document_id: Option<Ulid>,
+    pub provenance_status: Option<String>,
+    /// The sequence of the newest event row; event sequences start at 1.
+    pub last_event_seq: u64,
+    pub local_only: bool,
+    pub origin: Option<RunOrigin>,
+    pub parent_job_id: Option<JobId>,
+    pub claim_token_digest: Option<String>,
+    /// Coordinator attempts started so far.
+    pub attempts: u32,
+    /// The task counts of each step, in the order the steps first appeared.
+    pub steps: Vec<StepRecord>,
+}
+
+/// One task of a run, with the state of its newest attempt.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowTaskRecord {
+    pub run_id: Ulid,
+    pub task_id: u64,
+    /// The key of uwe's canonical task specification; another key means another task.
+    pub task_key: String,
+    pub step: String,
+    /// The unique name of the newest attempt, like `<run>-<task>-<attempt>`.
+    pub name: String,
+    pub state: RunState,
+    pub attempt: u32,
+    pub index: Option<u64>,
+    pub child_job_id: Option<JobId>,
+    pub node_id: Option<NodeId>,
+    pub mode: Option<String>,
+    pub cached: bool,
+    pub cache_key: Option<String>,
+    pub staged_bytes: Option<u64>,
+    pub cpu_seconds: Option<f64>,
+    pub max_rss_bytes: Option<u64>,
+    pub started_at_ms: Option<u64>,
+    pub finished_at_ms: Option<u64>,
+    pub exit_code: Option<i32>,
+    pub error: Option<String>,
+    pub inputs: Vec<RunFile>,
+    pub outputs: Vec<RunFile>,
+    pub stdout_tail: Vec<u8>,
+    pub stderr_tail: Vec<u8>,
+}
+
+/// One row of a run's event stream, replayed after a sequence.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunEventRecord {
+    pub seq: u64,
+    /// `run`, `state`, `step` or `task`.
+    pub event_type: String,
+    pub payload_json: String,
+}
+
+/// The run an idempotency key of a caller started, and the digest of what it asked for.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunKeyRecord {
+    pub run_id: Ulid,
+    pub request_digest: [u8; 32],
+}
+
+macro_rules! postcard_codec {
+    ($($record:ty),*) => {$(
+        impl $record {
+            pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+                Ok(postcard::to_allocvec(self)?)
+            }
+
+            pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+                Ok(postcard::from_bytes(bytes)?)
+            }
+        }
+    )*};
+}
+
+postcard_codec!(
+    WorkflowRunRecord,
+    WorkflowTaskRecord,
+    RunEventRecord,
+    RunKeyRecord,
+    LogHead
+);
+
+/// A run log page as JSON, since its entries carry uwe's changes as free JSON.
+pub fn encode_page(page: &RunLogPage) -> Result<Vec<u8>, ConversionError> {
+    Ok(serde_json::to_vec(page)?)
+}
+
+pub fn decode_page(bytes: &[u8]) -> Result<RunLogPage, ConversionError> {
+    Ok(serde_json::from_slice(bytes)?)
+}
+
+/// The row of a run: its id.
+pub fn run_key(run_id: Ulid) -> Key {
+    Key::from(run_id.to_bytes().to_vec())
+}
+
+/// The rows of a run's tasks, events or log pages all start with the run id.
+pub fn run_prefix(run_id: Ulid) -> Key {
+    run_key(run_id)
+}
+
+/// The row of a task: the run id, then the task number big-endian.
+pub fn task_key(run_id: Ulid, task_id: u64) -> Key {
+    numbered(run_id, &task_id.to_be_bytes())
+}
+
+/// The row of an event: the run id, then its sequence big-endian, so rows list in order.
+pub fn event_key(run_id: Ulid, seq: u64) -> Key {
+    numbered(run_id, &seq.to_be_bytes())
+}
+
+/// Where the run log of a run stands: how many pages it has and the newest change it holds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogHead {
+    pub pages: u32,
+    pub entries: u32,
+    pub last_seq: Option<u64>,
+    pub begun: bool,
+}
+
+/// The row of a run log's head; it sorts after every page of the run.
+pub fn head_key(run_id: Ulid) -> Key {
+    page_key(run_id, u32::MAX)
+}
+
+/// The row of a run log page: the run id, then the page number big-endian.
+pub fn page_key(run_id: Ulid, page: u32) -> Key {
+    numbered(run_id, &page.to_be_bytes())
+}
+
+/// The row of an idempotency key: the group, the caller, then the key with its length first.
+pub fn run_key_row(group_id: GroupId, created_by: UserId, key: &str) -> Key {
+    let mut row = group_id.to_bytes().to_vec();
+    row.extend_from_slice(&created_by.to_bytes());
+    row.extend_from_slice(&(key.len() as u32).to_be_bytes());
+    row.extend_from_slice(key.as_bytes());
+    Key::from(row)
+}
+
+fn numbered(run_id: Ulid, number: &[u8]) -> Key {
+    let mut key = run_id.to_bytes().to_vec();
+    key.extend_from_slice(number);
+    Key::from(key)
+}
+
+/// The task number a sequence-free name maps to: a stable hash with the high bit set, so it never
+/// meets a number uwe gives.
+pub fn named_task(name: &str) -> u64 {
+    let hash = blake3::hash(name.as_bytes());
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&hash.as_bytes()[..8]);
+    u64::from_be_bytes(bytes) | (1 << 63)
+}
+
+#[cfg(test)]
+mod tests {
+    use aruna_workflow_contract::preflight::RunLogEntry;
+
+    use super::*;
+
+    #[test]
+    fn orders_event_keys() {
+        let run = Ulid::from_bytes([1; 16]);
+        assert!(event_key(run, 2) < event_key(run, 10));
+        assert!(event_key(run, 7).starts_with(&run_prefix(run)));
+        let other = Ulid::from_bytes([2; 16]);
+        assert!(!task_key(other, 1).starts_with(&run_prefix(run)));
+    }
+
+    #[test]
+    fn separates_key_rows() {
+        let group = Ulid::from_bytes([3; 16]);
+        let user = UserId::default();
+        assert_ne!(
+            run_key_row(group, user, "ab"),
+            run_key_row(group, user, "a")
+        );
+        assert!(named_task("run-1-1") >= 1 << 63);
+        assert_eq!(named_task("x"), named_task("x"));
+    }
+
+    #[test]
+    fn round_trips_pages() {
+        let page = RunLogPage {
+            entries: vec![RunLogEntry::Change {
+                seq: 4,
+                change_json: serde_json::json!({"task": 1}),
+            }],
+        };
+        let bytes = encode_page(&page).unwrap();
+        assert_eq!(decode_page(&bytes).unwrap(), page);
+        for state in RunState::ALL {
+            assert_eq!(RunState::parse(state.as_str()), Some(state));
+        }
+        assert!(RunState::Cancelling.is_active() && !RunState::Cancelling.is_terminal());
+    }
+
+    #[test]
+    fn counts_step_states() {
+        let mut step = StepRecord::default();
+        step.count(None, Some(RunState::Queued));
+        step.count(None, Some(RunState::Queued));
+        assert_eq!(step.state(), RunState::Queued);
+        step.count(Some(RunState::Queued), Some(RunState::Succeeded));
+        assert_eq!(step.state(), RunState::Running);
+        step.count(Some(RunState::Queued), Some(RunState::Failed));
+        assert_eq!((step.total(), step.state()), (2, RunState::Failed));
+    }
+}

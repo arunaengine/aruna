@@ -6,6 +6,7 @@
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::values;
+use aruna_core::structs::execution::job::input::WORKFLOW_RUN_TAG;
 
 use super::*;
 
@@ -414,8 +415,8 @@ fn crate_obligation(record: &JobRecord) -> Result<JobWrites, JobMutationError> {
     let JobPayload::Execution(spec) = &record.payload else {
         return Ok(Vec::new());
     };
-    // A stopped notebook session keeps its report; it is no run to describe.
-    if session_of(spec).is_some() {
+    // A stopped notebook session keeps its report; a workflow task is described by its run.
+    if session_of(spec).is_some() || spec.tags.contains_key(WORKFLOW_RUN_TAG) {
         return Ok(Vec::new());
     }
     let now_ms = record.finished_at_ms.unwrap_or(record.updated_at_ms);

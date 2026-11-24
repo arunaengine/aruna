@@ -11,6 +11,7 @@ use aruna_core::id::NodeId;
 use aruna_core::structs::execution::job::input::JobPayload;
 use aruna_core::structs::execution::job::local::{JobError, JobResultPayload};
 
+use super::coordinator::run_workflow;
 use super::job_host::{run_backend_import, run_hosted, run_staging_job, run_storage_purge};
 use crate::plugin_host::plugin_work::run_plugin_work;
 use aruna_core::jobs::JobRunOutcome;
@@ -113,6 +114,7 @@ pub(crate) async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> 
             Box::pin(run_delivery(ctx, drive(job, &ctx.driver))).await
         }
         JobPayload::PluginWork(spec) => Box::pin(run_plugin_work(ctx, spec)).await,
+        JobPayload::WorkflowRun(spec) => Box::pin(run_workflow(ctx, spec)).await,
         // Guard: an execution job must run through the external attempt path.
         JobPayload::Execution(_) => JobRunOutcome::Failed(JobError::permanent(
             "execution payload dispatched through the in-process seam",

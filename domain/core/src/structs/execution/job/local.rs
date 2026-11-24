@@ -229,6 +229,11 @@ pub enum JobResultPayload {
         bytes: u64,
         version_id: Option<Ulid>,
     },
+    /// The workflow run the job drove and the state it ended in.
+    WorkflowRun {
+        run_id: Ulid,
+        state: String,
+    },
 }
 
 impl JobResultPayload {
@@ -250,6 +255,7 @@ impl JobResultPayload {
             JobResultPayload::Webhook { .. } => "webhook",
             JobResultPayload::Email { .. } => "email",
             JobResultPayload::PluginWork { .. } => "plugin_work",
+            JobResultPayload::WorkflowRun { .. } => "workflow_run",
         }
     }
 
@@ -451,6 +457,10 @@ impl JobResultPayload {
             JobResultPayload::PluginWork { bytes, version_id } => serde_json::json!({
                 "bytes": bytes,
                 "version_id": version_id.map(|id| id.to_string()),
+            }),
+            JobResultPayload::WorkflowRun { run_id, state } => serde_json::json!({
+                "run_id": run_id.to_string(),
+                "state": state,
             }),
         }
     }

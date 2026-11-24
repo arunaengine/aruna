@@ -80,7 +80,21 @@ pub struct ExecutorRegistry {
     sessions: Arc<SessionRegistry>,
     /// The workflow coordinators of this node, which run on these backends or as a local binary.
     workflow: Option<Arc<dyn WorkflowHost>>,
+    run_wakes: RunWakes,
 }
+
+/// Wakes the event streams of workflow runs on this node when a run stored new events. A wake
+/// carries the run id; a missed one only delays a stream until its next read.
+pub struct RunWakes(tokio::sync::broadcast::Sender<String>);
+
+impl Default for RunWakes {
+    fn default() -> Self {
+        Self(tokio::sync::broadcast::channel(RUN_WAKES).0)
+    }
+}
+
+/// Wakes one stream may fall behind by before it rereads from its last event.
+const RUN_WAKES: usize = 256;
 
 impl ExecutorRegistry {
     pub fn new() -> Self {
@@ -88,7 +102,18 @@ impl ExecutorRegistry {
             backends: BTreeMap::new(),
             sessions: Arc::new(SessionRegistry::new()),
             workflow: None,
+            run_wakes: RunWakes::default(),
         }
+    }
+
+    /// Tells the event streams of run `run_id` that it stored new events.
+    pub fn wake_run(&self, run_id: String) {
+        let _ = self.run_wakes.0.send(run_id);
+    }
+
+    /// The wakes of every run on this node, from now on.
+    pub fn run_wakes(&self) -> tokio::sync::broadcast::Receiver<String> {
+        self.run_wakes.0.subscribe()
     }
 
     /// Attaches the workflow runtime that answers `Effect::Workflow` on this node.

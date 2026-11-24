@@ -6,6 +6,7 @@
 pub mod import;
 pub mod inspect;
 pub mod reads;
+pub mod runs;
 pub mod tools;
 pub mod versions;
 
