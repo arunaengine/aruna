@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod events;
+pub mod plan;
 pub mod registry;
 pub mod reports;
 pub mod run_wire;
@@ -34,6 +35,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     registry::router()
         .merge(versions::router())
         .merge(tools::router())
+        .merge(plan::router())
         .merge(runs::router())
         .merge(tasks::router())
         .merge(reports::router())

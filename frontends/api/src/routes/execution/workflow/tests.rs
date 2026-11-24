@@ -79,6 +79,13 @@ fn scripted(kind: PreflightKind) -> Result<PreflightResult, WorkflowError> {
                 })
                 .collect(),
         },
+        PreflightKind::DryRun { .. } => PreflightResult::DryRun {
+            graph_json: json!({"nodes": [{"task": {"id": 1, "step": "echo", "image": "debian",
+                "inputs": [], "resources": {"cpus": 1.0}, "after": []}, "markers": []}],
+                "edges": []}),
+            tasks: vec![json!({"id": 1, "step": "echo", "markers": [], "more_tasks": false})],
+            diagnostics: Vec::new(),
+        },
         other => {
             return Err(WorkflowError::Refused(ContractError::unsupported(
                 other.name(),

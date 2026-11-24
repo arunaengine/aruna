@@ -12,6 +12,7 @@ use aruna_ops_work::workflows::runs::control::{Follow, FollowRunOperation};
 use aruna_ops_work::workflows::runs::reads::{
     ListRunsOperation, RunFilter, RunGraphOperation, RunOriginOperation, RunSnapshotOperation,
 };
+use aruna_ops_work::workflows::runs::replica::replica_note;
 use aruna_runner::driver::drive;
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -72,7 +73,7 @@ fn pinned(name: &str, pin: &PinnedInputBody) -> Result<PinnedInput, ServerError>
 }
 
 /// The domain request of a start, with every id and pin checked.
-fn run_request(
+pub(super) fn run_request(
     state: &ServerState,
     request: WorkflowRunRequest,
     idempotency_key: Option<String>,
@@ -136,7 +137,17 @@ fn run_request(
             .and_then(|provenance| provenance.run_crate))
         .unwrap_or(false),
         idempotency_key,
+        placement_site: (request.placement)
+            .and_then(|placement| placement.site)
+            .filter(|site| !site.trim().is_empty()),
     })
+}
+
+/// Shows that another node coordinates a run that has not ended, when this node holds a copy.
+fn noted(body: &mut WorkflowRunBody, note: Option<&str>) {
+    if let Some(note) = note {
+        body.error = Some(note.to_owned());
+    }
 }
 
 fn idempotency_key(headers: &HeaderMap) -> Result<Option<String>, ServerError> {
@@ -165,8 +176,12 @@ fn idempotency_key(headers: &HeaderMap) -> Result<Option<String>, ServerError> {
 
 **Behavior**
 - The caller must read the version, read every pinned input this node holds and write the
-  output bucket below its prefix. The run's task files are kept below
-  `<prefix>/.uwe/runs/<run_id>/`, so a run needs an output bucket.
+  output bucket below its prefix. The run's control files are kept below
+  `<prefix>/.uwe/runs/<run_id>/`, so a run needs an output bucket. Each task's work folder
+  stays on the node that runs it, in the group's run area bucket there, which is named
+  `runs-<group id>-<node prefix>` and created once when it is missing.
+- `placement.site` pins every task of the run to that site; a task never falls back to
+  another site.
 - The same `Idempotency-Key` header with the same request answers the run it started, never a
   second one; with another request it is a 409.
 - The run is queued as a job of this node and runs as its creator. Its progress follows on
@@ -271,8 +286,15 @@ pub async fn list_runs(
         .transpose()?;
     let list = ListRunsOperation::new(&auth, filter, after, limit(query.limit));
     let page = drive(list, &state.get_ctx()).await.map_err(catalog_error)?;
+    let here = state.get_node_id();
     Ok(Json(WorkflowRunPage {
-        items: page.items.iter().map(WorkflowRunBody::from).collect(),
+        items: (page.items.iter())
+            .map(|record| {
+                let mut body = WorkflowRunBody::from(record);
+                noted(&mut body, replica_note(record, here));
+                body
+            })
+            .collect(),
         next_cursor: page.next.map(|run| run.to_string()),
         total: Some(page.total as u64),
     }))
@@ -321,7 +343,10 @@ pub async fn get_run(
 ) -> ServerResult<Json<RunSnapshotBody>> {
     let read = RunSnapshotOperation::new(&auth, run_id(&run)?);
     let snapshot = drive(read, &state.get_ctx()).await.map_err(catalog_error)?;
-    Ok(Json(snapshot.into()))
+    let note = replica_note(&snapshot.record, state.get_node_id());
+    let mut body: RunSnapshotBody = snapshot.into();
+    noted(&mut body.run, note);
+    Ok(Json(body))
 }
 
 #[utoipa::path(
@@ -499,9 +524,16 @@ pub async fn cancel_run(
   instead of run again.
 - Admission checks the same rights as a new start.
 
+- A node that holds a copy of a run another node coordinates shows it with the error
+  `coordinator node unreachable` while it has not ended. Its owner or a realm admin may
+  resume it there; nothing takes the run over on its own, and its output bucket must exist on
+  this node.
+
 **Errors**
+- 403 when another node coordinates the run and the caller is neither its owner nor a realm
+  admin.
 - 404 for an unknown run or one the caller cannot read.
-- 409 while the run is queued, planning, running or cancelling."#,
+- 409 while the run is queued, planning, running or cancelling on this node."#,
     params(("run_id" = String, Path, description = "Run id, as a 26-character ULID")),
     responses(
         (status = 202, description = "The new run, queued", body = WorkflowRunBody, example = json!({

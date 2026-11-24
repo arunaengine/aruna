@@ -490,6 +490,76 @@ fn event_matches_route() {
     assert_eq!(event, route);
 }
 
+/// The keys of a JSON object, in order.
+fn keys(value: &Value) -> Vec<&str> {
+    value
+        .as_object()
+        .map_or_else(Vec::new, |map| map.keys().map(String::as_str).collect())
+}
+
+// A plan answers every field the portal reads and writes nothing: values that do not pass
+// end it with no tasks, and a task no node advertises a backend for is placed at run time.
+#[tokio::test]
+async fn plans_runs() {
+    let node = node(Some(Arc::new(Scripted))).await;
+    let workflow_id = workflow(&node).await;
+    let plan = ("POST", "/compute/workflow-runs/plan");
+    let body = run_body(&node, &workflow_id, "Hola");
+    let (status, planned) = send(&node, &node.owner, plan, &[], Some(body.clone())).await;
+    assert_eq!(status, StatusCode::OK, "{planned}");
+    let planned = json_of(&planned);
+    let mut fields = keys(&planned);
+    fields.sort_unstable();
+    assert_eq!(fields, ["complete", "diagnostics", "rejected", "tasks"]);
+    let task = &planned["tasks"][0];
+    let mut fields = keys(task);
+    fields.sort_unstable();
+    assert_eq!(
+        fields,
+        [
+            "bytes",
+            "cached",
+            "mode",
+            "node_id",
+            "step",
+            "task_count",
+            "transfer_ms"
+        ]
+    );
+    assert_eq!(task["step"], "echo");
+    assert_eq!(task["mode"], "placed_at_runtime");
+    assert_eq!(
+        (task["bytes"].clone(), task["task_count"].clone()),
+        (Value::Null, json!(1))
+    );
+    assert_eq!(planned["complete"], false);
+    let (_, listed) = send(
+        &node,
+        &node.owner,
+        ("GET", "/compute/workflow-runs"),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(json_of(&listed)["total"], 0, "a plan starts no run");
+
+    let mut invalid = run_body(&node, &workflow_id, "");
+    invalid["values"] = json!({});
+    let (status, refused) = send(&node, &node.owner, plan, &[], Some(invalid)).await;
+    assert_eq!(status, StatusCode::OK, "{refused}");
+    let refused = json_of(&refused);
+    assert_eq!(
+        (refused["complete"].clone(), refused["tasks"].clone()),
+        (json!(false), json!([]))
+    );
+    let (status, _) = send(&node, &node.stranger, plan, &[], Some(body)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let mut malformed = run_body(&node, &workflow_id, "Hola");
+    malformed["values"] = json!([1]);
+    let (status, _) = send(&node, &node.owner, plan, &[], Some(malformed)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
 /// The node and a CWL hello workflow for runs through the real coordinator binary.
 async fn real_node() -> (Node, String) {
     let settings = aruna_workflow::WorkflowSettings {
@@ -628,6 +698,23 @@ async fn drives_real_run() {
         .collect();
     assert!(kinds.iter().any(|kind| kind == "task"), "{stream}");
     assert_eq!(kinds.last().map(String::as_str), Some("state"), "{stream}");
+}
+
+/// A plan through the real coordinator binary: the simulated echo task, placed at run time on
+/// this node without a compute backend.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs the aruna-coordinator binary"]
+async fn plans_real_run() {
+    let (node, workflow_id) = real_node().await;
+    let body = run_body(&node, &workflow_id, "Hola");
+    let plan = ("POST", "/compute/workflow-runs/plan");
+    let (status, planned) = send(&node, &node.owner, plan, &[], Some(body)).await;
+    assert_eq!(status, StatusCode::OK, "{planned}");
+    let planned = json_of(&planned);
+    let steps: Vec<&str> = (planned["tasks"].as_array().into_iter().flatten())
+        .filter_map(|task| task["step"].as_str())
+        .collect();
+    assert!(!steps.is_empty(), "{planned}");
 }
 
 /// The reports of two recorded runs through report sessions of the real coordinator binary:

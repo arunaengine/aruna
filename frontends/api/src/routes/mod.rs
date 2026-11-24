@@ -702,6 +702,7 @@ pub(crate) mod tests {
         ("POST", "/compute/tools/suggest"),
         ("GET", "/compute/workflow-runs"),
         ("POST", "/compute/workflow-runs"),
+        ("POST", "/compute/workflow-runs/plan"),
         ("GET", "/compute/workflow-runs/{run_id}"),
         ("DELETE", "/compute/workflow-runs/{run_id}"),
         ("GET", "/compute/workflow-runs/{run_id}/graph"),
