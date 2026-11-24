@@ -3,15 +3,19 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 mod hosts;
+mod pages;
 mod policy;
+mod preview;
 mod session;
 pub mod settings;
 mod upstream;
+mod visit;
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use crate::hosts::HostCache;
+use crate::session::Sealer;
 use crate::settings::Settings;
 use crate::upstream::{Answer, Upstream};
 
@@ -23,11 +27,13 @@ pub enum GatewayError {
     Listen(#[source] std::io::Error),
 }
 
-/// What every request shares: the settings, the node client and the decision cache.
+/// What every request shares: the settings, the node client, the decision cache and the
+/// cookie sealer.
 pub struct Gateway {
     settings: Settings,
     upstream: Upstream,
     hosts: HostCache,
+    sealer: Sealer,
 }
 
 impl Gateway {
@@ -35,6 +41,7 @@ impl Gateway {
         let upstream = Upstream::new(settings.upstreams.clone(), settings.edge_key.clone())?;
         Ok(Arc::new(Self {
             hosts: HostCache::new(settings.host_cache),
+            sealer: Sealer::new(&settings.edge_key),
             upstream,
             settings,
         }))

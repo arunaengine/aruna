@@ -84,6 +84,13 @@ impl Upstream {
         (self.client.request(method, format!("{base}{path}"))).header("x-aruna-edge-key", &self.key)
     }
 
+    /// `path` with the encoded query `pairs`.
+    pub fn with_query(path: &str, pairs: &[(&str, &str)]) -> String {
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        query.extend_pairs(pairs);
+        format!("{path}?{}", query.finish())
+    }
+
     /// Asks each node in order; the first that knows the host answers. `None` means no node
     /// serves it, and an error means no node could say.
     pub async fn decide(&self, host: &str) -> Result<Option<Answer>, reqwest::Error> {
