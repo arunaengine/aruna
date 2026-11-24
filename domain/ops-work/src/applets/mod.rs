@@ -5,6 +5,7 @@
 pub mod build;
 pub mod change;
 pub mod create;
+pub mod draft;
 pub mod identity;
 pub mod reads;
 pub mod release;

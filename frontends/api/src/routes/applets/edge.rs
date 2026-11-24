@@ -16,7 +16,7 @@ use aruna_ops_work::applets::{AppletAccessOperation, Need};
 use aruna_runner::driver::drive;
 use axum::Json;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -32,7 +32,7 @@ use crate::rate_limit::LocalKey;
 use crate::server::state::ServerState;
 
 /// Bytes a version manifest may hold.
-const MAX_MANIFEST: usize = 16 << 20;
+pub(super) const MAX_MANIFEST: usize = 16 << 20;
 /// How long the edge may cache a host decision.
 const MAX_AGE_SECONDS: u32 = 30;
 
@@ -59,7 +59,11 @@ pub(super) fn edge_auth<'a>(
 
 /// The visitor a sealed visitor token names, only when that token was made for `applet_id`; the
 /// returned context drops the marker, so checks see the visitor's own rights.
-async fn visitor(state: &ServerState, headers: &HeaderMap, applet_id: Ulid) -> Option<AuthContext> {
+pub(super) async fn visitor(
+    state: &ServerState,
+    headers: &HeaderMap,
+    applet_id: Ulid,
+) -> Option<AuthContext> {
     let token = headers.get("x-aruna-visitor")?.to_str().ok()?;
     let (auth, _) = bearer_auth(state, token).await?;
     let marker = visitor_marker(auth.realm_id, applet_id);
@@ -201,11 +205,13 @@ async fn read_pinned(
         .map_err(|error| ServerError::ServiceUnavailableReason(error.to_string()))
 }
 
-async fn read_manifest(
+/// The bytes of a small pinned object, at most `max` of them.
+pub(super) async fn read_bytes(
     state: &ServerState,
     applet: &Applet,
     pinned: &PinnedObject,
-) -> ServerResult<VersionManifest> {
+    max: usize,
+) -> ServerResult<Vec<u8>> {
     let object = (
         pinned.bucket.as_str(),
         pinned.key.as_str(),
@@ -217,12 +223,19 @@ async fn read_manifest(
         let chunk =
             chunk.map_err(|error| ServerError::ServiceUnavailableReason(error.to_string()))?;
         bytes.extend_from_slice(&chunk);
-        if bytes.len() > MAX_MANIFEST {
-            return Err(ServerError::InternalError(
-                "the manifest is too large".into(),
-            ));
+        if bytes.len() > max {
+            return Err(ServerError::InternalError("the object is too large".into()));
         }
     }
+    Ok(bytes)
+}
+
+pub(super) async fn read_manifest(
+    state: &ServerState,
+    applet: &Applet,
+    pinned: &PinnedObject,
+) -> ServerResult<VersionManifest> {
+    let bytes = read_bytes(state, applet, pinned, MAX_MANIFEST).await?;
     VersionManifest::from_bytes(&bytes).map_err(|error| ServerError::InternalError(error.into()))
 }
 
@@ -240,7 +253,8 @@ token in `X-Aruna-Visitor` where the version needs a visitor.
 - The live version of a public applet needs no visitor. A group members applet needs a visitor
   who may read the group's data; a private applet and every private version need the applet's
   creator or an approver.
-- `ETag` is the file's BLAKE3 digest, so the edge can cache it for good."#,
+- `ETag` is the file's BLAKE3 digest, so the edge can cache it for good. An `If-None-Match`
+  that names it answers 304 without reading the file."#,
     params(
         ("applet_id" = String, Path, description = "Applet id; an unparseable id is 404"),
         ("version" = u32, Path, description = "Version number"),
@@ -248,6 +262,7 @@ token in `X-Aruna-Visitor` where the version needs a visitor.
     ),
     responses(
         (status = 200, description = "The file bytes with their content type", content_type = "application/octet-stream", body = Vec<u8>),
+        (status = 304, description = "The edge holds this file already"),
         (status = 401, description = "No valid edge key", body = ErrorResponse),
         (status = 403, description = "The visitor may not see this version", body = ErrorResponse),
         (status = 404, description = "No such applet, version or file", body = ErrorResponse)
@@ -285,26 +300,55 @@ pub async fn version_file(
         return Err(ServerError::Forbidden);
     }
     let manifest = read_manifest(&state, &applet, &entry.manifest).await?;
-    let file = manifest
-        .resolve(&query.path)
-        .ok_or(ServerError::NotFound)?
-        .clone();
+    let file = manifest.resolve(&query.path).ok_or(ServerError::NotFound)?;
+    let pinned = file.pinned();
+    let typed = (file.content_type.as_str(), Some(file.size_bytes));
+    serve_pinned(&state, (&applet, &headers), &pinned, typed).await
+}
+
+/// Whether the edge already holds the object tagged `blake3`, per its `If-None-Match`.
+fn held_by_edge(headers: &HeaderMap, blake3: &str) -> bool {
+    let tag = format!("\"{blake3}\"");
+    (headers.get(header::IF_NONE_MATCH))
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            (value.split(',').map(str::trim))
+                .any(|held| held.trim_start_matches("W/") == tag || held == "*")
+        })
+}
+
+/// Streams one pinned object with its digest as `ETag`, or answers 304 without reading it
+/// when the edge already holds that digest.
+pub(super) async fn serve_pinned(
+    state: &ServerState,
+    (applet, request): (&Applet, &HeaderMap),
+    pinned: &PinnedObject,
+    (content_type, size): (&str, Option<u64>),
+) -> ServerResult<Response> {
+    let tag = header::HeaderValue::from_str(&format!("\"{}\"", pinned.blake3))
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+    if held_by_edge(request, &pinned.blake3) {
+        let mut response = Response::new(axum::body::Body::empty());
+        *response.status_mut() = StatusCode::NOT_MODIFIED;
+        response.headers_mut().insert(header::ETAG, tag);
+        return Ok(response);
+    }
     let object = (
-        file.bucket.as_str(),
-        file.key.as_str(),
-        file.version_id.as_str(),
+        pinned.bucket.as_str(),
+        pinned.key.as_str(),
+        pinned.version_id.as_str(),
     );
-    let read = read_pinned(&state, &applet, object).await?;
-    let permit = crate::download::admit(&state, LocalKey::User(applet.created_by))
+    let read = read_pinned(state, applet, object).await?;
+    let permit = crate::download::admit(state, LocalKey::User(applet.created_by))
         .map_err(|_| ServerError::ServiceUnavailableReason("too many downloads".to_string()))?;
     let mut response = Response::new(crate::download::body(read.blob, permit));
     let headers = response.headers_mut();
-    let typed = header::HeaderValue::from_str(&file.content_type);
-    let tag = header::HeaderValue::from_str(&format!("\"{}\"", file.blake3));
-    if let (Ok(typed), Ok(tag)) = (typed, tag) {
+    if let Ok(typed) = header::HeaderValue::from_str(content_type) {
         headers.insert(header::CONTENT_TYPE, typed);
-        headers.insert(header::ETAG, tag);
     }
-    headers.insert(header::CONTENT_LENGTH, file.size_bytes.into());
+    headers.insert(header::ETAG, tag);
+    if let Some(size) = size {
+        headers.insert(header::CONTENT_LENGTH, size.into());
+    }
     Ok(response)
 }
