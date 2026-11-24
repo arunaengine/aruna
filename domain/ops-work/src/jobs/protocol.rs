@@ -910,6 +910,9 @@ mod pure_tests {
                 locally_exhausted: false,
                 session_runtime: None,
                 awaiting_keys: Vec::new(),
+                group_id: None,
+                started_at_ms: None,
+                node_id: None,
             },
             run_crate: Some(r#"{"status":"pending"}"#.to_string()),
         };

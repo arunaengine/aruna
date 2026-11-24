@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use ulid::Ulid;
 
+use crate::compute::runtimes::{SESSION_TAG, SESSION_TAG_NOTEBOOK};
 use crate::events::Event;
+use crate::id::NodeId;
 use crate::metadata::AuthToken;
 use crate::operation::SubOperation;
 use crate::rocrate_archive::{ArchiveCompression, ArchiveInspection};
@@ -60,6 +62,26 @@ pub enum JobKind {
 }
 
 impl JobKind {
+    pub const ALL: [JobKind; 17] = [
+        Self::Probe,
+        Self::Execution,
+        Self::WriteRunCrate,
+        Self::TerminalCleanup,
+        Self::Staging,
+        Self::ImportRoCrate,
+        Self::ExportRoCrate,
+        Self::Harvest,
+        Self::MintPersistentId,
+        Self::StoragePurge,
+        Self::CopyObject,
+        Self::RegisterIdentifiers,
+        Self::BackendImport,
+        Self::WebhookDelivery,
+        Self::EmailDelivery,
+        Self::PluginWork,
+        Self::WorkflowRun,
+    ];
+
     pub fn name(self) -> &'static str {
         match self {
             Self::Probe => "probe",
@@ -144,6 +166,13 @@ pub struct JobStatusView {
     pub session_runtime: Option<String>,
     /// Bucket keys an `awaiting_key` job still needs; filled by the owning node.
     pub awaiting_keys: Vec<KeyWait>,
+    #[serde(default)]
+    pub group_id: Option<GroupId>,
+    #[serde(default)]
+    pub started_at_ms: Option<u64>,
+    /// The node that holds the job's record, or that ran its latest execution.
+    #[serde(default)]
+    pub node_id: Option<NodeId>,
 }
 
 mod json_value {
@@ -191,6 +220,12 @@ impl From<&JobRecord> for JobStatusView {
                 _ => None,
             },
             awaiting_keys: Vec::new(),
+            group_id: match &record.payload {
+                JobPayload::Execution(spec) => Some(spec.group_id),
+                _ => None,
+            },
+            started_at_ms: record.started_at_ms,
+            node_id: Some(record.owner_node_id),
         }
     }
 }
@@ -212,7 +247,11 @@ pub enum JobTarget {
 /// A job running on this node now; the group and creator decide who may see its details.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunningJobView {
+    pub job_id: JobId,
     pub kind: JobKind,
+    /// A notebook session rather than a run that ends on its own.
+    pub session: bool,
+    pub cancel_requested: bool,
     pub target: Option<JobTarget>,
     pub group_id: Option<GroupId>,
     pub created_by: UserId,
@@ -276,8 +315,17 @@ impl RunningJobView {
             JobPayload::PluginWork(spec) => (None, Some(spec.group_id)),
             JobPayload::WorkflowRun(spec) => (None, Some(spec.group_id)),
         };
+        let session = match &record.payload {
+            JobPayload::Execution(spec) => {
+                spec.tags.get(SESSION_TAG).map(String::as_str) == Some(SESSION_TAG_NOTEBOOK)
+            }
+            _ => false,
+        };
         Self {
+            job_id: record.job_id,
             kind: JobKind::from(&record.payload),
+            session,
+            cancel_requested: record.cancel_requested,
             target,
             group_id,
             created_by: record.created_by,

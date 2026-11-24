@@ -20,7 +20,7 @@ use aruna_core::structs::execution::job::family::{
 use aruna_core::structs::execution::job::identity::{JobId, JobState};
 use aruna_core::structs::execution::job::input::{
     ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, JobPayload,
-    OutputDestination, OutputSelection,
+    OutputDestination, OutputSelection, WORKFLOW_RUN_TAG,
 };
 use aruna_core::structs::execution::job::local::{JobRecord, JobResultPayload, WorkspaceMode};
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
@@ -74,7 +74,18 @@ const ID_TAG_KEY: &str = "aruna-engine.org/job-id";
 const STATE_TAG_KEY: &str = "aruna-engine.org/logical-state";
 const KIND_TAG_KEY: &str = "aruna-engine.org/executor-kind";
 const TRANSFER_TAG_KEY: &str = "aruna-engine.org/estimated-transfer-bytes";
-const DERIVED_TAG_KEYS: [&str; 4] = [ID_TAG_KEY, STATE_TAG_KEY, KIND_TAG_KEY, TRANSFER_TAG_KEY];
+/// The node that runs the task, or that holds it while no placement names one.
+const NODE_TAG_KEY: &str = "aruna-engine.org/node-id";
+/// What a `PAUSED` task waits for: `bucket_key`.
+const WAITING_TAG_KEY: &str = "aruna-engine.org/waiting-for";
+const DERIVED_TAG_KEYS: [&str; 6] = [
+    ID_TAG_KEY,
+    STATE_TAG_KEY,
+    KIND_TAG_KEY,
+    TRANSFER_TAG_KEY,
+    NODE_TAG_KEY,
+    WAITING_TAG_KEY,
+];
 
 const DEFAULT_PAGE_SIZE: usize = 256;
 const MAX_PAGE_SIZE: usize = 512;
@@ -359,6 +370,12 @@ impl TaskFilters {
         })
     }
 
+    /// Whether the query asks for the child tasks of workflow runs, which are left out unless
+    /// it names their tag.
+    fn names_run(&self) -> bool {
+        self.tags.iter().any(|(key, _)| key == WORKFLOW_RUN_TAG)
+    }
+
     fn matches(&self, record: &JobRecord) -> bool {
         self.matches_base(record)
     }
@@ -374,7 +391,8 @@ impl TaskFilters {
             return false;
         };
         let tags = project_tags(spec);
-        self.state.is_none_or(|state| tes_state(record) == state)
+        (self.names_run() || !tags.contains_key(WORKFLOW_RUN_TAG))
+            && self.state.is_none_or(|state| tes_state(record) == state)
             && self.name_prefix.as_deref().is_none_or(|prefix| {
                 spec.name
                     .as_deref()
@@ -398,7 +416,7 @@ impl TaskFilters {
             return false;
         };
         let mut tags = project_tags(spec);
-        details.stamp(&record.job_id.to_string(), &mut tags);
+        details.stamp(record, &mut tags);
         self.tags
             .iter()
             .filter(|(key, _)| DERIVED_TAG_KEYS.contains(&key.as_str()))
@@ -1021,6 +1039,11 @@ credential additionally sees only tasks of that credential's group.
 - `BASIC` and `FULL` also carry the derived read-only tags `aruna-engine.org/job-id`,
   `aruna-engine.org/logical-state`, `aruna-engine.org/executor-kind` and
   `aruna-engine.org/estimated-transfer-bytes` wherever this responder knows them.
+- `BASIC` and `FULL` also carry `aruna-engine.org/node-id`, the node that runs the task or holds
+  it while no placement names one, and `aruna-engine.org/waiting-for` `bucket_key` on a `PAUSED`
+  task that waits for a bucket key.
+- The child tasks of workflow runs, tagged `aruna-engine.org/workflow-run`, are left out unless
+  `tag_key` names that tag; with a `tag_value` they are the tasks of one run.
 - `tag_value` pairs by position with `tag_key`, and an empty or missing value matches any value of
   that key.
 
@@ -1782,6 +1805,7 @@ struct TaskDetails {
     logical_state: Option<String>,
     executor_kind: Option<String>,
     transfer_bytes: Option<u64>,
+    node_id: Option<aruna_core::id::NodeId>,
 }
 
 impl TaskDetails {
@@ -1795,11 +1819,19 @@ impl TaskDetails {
                 .and_then(|plan| plan.target.as_ref())
                 .map(|target| target.executor_kind.clone()),
             transfer_bytes: placed.map(|plan| plan.estimated_transfer_bytes),
+            node_id: placed
+                .and_then(|plan| plan.target.as_ref())
+                .map(|target| target.node_id),
         }
     }
 
-    fn stamp(&self, id: &str, tags: &mut BTreeMap<String, String>) {
-        tags.insert(ID_TAG_KEY.to_string(), id.to_string());
+    fn stamp(&self, record: &JobRecord, tags: &mut BTreeMap<String, String>) {
+        tags.insert(ID_TAG_KEY.to_string(), record.job_id.to_string());
+        let node = self.node_id.unwrap_or(record.owner_node_id);
+        tags.insert(NODE_TAG_KEY.to_string(), node.to_string());
+        if record.state == JobState::AwaitingKey {
+            tags.insert(WAITING_TAG_KEY.to_string(), "bucket_key".to_string());
+        }
         if let Some(state) = &self.logical_state {
             tags.insert(STATE_TAG_KEY.to_string(), state.clone());
         }
@@ -1930,7 +1962,7 @@ fn project_task(
     });
 
     let mut tags = project_tags(spec);
-    details.stamp(&id, &mut tags);
+    details.stamp(record, &mut tags);
 
     let mut log = build_task_log(record, base_url);
     if view == TesView::Basic {

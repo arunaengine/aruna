@@ -91,11 +91,16 @@ pub struct SessionEndedResponse {
     /// One of `ended`, `idle`, `walltime`, `cancelled`, `kernel_exit` or
     /// `node_restart`.
     pub reason: String,
+    /// When the session's job ended; absent while the ended session is still held here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct SessionResponse {
     pub job_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
     /// One of `starting`, `ready`, `busy` or `ended`.
     pub state: String,
     pub runtime: String,
@@ -301,7 +306,10 @@ async fn ended_response(
     .unwrap_or_else(|| default_reason(record).to_string());
     Json(SessionResponse {
         state: "ended".to_string(),
-        ended: Some(SessionEndedResponse { reason }),
+        ended: Some(SessionEndedResponse {
+            reason,
+            ended_at_ms: record.finished_at_ms,
+        }),
         ..base_response(record)
     })
 }
@@ -321,6 +329,7 @@ fn base_response(record: &JobRecord) -> SessionResponse {
     };
     SessionResponse {
         job_id: record.job_id.to_string(),
+        group_id: group_of(record),
         state: String::new(),
         runtime: requested.map(|session| session.runtime).unwrap_or_default(),
         workspace_bucket: record.workspace_bucket.clone().unwrap_or_default(),
@@ -335,9 +344,21 @@ fn base_response(record: &JobRecord) -> SessionResponse {
     }
 }
 
-fn session_response(snapshot: SessionSnapshot, with_cells: bool) -> SessionResponse {
+fn group_of(record: &JobRecord) -> Option<String> {
+    match &record.payload {
+        JobPayload::Execution(spec) => Some(spec.group_id.to_string()),
+        _ => None,
+    }
+}
+
+fn session_response(
+    snapshot: SessionSnapshot,
+    record: &JobRecord,
+    with_cells: bool,
+) -> SessionResponse {
     SessionResponse {
         job_id: snapshot.job_id,
+        group_id: group_of(record),
         state: snapshot.state.as_str().to_string(),
         runtime: snapshot.runtime,
         workspace_bucket: snapshot.workspace_bucket,
@@ -362,6 +383,7 @@ fn session_response(snapshot: SessionSnapshot, with_cells: bool) -> SessionRespo
         }),
         ended: snapshot.ended.map(|reason| SessionEndedResponse {
             reason: reason.as_str().to_string(),
+            ended_at_ms: None,
         }),
     }
 }
@@ -455,7 +477,7 @@ pub async fn get_session(
     Ok(
         match ask_session(&state, &record, physical_job_id, true, request).await {
             Ok(SessionAnswer::Snapshot(snapshot)) => {
-                Json(session_response(*snapshot, true)).into_response()
+                Json(session_response(*snapshot, &record, true)).into_response()
             }
             Ok(answer) => other_answer(answer),
             Err(response) => response,
@@ -511,7 +533,10 @@ pub async fn stream_session(
     };
     let job_id = physical_job_id.ok_or(ServerError::NotFound)?;
     let after = query.after.or_else(|| last_event_id(&headers)).unwrap_or(0);
-    let mut initial = vec![frame("session", &session_response(snapshot, false))];
+    let mut initial = vec![frame(
+        "session",
+        &session_response(snapshot, &record, false),
+    )];
     let resume = SessionRequest::Subscribe { after: Some(after) };
     let (backlog, receiver) = match session_call(&state, job_id, resume).await {
         SessionAnswer::Stream { backlog, live } => (backlog, live),

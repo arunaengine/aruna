@@ -88,6 +88,13 @@ pub(crate) fn status_view(
         locally_exhausted: false,
         session_runtime: spec.payload.session_runtime(),
         awaiting_keys: Vec::new(),
+        group_id: Some(spec.group_id),
+        started_at_ms: (projection.executions.iter())
+            .filter_map(|execution| execution.started_at_ms)
+            .min(),
+        node_id: terminal
+            .or_else(|| projection.executions.last())
+            .map(|execution| execution.executor_node_id),
     }
 }
 

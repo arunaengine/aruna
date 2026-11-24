@@ -418,10 +418,23 @@ fn filters_tasks() {
         logical_state: Some("running".to_string()),
         executor_kind: Some("docker".to_string()),
         transfer_bytes: Some(4_096),
+        node_id: None,
     };
     assert!(derived.has_derived());
     assert!(derived.matches(&record));
     assert!(derived.matches_details(&record, &details));
+
+    // A workflow run's child task is left out unless the query names the run tag.
+    let mut child = record.clone();
+    if let JobPayload::Execution(spec) = &mut child.payload {
+        spec.tags
+            .insert(WORKFLOW_RUN_TAG.to_string(), "run-1".to_string());
+    }
+    let plain = TaskFilters::from_query(&ListTasksQuery::default(), None).unwrap();
+    assert!(plain.matches(&record) && !plain.matches(&child));
+    let run = Some("tag_key=aruna-engine.org%2Fworkflow-run&tag_value=run-1");
+    let run = TaskFilters::from_query(&ListTasksQuery::default(), run).unwrap();
+    assert!(run.matches(&child) && !run.matches(&record));
 
     let wrong_name = ListTasksQuery {
         name_prefix: Some("other".to_string()),
@@ -1109,6 +1122,9 @@ fn family_fixture() -> aruna_ops_work::jobs::lifecycle::report::FamilyReport {
             locally_exhausted: false,
             session_runtime: None,
             awaiting_keys: Vec::new(),
+            group_id: None,
+            started_at_ms: None,
+            node_id: None,
         },
         spec,
         submission_id,

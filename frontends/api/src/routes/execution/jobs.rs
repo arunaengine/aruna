@@ -18,7 +18,7 @@ use aruna_core::node::state::ReadInfoOperation;
 use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::execution::job::identity::{JobId, SYSTEM_ENTRY_PREFIX};
 use aruna_core::structs::execution::job::input::{
-    CompositionError, ExportReportRow, ImportReportRow,
+    CompositionError, ExportReportRow, ImportReportRow, JobPayload, WORKFLOW_RUN_TAG,
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::object_read::ObjectRangeRequest;
@@ -419,6 +419,8 @@ pub struct ListJobsQuery {
     pub limit: Option<usize>,
     pub cursor: Option<String>,
     pub state: Option<String>,
+    /// Lists the child tasks of this workflow run, which are left out otherwise.
+    pub workflow_run: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
@@ -544,6 +546,8 @@ caller's own jobs.
 - A distributed execution job is listed where it was admitted or is running; read one by id for
   the replicated family view, which any node holding its records can answer.
 - Jobs the system creates for its own bookkeeping are never listed.
+- The child tasks of workflow runs are left out; `workflow_run` lists the tasks of that run
+  instead. The run itself is listed by `GET /compute/workflow-runs`.
 - A page without `next_cursor` is the last one.
 
 **Limits**
@@ -554,7 +558,8 @@ caller's own jobs.
     params(
         ("limit" = Option<usize>, Query, description = "Maximum jobs in one page; default 50, at most 200, and 0 is treated as unset"),
         ("cursor" = Option<String>, Query, description = "Opaque `next_cursor` from a previous page; absent starts at the newest job"),
-        ("state" = Option<String>, Query, description = "Restrict the page to one job state; absent returns every state")
+        ("state" = Option<String>, Query, description = "Restrict the page to one job state; absent returns every state"),
+        ("workflow_run" = Option<String>, Query, description = "List only the child tasks of this workflow run; absent leaves every child task out")
     ),
     responses(
         (
@@ -620,13 +625,20 @@ pub async fn list_jobs(
         .unwrap_or(DEFAULT_LIST_LIMIT)
         .min(MAX_LIST_LIMIT);
     let state_filter = query.state.as_deref().map(parse_state).transpose()?;
+    let run = query.workflow_run.filter(|run| !run.is_empty());
 
     let (records, next_cursor) = list_owned_jobs(
         &state.get_ctx(),
         auth.user_id,
         cursor,
         limit,
-        move |record| state_filter.is_none_or(|state| record.state == state),
+        move |record| {
+            let parent = match &record.payload {
+                JobPayload::Execution(spec) => spec.tags.get(WORKFLOW_RUN_TAG),
+                _ => None,
+            };
+            parent == run.as_ref() && state_filter.is_none_or(|state| record.state == state)
+        },
     )
     .await
     .map_err(|error| ServerError::InternalError(error.into()))?;

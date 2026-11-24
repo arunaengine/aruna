@@ -974,6 +974,21 @@ pub struct JobStatusResponse {
     /// Absent for a distributed execution job and when this node does not know the url.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_node_url: Option<String>,
+    /// The group an execution job runs for; absent for other jobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
+    /// The node that holds the job, or for a distributed job the node of its latest execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    /// `bucket_key` while the job is `awaiting_key`: it waits for the keys `awaiting_keys` names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_for: Option<String>,
+    /// Whether the caller may cancel and delete the job: only its submitter reads a job, so a
+    /// job the caller sees is its own.
+    #[serde(default)]
+    pub writable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1026,6 +1041,11 @@ pub(crate) fn job_view_response(job: &JobStatusView) -> JobStatusResponse {
             .map(KeyWait::to_public_json)
             .collect(),
         owner_node_url: None,
+        group_id: job.group_id.map(|group| group.to_string()),
+        node_id: job.node_id.map(|node| node.to_string()),
+        started_at: job.started_at_ms.map(rfc3339),
+        waiting_for: (job.state == JobState::AwaitingKey).then(|| "bucket_key".to_string()),
+        writable: true,
     }
 }
 
