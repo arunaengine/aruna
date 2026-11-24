@@ -7,6 +7,8 @@ use std::sync::Arc;
 
 use aruna_core::errors::StorageError;
 use aruna_core::structs::identity::auth::Permission;
+use aruna_core::structs::identity::features::{Feature, FeatureMode};
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 use aruna_ops_identity::realm::set_portal::{SetPortalConfig, SetPortalError, SetPortalOperation};
@@ -45,7 +47,9 @@ pub struct PortalFeatures {
 
 **Behavior**
 - A feature missing from the map is on. A user can override each default with the user
-  attribute `ui.feature.<name>`."#,
+  attribute `ui.feature.<name>`.
+- `compute` mirrors the realm default of the feature `runs` once the realm feature policy sets
+  it; see `/system/realm/features`."#,
     responses(
         (status = 200, description = "The stored feature defaults", body = PortalFeatures,
             example = json!({"features": {"compute": false}})),
@@ -64,7 +68,7 @@ pub async fn get_portal_features(
             other => ServerError::InternalError(other.into()),
         })?;
     Ok(Json(PortalFeatures {
-        features: config.portal_features,
+        features: portal_view(&config),
     }))
 }
 
@@ -80,6 +84,7 @@ management node serves the call and every other node relays it to one.
 
 **Behavior**
 - The body replaces the stored map. Features absent from it fall back to on.
+- When the realm feature policy sets `runs`, `compute` also sets its realm default.
 
 **Limits**
 - At most 64 features. Names hold 1 to 64 characters of `a-z`, `0-9` and `-`."#,
@@ -116,15 +121,26 @@ pub async fn set_portal_features(
         SetPortalOperation::new(SetPortalConfig {
             actor: actor(&state, &auth),
             auth_context: auth,
-            features: request.features,
+            features: Some(request.features),
+            policy: None,
         }),
         &state.get_ctx(),
     )
     .await
     .map_err(ServerError::from)?;
     Ok(Json(PortalFeatures {
-        features: stored.portal_features,
+        features: portal_view(&stored),
     }))
+}
+
+/// The stored defaults with `compute` read from the realm `runs` setting, when the realm sets it.
+fn portal_view(config: &RealmConfigDocument) -> BTreeMap<String, bool> {
+    let mut features = config.portal_features.clone();
+    if let Some(mode) = config.features.get(&Feature::Runs) {
+        let on = matches!(mode, FeatureMode::Scoped { default: true, .. });
+        features.insert("compute".to_string(), on);
+    }
+    features
 }
 
 impl From<SetPortalError> for ServerError {

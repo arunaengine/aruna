@@ -7,6 +7,8 @@ use crate::error::{ServerError, ServerSetupError};
 use crate::https::check_host;
 use crate::https::listener::CombinedListener;
 use crate::server::state::{PortalRuntimeState, ServerState};
+use aruna_core::structs::identity::features::{Feature, FeatureMode, resolve};
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 use aruna_runner::driver::drive;
 use aruna_wire::portal::{LegalDocument, PortalLogin};
@@ -120,19 +122,23 @@ async fn portal_config(State(state): State<PortalState>) -> Response {
     if let Err(error) = portal_dir(&state.server).await {
         return error.into_response();
     }
-    let registry_url = match drive(
+    let config = match drive(
         GetConfigOperation::new(state.server.get_realm_id()),
         &state.server.get_ctx(),
     )
     .await
     {
-        // Stored settings decide, also a cleared URL; without them the node default applies.
-        Ok(config) => match config.federation {
-            Some(settings) => settings.registry_url.map(String::from),
-            None => state.registry_url.clone(),
-        },
-        Err(GetConfigError::DocumentNotFound) => state.registry_url.clone(),
+        Ok(config) => Some(config),
+        Err(GetConfigError::DocumentNotFound) => None,
         Err(error) => return ServerError::InternalError(error.into()).into_response(),
+    };
+    // Stored settings decide, also a cleared URL; without them the node default applies.
+    let registry_url = match config
+        .as_ref()
+        .and_then(|config| config.federation.as_ref())
+    {
+        Some(settings) => settings.registry_url.clone().map(String::from),
+        None => state.registry_url.clone(),
     };
     let config = Json(PortalRuntimeConfig {
         api_base_url: &state.api_base_url,
@@ -140,19 +146,43 @@ async fn portal_config(State(state): State<PortalState>) -> Response {
         login: state.login.as_ref(),
         landing: (!state.landing).then_some(false),
         legal: &state.legal,
-        features: node_features(&state.server),
+        features: node_features(&state.server, config.as_ref()),
     });
     ([(header::CACHE_CONTROL, NO_CACHE)], config).into_response()
 }
 
-/// The surfaces this node turns on: `workflows` when a workflow runtime is attached.
-fn node_features(state: &ServerState) -> BTreeMap<String, bool> {
-    let context = state.get_ctx();
-    let workflows =
-        (context.compute_handle.as_ref()).is_some_and(|registry| registry.workflow().is_some());
-    let mut features = BTreeMap::new();
-    if workflows {
-        features.insert("workflows".to_string(), true);
+/// Node and realm level feature flags, with the older names `compute` and `builder`. Anyone
+/// reads them, so they never show one group's state; without a realm config only the node's.
+fn node_features(
+    state: &ServerState,
+    config: Option<&RealmConfigDocument>,
+) -> BTreeMap<String, bool> {
+    let off = state.disabled_features();
+    let Some(config) = config else {
+        let workflows = !off.contains(&Feature::Workflows);
+        return (workflows
+            .then(|| ("workflows".to_string(), true))
+            .into_iter())
+        .collect();
+    };
+    let named = [
+        ("workflows", Feature::Workflows),
+        ("applets", Feature::Applets),
+        ("builder", Feature::Applets),
+        ("runs", Feature::Runs),
+        ("compute", Feature::Runs),
+    ];
+    let mut features: BTreeMap<String, bool> = (named.into_iter())
+        .map(|(name, feature)| (name.to_string(), resolve(config, &off, feature, None).on))
+        .collect();
+    // Runs off for every group also hides the job and TES surfaces.
+    let forced = matches!(
+        config.features.get(&Feature::Runs),
+        Some(FeatureMode::ForcedOff)
+    );
+    if off.contains(&Feature::Runs) || forced {
+        features.insert("jobs".to_string(), false);
+        features.insert("tes".to_string(), false);
     }
     features
 }
@@ -289,7 +319,8 @@ mod tests {
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
     use aruna_core::listener::MAX_BODY_SIZE;
     use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
-    use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmId};
+    use aruna_core::structs::identity::features::{Feature, FeatureMode};
+    use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmConfigDocument, RealmId};
     use aruna_core::user::id::UserId;
     use aruna_ops_identity::document_repository::GetConfigOperation;
     use aruna_ops_identity::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
@@ -569,9 +600,13 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let config: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // Realm level feature flags only; no group's state reaches this unauthenticated file.
+        let features = serde_json::json!({
+            "applets": false, "builder": false, "compute": true, "runs": true, "workflows": false
+        });
         assert_eq!(
             config,
-            serde_json::json!({ "apiBaseUrl": format!("{TEST_API_URL}/api/v1") })
+            serde_json::json!({ "apiBaseUrl": format!("{TEST_API_URL}/api/v1"), "features": features })
         );
 
         let index = router.oneshot(request(Method::GET, "/")).await.unwrap();
@@ -595,7 +630,7 @@ mod tests {
     #[tokio::test]
     async fn names_workflow_feature() {
         let (state, _dir) = setup_state().await;
-        assert!(super::node_features(&state).is_empty());
+        assert!(super::node_features(&state, None).is_empty());
         let mut context = (*state.get_ctx()).clone();
         let registry =
             aruna_compute::registry::ExecutorRegistry::new().with_workflow(Arc::new(Idle));
@@ -610,10 +645,23 @@ mod tests {
             aruna_runner::jobs::runtime::JobsRuntime::new(),
         )
         .await;
-        let features = super::node_features(&state);
+        let features = super::node_features(&state, None);
         assert_eq!(
             serde_json::to_value(&features).unwrap(),
             serde_json::json!({"workflows": true})
+        );
+        // With the realm config the flags are realm level, with the older names beside them.
+        let mut config = RealmConfigDocument::new(state.get_realm_id(), Vec::new(), 3);
+        config
+            .features
+            .insert(Feature::Runs, FeatureMode::ForcedOff);
+        let features = super::node_features(&state, Some(&config));
+        assert_eq!(
+            serde_json::to_value(&features).unwrap(),
+            serde_json::json!({
+                "workflows": false, "applets": false, "builder": false, "runs": false,
+                "compute": false, "jobs": false, "tes": false
+            })
         );
     }
 
