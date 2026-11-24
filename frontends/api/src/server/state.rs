@@ -213,6 +213,8 @@ pub struct ServerState {
     import_roots: Arc<BTreeMap<String, ImportRoot>>,
     /// Features the operator turned off on this node.
     disabled_features: Arc<BTreeSet<Feature>>,
+    /// Applet hosting and building on this node; both off unless configured.
+    applets: Arc<aruna_core::applet::settings::AppletSettings>,
     started: (SystemTime, Instant),
     archive_links: Arc<crate::routes::storage::archive::ArchiveLinks>,
 }
@@ -327,6 +329,7 @@ impl ServerState {
             },
             import_roots: Arc::default(),
             disabled_features: Arc::default(),
+            applets: Arc::default(),
             started: (SystemTime::now(), Instant::now()),
             archive_links: Arc::default(),
         };
@@ -430,6 +433,15 @@ impl ServerState {
 
     pub fn credential_encryption_key(&self) -> &CredentialEncryptionKey {
         &self.identity.credential_encryption_key
+    }
+
+    pub fn with_applets(mut self, settings: aruna_core::applet::settings::AppletSettings) -> Self {
+        self.applets = Arc::new(settings);
+        self
+    }
+
+    pub fn applet_settings(&self) -> &aruna_core::applet::settings::AppletSettings {
+        &self.applets
     }
 
     pub fn with_import_roots(mut self, roots: BTreeMap<String, ImportRoot>) -> Self {

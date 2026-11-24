@@ -309,6 +309,7 @@ async fn bind_all(
     .await
     .with_metrics(metrics.clone())
     .with_rocrate_limits(config.rocrate_limits.clone())
+    .with_applets(config.applets.clone())
     .with_assistant_proxy(config.assistant_proxy)
     .with_disabled_features(config.disabled_features.clone())
     .with_import_roots(served_roots(&config.blob_backends))

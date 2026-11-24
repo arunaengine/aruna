@@ -110,6 +110,7 @@ pub struct Settings {
     pub registry_url: Option<reqwest::Url>,
     pub trusted_proxies: Vec<ipnet::IpNet>,
     pub rocrate_limits: RoCrateLimits,
+    pub applets: aruna_core::applet::settings::AppletSettings,
     pub rate_limits: RateLimitSettings,
     pub s3_address: Option<String>,
     pub onboarding_secret: Option<String>,
@@ -304,6 +305,7 @@ pub fn read_settings_from(env: &dyn SettingsEnv) -> Result<Settings, SetupError>
     let registry_url = registry_url_env(env)?;
     let trusted_proxies = trusted_proxies_env(env)?;
     let rocrate_limits = rocrate_limits_env(env)?;
+    let applets = applets_env(env)?;
     let rate_limits = rate_limits_env(env)?;
     // Devices may omit both S3 values, but supplying only one is always invalid.
     // The node identity later decides whether the listener is required.
@@ -389,6 +391,7 @@ pub fn read_settings_from(env: &dyn SettingsEnv) -> Result<Settings, SetupError>
         registry_url,
         trusted_proxies,
         rocrate_limits,
+        applets,
         rate_limits,
         s3_address,
         onboarding_secret,
@@ -567,6 +570,94 @@ fn positive_u32_env(
         ));
     }
     Ok(parsed)
+}
+
+/// Applet hosting from `APPLETS_DOMAIN` and building from `APPLETS_BUILD_BACKEND` with
+/// `APPLETS_BUILD_IMAGE`; each stays off while its main variable is unset.
+fn applets_env(
+    env: &dyn SettingsEnv,
+) -> Result<aruna_core::applet::settings::AppletSettings, SetupError> {
+    use aruna_core::applet::settings::{
+        AppletSettings, BuildingSettings, DEFAULT_DRAFT_HOURS, DEFAULT_DRAFTS, DEFAULT_ORIGINS,
+        HostingSettings, default_catalogue, image_pinned,
+    };
+    let flag = |name: &'static str| {
+        env.var(name)
+            .map(|value| value.trim().parse::<bool>())
+            .transpose()
+            .map_err(|_| invalid_config_value(name, String::new(), "must be true or false"))
+            .map(Option::unwrap_or_default)
+    };
+    let hosting = match optional_nonempty_env(env, "APPLETS_DOMAIN")? {
+        Some(domain) => {
+            let applet_domain =
+                aruna_core::applet::hosts::normalize_host(&domain).map_err(|error| {
+                    invalid_config_value("APPLETS_DOMAIN", domain.clone(), error.to_string())
+                })?;
+            let key_hash = optional_nonempty_env(env, "APPLETS_EDGE_KEY_SHA256")?
+                .ok_or(SetupError::MissingConfigValue("APPLETS_EDGE_KEY_SHA256"))?;
+            let edge_key_sha256 = hex::decode(key_hash.trim())
+                .ok()
+                .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                .ok_or_else(|| {
+                    let reason = "must be 64 hex characters".to_string();
+                    invalid_config_value("APPLETS_EDGE_KEY_SHA256", String::new(), reason)
+                })?;
+            let max_origins = env
+                .var("APPLETS_MAX_ORIGINS")
+                .map(|value| value.trim().parse::<usize>())
+                .transpose()?
+                .unwrap_or(DEFAULT_ORIGINS);
+            Some(HostingSettings {
+                applet_domain,
+                edge_key_sha256,
+                custom_domains: flag("APPLETS_CUSTOM_DOMAINS")?,
+                guests: flag("APPLETS_GUESTS")?,
+                embedding: flag("APPLETS_EMBEDDING")?,
+                max_origins,
+                portal_origin: optional_nonempty_env(env, "APPLETS_PORTAL_ORIGIN")?,
+            })
+        }
+        None => None,
+    };
+    let building = match optional_nonempty_env(env, "APPLETS_BUILD_BACKEND")? {
+        Some(backend) => {
+            let image = optional_nonempty_env(env, "APPLETS_BUILD_IMAGE")?
+                .ok_or(SetupError::MissingConfigValue("APPLETS_BUILD_IMAGE"))?;
+            if !image_pinned(&image) {
+                let reason = "must be pinned by @sha256 digest".to_string();
+                return Err(invalid_config_value("APPLETS_BUILD_IMAGE", image, reason));
+            }
+            let mirror = optional_nonempty_env(env, "APPLETS_BUILD_MIRROR")?;
+            let max_drafts = env
+                .var("APPLETS_MAX_DRAFTS")
+                .map(|value| value.trim().parse::<usize>())
+                .transpose()?
+                .unwrap_or(DEFAULT_DRAFTS);
+            let draft_ttl_hours = env
+                .var("APPLETS_DRAFT_TTL_HOURS")
+                .map(|value| value.trim().parse::<u64>())
+                .transpose()?
+                .unwrap_or(DEFAULT_DRAFT_HOURS);
+            // A JSON list of `{name, version, role, license, license_source}` replaces the defaults.
+            let catalogue = match optional_nonempty_env(env, "APPLETS_CATALOGUE")? {
+                Some(text) => serde_json::from_str(&text).map_err(|error| {
+                    invalid_config_value("APPLETS_CATALOGUE", String::new(), error)
+                })?,
+                None => default_catalogue(),
+            };
+            Some(BuildingSettings {
+                backend,
+                image,
+                mirror,
+                max_drafts,
+                draft_ttl_hours,
+                catalogue,
+            })
+        }
+        None => None,
+    };
+    Ok(AppletSettings { hosting, building })
 }
 
 fn rocrate_limits_env(env: &dyn SettingsEnv) -> Result<RoCrateLimits, SetupError> {

@@ -605,11 +605,17 @@ pub(crate) async fn run_node_info(state: &ServerState, auth: Option<AuthContext>
             interfaces,
         },
         warnings: Vec::new(),
+        applets: None,
     };
 
     if !realm {
         return response;
     }
+    let applets = state.applet_settings();
+    response.applets = Some(aruna_wire::info::AppletCapabilities {
+        hosting: applets.hosting.is_some(),
+        building: applets.building.is_some(),
+    });
 
     let ctx = state.get_ctx();
     let snapshot = ctx.status().await;
