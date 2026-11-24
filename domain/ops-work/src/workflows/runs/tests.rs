@@ -407,6 +407,13 @@ async fn protects_encrypted_runs() {
         matches!(refused, Err(CatalogError::Invalid(_))),
         "{refused:?}"
     );
+    let mut no_output = request.clone();
+    no_output.output = None;
+    let refused_run_area = runs.start(alice, no_output).await;
+    assert!(
+        matches!(refused_run_area, Err(CatalogError::Invalid(_))),
+        "{refused_run_area:?}"
+    );
     let open = runs.started().await;
     assert!(!open.protected);
 

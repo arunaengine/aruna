@@ -1,6 +1,5 @@
-//! Copies of a run and its log pages on the holders of the run group's records, so that when
-//! the run's node is unreachable, its owner or a realm admin can resume it on a surviving node.
-//! Nothing takes a run over on its own.
+//! Copies a run and its log pages onto group record holders so an owner or realm admin can
+//! resume an unreachable run on a surviving node; nothing takes over automatically.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

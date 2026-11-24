@@ -232,10 +232,13 @@ impl StartRunOperation {
                 .map_err(|error| CatalogError::Storage(error.to_string()))?;
             encrypted.push(settings.is_encrypted());
         }
-        let output = encrypted.pop().unwrap_or(false);
-        if encrypted.contains(&true) && !output {
+        let output = match self.request.output.is_some() {
+            true => encrypted.pop().unwrap_or(false),
+            false => false,
+        };
+        if (encrypted.contains(&true) || self.lineage.protected) && !output {
             return Err(CatalogError::Invalid(
-                "an input bucket encrypts, so the output bucket must encrypt too".into(),
+                "a protected run requires an encrypted output bucket".into(),
             ));
         }
         Ok(self.lineage.protected || output || encrypted.contains(&true))

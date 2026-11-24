@@ -1,6 +1,5 @@
-//! Previews where the tasks of a run would go, without side effects: the version's values are
-//! checked, the run is simulated, and each task that reads only pinned inputs is planned like
-//! its launch. Tasks that read the outputs of others are placed when the run creates them.
+//! Previews where the tasks of a run would go without side effects, simulating pinned tasks like
+//! launch while deferring tasks that depend on earlier outputs.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
