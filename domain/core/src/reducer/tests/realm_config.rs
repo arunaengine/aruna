@@ -1307,6 +1307,38 @@ fn legacy_removal_leaves() {
 }
 
 #[test]
+fn legacy_promotion_open() {
+    // Promoting a legacy server keeps its first add, so a record citing the clock before the
+    // promotion sees the same open membership with and without the backfill.
+    use crate::structs::execution::job::membership::{Membership, membership};
+    let mut before = nodes_state(true);
+    let mut after = nodes_state(true);
+    assert_eq!(after.keep_legacy_history(), 2);
+    let cited = before.clock.clone();
+    for state in [&mut before, &mut after] {
+        let promote = AdminDocumentOperation::ConfigNodeEnsured {
+            node_id: node(5),
+            kind: RealmNodeKind::Management,
+        };
+        state
+            .apply_operation(&actor(node(1)), promote, Ulid::from_parts(3, 1))
+            .unwrap();
+    }
+    let promoted = |state: &AdminDocumentState| {
+        let intervals = state.node_intervals();
+        let verdict = membership(node(5), &cited, &intervals, &state.clock);
+        let kept = intervals
+            .into_iter()
+            .filter(|interval| interval.node_id == node(5));
+        (verdict, kept.collect::<Vec<_>>())
+    };
+    let (verdict, intervals) = promoted(&before);
+    assert_eq!(verdict, Membership::Open);
+    assert_eq!(intervals.len(), 2, "the first add and the promotion");
+    assert_eq!((verdict, intervals), promoted(&after));
+}
+
+#[test]
 fn clocks_compare_componentwise() {
     use crate::admin_documents::AdminDocumentClock;
     let one = AdminDocumentClock::default().with_observed(node(1), 2);

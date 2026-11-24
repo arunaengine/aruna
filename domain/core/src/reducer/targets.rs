@@ -924,7 +924,7 @@ impl AdminDocumentState {
         kept.count()
     }
 
-    /// Keeps the legacy add of `node_id` before its removal replaces the add in the config.
+    /// Keeps the legacy add of `node_id` before a removal or a new kind replaces the add.
     pub(super) fn keep_legacy_node(&mut self, node_id: &NodeId) {
         let legacy = self.legacy_adds(&self.membership_events());
         for (_, dot) in legacy
