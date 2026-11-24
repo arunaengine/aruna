@@ -298,11 +298,23 @@ impl BlobHandler {
         ))
     }
 
+    /// The lock of one hidden bucket's counter row. Other writers of the row still conflict,
+    /// so the retry loops stay.
+    fn stats_lock(&self, backend: &BackendRef, bucket: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = (self.stats_locks.lock()).expect("bucket stats locks poisoned");
+        let lock = locks
+            .entry((backend.clone(), bucket.to_string()))
+            .or_default();
+        lock.clone()
+    }
+
     pub(super) async fn release_hidden_key(&self, key: &HiddenBlobKey) -> Result<(), BlobError> {
         if !self.stats_managed(&key.backend, &key.storage_bucket) {
             return Ok(());
         }
         let marker = reservation_key(key)?;
+        let lock = self.stats_lock(&key.backend, &key.storage_bucket);
+        let _queued = lock.lock().await;
         let mut last_error = None;
         for attempt in 0..BUCKET_STATS_RETRIES {
             match self.release_key_txn(key, &marker).await {
@@ -338,6 +350,8 @@ impl BlobHandler {
             return Ok(LoadUpdate::Applied);
         }
         let marker = reservation_key(key)?;
+        let lock = self.stats_lock(backend, bucket);
+        let _queued = lock.lock().await;
         let mut last_error = None;
         for attempt in 0..BUCKET_STATS_RETRIES {
             match self
@@ -848,6 +862,8 @@ impl BlobHandler {
         if !self.stats_managed(&location.backend, &location.storage_bucket) {
             return self.clear_marker(location).await;
         }
+        let lock = self.stats_lock(&location.backend, &location.storage_bucket);
+        let _queued = lock.lock().await;
         let mut last_error = None;
         for attempt in 0..BUCKET_STATS_RETRIES {
             match self.release_marker(location).await {
@@ -1149,6 +1165,8 @@ impl BlobHandler {
             }
             return Ok(LoadUpdate::Applied);
         }
+        let lock = self.stats_lock(backend, bucket);
+        let _queued = lock.lock().await;
 
         for attempt in 0..BUCKET_STATS_RETRIES {
             match self

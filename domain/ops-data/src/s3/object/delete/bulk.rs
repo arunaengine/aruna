@@ -69,7 +69,7 @@ impl BulkDeleteOperation {
             return Ok(Next::Done(std::mem::take(&mut self.outcomes)));
         };
         let input = &self.input;
-        let operation = DeleteObjectOperation::new(DeleteObjectInput {
+        let delete = DeleteObjectInput {
             bucket: input.bucket.clone(),
             key: entry.key.clone(),
             version_id: entry.version_id,
@@ -77,14 +77,22 @@ impl BulkDeleteOperation {
             realm_id: input.realm_id,
             node_id: input.node_id,
             deleted_by: input.deleted_by,
-        })
-        .with_restrictions(input.restrictions.clone());
-        let operation = match entry.version_id.is_some() && !input.guards.is_empty() {
-            true => operation.with_fence(input.guards.clone(), Vec::new()),
-            false => operation,
         };
+        let restrictions = input.restrictions.clone();
+        let guards = (entry.version_id.is_some()).then(|| input.guards.clone());
+        let guards = guards.filter(|guards| !guards.is_empty());
+        // A lost commit conflict deletes again after a backoff; nothing moves before the commit.
+        let build = move || {
+            let operation =
+                DeleteObjectOperation::new(delete.clone()).with_restrictions(restrictions.clone());
+            match guards.clone() {
+                Some(guards) => operation.with_fence(guards, Vec::new()),
+                None => operation,
+            }
+        };
+        let seed = entry.key.clone().into_bytes();
         self.running = Some(entry);
-        Ok(Next::Call(IoCall::child(operation)))
+        Ok(Next::Call(IoCall::retry_with(build, &seed)))
     }
 }
 

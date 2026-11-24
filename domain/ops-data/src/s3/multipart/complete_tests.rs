@@ -333,9 +333,10 @@ fn refused_rolls_back() {
     // A second abort finds nothing left to do.
     assert!(operation.abort().is_empty());
 
-    // A lost conflict is the same refusal.
+    // A lost conflict past its retries is the same refusal.
     let composed = composed_location(Ulid::from_bytes([5u8; 16]));
     let mut operation = finalize_waiting(open_upload_record(&input), composed.clone());
+    operation.conflicts = CONFLICT_RETRIES;
     let conflict = StorageError::TransactionConflict;
     operation
         .next(finalize_answer(Err(conflict.into())))
@@ -347,6 +348,28 @@ fn refused_rolls_back() {
     ));
     assert_eq!(operation.composed_location, None);
     drop(composed);
+}
+
+#[test]
+fn finalize_conflict_retries() {
+    // A lost finalize conflict publishes again after a jittered backoff with the same composed
+    // object and parts; nothing is rolled back in between.
+    let input = finalize_input();
+    let composed = composed_location(Ulid::from_bytes([5u8; 16]));
+    let mut operation = finalize_waiting(open_upload_record(&input), composed.clone());
+    let conflict = StorageError::TransactionConflict;
+    let turn = operation.next(finalize_answer(Err(conflict.into())));
+    let Ok(Next::Call(IoCall::Delay(wait))) = turn else {
+        panic!("expected a backoff, got {turn:?}");
+    };
+    assert!(wait >= std::time::Duration::from_millis(25));
+    assert_eq!(operation.composed_location, Some(composed.clone()));
+    let turn = operation.next(IoResult::Woke);
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    assert_eq!(operation.state, CompleteUploadState::Finalize);
+    let child = operation.finalize_child();
+    assert_eq!(child.composed_location, Some(composed));
+    assert_eq!(operation.conflicts, 1);
 }
 
 #[test]
@@ -454,6 +477,7 @@ fn conflict_keeps_object() {
     let input = finalize_input();
     let target = composed_location(Ulid::from_bytes([5u8; 16]));
     let mut operation = finalize_waiting(in_place_record(&input, &target), target.clone());
+    operation.conflicts = CONFLICT_RETRIES;
 
     let conflict = StorageError::TransactionConflict;
     operation
@@ -1366,6 +1390,7 @@ fn conflict_recheck(epoch: u64) -> Reopened {
     let input = finalize_input();
     let location = composed_location(Ulid::from_parts(9, 9));
     let mut operation = finalize_waiting(sealed_record(&input), location);
+    operation.conflicts = CONFLICT_RETRIES;
     let conflict = StorageError::TransactionConflict;
     operation
         .next(finalize_answer(Err(conflict.into())))

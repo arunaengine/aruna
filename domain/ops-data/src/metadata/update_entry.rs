@@ -331,7 +331,10 @@ impl UpdateEntryOperation {
             .take()
             .ok_or_else(|| MetadataError::Backend("the update was already started".into()))?;
         self.stage = EntryStage::Update;
-        Ok(Next::Call(IoCall::child(operation)))
+        // A lost commit conflict plans and commits again after a backoff, as a create does.
+        let seed = operation.config.document_id.to_bytes();
+        let update = IoCall::retry_with(move || operation.fresh_copy(), &seed);
+        Ok(Next::Call(update))
     }
 
     fn updated(&mut self, result: IoResult) -> EntryTurn {

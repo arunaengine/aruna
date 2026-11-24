@@ -306,6 +306,12 @@ fn retries_commit_conflict() {
 
     let conflict = StorageError::TransactionConflict;
     let turn = operation.next(published(Err(conflict.into())));
+    // The rerun waits a jittered backoff, so writers that lost one row spread out.
+    let Ok(Next::Call(IoCall::Delay(wait))) = turn else {
+        panic!("expected a backoff, got {turn:?}");
+    };
+    assert!(wait >= Duration::from_millis(25) && wait < Duration::from_millis(50));
+    let turn = operation.next(IoResult::Woke);
 
     assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
     assert_eq!(operation.state, PutObjectState::Publish);
@@ -331,6 +337,8 @@ fn conflict_exhausts_retries() {
     let conflict = || published(Err(StorageError::TransactionConflict.into()));
     for _ in 0..CONFLICT_RETRIES {
         let turn = operation.next(conflict());
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Delay(_)))));
+        let turn = operation.next(IoResult::Woke);
         assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
     }
 
@@ -1497,11 +1505,32 @@ async fn mismatch_cleans_blob() {
     assert_eq!(count_files(Path::new(&blob_root)), 0);
 }
 
-/// A version transaction with `output` as the location it publishes.
+/// A version transaction with `output` as the new location it publishes.
 fn publishing(config: PutObjectConfig, output: BackendLocation) -> PutObjectOperation {
     let mut child = publisher(PutObjectOperation::new(config), output.clone());
     child.output = Some(output);
+    child.new_blob = true;
     child
+}
+
+#[test]
+fn existing_location_kept() {
+    // Bytes this transaction found stored already keep their location row: identical uploads
+    // then share no written row, so they do not conflict, and the read fences a reclaim.
+    let config = put_config(
+        RealmId::from_bytes([1u8; 32]),
+        Ulid::generate(),
+        iroh::SecretKey::generate().public(),
+    );
+    let output = hashed(test_location(config.user_id));
+    let mut child = publishing(config, output);
+    child.new_blob = false;
+    let turn = child.object_lookup_read(None);
+    let spaces: Vec<_> = written(&turn)
+        .iter()
+        .map(|(space, ..)| space.as_str())
+        .collect();
+    assert_eq!(spaces, [BLOB_HEAD_KEYSPACE]);
 }
 
 #[test]
@@ -1583,6 +1612,7 @@ fn history_keeps_head() {
     parent.written_location = Some(output.clone());
     let mut child = parent.publish_child();
     child.output = Some(output);
+    child.new_blob = true;
     let head = CurrentVersionPointer::new_with_generation(Ulid::generate(), 4);
     child
         .object_lookup_read(Some(head.to_bytes().unwrap().into()))
@@ -1667,6 +1697,7 @@ fn writer_reads_trail() {
         operation.stamp(1_000);
         let mut child = publisher(operation, output.clone());
         child.output = Some(output);
+        child.new_blob = true;
         // The version is not registered, so the trail is read before the head moves, in the
         // incarnation the bucket's creation row names.
         let turn = child.history_read(None);
@@ -2677,5 +2708,79 @@ mod decisions {
         let same = bucket(vec![rule.policy_ref()], 1);
         let turn = reread(vec![rule.policy_ref()], same, Some(subject_row(2)));
         assert_eq!(turn.err(), Some(PolicyGateError::Drift.into()));
+    }
+}
+
+/// A driver context on Fjall storage in `root`, with a file system blob backend. The DHT and the
+/// backend's bucket counters keep their own store, so the Fjall conflict count holds the version
+/// transactions alone.
+async fn fjall_context(root: &Path) -> DriverContext {
+    let blob_root = root.join("blobstore");
+    std::fs::create_dir_all(&blob_root).unwrap();
+    let database = root.join("database");
+    let storage_handle = storage::worker::FjallStorage::open(database.to_str().unwrap()).unwrap();
+    let side_storage = storage::memory::MemoryStorage::open();
+    let net_handle = NetHandle::new(aruna_runner::testing::local_net(), side_storage.clone())
+        .await
+        .unwrap();
+    let blob_handle = BlobHandler::new(
+        BackendConfig {
+            backend_type: Backend::FileSystem,
+            bucket_prefix: Some("aruna_".to_string()),
+            max_bucket_size: Some(100000),
+            multipart_bucket: Some("multipart".to_string()),
+            root: blob_root.to_str().unwrap().to_string(),
+            service_config: HashMap::new(),
+            timeouts: Default::default(),
+        },
+        side_storage,
+        net_handle.clone(),
+    )
+    .await
+    .unwrap();
+    DriverContext {
+        storage_handle,
+        net_handle: Some(net_handle),
+        blob_handle: Some(blob_handle),
+        graph_handle: None,
+        task_handle: None,
+        compute_handle: None,
+        outbound_handle: None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_puts_commit() {
+    // Sixteen uploads at once to distinct keys, of bytes already stored and of distinct bytes:
+    // every one commits, and neither round's version transactions lose a single conflict.
+    let dir = tempdir().unwrap();
+    let context = fjall_context(dir.path()).await;
+    let realm_id = RealmId::from_bytes([1u8; 32]);
+    let group_id = Ulid::generate();
+    let node_id = context.net_handle.as_ref().unwrap().node_id();
+    let put = |key: String, bytes: Vec<u8>| {
+        let mut config = put_config(realm_id, group_id, node_id);
+        config.quota_ceiling = None;
+        config.request.key = key;
+        config.request.content_length = Some(bytes.len() as u64);
+        let stream = tokio_util::io::ReaderStream::new(std::io::Cursor::new(bytes));
+        config.request.body = Some(BackendStream::new(stream));
+        drive(PutObjectOperation::new(config), &context)
+    };
+    let shared = b"the same bytes in every object".to_vec();
+    put("seed".to_string(), shared.clone()).await.unwrap();
+    for (round, same) in [("same", true), ("unique", false)] {
+        let before = context.storage_handle.snapshot_metrics().conflicts_total;
+        let puts = (0..16).map(|index| {
+            let bytes = match same {
+                true => shared.clone(),
+                false => format!("distinct bytes {index}").into_bytes(),
+            };
+            put(format!("{round}/{index}"), bytes)
+        });
+        let results = futures_util::future::join_all(puts).await;
+        assert!(results.iter().all(Result::is_ok), "{round}: {results:?}");
+        let conflicts = context.storage_handle.snapshot_metrics().conflicts_total - before;
+        assert_eq!(conflicts, 0, "{round} uploads conflicted");
     }
 }

@@ -179,7 +179,7 @@ impl From<IoError> for DeleteObjectError {
 
 type Turn = Result<Next<DeleteObjectResult>, DeleteObjectError>;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DeleteObjectInput {
     pub bucket: String,
     pub key: String,

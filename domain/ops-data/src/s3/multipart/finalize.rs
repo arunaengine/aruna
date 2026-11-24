@@ -159,8 +159,12 @@ impl CompleteUploadOperation {
     }
 
     /// Keyed by the location's own backend, so a rewrite of identical content only ever
-    /// replaces the copy on the backend the write resolved to.
+    /// replaces the copy on the backend the write resolved to. A row this transaction read
+    /// stays as it is: rewriting it would conflict identical uploads, and the read fences a reclaim.
     pub(super) fn write_blob_location(&mut self) -> Turn {
+        if !self.new_blob {
+            return self.read_object_lookup();
+        }
         let location = self.final_location.clone();
         let location = location.ok_or(CompleteUploadError::CompleteUploadFailed)?;
         let blake3_hash = location.get_blake3();

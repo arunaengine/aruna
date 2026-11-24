@@ -17,6 +17,7 @@ use crate::s3::usage::{
     schedule_snapshot_publish, upload_count,
 };
 use crate::s3::write_cleanup::{RollbackWrite, WriteCleanup, record_rows};
+use aruna_core::backoff::conflict_backoff;
 use aruna_core::blob_records::HeadAliasContext;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
@@ -87,6 +88,10 @@ use ulid::Ulid;
 /// Part rows read per page.
 const PART_PAGE: usize = 256;
 
+/// Bounded retries for a conflict on the finalize commit: completions in one group contend on
+/// shared counters, which is a refused transaction, not a failed request.
+const CONFLICT_RETRIES: u8 = 8;
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum CompleteUploadState {
     Init,
@@ -115,6 +120,8 @@ pub enum CompleteUploadState {
     WriteEvidence,
     /// Publishes the composed object in the finalize transaction, run as a child.
     Finalize,
+    /// Waits out a lost finalize conflict before the next finalize.
+    FinalizeBackoff,
     CheckPurgeFinalize,
     ReadBucketDefault,
     CheckSealSettings,
@@ -356,6 +363,8 @@ pub struct CompleteUploadOperation {
     close: Option<InventoryUpdate>,
     /// The reopen of the record is already planned or done.
     reset_done: bool,
+    /// Finalize runs that lost a transaction conflict.
+    conflicts: u8,
     /// Working set of a sealed composition, reserved before the piece records load. It stays
     /// until the operation drops the selected piece records.
     compose_share: Option<WorkingShare>,
@@ -435,6 +444,7 @@ impl CompleteUploadOperation {
             authority: None,
             close: None,
             reset_done: false,
+            conflicts: 0,
             compose_share: None,
             selected_parts: HashMap::new(),
             selected_bytes: 0,
@@ -986,31 +996,32 @@ impl CompleteUploadOperation {
         self.start_finalize()
     }
 
-    /// Hands the state the finalize needs to its child; the parent keeps what its cleanup needs.
+    /// Hands the state the finalize needs to its child; the parent keeps it all, so a finalize
+    /// that lost a conflict can run again.
     fn finalize_child(&mut self) -> Self {
         let mut child = Self::new(self.input.clone());
         child.finalizing = true;
         child.state = CompleteUploadState::CheckPurgeFinalize;
         child.upload_record = self.upload_record.clone();
-        child.upload_parts = std::mem::take(&mut self.upload_parts);
-        child.resolved_parts = std::mem::take(&mut self.resolved_parts);
+        child.upload_parts = self.upload_parts.clone();
+        child.resolved_parts = self.resolved_parts.clone();
         child.composed_location = self.composed_location.clone();
-        child.composite_hashes = std::mem::take(&mut self.composite_hashes);
+        child.composite_hashes = self.composite_hashes.clone();
         child.version_id = self.version_id;
         child.rocrate_limits = self.rocrate_limits.clone();
         child.restrictions = self.restrictions.clone();
-        child.gated_bucket = self.gated_bucket.take();
+        child.gated_bucket = self.gated_bucket.clone();
         child.compression = self.compression;
         child.set_hint = self.set_hint;
         child.binding = self.binding.clone();
         child.version_epoch = self.version_epoch;
         child.authority = self.authority.clone();
         child.plain = self.plain.clone();
-        child.plain_path = self.plain_path.take();
-        child.plain_version = self.plain_version.take();
-        child.plain_etag = self.plain_etag.take();
-        child.written_intent = std::mem::take(&mut self.written_intent);
-        child.version_origin = self.version_origin.take();
+        child.plain_path = self.plain_path.clone();
+        child.plain_version = self.plain_version.clone();
+        child.plain_etag = self.plain_etag.clone();
+        child.written_intent = self.written_intent.clone();
+        child.version_origin = self.version_origin.clone();
         child
     }
 
@@ -1031,6 +1042,12 @@ impl CompleteUploadOperation {
         match &error {
             CompleteUploadError::StorageError(storage) => {
                 self.recheck_pending = sealed && *storage == StorageError::TransactionConflict;
+                if *storage == StorageError::TransactionConflict
+                    && self.conflicts < CONFLICT_RETRIES
+                {
+                    self.conflicts += 1;
+                    return self.finalize_later();
+                }
                 if !storage.proves_no_commit()
                     && let Some(location) = self.composed_location.take()
                 {
@@ -1051,6 +1068,14 @@ impl CompleteUploadOperation {
             _ => {}
         }
         Err(error)
+    }
+
+    /// Spreads completions that lost one row apart; the upload id's random tail seeds the jitter.
+    fn finalize_later(&mut self) -> Turn {
+        let seed = self.input.upload_id.to_bytes();
+        let attempt = usize::from(self.conflicts.saturating_sub(1));
+        let wait = conflict_backoff(attempt, &seed[8..]);
+        self.call(CompleteUploadState::FinalizeBackoff, IoCall::Delay(wait))
     }
 
     /// The reservation of the composed object is released and the follow-up work woken once
@@ -1113,6 +1138,14 @@ impl Operation for CompleteUploadOperation {
             CompleteUploadState::SyncDroppedIntent => self.dropped_synced(result),
             CompleteUploadState::WriteEvidence => self.evidence_written(result),
             CompleteUploadState::Finalize => self.finalized(result),
+            CompleteUploadState::FinalizeBackoff => match result {
+                IoResult::Woke => self.start_finalize(),
+                other => Err(IoError::Unexpected {
+                    expected: "IoResult::Woke",
+                    got: other.label(),
+                }
+                .into()),
+            },
             CompleteUploadState::CheckPurgeFinalize => self.publication_checked(result.values()?),
             CompleteUploadState::ReadBucketDefault => self.handle_default_read(result.values()?),
             CompleteUploadState::CheckSealSettings => self.seal_settings_read(result.value()?),

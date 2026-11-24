@@ -1191,6 +1191,46 @@ async fn reuses_current_bucket() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_reservations_queue() {
+    // Sixteen writes into one hidden bucket at once reserve their slots of its counter in turn,
+    // so none of them loses a transaction conflict on the counter row.
+    let context = setup_blob_handle(1_000).await;
+    let write = |key: String| {
+        let handle = context.blob_handle.clone();
+        async move {
+            let effect = BlobEffect::Write {
+                resolved: ResolvedBackend::node_default(),
+                bucket: "bucket-a".to_string(),
+                blob: stream_from_bytes(key.as_bytes()),
+                key,
+                created_by: test_user_id(),
+                size: None,
+            };
+            handle.send_blob_effect(effect).await.into_blob()
+        }
+    };
+    let Ok(BlobEvent::WriteFinished { location: first }) = write("seed.bin".to_string()).await
+    else {
+        panic!("the first write registers the bucket")
+    };
+    let before = context.storage_handle.snapshot_metrics().conflicts_total;
+    let writes = (0..16).map(|index| write(format!("object-{index}.bin")));
+    let results = futures::future::join_all(writes).await;
+    assert!(
+        (results.iter()).all(|result| matches!(result, Ok(BlobEvent::WriteFinished { .. }))),
+        "{results:?}"
+    );
+    let conflicts = context.storage_handle.snapshot_metrics().conflicts_total - before;
+    assert_eq!(
+        conflicts, 0,
+        "reservations conflicted on the bucket counter"
+    );
+    let backend = BackendRef::node_default();
+    let load = bucket_load(&context.storage_handle, &backend, &first.storage_bucket).await;
+    assert_eq!(load, 17);
+}
+
 #[tokio::test]
 async fn hidden_bucket_registered() {
     let context = setup_blob_handle(5).await;

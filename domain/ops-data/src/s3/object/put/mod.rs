@@ -13,6 +13,7 @@ use crate::s3::usage::{
     schedule_snapshot_publish,
 };
 use crate::s3::write_cleanup::{ReleaseWrite, RollbackWrite, WriteCleanup};
+use aruna_core::backoff::conflict_backoff;
 use aruna_core::blob_records::{HeadAliasContext, dht_registration_effect, release_rows};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
@@ -84,8 +85,8 @@ fn seal_error(error: BucketKeyError) -> PutObjectError {
 
 /// Bounded retries for an SSI conflict on the metadata commit. Concurrent
 /// writes in one group contend on the shared usage counters, which is a
-/// refused transaction, not a failed request.
-const CONFLICT_RETRIES: u8 = 4;
+/// refused transaction, not a failed request. Each retry waits a jittered backoff.
+const CONFLICT_RETRIES: u8 = 8;
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum PutObjectState {
@@ -104,6 +105,8 @@ pub enum PutObjectState {
     WriteBlob,
     /// Publishes the written bytes in the version transaction, run as a child.
     Publish,
+    /// Waits out a lost publish conflict before the next publish.
+    PublishBackoff,
     /// Writes the reconcile row of the written blob in the version transaction.
     WriteCleanupRow,
     CheckPurgeFence,
@@ -978,12 +981,20 @@ impl PutObjectOperation {
         };
         if *storage == StorageError::TransactionConflict && self.conflicts < CONFLICT_RETRIES {
             self.conflicts += 1;
-            return self.start_publish();
+            return self.publish_later();
         }
         if !storage.proves_no_commit() {
             self.keep_written_blob(storage);
         }
         Err(error)
+    }
+
+    /// Spreads writers that lost one row apart; the version id's random tail seeds the jitter.
+    fn publish_later(&mut self) -> Turn {
+        let seed = self.version_id.map(|id| id.to_bytes()).unwrap_or_default();
+        let attempt = usize::from(self.conflicts.saturating_sub(1));
+        let wait = conflict_backoff(attempt, &seed[8..]);
+        self.call(PutObjectState::PublishBackoff, IoCall::Delay(wait))
     }
 
     /// A commit whose outcome is unknown may already own these bytes, so they go to the
@@ -1090,6 +1101,14 @@ impl Operation for PutObjectOperation {
             }
             PutObjectState::WriteBlob => self.handle_write_finished(result.event()?),
             PutObjectState::Publish => self.published(result),
+            PutObjectState::PublishBackoff => match result {
+                IoResult::Woke => self.start_publish(),
+                other => Err(IoError::Unexpected {
+                    expected: "IoResult::Woke",
+                    got: other.label(),
+                }
+                .into()),
+            },
             PutObjectState::ReadPlainOwner => self.plain_owner(result.value()?),
             PutObjectState::StatPlain => self.plain_stat(result.event()?),
             PutObjectState::WritePlainRecords => {
