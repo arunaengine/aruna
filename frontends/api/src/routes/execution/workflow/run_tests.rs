@@ -1,6 +1,5 @@
-//! Tests the workflow run routes through their router: start under an idempotency key, list,
-//! snapshot, tasks, logs, origin, the event stream with `after` and `Last-Event-ID`, cancel and
-//! delete, and a run driven through the real coordinator binary.
+//! Tests the workflow run routes through their router: start, list, snapshot, tasks, logs, the
+//! event stream, cancel, resume, repeat, delete, the reports, and runs through the real coordinator.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -287,6 +286,185 @@ async fn refuses_bad_runs() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+/// The response of one GET through `router`, with its headers.
+async fn fetch(
+    node: &Node,
+    auth: &AuthContext,
+    router: utoipa_axum::router::OpenApiRouter<Arc<crate::server::state::ServerState>>,
+    uri: &str,
+) -> (StatusCode, axum::http::HeaderMap, Value) {
+    let (router, _) = router.split_for_parts();
+    let router = router
+        .layer(Extension(Some(auth.clone())))
+        .layer(Extension(Option::<ValidatedBearer>::None))
+        .with_state(node.state.clone());
+    let request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    let (status, headers) = (response.status(), response.headers().clone());
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
+    (status, headers, body)
+}
+
+// Resume, repeat and the crate wait for the end of a run; every report answers from the run's
+// records without a coordinator, `compare` is its own route, and the report is a file to save.
+#[tokio::test]
+async fn serves_run_reports() {
+    let node = node(Some(Arc::new(Scripted))).await;
+    let workflow_id = workflow(&node).await;
+    let owner = node.owner.clone();
+    let start = ("POST", "/compute/workflow-runs");
+    let (_, text) = send(
+        &node,
+        &owner,
+        start,
+        &[],
+        Some(run_body(&node, &workflow_id, "Hola")),
+    )
+    .await;
+    let run_id = json_of(&text)["run_id"].as_str().unwrap().to_owned();
+    let path = format!("/compute/workflow-runs/{run_id}");
+    for action in ["resume", "repeat"] {
+        let (status, _) = send(
+            &node,
+            &owner,
+            ("POST", &format!("{path}/{action}")),
+            &[],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{action}");
+    }
+    let (status, _) = send(&node, &owner, ("GET", &format!("{path}/crate")), &[], None).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, time) = send(&node, &owner, ("GET", &format!("{path}/time")), &[], None).await;
+    assert_eq!(
+        (status, json_of(&time)["source"].as_str()),
+        (StatusCode::OK, Some("record"))
+    );
+
+    let compare = "/compute/workflow-runs/compare";
+    let (status, _) = send(&node, &owner, ("GET", compare), &[], None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "compare is no run id");
+    let both = format!("{compare}?first={run_id}&second={run_id}");
+    let (status, compared) = send(&node, &owner, ("GET", &both), &[], None).await;
+    assert_eq!(status, StatusCode::OK, "{compared}");
+    assert_eq!(json_of(&compared)["same_version"], true);
+    let unknown = format!(
+        "{compare}?first={run_id}&second={}",
+        ulid::Ulid::from_bytes([9; 16])
+    );
+    let (status, _) = send(&node, &owner, ("GET", &unknown), &[], None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = send(&node, &node.stranger, ("GET", &both), &[], None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, _) = send(
+        &node,
+        &owner,
+        ("POST", &format!("{path}/cancel")),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let (status, _, built) = fetch(&node, &owner, super::router(), &format!("{path}/crate")).await;
+    assert_eq!(status, StatusCode::OK, "{built}");
+    assert_eq!(
+        built["@context"][0],
+        "https://w3id.org/ro/crate/1.2/context"
+    );
+    let graph = built["@graph"].as_array().unwrap();
+    let root = graph.iter().find(|entity| entity["@id"] == "./").unwrap();
+    assert_eq!(root["mentions"]["@id"], format!("#workflow-run-{run_id}"));
+    assert_eq!(root["conformsTo"].as_array().unwrap().len(), 3, "{root}");
+    let (status, headers, report) =
+        fetch(&node, &owner, super::router(), &format!("{path}/report")).await;
+    assert_eq!(status, StatusCode::OK);
+    let header = |name: header::HeaderName| headers[name].to_str().unwrap().to_owned();
+    assert_eq!(header(header::CONTENT_TYPE), "text/html; charset=utf-8");
+    assert_eq!(
+        header(header::CONTENT_DISPOSITION),
+        format!("attachment; filename=\"run-{run_id}-report.html\"")
+    );
+    assert_eq!(header(header::X_CONTENT_TYPE_OPTIONS), "nosniff");
+    assert_eq!(header(header::CONTENT_SECURITY_POLICY), "sandbox");
+    assert!(report.as_str().unwrap().contains(&run_id));
+    let (status, _) = send(
+        &node,
+        &owner,
+        ("GET", &format!("{path}/tasks/1/why")),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, changes) = send(
+        &node,
+        &owner,
+        ("GET", &format!("{path}/changes")),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(
+        (status, json_of(&changes)["changed"].as_bool()),
+        (StatusCode::OK, Some(false))
+    );
+
+    let (status, resumed) = send(
+        &node,
+        &owner,
+        ("POST", &format!("{path}/resume")),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{resumed}");
+    let resumed = json_of(&resumed);
+    assert_eq!(
+        (resumed["lineage"].as_str(), resumed["state"].as_str()),
+        (Some(run_id.as_str()), Some("queued"))
+    );
+    assert_ne!(resumed["run_id"].as_str(), Some(run_id.as_str()));
+    let (status, _) = send(
+        &node,
+        &owner,
+        ("POST", &format!("{path}/repeat")),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let (status, _) = send(
+        &node,
+        &node.stranger,
+        ("POST", &format!("{path}/repeat")),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let runs = crate::routes::execution::runs::router();
+    let (status, _, link) = fetch(&node, &owner, runs, &format!("/compute/runs/{run_id}")).await;
+    assert_eq!(
+        (status, link["run_id"].as_str()),
+        (StatusCode::OK, Some(run_id.as_str())),
+        "{link}"
+    );
+    let runs = crate::routes::execution::runs::router();
+    let (status, ..) = fetch(
+        &node,
+        &node.stranger,
+        runs,
+        &format!("/compute/runs/{run_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
 // The `task` event and the task route give the same fields, so the portal merges them alike.
 #[test]
 fn event_matches_route() {
@@ -312,20 +490,8 @@ fn event_matches_route() {
     assert_eq!(event, route);
 }
 
-/// A run of a CWL workflow through the real coordinator binary and the run's own operations.
-/// This node has no compute backend, so the coordinator's task cannot be placed: the run must
-/// still record the task, store its log, end as failed with the reason and close its stream.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "needs the aruna-coordinator binary"]
-async fn drives_real_run() {
-    use aruna_ops_work::jobs::lifecycle::submit_external::IngressNode;
-    use aruna_ops_work::workflows::runs::log::LoadLogOperation;
-    use aruna_ops_work::workflows::runs::run::{
-        AnswerCallOperation, ApplyEventOperation, CallNode, FinishRunOperation, Inbound,
-        PrepareRunOperation, Prepared, SessionOperation, inbound,
-    };
-    use aruna_runner::driver::drive;
-
+/// The node and a CWL hello workflow for runs through the real coordinator binary.
+async fn real_node() -> (Node, String) {
     let settings = aruna_workflow::WorkflowSettings {
         binary: Some(super::tests::coordinator_binary()),
         ..aruna_workflow::WorkflowSettings::default()
@@ -340,21 +506,38 @@ async fn drives_real_run() {
     let workflow_id = created["workflow_id"].as_str().unwrap().to_owned();
     bind_jobs(&node).await;
     let context = node.state.get_ctx();
-    let owner = node.owner.clone();
     aruna_runner::testing::seed_bucket(
         &context,
         "results",
         node.group_id,
-        owner.user_id,
+        node.owner.user_id,
         Vec::new(),
     )
     .await;
+    (node, workflow_id)
+}
+
+/// One run through the real coordinator and the run's own operations, to its end. This node has
+/// no compute backend, so the coordinator's task cannot be placed and the run fails.
+async fn real_run(
+    node: &Node,
+    workflow_id: &str,
+) -> aruna_core::structs::execution::workflow_run::WorkflowRunRecord {
+    use aruna_ops_work::jobs::lifecycle::submit_external::IngressNode;
+    use aruna_ops_work::workflows::runs::run::{
+        AnswerCallOperation, ApplyEventOperation, CallNode, FinishRunOperation, Inbound,
+        PrepareRunOperation, Prepared, SessionOperation, inbound,
+    };
+    use aruna_runner::driver::drive;
+
+    let context = node.state.get_ctx();
+    let owner = node.owner.clone();
     let (status, text) = send(
-        &node,
+        node,
         &owner,
         ("POST", "/compute/workflow-runs"),
         &[],
-        Some(run_body(&node, &workflow_id, "Hola")),
+        Some(run_body(node, workflow_id, "Hola")),
     )
     .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{text}");
@@ -386,7 +569,7 @@ async fn drives_real_run() {
             fresh: Default::default(),
         },
     };
-    let ended = loop {
+    loop {
         let frame = drive(SessionOperation::receive(run_id), &context).await;
         let frame = frame
             .expect("the session answers")
@@ -409,19 +592,111 @@ async fn drives_real_run() {
             }
             other => panic!("an unexpected frame {other:?}"),
         }
-    };
+    }
+}
+
+/// A run of a CWL workflow through the real coordinator binary and the run's own operations.
+/// The run must still record the task, store its log, end as failed with the reason and close
+/// its stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs the aruna-coordinator binary"]
+async fn drives_real_run() {
+    use aruna_ops_work::workflows::runs::log::LoadLogOperation;
+    use aruna_runner::driver::drive;
+
+    let (node, workflow_id) = real_node().await;
+    let ended = real_run(&node, &workflow_id).await;
+    let run_id = ended.run_id;
     assert_eq!(ended.state, RunState::Failed, "{ended:?}");
     assert!(ended.error.is_some(), "{ended:?}");
-    let pages = drive(LoadLogOperation::new(run_id), &context)
+    let pages = drive(LoadLogOperation::new(run_id), &node.state.get_ctx())
         .await
         .unwrap();
     assert!(!pages.is_empty(), "the run log holds the start of the run");
     let path = format!("/compute/workflow-runs/{run_id}");
-    let (_, stream) = send(&node, &owner, ("GET", &format!("{path}/events")), &[], None).await;
+    let (_, stream) = send(
+        &node,
+        &node.owner,
+        ("GET", &format!("{path}/events")),
+        &[],
+        None,
+    )
+    .await;
     let kinds: Vec<String> = frames(&stream)
         .into_iter()
         .map(|(_, kind, _)| kind)
         .collect();
     assert!(kinds.iter().any(|kind| kind == "task"), "{stream}");
     assert_eq!(kinds.last().map(String::as_str), Some("state"), "{stream}");
+}
+
+/// The reports of two recorded runs through report sessions of the real coordinator binary:
+/// time, why, compare, changes, the merged crate and the HTML report.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs the aruna-coordinator binary"]
+async fn reports_real_runs() {
+    let (node, workflow_id) = real_node().await;
+    let owner = node.owner.clone();
+    let first = real_run(&node, &workflow_id).await.run_id;
+    let second = real_run(&node, &workflow_id).await.run_id;
+    let path = format!("/compute/workflow-runs/{second}");
+    let get = |rest: String| (String::from("GET"), format!("{path}{rest}"));
+
+    let (method, uri) = get("/time".into());
+    let (status, time) = send(&node, &owner, (&method, &uri), &[], None).await;
+    let time = json_of(&time);
+    assert_eq!(status, StatusCode::OK, "{time}");
+    assert_eq!(time["source"], "uwe", "{time}");
+    assert!(
+        time["started"].is_number() && time["ended"].is_number(),
+        "{time}"
+    );
+
+    let (_, tasks) = send(&node, &owner, ("GET", &format!("{path}/tasks")), &[], None).await;
+    let task = json_of(&tasks)["items"][0]["task_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (method, uri) = get(format!("/tasks/{task}/why"));
+    let (status, why) = send(&node, &owner, (&method, &uri), &[], None).await;
+    let why = json_of(&why);
+    assert_eq!(status, StatusCode::OK, "{why}");
+    assert!(
+        ["ran", "reran"].contains(&why["verdict"].as_str().unwrap()),
+        "{why}"
+    );
+
+    let compare = format!("/compute/workflow-runs/compare?first={first}&second={second}");
+    let (status, compared) = send(&node, &owner, ("GET", &compare), &[], None).await;
+    let compared = json_of(&compared);
+    assert_eq!(status, StatusCode::OK, "{compared}");
+    assert!(compared["comparison"].is_object(), "{compared}");
+
+    let (method, uri) = get("/changes".into());
+    let (status, changes) = send(&node, &owner, (&method, &uri), &[], None).await;
+    let changes = json_of(&changes);
+    assert_eq!(status, StatusCode::OK, "{changes}");
+    assert!(changes["recorded"].is_object(), "{changes}");
+
+    let (method, uri) = get("/crate".into());
+    let (status, built) = send(&node, &owner, (&method, &uri), &[], None).await;
+    let built = json_of(&built);
+    assert_eq!(status, StatusCode::OK, "{built}");
+    let graph = built["@graph"].as_array().unwrap();
+    let action = format!("#workflow-run-{second}");
+    assert!(
+        graph.iter().any(|entity| entity["@id"] == action.as_str()),
+        "{built}"
+    );
+    assert!(
+        graph.iter().any(|entity| entity["@id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("#engine/"))),
+        "the crate is uwe's: {built}"
+    );
+
+    let (method, uri) = get("/report".into());
+    let (status, html) = send(&node, &owner, (&method, &uri), &[], None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("<html"), "{}", &html[..html.len().min(200)]);
 }

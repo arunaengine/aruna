@@ -1,5 +1,5 @@
 //! Serves workflow runs: start one under an idempotency key, list, read the snapshot and the
-//! graph, find the origin, cancel and delete.
+//! graph, find the origin, cancel, resume, repeat and delete.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -8,6 +8,7 @@ use std::sync::Arc;
 use aruna_core::structs::execution::workflow_run::{RunOutput, RunState};
 use aruna_ops_work::workflows::runs::admit::{PinnedInput, RunRequest, StartRunOperation};
 use aruna_ops_work::workflows::runs::cancel::{CancelRunOperation, DeleteRunOperation};
+use aruna_ops_work::workflows::runs::control::{Follow, FollowRunOperation};
 use aruna_ops_work::workflows::runs::reads::{
     ListRunsOperation, RunFilter, RunGraphOperation, RunOriginOperation, RunSnapshotOperation,
 };
@@ -41,6 +42,8 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(run_graph))
         .routes(routes!(run_origin))
         .routes(routes!(cancel_run))
+        .routes(routes!(resume_run))
+        .routes(routes!(repeat_run))
 }
 
 /// The run id of a path; one that is no ULID names no run.
@@ -478,4 +481,103 @@ pub async fn cancel_run(
         StatusCode::ACCEPTED,
         Json(WorkflowRunBody::from(&cancelled.record)),
     ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/compute/workflow-runs/{run_id}/resume",
+    tag = "compute/workflow-runs",
+    summary = "Resume a workflow run",
+    description = r#"Starts a new run of the lineage that replays the run log of an ended run.
+
+**Authentication**: realm bearer token with WRITE on the group's workflows.
+
+**Behavior**
+- The new run keeps the lineage, workflow version, values, inputs, output and crate setting of
+  the run it resumes, and names it as `resumes`.
+- Its coordinator gets the run logs of the lineage, so tasks that finished there are reused
+  instead of run again.
+- Admission checks the same rights as a new start.
+
+**Errors**
+- 404 for an unknown run or one the caller cannot read.
+- 409 while the run is queued, planning, running or cancelling."#,
+    params(("run_id" = String, Path, description = "Run id, as a 26-character ULID")),
+    responses(
+        (status = 202, description = "The new run, queued", body = WorkflowRunBody, example = json!({
+            "run_id": "01K8W2B0000000000000000000", "group_id": "01JABCDEF0123456789ABCDEFG",
+            "workflow_id": "01K8W1B3D5F7H9KMQ1S3V5X7Z2", "version": "1", "state": "queued",
+            "node_id": "4f0c9d1e2b3a495867788990aabbccddeeff00112233445566778899aabbccdd",
+            "created_at": "2026-11-24T09:00:00+00:00", "finished_at": null,
+            "created_by": "01K8W1A0000000000000000000", "error": null,
+            "lineage": "01K8W2A0000000000000000000", "workflow_name": "hello", "local_only": false
+        })),
+        (status = 403, description = "No WRITE on the group's workflows", body = ErrorResponse),
+        (status = 404, description = "Unknown, or not visible to the caller", body = ErrorResponse),
+        (status = 409, description = "The run has not ended", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn resume_run(
+    State(state): State<Arc<ServerState>>,
+    RealmAuth(auth): RealmAuth,
+    Path(run): Path<String>,
+) -> ServerResult<(StatusCode, Json<WorkflowRunBody>)> {
+    follow(&state, &auth, &run, Follow::Resume).await
+}
+
+#[utoipa::path(
+    post,
+    path = "/compute/workflow-runs/{run_id}/repeat",
+    tag = "compute/workflow-runs",
+    summary = "Repeat a workflow run",
+    description = r#"Starts a new run of the lineage from the same sources, values, inputs and images.
+
+**Authentication**: realm bearer token with WRITE on the group's workflows.
+
+**Behavior**
+- The new run keeps the lineage, workflow version with its pinned images, values, inputs,
+  output and crate setting of the run it repeats, and names it as `repeats`.
+- Its tasks use a cache of their own, so every task runs again and no earlier result is reused.
+- Admission checks the same rights as a new start.
+
+**Errors**
+- 404 for an unknown run or one the caller cannot read.
+- 409 while the run is queued, planning, running or cancelling."#,
+    params(("run_id" = String, Path, description = "Run id, as a 26-character ULID")),
+    responses(
+        (status = 202, description = "The new run, queued", body = WorkflowRunBody, example = json!({
+            "run_id": "01K8W2C0000000000000000000", "group_id": "01JABCDEF0123456789ABCDEFG",
+            "workflow_id": "01K8W1B3D5F7H9KMQ1S3V5X7Z2", "version": "1", "state": "queued",
+            "node_id": "4f0c9d1e2b3a495867788990aabbccddeeff00112233445566778899aabbccdd",
+            "created_at": "2026-11-24T09:00:00+00:00", "finished_at": null,
+            "created_by": "01K8W1A0000000000000000000", "error": null,
+            "lineage": "01K8W2A0000000000000000000", "workflow_name": "hello", "local_only": false
+        })),
+        (status = 403, description = "No WRITE on the group's workflows", body = ErrorResponse),
+        (status = 404, description = "Unknown, or not visible to the caller", body = ErrorResponse),
+        (status = 409, description = "The run has not ended", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn repeat_run(
+    State(state): State<Arc<ServerState>>,
+    RealmAuth(auth): RealmAuth,
+    Path(run): Path<String>,
+) -> ServerResult<(StatusCode, Json<WorkflowRunBody>)> {
+    follow(&state, &auth, &run, Follow::Repeat).await
+}
+
+async fn follow(
+    state: &ServerState,
+    auth: &aruna_core::structs::identity::auth::AuthContext,
+    run: &str,
+    how: Follow,
+) -> ServerResult<(StatusCode, Json<WorkflowRunBody>)> {
+    let node = (state.get_node_id(), state.get_realm_id());
+    let follow = FollowRunOperation::new(auth, node, run_id(run)?, how);
+    let record = drive(follow, &state.get_ctx())
+        .await
+        .map_err(catalog_error)?;
+    Ok((StatusCode::ACCEPTED, Json(WorkflowRunBody::from(&record))))
 }

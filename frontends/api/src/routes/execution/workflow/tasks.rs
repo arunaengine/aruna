@@ -32,7 +32,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
 }
 
 /// The task number of a path; one that is no number names no task.
-fn task_id(text: &str) -> Result<u64, ServerError> {
+pub(super) fn task_id(text: &str) -> Result<u64, ServerError> {
     text.parse().map_err(|_| ServerError::NotFound)
 }
 

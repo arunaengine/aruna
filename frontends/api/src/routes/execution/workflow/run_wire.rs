@@ -283,6 +283,37 @@ pub struct RunEventsQuery {
     pub after: Option<u64>,
 }
 
+/// The two runs a comparison takes.
+#[derive(Clone, Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct CompareQuery {
+    /// The first run, as a 26-character ULID.
+    pub first: String,
+    /// The second run, as a 26-character ULID.
+    pub second: String,
+}
+
+/// Why a task ran, ran again or reused a cached result.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct WhyReportBody {
+    pub run_id: String,
+    pub task_id: String,
+    /// `cached`, `reran` or `ran`.
+    pub verdict: String,
+    pub summary: String,
+    pub cache_key: Option<String>,
+    /// The task runs without network, reads every input by content and names a pinned image.
+    pub deterministic: Option<bool>,
+    /// One entry per difference, each with a `field` and, where known, `before` and `after`.
+    #[schema(value_type = Vec<Object>)]
+    pub changes: Vec<Value>,
+    /// The earlier run and task of the lineage that uwe compared with.
+    #[schema(value_type = Option<Object>)]
+    pub earlier: Option<Value>,
+    /// `uwe` for uwe's comparison, `record` for an answer from the task's record.
+    pub source: String,
+}
+
 fn node_text(node: Option<aruna_core::id::NodeId>) -> Option<String> {
     node.map(|node| node.to_string())
 }

@@ -5,6 +5,7 @@
 
 pub mod events;
 pub mod registry;
+pub mod reports;
 pub mod run_wire;
 pub mod runs;
 pub mod tasks;
@@ -35,6 +36,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .merge(tools::router())
         .merge(runs::router())
         .merge(tasks::router())
+        .merge(reports::router())
         .merge(events::router())
 }
 
