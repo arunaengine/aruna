@@ -227,3 +227,7 @@ impl Operation for AppletAccessOperation {
         matches!(error, AppletError::NotFound | AppletError::Forbidden)
     }
 }
+
+#[cfg(test)]
+#[path = "flow_tests.rs"]
+mod flow_tests;
