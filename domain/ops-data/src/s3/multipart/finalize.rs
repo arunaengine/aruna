@@ -443,11 +443,16 @@ impl CompleteUploadOperation {
         self.call(CompleteUploadState::ReadUploadRecord, read)
     }
 
-    /// A concurrent delete of the record conflicts with this read, so a record is counted
-    /// closed once.
+    /// Publishes only while the record is still this attempt's completion: a purge that aborted
+    /// the upload or a takeover of the lease ends it here, and the reopen leaves their record be.
+    /// A concurrent delete of the record conflicts with this read, so it is counted closed once.
     pub(super) fn upload_record_read(&mut self, value: Option<Value>) -> Turn {
-        if value.is_none() {
-            return self.delete_records();
+        let value = value.ok_or(CompleteUploadError::NoSuchUpload)?;
+        let record = MultipartUpload::from_bytes(value.as_ref())?;
+        if record.status != MultipartUploadStatus::Completing
+            || record.completing_since_ms != Some(self.input.now_ms)
+        {
+            return Err(CompleteUploadError::UploadNotOpen);
         }
         let count = upload_count(&self.input.bucket, -1);
         self.call(CompleteUploadState::CountUpload, count)

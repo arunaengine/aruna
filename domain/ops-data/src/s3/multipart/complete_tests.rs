@@ -373,6 +373,38 @@ fn finalize_conflict_retries() {
 }
 
 #[test]
+fn purged_never_publishes() {
+    // A purge that aborted the upload while the finalize waited out a conflict, or an attempt
+    // that took the lease over, ends the retried finalize before it publishes.
+    let input = finalize_input();
+    let composed = composed_location(Ulid::from_bytes([5u8; 16]));
+    let mut operation = finalize_waiting(open_upload_record(&input), composed);
+    let conflict = StorageError::TransactionConflict;
+    let turn = operation.next(finalize_answer(Err(conflict.into())));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Delay(_)))));
+    let turn = operation.next(IoResult::Woke);
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    let mut child = operation.finalize_child();
+    let gone = child.upload_record_read(None);
+    assert_eq!(gone.err(), Some(CompleteUploadError::NoSuchUpload));
+    let mut record = open_upload_record(&input);
+    for (status, since) in [
+        (MultipartUploadStatus::Aborting, Some(TEST_NOW_MS)),
+        (MultipartUploadStatus::Completing, Some(TEST_NOW_MS + 1)),
+    ] {
+        (record.status, record.completing_since_ms) = (status, since);
+        let row = Some(Value::from(record.to_bytes().unwrap()));
+        let other = child.upload_record_read(row);
+        assert_eq!(other.err(), Some(CompleteUploadError::UploadNotOpen));
+    }
+    record.completing_since_ms = Some(TEST_NOW_MS);
+    let own = child.upload_record_read(Some(Value::from(record.to_bytes().unwrap())));
+    assert!(own.is_ok());
+    let turn = operation.next(finalize_answer(Err(CompleteUploadError::NoSuchUpload)));
+    assert_eq!(turn.err(), Some(CompleteUploadError::NoSuchUpload));
+}
+
+#[test]
 fn commit_keeps_composed() {
     // A possibly-landed finalize commit owns the composed object, so it goes to
     // reconciliation instead of being deleted here.
