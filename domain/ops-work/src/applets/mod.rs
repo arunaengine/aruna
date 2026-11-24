@@ -13,6 +13,7 @@ pub mod identity;
 pub mod intake;
 pub mod reads;
 pub mod release;
+pub mod replica;
 pub mod runs;
 pub mod visits;
 

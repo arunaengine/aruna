@@ -18,6 +18,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::routing::NodeRouting;
 use ulid::Ulid;
 
+use crate::applets::replica::StoreAppletOperation;
 use crate::jobs::lifecycle::admit::forwarded::AdmitForwardedOperation;
 use crate::jobs::lifecycle::closure::{
     AnswerClosureOperation, ClosureError, ServeClosureOperation,
@@ -87,6 +88,8 @@ enum Asked {
     Page,
     /// The run's node hands this holder a copy of a run and its log pages.
     RunLog,
+    /// An applet's host node hands this holder a copy of the applet.
+    Applet,
     Serve,
 }
 
@@ -198,6 +201,10 @@ impl MetadataPeerOperation {
                 let store = StoreReplicaOperation::new(peer, self.local, run, first_page, pages);
                 self.ask(Asked::RunLog, store)
             }
+            Message::StoreApplet { applet } => {
+                let store = StoreAppletOperation::new(peer, self.local, applet);
+                self.ask(Asked::Applet, store)
+            }
             message => {
                 let serving = ServeNode {
                     local: serving,
@@ -273,6 +280,9 @@ impl Operation for MetadataPeerOperation {
             }
             Asked::RunLog => Message::RunLogStored {
                 result: result.child::<u32, MetadataReadError>()?,
+            },
+            Asked::Applet => Message::AppletStored {
+                result: result.child::<u64, MetadataReadError>()?,
             },
             Asked::Serve => {
                 let served = result.child::<ServedReply, IoError>()?;
