@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod builds;
+pub mod domains;
 pub mod edge;
 pub mod lifecycle;
 pub mod node;
@@ -40,6 +41,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .merge(review::router())
         .merge(source::router())
         .merge(builds::router())
+        .merge(domains::router())
         .merge(edge::router())
         .merge(preview::router())
         .merge(signin::router())

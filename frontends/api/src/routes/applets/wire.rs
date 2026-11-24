@@ -443,7 +443,7 @@ fn version_body(entry: &VersionRef) -> VersionBody {
     }
 }
 
-fn domain_body(domain: &CustomDomain) -> DomainBody {
+pub(super) fn domain_body(domain: &CustomDomain) -> DomainBody {
     DomainBody {
         host: domain.host.clone(),
         state: match domain.state {

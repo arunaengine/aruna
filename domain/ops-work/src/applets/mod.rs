@@ -6,6 +6,7 @@ pub mod backends;
 pub mod build;
 pub mod change;
 pub mod create;
+pub mod domains;
 pub mod draft;
 pub mod identity;
 pub mod reads;

@@ -244,6 +244,10 @@ pub(crate) mod tests {
         ("DELETE", "/applets/{applet_id}/drafts/{build_id}"),
         ("POST", "/applets/{applet_id}/drafts/{build_id}/keep"),
         ("GET", "/applets/{applet_id}/versions/{version}/diff"),
+        ("GET", "/applets/{applet_id}/domains"),
+        ("POST", "/applets/{applet_id}/domains"),
+        ("DELETE", "/applets/{applet_id}/domains/{domain}"),
+        ("POST", "/applets/{applet_id}/domains/{domain}/verify"),
         ("GET", "/edge/v1/hosts/{host}"),
         (
             "GET",
