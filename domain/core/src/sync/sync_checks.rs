@@ -24,6 +24,7 @@ use crate::structs::placement::policy::document::{
 use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
 use crate::structs::storage::node_info::NodeInfoDocument;
 use crate::structs::storage::usage::{NodeUsageSnapshot, usage_node_id};
+use crate::structs::sync_quarantine::SyncQuarantineRecord;
 use crate::user::id::UserId;
 
 /// Validates a replicated node-usage snapshot against its target: the payload
@@ -235,6 +236,23 @@ pub fn validate_node_upsert(
         ));
     }
     Ok(document)
+}
+
+/// The node info document a quarantined upsert carries when this version accepts it, as one
+/// an older version could not read: its publisher owns the node and the document decodes.
+pub fn quarantined_node_info(
+    record: &SyncQuarantineRecord,
+) -> Option<(DocumentTarget, NodeInfoDocument, Vec<u8>)> {
+    let event = record.decoded_event()?;
+    if !matches!(event.target(), DocumentTarget::NodeInfo { .. }) {
+        return None;
+    }
+    shared_verdict(record.identity.topic, record.identity.actor, &event).ok()?;
+    let DocumentEvent::Upsert { target, bytes, .. } = event else {
+        return None;
+    };
+    let document = validate_node_upsert(&target, &bytes).ok()?;
+    Some((target, document, bytes))
 }
 
 /// Whether an incoming advertisement replaces the stored one. Undecodable

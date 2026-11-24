@@ -16,7 +16,7 @@ use super::fixtures::{
 };
 use super::followups::{FollowUpNode, QueuedApply, followup_id, followup_row};
 use super::links::LinkPlan;
-use super::quarantine::CursorEvidencePlan;
+use super::quarantine::{CursorEvidencePlan, SupersededInfoPlan};
 use super::reads::{dependency_available, relay_allowed};
 use super::registry::{
     DeleteRegistryPlan, DocumentLifecyclePlan, GraphLifecyclePlan, PidMappingPlan,
@@ -56,8 +56,8 @@ use crate::structs::placement::policy::{PlacementPolicy, PlacementSelector, Veri
 use crate::structs::placement::record::{LabelMatch, METADATA_HANDLE, PlacementRef};
 use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
 use crate::structs::sync_quarantine::{
-    QUARANTINE_MAX_RECORDS, SyncQuarantineIdentity, SyncQuarantineUsage, SyncRejection,
-    quarantine_usage_entry,
+    QUARANTINE_MAX_RECORDS, SyncQuarantineIdentity, SyncQuarantineRecord, SyncQuarantineUsage,
+    SyncRejection, quarantine_row_entry, quarantine_usage_entry,
 };
 use crate::structured_id::{BucketId, MetaResourceId, PlacementHandle, StructuredId};
 use crate::types::{Key, KeySpace, Value};
@@ -876,6 +876,67 @@ fn full_holds_cursor() {
     let ran = run(plan, &stored);
     assert!(ran.unchanged());
     assert!(!ran.output());
+}
+
+#[test]
+fn superseded_info_cleared() {
+    // An applied node info upsert drops the earlier quarantined advertisements of its publisher
+    // for that node and releases their usage; a later one and another node's stay.
+    let info = |node_id| DocumentTarget::NodeInfo {
+        realm_id: realm(),
+        node_id,
+    };
+    let row = |seq: u64, target: DocumentTarget| {
+        let event = DocumentEvent::Upsert {
+            event_id: Ulid::from_parts(seq, 1),
+            target,
+            bytes: vec![0xff; 4],
+            change: change(DocumentChangeKind::Upsert, PlacementRef::NIL),
+        };
+        let identity = SyncQuarantineIdentity {
+            actor_seq: seq,
+            ..identity()
+        };
+        let rejection = SyncRejection::new(identity, event, "invalid node info document");
+        let record = SyncQuarantineRecord::new(identity, rejection.evidence, &rejection.reason, 1);
+        quarantine_row_entry(&record).unwrap()
+    };
+    let other = iroh::SecretKey::from_bytes(&[8; 32]).public();
+    let rows = [
+        row(3, info(node())),
+        row(9, info(node())),
+        row(2, info(other)),
+    ];
+    let total: u64 = rows.iter().map(|(_, _, value)| value.len() as u64).sum();
+    let usage = SyncQuarantineUsage {
+        records: 3,
+        bytes: total,
+    };
+    let mut stored = with_row(nothing(), quarantine_usage_entry(usage).unwrap());
+    for row in rows.clone() {
+        stored = with_row(stored, row);
+    }
+    let applied = SyncQuarantineIdentity {
+        actor_seq: 5,
+        ..identity()
+    };
+    let plan = SupersededInfoPlan {
+        identity: applied,
+        target: info(node()),
+    };
+    assert_eq!(plan.transaction(), TransactionMode::Write);
+    let ran = run(plan.clone(), &stored);
+    let (space, key, value) = &rows[0];
+    assert_eq!(ran.deletes, vec![(space.clone(), key.clone())]);
+    let released = SyncQuarantineUsage {
+        records: 2,
+        bytes: total - value.len() as u64,
+    };
+    assert_eq!(ran.writes, vec![quarantine_usage_entry(released).unwrap()]);
+    assert!(
+        run(plan, &nothing()).unchanged(),
+        "nothing quarantined changes nothing"
+    );
 }
 
 #[test]

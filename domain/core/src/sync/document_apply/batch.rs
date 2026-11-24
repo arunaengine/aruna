@@ -14,6 +14,7 @@ use super::create::PendingCreateApply;
 use super::distribution::{DistributionPlan, Handled, RetryParkedPlan};
 use super::events::{ApplyEventPlan, ApplyOutcome, family_target};
 use super::followups::{FollowUpNode, QueuedApply};
+use super::quarantine::SupersededInfoPlan;
 use super::reconcile::net_answer;
 use super::validate::{ConfigSnapshot, ValidateAdminPlan};
 use super::{ApplyError, plan_call};
@@ -89,7 +90,10 @@ enum Wait {
     /// The last run was flushed; the deferred admin events come next.
     FlushedLast,
     Checked(Box<AdminItem>),
-    Applied,
+    /// An event applies; a node info upsert then clears the quarantine rows it made obsolete.
+    Applied(Option<Box<SupersededInfoPlan>>),
+    /// The obsolete quarantine rows of an applied node info upsert are dropped.
+    Cleared,
     /// The stored Git record of an applied event is being counted.
     GitNoted,
     AdminApplied(Box<AdminItem>),
@@ -258,6 +262,16 @@ impl ApplyBatchOperation {
                 self.call(Wait::Checked(Box::new(item)), check)
             }
             event => {
+                let cleanup = match &event {
+                    DocumentEvent::Upsert {
+                        target: target @ DocumentTarget::NodeInfo { .. },
+                        ..
+                    } => Some(Box::new(SupersededInfoPlan {
+                        identity,
+                        target: target.clone(),
+                    })),
+                    _ => None,
+                };
                 let plan = ApplyEventPlan {
                     topic_id: self.topic_id,
                     actor_id: actor,
@@ -266,7 +280,7 @@ impl ApplyBatchOperation {
                     event,
                 };
                 let call = self.apply_call(plan, identity);
-                self.call(Wait::Applied, call)
+                self.call(Wait::Applied(cleanup), call)
             }
         }
     }
@@ -548,12 +562,20 @@ impl Operation for ApplyBatchOperation {
                 let validation = self.checked(result)?;
                 self.on_checked(*item, validation)
             }
-            Wait::Applied => {
+            Wait::Applied(cleanup) => {
                 let outcome = result.child::<ApplyOutcome, ApplyError>()??;
+                let applied = matches!(outcome, ApplyOutcome::Applied { .. });
                 match self.on_event(outcome) {
                     Some(document_id) => self.note_git_record(document_id),
-                    None => self.advance(),
+                    None => match cleanup.filter(|_| applied) {
+                        Some(plan) => self.call(Wait::Cleared, plan_call(*plan)),
+                        None => self.advance(),
+                    },
                 }
+            }
+            Wait::Cleared => {
+                result.child::<(), ApplyError>()??;
+                self.advance()
             }
             Wait::GitNoted => match net_answer(result, "DocumentNetEvent::GitRecordNoted")? {
                 DocumentNetEvent::GitRecordNoted => self.advance(),

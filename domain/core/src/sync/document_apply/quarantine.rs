@@ -9,12 +9,15 @@ use tracing::warn;
 
 use super::registry::Row;
 use super::{ApplyError, Step, invalid};
+use crate::document::DocumentTarget;
 use crate::keyspaces::{QUARANTINE_USAGE_KEYSPACE, SYNC_QUARANTINE_KEYSPACE};
 use crate::row_plan::{NeedsRows, PlanRows, PlanStop, Planned, RowPlan};
 use crate::structs::sync_quarantine::{
-    QUARANTINE_USAGE_KEY, SyncQuarantineCapacity, SyncQuarantineError, SyncQuarantineInput,
-    SyncQuarantineUsage, SyncRejection, build_quarantine_entries, quarantine_usage_entry,
+    QUARANTINE_USAGE_KEY, SyncQuarantineCapacity, SyncQuarantineError, SyncQuarantineIdentity,
+    SyncQuarantineInput, SyncQuarantineRecord, SyncQuarantineUsage, SyncRejection,
+    build_quarantine_entries, quarantine_usage_entry,
 };
+use crate::types::{Key, KeySpace};
 
 /// Evidence rows for permanently rejected events, chained through the usage total and
 /// deduplicated by transport identity. `None` means the store is full: cursors stay unwritten so
@@ -96,6 +99,70 @@ pub fn quarantine_entries(
     let mut entries = pending.into_values().collect::<Vec<_>>();
     entries.push(quarantine_usage_entry(usage).map_err(invalid)?);
     Ok(Some(entries))
+}
+
+/// The rows a change deletes and writes.
+type RowChanges = (Vec<(KeySpace, Key)>, Vec<Row>);
+
+/// Deletes the quarantine rows of earlier node info upserts the publisher of `identity` sent on
+/// its topic for `target`: a later one applied, so their evidence is obsolete. The usage row
+/// releases them; no such row changes nothing.
+fn superseded_info(
+    rows: &mut PlanRows,
+    identity: SyncQuarantineIdentity,
+    target: &DocumentTarget,
+) -> Step<RowChanges> {
+    let publisher = [
+        identity.topic.as_bytes().as_slice(),
+        identity.actor.as_bytes().as_slice(),
+    ]
+    .concat();
+    let found = rows.scan(SYNC_QUARANTINE_KEYSPACE, Some(ByteView::from(publisher)))?;
+    let mut deletes = Vec::new();
+    let (mut records, mut bytes) = (0u64, 0u64);
+    for (key, value) in found {
+        let Ok(record) = SyncQuarantineRecord::from_bytes(value.as_ref()) else {
+            continue;
+        };
+        if record.identity.actor_seq < identity.actor_seq && record.target() == Some(target) {
+            deletes.push((SYNC_QUARANTINE_KEYSPACE.to_string(), key));
+            (records, bytes) = (records + 1, bytes + value.len() as u64);
+        }
+    }
+    if deletes.is_empty() {
+        return Ok((deletes, Vec::new()));
+    }
+    let stored = rows.read(
+        QUARANTINE_USAGE_KEYSPACE,
+        ByteView::from(QUARANTINE_USAGE_KEY),
+    )?;
+    let mut usage = match stored {
+        Some(value) => SyncQuarantineUsage::from_bytes(value.as_ref()).map_err(invalid)?,
+        None => SyncQuarantineUsage::default(),
+    };
+    usage.release(records, bytes);
+    Ok((
+        deletes,
+        vec![quarantine_usage_entry(usage).map_err(invalid)?],
+    ))
+}
+
+/// Drops the quarantine rows an applied node info upsert made obsolete, with their usage, in one
+/// write transaction; the node info apply itself runs without one.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SupersededInfoPlan {
+    pub identity: SyncQuarantineIdentity,
+    pub target: DocumentTarget,
+}
+
+impl RowPlan for SupersededInfoPlan {
+    type Output = ();
+    type Error = ApplyError;
+
+    fn plan(&self, rows: &mut PlanRows) -> Step<Planned<()>> {
+        let (deletes, writes) = superseded_info(rows, self.identity, &self.target)?;
+        Ok(Planned::changes((), deletes, writes))
+    }
 }
 
 /// Writes rejection evidence and the topic cursor together, so the cursor never moves past
