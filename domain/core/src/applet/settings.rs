@@ -53,6 +53,16 @@ pub const DEFAULT_DRAFTS: usize = 6;
 /// Hours a build preview lives when the operator sets no other number.
 pub const DEFAULT_DRAFT_HOURS: u64 = 24;
 
+/// License files read in the builder image's `/starter/node_modules`, for the libraries the
+/// portal does not already ship.
+const CHECKED_LICENSES: [(&str, &str); 5] = [
+    ("reka-ui", "LICENSE"),
+    ("echarts", "LICENSE"),
+    ("three", "LICENSE"),
+    ("@tanstack/vue-table", "LICENSE"),
+    ("maplibre-gl", "LICENSE.txt"),
+];
+
 /// The starter's libraries, each license checked on the pinned version. `reka-ui` backs the
 /// starter's copied shadcn-vue component source, which is no npm package of its own.
 pub fn default_catalogue() -> Vec<CataloguePackage> {
@@ -70,14 +80,20 @@ pub fn default_catalogue() -> Vec<CataloguePackage> {
         ("papaparse", "5.7.0", "data", "MIT"),
     ]
     .into_iter()
-    .map(|(name, version, role, license)| CataloguePackage {
-        name: name.to_string(),
-        version: version.to_string(),
-        role: role.to_string(),
-        license: license.to_string(),
-        // TODO: point reka-ui, echarts, three, vue-table and maplibre-gl at their installed
-        // LICENSE files once the starter lockfile is generated.
-        license_source: Some(format!("npm:{name}@{version}")),
+    .map(|(name, version, role, license)| {
+        let checked = CHECKED_LICENSES
+            .iter()
+            .find(|(package, _)| *package == name);
+        CataloguePackage {
+            name: name.to_string(),
+            version: version.to_string(),
+            role: role.to_string(),
+            license: license.to_string(),
+            license_source: Some(match checked {
+                Some((_, file)) => format!("/starter/node_modules/{name}/{file}"),
+                None => format!("npm:{name}@{version}"),
+            }),
+        }
     })
     .collect()
 }
