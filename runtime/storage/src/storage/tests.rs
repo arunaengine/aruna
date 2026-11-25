@@ -2531,6 +2531,7 @@ fn deletes_cross_threshold() {
         crate::compaction::CompactionJob {
             key_space: job.key_space,
             deletes: job.deletes,
+            require_deletes: job.require_deletes,
             run: Box::new(move || {
                 (job.run)().expect("keyspace compacts");
                 storage.process_effect(delete_batch(crate::compaction::DELETE_THRESHOLD));

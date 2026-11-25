@@ -1249,7 +1249,7 @@ pub(super) fn compact_slow_scan(
     if let Ok(Some(keyspace)) = store.existing_keyspace(name) {
         let inner = keyspace.inner();
         if crate::compaction::scan_compactable(inner.disk_space(), inner.table_count()) {
-            compactor.submit(name, 1, store.db.clone(), keyspace);
+            compactor.submit_scan(name, store.db.clone(), keyspace);
         }
     }
 }
