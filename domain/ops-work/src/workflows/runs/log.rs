@@ -180,7 +180,7 @@ impl Operation for LoadLogOperation {
         let (rows, next) = result.page()?;
         let head = head_key(self.run_id);
         for (key, value) in rows {
-            if key != head {
+            if key != head && key.len() == 20 {
                 self.pages.push(decode_page(&value)?);
             }
         }

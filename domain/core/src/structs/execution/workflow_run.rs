@@ -31,8 +31,18 @@ pub struct PrecapturedInput {
     pub captured: CapturedInput,
 }
 
-/// Immutable catalog records copied alongside a run so a surviving holder can resume it.
+/// One bounded piece of a large replicated workflow source or tool record.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicatedChunk {
+    /// `None` for the workflow version's source blob, or `Some((tool_id, version))`.
+    pub tool: Option<(String, String)>,
+    pub index: u32,
+    pub total: u32,
+    pub data: Vec<u8>,
+}
+
+/// Immutable catalog records copied alongside a run so a surviving holder can resume it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplicatedWorkflow {
     pub workflow: Vec<u8>,
     pub version: Vec<u8>,
@@ -40,6 +50,12 @@ pub struct ReplicatedWorkflow {
     /// Group tool definitions required to lower a composed `.uwe.yaml` workflow after failover.
     #[serde(default)]
     pub tools: Vec<Vec<u8>>,
+    /// Bounded chunks of a large source or tool record; assembled when `index + 1 == total`.
+    #[serde(default)]
+    pub chunks: Vec<ReplicatedChunk>,
+    /// True while earlier metadata frames are still arriving; the run commits on the final frame.
+    #[serde(default)]
+    pub more: bool,
 }
 
 /// Which secret store a workflow secret binding reads from.
@@ -439,6 +455,16 @@ pub fn head_key(run_id: Ulid) -> Key {
 /// The row of a run log page: the run id, then the page number big-endian.
 pub fn page_key(run_id: Ulid, page: u32) -> Key {
     numbered(run_id, &page.to_be_bytes())
+}
+
+/// Temporary row staging one chunk of a replicated source or tool under `run_prefix(run_id)`.
+pub fn chunk_key(run_id: Ulid, target: [u8; 32], index: u32) -> Key {
+    let mut key = Vec::with_capacity(53);
+    key.extend_from_slice(&run_id.to_bytes());
+    key.push(b'c');
+    key.extend_from_slice(&target);
+    key.extend_from_slice(&index.to_be_bytes());
+    Key::from(key)
 }
 
 /// The row of an idempotency key: the group, the caller, then the key with its length first.

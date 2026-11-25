@@ -24,11 +24,11 @@ use aruna_core::structs::execution::workflow::{
     version_key, workflow_key,
 };
 use aruna_core::structs::execution::workflow_run::{
-    LogHead, ReplicatedWorkflow, WorkflowRunRecord, decode_page, encode_page, head_key, page_key,
-    run_key,
+    LogHead, ReplicatedChunk, ReplicatedWorkflow, WorkflowRunRecord, chunk_key, decode_page,
+    encode_page, head_key, page_key, run_key,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::types::GroupId;
+use aruna_core::types::{GroupId, Key};
 use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 use aruna_workflow_contract::preflight::{RunLogEntry, RunLogPage};
 use byteview::ByteView;
@@ -41,6 +41,8 @@ use crate::workflows::{CatalogError, ScanOperation, scan_answer};
 
 /// Encoded page bytes one store request carries at most, well inside one metadata frame.
 const BATCH_BYTES: usize = 8 << 20;
+/// Maximum chunk count allowed for one replicated source or tool blob.
+const MAX_CHUNKS: u32 = 64;
 
 /// What a replica of an active run shows on a node that is not its coordinator.
 pub const UNREACHABLE: &str = "coordinator node unreachable";
@@ -67,6 +69,49 @@ pub fn record_holders(
 /// node holds only a copy, which its owner or a realm admin may resume here.
 pub fn replica_note(record: &WorkflowRunRecord, local: NodeId) -> Option<&'static str> {
     (record.node_id != local && record.state.is_active()).then_some(UNREACHABLE)
+}
+
+fn chunk_target(tool: Option<&(String, String)>) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    match tool {
+        None => {
+            hasher.update(b"source");
+        }
+        Some((id, version)) => {
+            hasher.update(b"tool\0");
+            hasher.update(id.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(version.as_bytes());
+        }
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn keep_stored(stored: &WorkflowRunRecord, incoming: &WorkflowRunRecord) -> bool {
+    if stored.state.is_terminal() != incoming.state.is_terminal() {
+        return stored.state.is_terminal();
+    }
+    (stored.attempts, stored.last_event_seq) > (incoming.attempts, incoming.last_event_seq)
+}
+
+fn tool_update(
+    existing: Option<&[u8]>,
+    incoming: &[u8],
+    group: GroupId,
+) -> Result<Option<(Key, ByteView)>, CatalogError> {
+    let tool = ToolRecord::from_bytes(incoming).map_err(|_| CatalogError::Forbidden)?;
+    if tool.group_id != group {
+        return Err(CatalogError::Forbidden);
+    }
+    if let Some(old_bytes) = existing
+        && let Ok(old) = ToolRecord::from_bytes(old_bytes)
+        && ((old.definition == tool.definition && old.files == tool.files)
+            || tool.created_at_ms < old.created_at_ms)
+    {
+        return Ok(None);
+    }
+    let key = tool_key(&tool.tool_id, &tool.version, tool.group_id);
+    Ok(Some((key, ByteView::from(incoming.to_vec()))))
 }
 
 #[derive(Debug, PartialEq)]
@@ -273,6 +318,8 @@ impl Operation for ReplicateLogOperation {
                         version: ver.to_vec(),
                         source: values.next().flatten().map(|s| s.to_vec()),
                         tools: Vec::new(),
+                        chunks: Vec::new(),
+                        more: false,
                     }),
                     _ => None,
                 };
@@ -420,7 +467,7 @@ impl Operation for StoreReplicaOperation {
                     first_page: self.first_page,
                     pages: std::mem::take(&mut self.pages),
                     workflow: self.workflow.take(),
-                    reading: true,
+                    step: WriteStep::Read,
                     kept: 0,
                 };
                 Ok(Next::Call(IoCall::retry(
@@ -447,6 +494,13 @@ impl Operation for StoreReplicaOperation {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum WriteStep {
+    Read,
+    Write(Vec<(String, Key)>),
+    Delete,
+}
+
 /// Writes a run copy with its pages and the log head they make, in one transaction.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WriteReplicaOperation {
@@ -455,7 +509,7 @@ pub struct WriteReplicaOperation {
     first_page: u32,
     pages: Vec<Vec<u8>>,
     workflow: Option<ReplicatedWorkflow>,
-    reading: bool,
+    step: WriteStep,
     kept: u32,
 }
 
@@ -470,19 +524,17 @@ impl Operation for WriteReplicaOperation {
     fn first(&mut self) -> Result<Next<u32>, CatalogError> {
         let wf_key = workflow_key(self.run.workflow_id);
         let ver_key = version_key(self.run.workflow_id, self.run.version);
+        let run_id = self.run.run_id;
         let mut reads = vec![
-            (WORKFLOW_RUN_KEYSPACE.to_string(), run_key(self.run.run_id)),
-            (RUN_LOG_KEYSPACE.to_string(), head_key(self.run.run_id)),
+            (WORKFLOW_RUN_KEYSPACE.to_string(), run_key(run_id)),
+            (RUN_LOG_KEYSPACE.to_string(), head_key(run_id)),
             (WORKFLOW_KEYSPACE.to_string(), wf_key),
             (WORKFLOW_VERSION_KEYSPACE.to_string(), ver_key.clone()),
             (WORKFLOW_SOURCE_KEYSPACE.to_string(), ver_key),
         ];
         for index in 0..self.pages.len() {
             let number = self.first_page + index as u32;
-            reads.push((
-                RUN_LOG_KEYSPACE.to_string(),
-                page_key(self.run.run_id, number),
-            ));
+            reads.push((RUN_LOG_KEYSPACE.to_string(), page_key(run_id, number)));
         }
         if let Some(replicated) = &self.workflow {
             for tool_bytes in &replicated.tools {
@@ -496,20 +548,51 @@ impl Operation for WriteReplicaOperation {
                     tool_key(&tool.tool_id, &tool.version, tool.group_id),
                 ));
             }
+            for chunk in &replicated.chunks {
+                if chunk.total == 0 || chunk.index >= chunk.total || chunk.total > MAX_CHUNKS {
+                    return Err(CatalogError::Forbidden);
+                }
+                if chunk.index + 1 == chunk.total {
+                    let target = chunk_target(chunk.tool.as_ref());
+                    for prior in 0..chunk.index {
+                        reads.push((
+                            RUN_LOG_KEYSPACE.to_string(),
+                            chunk_key(run_id, target, prior),
+                        ));
+                    }
+                    if let Some((id, version)) = &chunk.tool {
+                        reads.push((
+                            WORKFLOW_TOOL_KEYSPACE.to_string(),
+                            tool_key(id, version, self.run.group_id),
+                        ));
+                    }
+                }
+            }
         }
         Ok(Next::Call(IoCall::Read(reads)))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<u32>, CatalogError> {
-        if !std::mem::replace(&mut self.reading, false) {
-            result.done()?;
-            return Ok(Next::Done(self.kept));
+        match std::mem::replace(&mut self.step, WriteStep::Delete) {
+            WriteStep::Write(deletes) => {
+                result.done()?;
+                if !deletes.is_empty() {
+                    self.step = WriteStep::Delete;
+                    return Ok(Next::Call(IoCall::Delete(deletes)));
+                }
+                return Ok(Next::Done(self.kept));
+            }
+            WriteStep::Delete => {
+                result.done()?;
+                return Ok(Next::Done(self.kept));
+            }
+            WriteStep::Read => {}
         }
         let mut values = result.values()?.into_iter();
         let stored = (values.next().flatten())
             .map(|value| WorkflowRunRecord::from_bytes(&value))
             .transpose()?;
-        if stored.is_some_and(|stored| stored.node_id == self.local) {
+        if stored.as_ref().is_some_and(|old| old.node_id == self.local) {
             return Err(CatalogError::Forbidden);
         }
         let mut head = (values.next().flatten())
@@ -519,118 +602,181 @@ impl Operation for WriteReplicaOperation {
         let wf_row = values.next().flatten();
         let ver_row = values.next().flatten();
         let src_row = values.next().flatten();
+        let mut page_rows = Vec::with_capacity(self.pages.len());
+        for _ in 0..self.pages.len() {
+            page_rows.push(values.next().flatten());
+        }
+        let more = self.workflow.as_ref().is_some_and(|wf| wf.more);
         // Reject gaps or missing catalog records so a replacement holder triggers full backfill.
-        if self.first_page > head.pages
-            || (self.workflow.is_none() && (wf_row.is_none() || ver_row.is_none()))
+        if !more
+            && (self.first_page > head.pages
+                || (self.workflow.is_none()
+                    && (wf_row.is_none() || ver_row.is_none() || src_row.is_none())))
         {
             return Err(CatalogError::NotFound);
         }
-        let mut writes = vec![run_row(&self.run)?];
-        let mut replicated_tools = Vec::new();
+        let mut writes = Vec::new();
+        let mut deletes = Vec::new();
+        let mut wrote_source = false;
+        let run_id = self.run.run_id;
+        let space = RUN_LOG_KEYSPACE.to_string();
+        let ver_key = version_key(self.run.workflow_id, self.run.version);
         if let Some(replicated) = self.workflow.take() {
-            let mut wf = WorkflowRecord::from_bytes(&replicated.workflow)
-                .map_err(|_| CatalogError::Forbidden)?;
-            let ver = WorkflowVersionRecord::from_bytes(&replicated.version)
-                .map_err(|_| CatalogError::Forbidden)?;
-            if wf.workflow_id != self.run.workflow_id
-                || wf.group_id != self.run.group_id
-                || ver.workflow_id != self.run.workflow_id
-                || ver.version != self.run.version
-            {
-                return Err(CatalogError::Forbidden);
+            for tool_bytes in replicated.tools {
+                let existing = values.next().flatten();
+                if let Some((key, value)) =
+                    tool_update(existing.as_deref(), &tool_bytes, self.run.group_id)?
+                {
+                    writes.push((WORKFLOW_TOOL_KEYSPACE.to_string(), key, value));
+                }
             }
-            let min_count = wf.version_count.max(ver.version);
-            let wf_key = workflow_key(self.run.workflow_id);
-            let ver_key = version_key(self.run.workflow_id, self.run.version);
-            match wf_row {
-                Some(existing_bytes) => {
-                    let mut existing = WorkflowRecord::from_bytes(&existing_bytes)?;
-                    if existing.version_count < min_count {
-                        existing.version_count = min_count;
+            for chunk in replicated.chunks {
+                let target = chunk_target(chunk.tool.as_ref());
+                if chunk.index + 1 < chunk.total {
+                    writes.push((
+                        space.clone(),
+                        chunk_key(run_id, target, chunk.index),
+                        ByteView::from(chunk.data),
+                    ));
+                    continue;
+                }
+                let mut assembled = Vec::new();
+                for prior in 0..chunk.index {
+                    let part = values.next().flatten().ok_or(CatalogError::NotFound)?;
+                    assembled.extend_from_slice(&part);
+                    deletes.push((space.clone(), chunk_key(run_id, target, prior)));
+                }
+                assembled.extend_from_slice(&chunk.data);
+                match chunk.tool {
+                    None => {
+                        if src_row.is_none() {
+                            writes.push((
+                                WORKFLOW_SOURCE_KEYSPACE.to_string(),
+                                ver_key.clone(),
+                                ByteView::from(assembled),
+                            ));
+                        }
+                        wrote_source = true;
+                    }
+                    Some((id, version)) => {
+                        let existing = values.next().flatten();
+                        let expected = tool_key(&id, &version, self.run.group_id);
+                        if let Some((key, value)) =
+                            tool_update(existing.as_deref(), &assembled, self.run.group_id)?
+                        {
+                            if key != expected {
+                                return Err(CatalogError::Forbidden);
+                            }
+                            writes.push((WORKFLOW_TOOL_KEYSPACE.to_string(), key, value));
+                        }
+                    }
+                }
+            }
+            if !more {
+                let mut wf = WorkflowRecord::from_bytes(&replicated.workflow)
+                    .map_err(|_| CatalogError::Forbidden)?;
+                let ver = WorkflowVersionRecord::from_bytes(&replicated.version)
+                    .map_err(|_| CatalogError::Forbidden)?;
+                if wf.workflow_id != self.run.workflow_id
+                    || wf.group_id != self.run.group_id
+                    || ver.workflow_id != self.run.workflow_id
+                    || ver.version != self.run.version
+                {
+                    return Err(CatalogError::Forbidden);
+                }
+                let min_count = wf.version_count.max(ver.version);
+                let wf_key = workflow_key(self.run.workflow_id);
+                match wf_row {
+                    Some(existing_bytes) => {
+                        let mut existing = WorkflowRecord::from_bytes(&existing_bytes)?;
+                        if existing.version_count < min_count {
+                            existing.version_count = min_count;
+                            writes.push((
+                                WORKFLOW_KEYSPACE.to_string(),
+                                wf_key,
+                                ByteView::from(existing.to_bytes()?),
+                            ));
+                        }
+                    }
+                    None => {
+                        wf.version_count = min_count;
                         writes.push((
                             WORKFLOW_KEYSPACE.to_string(),
                             wf_key,
-                            ByteView::from(existing.to_bytes()?),
+                            ByteView::from(wf.to_bytes()?),
                         ));
                     }
                 }
-                None => {
-                    wf.version_count = min_count;
+                if ver_row.is_none() {
                     writes.push((
-                        WORKFLOW_KEYSPACE.to_string(),
-                        wf_key,
-                        ByteView::from(wf.to_bytes()?),
+                        WORKFLOW_VERSION_KEYSPACE.to_string(),
+                        ver_key.clone(),
+                        ByteView::from(replicated.version),
                     ));
                 }
-            }
-            if ver_row.is_none() {
-                writes.push((
-                    WORKFLOW_VERSION_KEYSPACE.to_string(),
-                    ver_key.clone(),
-                    ByteView::from(replicated.version),
-                ));
-            }
-            if src_row.is_none()
-                && let Some(source) = replicated.source
-            {
-                writes.push((
-                    WORKFLOW_SOURCE_KEYSPACE.to_string(),
-                    ver_key,
-                    ByteView::from(source),
-                ));
-            }
-            replicated_tools = replicated.tools;
-        }
-        let space = RUN_LOG_KEYSPACE.to_string();
-        let run_id = self.run.run_id;
-        for (index, bytes) in self.pages.iter().enumerate() {
-            let existing = values.next().flatten();
-            let page = decode_page(bytes).map_err(|_| CatalogError::Forbidden)?;
-            let shorter = existing
-                .as_deref()
-                .and_then(|row| decode_page(row).ok())
-                .is_some_and(|old| old.entries.len() > page.entries.len());
-            if shorter {
-                continue;
-            }
-            let number = self.first_page + index as u32;
-            if number + 1 > head.pages {
-                head.pages = number + 1;
-                head.entries = page.entries.len() as u32;
-            } else if number + 1 == head.pages {
-                head.entries = head.entries.max(page.entries.len() as u32);
-            }
-            for entry in &page.entries {
-                match entry {
-                    RunLogEntry::Begin { .. } => head.begun = true,
-                    RunLogEntry::Change { seq, .. } => {
-                        head.last_seq = Some(head.last_seq.map_or(*seq, |last| last.max(*seq)));
+                if !wrote_source && let Some(source) = replicated.source {
+                    if src_row.is_none() {
+                        writes.push((
+                            WORKFLOW_SOURCE_KEYSPACE.to_string(),
+                            ver_key,
+                            ByteView::from(source),
+                        ));
                     }
+                    wrote_source = true;
+                }
+                if src_row.is_none() && !wrote_source {
+                    return Err(CatalogError::NotFound);
                 }
             }
-            writes.push((
-                space.clone(),
-                page_key(run_id, number),
-                ByteView::from(bytes.clone()),
-            ));
         }
-        for tool_bytes in replicated_tools {
-            let existing = values.next().flatten();
-            if existing.is_some() {
-                continue;
+        if !more {
+            if stored
+                .as_ref()
+                .is_none_or(|old| !keep_stored(old, &self.run))
+            {
+                writes.push(run_row(&self.run)?);
             }
-            let tool = ToolRecord::from_bytes(&tool_bytes).map_err(|_| CatalogError::Forbidden)?;
-            if tool.group_id != self.run.group_id {
-                return Err(CatalogError::Forbidden);
+            for (index, (bytes, existing)) in self.pages.iter().zip(page_rows).enumerate() {
+                let page = decode_page(bytes).map_err(|_| CatalogError::Forbidden)?;
+                let shorter = existing
+                    .as_deref()
+                    .and_then(|row| decode_page(row).ok())
+                    .is_some_and(|old| old.entries.len() > page.entries.len());
+                if shorter {
+                    continue;
+                }
+                let number = self.first_page + index as u32;
+                if number + 1 > head.pages {
+                    head.pages = number + 1;
+                    head.entries = page.entries.len() as u32;
+                } else if number + 1 == head.pages {
+                    head.entries = head.entries.max(page.entries.len() as u32);
+                }
+                for entry in &page.entries {
+                    match entry {
+                        RunLogEntry::Begin { .. } => head.begun = true,
+                        RunLogEntry::Change { seq, .. } => {
+                            head.last_seq = Some(head.last_seq.map_or(*seq, |last| last.max(*seq)));
+                        }
+                    }
+                }
+                writes.push((
+                    space.clone(),
+                    page_key(run_id, number),
+                    ByteView::from(bytes.clone()),
+                ));
             }
-            writes.push((
-                WORKFLOW_TOOL_KEYSPACE.to_string(),
-                tool_key(&tool.tool_id, &tool.version, tool.group_id),
-                ByteView::from(tool_bytes),
-            ));
+            writes.push((space, head_key(run_id), ByteView::from(head.to_bytes()?)));
         }
-        writes.push((space, head_key(run_id), ByteView::from(head.to_bytes()?)));
         self.kept = head.pages;
+        if writes.is_empty() {
+            if !deletes.is_empty() {
+                self.step = WriteStep::Delete;
+                return Ok(Next::Call(IoCall::Delete(deletes)));
+            }
+            return Ok(Next::Done(self.kept));
+        }
+        self.step = WriteStep::Write(deletes);
         Ok(Next::Call(IoCall::Write(writes)))
     }
 }
