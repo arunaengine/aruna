@@ -400,3 +400,6 @@ impl Operation for PublishDeviceOperation {
     }
 }
 
+#[cfg(test)]
+#[path = "publish_tests.rs"]
+mod tests;

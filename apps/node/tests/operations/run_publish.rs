@@ -250,10 +250,11 @@ async fn publishes_local_run() -> TestResult<()> {
         "runs/assembly/run-out/contigs.fasta"
     );
     assert_eq!(published.outputs[0].node_id, server.node_id());
-    assert!(matches!(
-        published.run_crate,
-        RunCrateStatus::Written { .. }
-    ));
+    assert!(
+        matches!(published.run_crate, RunCrateStatus::Written { .. }),
+        "expected written crate, got {:?}",
+        published.run_crate
+    );
     assert_eq!(
         read_remote(&realm, group_id, "runs/assembly/run-out/contigs.fasta").await?,
         OUTPUT
@@ -507,5 +508,162 @@ async fn crate_redrive_links() -> TestResult<()> {
         .await?
         .ok_or("the run is linked again")?;
     assert_eq!(link.run_crate, Some(document_id));
+    Ok(())
+}
+
+/// Publishing a finished local workflow run copies its outputs to the realm bucket, writes its
+/// workflow RO-Crate once, replays idempotently, and refuses a target change.
+#[tokio::test]
+async fn publishes_local_workflow() -> TestResult<()> {
+    use aruna_core::keyspaces::WORKFLOW_RUN_KEYSPACE;
+    use aruna_core::structs::execution::workflow_run::{
+        CacheScope, RunFile, RunOutput, RunState, WorkflowRunRecord, run_key,
+    };
+    use aruna_ops_work::workflows::runs::provenance::{WriteProvenanceOperation, status};
+    use aruna_ops_work::workflows::runs::publish::{
+        DevicePublishInput, local_device_crate, publish_device_run,
+    };
+
+    let realm = Topology::spawn(2, 1, 1).await?;
+    let group_id = realm.seed_group().await?;
+    let device = realm.user_node();
+    let server = realm.node(0);
+    wait_until("the group on the device", device.node_id(), || async {
+        drive(
+            fetch_realm_documents(device.context.node_and_realm(), FETCH_BUDGET),
+            &device.context,
+        )
+        .await
+        .unwrap_or(false)
+            && matches!(read_group_auth(device, group_id).await, Ok(Some(_)))
+    })
+    .await?;
+    create_bucket(&server.context, REMOTE_BUCKET, group_id, &realm).await?;
+    create_bucket(&device.context, LOCAL_BUCKET, group_id, &realm).await?;
+    let version_id = write_output(&realm, group_id).await?;
+
+    let run_id = Ulid::generate();
+    let now_ms = aruna_clock::unix_timestamp_millis();
+    let record = WorkflowRunRecord {
+        run_id,
+        realm_id: realm.realm_id,
+        group_id,
+        workflow_id: Ulid::generate(),
+        workflow_name: "assembly".to_owned(),
+        version: 1,
+        lineage: run_id,
+        state: RunState::Succeeded,
+        node_id: device.node_id(),
+        created_by: realm.user_id,
+        created_at_ms: now_ms,
+        finished_at_ms: Some(now_ms),
+        error: None,
+        values_json: "{}".to_owned(),
+        inputs_json: None,
+        output: Some(RunOutput {
+            bucket: LOCAL_BUCKET.to_owned(),
+            prefix: String::new(),
+            node_id: None,
+            dataset_json: None,
+        }),
+        outputs: vec![RunFile {
+            name: "contigs.fasta".to_owned(),
+            bucket: Some(LOCAL_BUCKET.to_owned()),
+            key: Some("contigs.fasta".to_owned()),
+            version_id: Some(version_id.to_string()),
+            node_id: Some(device.node_id()),
+            size: Some(OUTPUT.len() as u64),
+            digest: Some(blake3::hash(OUTPUT).to_hex().to_string()),
+        }],
+        provenance_crate: true,
+        provenance_document_id: None,
+        provenance_status: None,
+        last_event_seq: 1,
+        local_only: true,
+        origin: None,
+        parent_job_id: None,
+        claim_token_digest: None,
+        attempts: 1,
+        steps: Vec::new(),
+        resumes_run_id: None,
+        repeats_run_id: None,
+        cache_scope: CacheScope::Group,
+        placement_site: None,
+        protected: false,
+        started_at_ms: Some(now_ms),
+        secrets: Default::default(),
+    };
+    device
+        .context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: WORKFLOW_RUN_KEYSPACE.to_owned(),
+            key: run_key(run_id),
+            value: record.to_bytes()?.into(),
+            txn_id: None,
+        })
+        .await;
+
+    let written = drive(
+        WriteProvenanceOperation::new(run_id, (device.node_id(), realm.realm_id)),
+        &device.context,
+    )
+    .await?;
+    assert_eq!(written.provenance_status.as_deref(), Some(status::LOCAL));
+    let local = drive(local_device_crate(run_id, realm.user_id), &device.context).await?;
+    assert!(local["@graph"].is_array());
+
+    let input = || DevicePublishInput {
+        id: run_id,
+        owner: realm.user_id,
+        node_id: device.node_id(),
+        target: RemoteBinding {
+            node_id: server.node_id(),
+            bucket: REMOTE_BUCKET.to_owned(),
+            prefix: "runs/workflow".to_owned(),
+        },
+    };
+    let published = drive(
+        publish_device_run(device.context.node_and_realm(), input()),
+        &device.context,
+    )
+    .await?;
+    assert_eq!(published.outputs.len(), 1);
+    assert_eq!(
+        published.outputs[0].key,
+        "runs/workflow/run-out/contigs.fasta"
+    );
+    assert_eq!(published.outputs[0].node_id, server.node_id());
+    assert!(
+        matches!(published.run_crate, RunCrateStatus::Written { .. }),
+        "expected written crate, got {:?}",
+        published.run_crate
+    );
+    assert_eq!(
+        read_remote(&realm, group_id, "runs/workflow/run-out/contigs.fasta").await?,
+        OUTPUT
+    );
+
+    let replayed = drive(
+        publish_device_run(device.context.node_and_realm(), input()),
+        &device.context,
+    )
+    .await?;
+    assert_eq!(
+        replayed.outputs[0].version_id,
+        published.outputs[0].version_id
+    );
+    assert_eq!(replayed.run_crate, published.run_crate);
+
+    let mut moved = input();
+    moved.target.prefix = "runs/other".to_owned();
+    assert!(matches!(
+        drive(
+            publish_device_run(device.context.node_and_realm(), moved),
+            &device.context
+        )
+        .await,
+        Err(PublishRunError::TargetChanged)
+    ));
     Ok(())
 }
