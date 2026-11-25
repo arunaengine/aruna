@@ -25,14 +25,15 @@ use super::creator_auth;
 use super::data::{DataCall, Target};
 use crate::workflows::CatalogError;
 
-/// Rewrites a remote link pin to the target object captured at admission so exact-version
-/// coordinator reads work on precaptured remote links without bypassing authorization.
-pub fn resolve_precaptured(run: &WorkflowRunRecord, mut target: Target, node: NodeId) -> Target {
+/// Rewrites a precaptured link pin to its captured target object so exact-version coordinator
+/// reads work both remotely and after a resume moves execution onto the former remote holder.
+pub fn resolve_precaptured(run: &WorkflowRunRecord, mut target: Target, local: NodeId) -> Target {
     let Some(version) = target.version else {
         return target;
     };
+    let holder = target.node.unwrap_or(local);
     let Some(entry) = run.captured_remote.iter().find(|entry| {
-        entry.pin_node_id == node
+        entry.pin_node_id == holder
             && entry.pin_bucket == target.bucket
             && entry.pin_key == target.key
             && entry.pin_version_id == version
@@ -51,7 +52,8 @@ pub fn resolve_precaptured(run: &WorkflowRunRecord, mut target: Target, node: No
         target.bucket = bucket.clone();
         target.key = key.clone();
         target.version = Some(resolved_ver);
-        target.node = entry.resolved.source_node_id.or(Some(node));
+        target.node = entry.resolved.source_node_id.or(Some(holder));
+        target.owned = false;
     }
     target
 }
@@ -326,7 +328,7 @@ mod tests {
             node: Some(node(2)),
         };
         let op = RemoteReadOperation::new(
-            run,
+            run.clone(),
             link_target,
             node(2),
             DataCall::Stat {
@@ -336,5 +338,18 @@ mod tests {
         assert_eq!(op.target.key, "real.dat");
         assert_eq!(op.target.version, Some(target_ver));
         assert_eq!(op.node, node(2));
+
+        // After resume onto the former remote holder (`node(2)`), omitting `node` still resolves.
+        let implicit_local = Target {
+            bucket: "data".into(),
+            key: "alias.link".into(),
+            version: Some(link_ver),
+            owned: true,
+            node: None,
+        };
+        let resolved_local = resolve_precaptured(&run, implicit_local, node(2));
+        assert_eq!(resolved_local.key, "real.dat");
+        assert_eq!(resolved_local.version, Some(target_ver));
+        assert!(!resolved_local.owned);
     }
 }

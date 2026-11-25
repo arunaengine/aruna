@@ -58,6 +58,12 @@ pub fn path_within(path: &str, root: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
+/// Escapes a literal permission path so glob metacharacters in bucket or prefix names match only
+/// themselves when a recursive wildcard is appended.
+pub fn escape_permission_path(path: &str) -> String {
+    globset::escape(path)
+}
+
 /// Whether `pattern` can match any path at or below `subtree_root` (fail-closed on globs and
 /// backslash escapes, which `globset` interprets at match time).
 pub fn pattern_overlaps_subtree(pattern: &str, subtree_root: &str) -> bool {

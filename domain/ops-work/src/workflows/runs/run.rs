@@ -268,6 +268,20 @@ impl PrepareRunOperation {
     }
 }
 
+/// Restricts catalog tools to the versions resolved by the source run when resuming a composed
+/// workflow so newly imported tool versions cannot invalidate cached step digests.
+pub(super) fn filter_tools(
+    record: &WorkflowRunRecord,
+    mut tools: Vec<ToolRecord>,
+) -> Vec<ToolRecord> {
+    if record.resumes_run_id.is_some() && !record.used_tools.is_empty() {
+        let pinned: std::collections::BTreeSet<&(String, String)> =
+            record.used_tools.iter().collect();
+        tools.retain(|tool| pinned.contains(&(tool.tool_id.clone(), tool.version.clone())));
+    }
+    tools
+}
+
 /// Splits prior log pages into bounded batches so long lineages never exceed one frame.
 fn replay_chunks(pages: &[RunLogPage]) -> Vec<Vec<RunLogPage>> {
     let mut chunks: Vec<Vec<RunLogPage>> = Vec::new();
@@ -381,6 +395,7 @@ impl Operation for PrepareRunOperation {
                     .into_iter()
                     .map(|(_, tool)| tool)
                     .collect();
+                let tools = filter_tools(self.record()?, tools);
                 let (catalog_tools, tool_files) = catalog_tools(&tools)?;
                 let text = view.version.uwe_yaml.clone().or_else(|| {
                     (view.files.as_ref())

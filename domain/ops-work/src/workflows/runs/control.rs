@@ -158,6 +158,7 @@ impl FollowRunOperation {
                 repeats: None,
                 cache_scope: source.cache_scope,
                 protected: source.protected,
+                used_tools: source.used_tools.clone(),
             },
             Follow::Repeat => Lineage {
                 first: Some(source.lineage),
@@ -165,6 +166,7 @@ impl FollowRunOperation {
                 repeats: Some(source.run_id),
                 cache_scope: CacheScope::Run,
                 protected: source.protected,
+                used_tools: Vec::new(),
             },
         };
         let mut start = StartRunOperation::new(&self.auth, self.node, request)

@@ -8,7 +8,7 @@ use aruna_core::applet::usage::caps;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
-use aruna_core::permission_path::pattern_overlaps_subtree;
+use aruna_core::permission_path::{escape_permission_path, pattern_overlaps_subtree};
 use aruna_core::structs::execution::workflow::workflow_permission_path;
 use aruna_core::structs::execution::workflow_run::{RunOutput, WorkflowRunRecord};
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
@@ -204,8 +204,9 @@ impl VisitRunOperation {
             &bucket,
             prefix,
         );
+        let escaped = escape_permission_path(&path);
         restrictions.push(PathRestriction {
-            pattern: format!("{path}/**"),
+            pattern: format!("{escaped}/**"),
             permission: Permission::WRITE,
         });
         restrictions.push(PathRestriction {
@@ -383,5 +384,46 @@ mod tests {
             .map(|r| r.pattern.as_str())
             .collect();
         assert!(!leading_pats.contains(&format!("{root}/data/{node}/uploads//bakta/**").as_str()));
+
+        // Glob metacharacters in the submission prefix are escaped in the visitor write grant.
+        applet.grants.submissions = Some(Folder {
+            bucket: "uploads".into(),
+            prefix: "team [1]/".into(),
+        });
+        applet.grants.read = Vec::new();
+        let glob_auth = VisitRunOperation::new(
+            &applet,
+            Visit {
+                pseudonym: "ab".into(),
+                guest: false,
+            },
+            (node, realm),
+            RunRequest {
+                group_id: applet.group_id,
+                workflow_id: Ulid::from_bytes([2; 16]),
+                version: 3,
+                values: Value::Object(Default::default()),
+                inputs: Vec::new(),
+                inputs_json: None,
+                output: None,
+                provenance_crate: false,
+                idempotency_key: None,
+                placement_site: None,
+                secrets: Default::default(),
+            },
+        )
+        .visitor_auth()
+        .unwrap();
+        let write_pat = glob_auth
+            .path_restrictions
+            .as_deref()
+            .unwrap()
+            .iter()
+            .find(|r| r.pattern.ends_with("/**"))
+            .unwrap();
+        assert!(
+            write_pat.pattern.ends_with("/uploads/team [[]1[]]/ab/**"),
+            "{write_pat:?}"
+        );
     }
 }

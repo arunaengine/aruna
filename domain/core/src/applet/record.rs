@@ -478,10 +478,9 @@ impl Applet {
             .map(|pattern| (pattern.clone(), Permission::READ))
             .collect();
         if let Some(folder) = &grants.submissions {
-            let prefix = folder.prefix.trim_end_matches('/');
-            let path =
-                object_permission_path(realm_id, self.group_id, node, &folder.bucket, prefix);
-            paths.push((format!("{path}/**"), Permission::WRITE));
+            let root = folder.permission_root(realm_id, self.group_id, node);
+            let escaped = crate::permission_path::escape_permission_path(&root);
+            paths.push((format!("{escaped}/**"), Permission::WRITE));
         }
         if grants.start.is_some() {
             let path = crate::structs::execution::workflow::workflow_permission_path(

@@ -205,6 +205,28 @@ fn role_paths_bounded() {
     );
     let encoded = applet.to_bytes().unwrap();
     assert_eq!(Applet::from_bytes(&encoded).unwrap(), applet);
+
+    // Bucket-root submission folders avoid a double slash, and glob chars in prefixes are escaped.
+    applet.grants.submissions = Some(Folder {
+        bucket: "uploads".into(),
+        prefix: String::new(),
+    });
+    let root_paths = applet.role_paths(realm, node());
+    assert!(
+        root_paths[1].0.ends_with("/uploads/**") && !root_paths[1].0.ends_with("/uploads//**"),
+        "{:?}",
+        root_paths[1]
+    );
+    applet.grants.submissions = Some(Folder {
+        bucket: "uploads".into(),
+        prefix: "team [1]/".into(),
+    });
+    let escaped_paths = applet.role_paths(realm, node());
+    assert!(
+        escaped_paths[1].0.ends_with("/uploads/team [[]1[]]/**"),
+        "{:?}",
+        escaped_paths[1]
+    );
 }
 
 #[test]

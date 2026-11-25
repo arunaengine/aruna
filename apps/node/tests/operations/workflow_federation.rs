@@ -11,9 +11,10 @@ use aruna_core::compute::{ExecutorAvailability, ExecutorCapability, ResourceEnve
 use aruna_core::effects::StorageEffect;
 use aruna_core::heartbeat::{HeldHeartbeat, NodeHeartbeat};
 use aruna_core::id::NodeId;
-use aruna_core::job_request::SubmissionScope;
+use aruna_core::job_request::{SubmissionScope, submission_of};
 use aruna_core::keyspaces::NODE_INFO_KEYSPACE;
 use aruna_core::node::vault::NodeVaultKey;
+use aruna_core::placement::resolve_shard_holders;
 use aruna_core::secrets::{
     Delivery, ResponseExposure, SecretConsumer, SecretFields, SecretKind, SecretName, UseRule,
 };
@@ -679,10 +680,22 @@ async fn plans_multi_node() -> TestResult<()> {
         spec.tags.contains_key(WORKFLOW_UNPROTECTED_TAG),
         "unprotected run child job must carry unprotected staging tag"
     );
+    let scope = (0..64)
+        .map(|i| SubmissionScope::Keyed(format!("workflow-task/test/align/1/{i}")))
+        .find(|candidate| {
+            realm
+                .config
+                .family_placement(submission_of(realm.user_id, candidate))
+                .ok()
+                .is_some_and(|placement| {
+                    resolve_shard_holders(&realm.config, &placement).contains(&planner.node_id())
+                })
+        })
+        .ok_or("no job family scope held by planner")?;
     let submission = ExternalSubmission {
         spec: spec.clone(),
         created_by: realm.user_id,
-        scope: SubmissionScope::Keyed("workflow-task/test/align/1/1".into()),
+        scope,
         workspace_mode: WorkspaceMode::None,
         workspace_bucket: None,
         retention_ms: RETENTION_MS,

@@ -80,7 +80,7 @@ impl Target {
 /// The bucket and key prefix of a run's area, ending in `/`; `None` without an output bucket.
 pub fn area_of(record: &WorkflowRunRecord) -> Option<(String, String)> {
     let output = record.output.as_ref()?;
-    let base = output.prefix.trim_matches('/');
+    let base = output.prefix.trim_end_matches('/');
     let folder = match base.is_empty() {
         true => AREA_FOLDER.to_owned(),
         false => format!("{base}/{AREA_FOLDER}"),
@@ -370,7 +370,8 @@ impl ReadDataOperation {
                     user_identity: self.run.created_by,
                     realm_id: self.run.realm_id,
                     node_id: self.node_id,
-                });
+                })
+                .with_disallow_encrypted(!self.run.protected && !target.owned);
                 self.step = Some(ReadStep::Get(target));
                 Ok(Next::Call(IoCall::child(get)))
             }
@@ -482,6 +483,9 @@ impl ReadDataOperation {
             Err(GetObjectError::NoSuchKey | GetObjectError::NoSuchVersion) => {
                 return Self::failed(not_found(format!("{} does not exist", target.key)));
             }
+            Err(GetObjectError::EncryptedDisallowed) => {
+                return Self::failed(denied("encrypted inputs require a protected workflow run"));
+            }
             Err(error) => return Err(CatalogError::Storage(error.to_string())),
         };
         let mut object = Box::new(object);
@@ -525,7 +529,7 @@ impl Operation for ReadDataOperation {
 
     fn first(&mut self) -> ReadNext {
         let target = match resolve(&self.run, self.call.address()) {
-            Ok(target) => target,
+            Ok(target) => remote::resolve_precaptured(&self.run, target, self.node_id),
             Err(error) => return Self::failed(error),
         };
         if let Some(node) = target.remote(self.node_id) {
@@ -634,7 +638,7 @@ pub fn delivery_target(record: &WorkflowRunRecord, path: &str) -> Result<Target,
     let output = record.output.as_ref().ok_or_else(no_area)?;
     let path = path.trim_start_matches('/');
     check_path(path)?;
-    let prefix = output.prefix.trim_matches('/');
+    let prefix = output.prefix.trim_end_matches('/');
     let key = match prefix.is_empty() {
         true => path.to_owned(),
         false => format!("{prefix}/{path}"),
@@ -707,6 +711,12 @@ impl WriteObjectOperation {
         target: Target,
         body: WriteBody,
     ) -> Self {
+        let body = match body {
+            WriteBody::Copy(source) => {
+                WriteBody::Copy(remote::resolve_precaptured(&run, source, node_id))
+            }
+            other => other,
+        };
         Self {
             run,
             node_id,
@@ -949,7 +959,8 @@ impl Operation for WriteObjectOperation {
                     user_identity: self.run.created_by,
                     realm_id: self.run.realm_id,
                     node_id: self.node_id,
-                });
+                })
+                .with_disallow_encrypted(!self.run.protected && !source.owned);
                 self.step = WriteStep::Read(Box::new((info, ceiling, routing, gate)));
                 Ok(Next::Call(IoCall::child(get)))
             }
@@ -958,6 +969,11 @@ impl Operation for WriteObjectOperation {
                     Ok(object) => object,
                     Err(GetObjectError::NoSuchKey | GetObjectError::NoSuchVersion) => {
                         return Self::failed(not_found("the output to deliver does not exist"));
+                    }
+                    Err(GetObjectError::EncryptedDisallowed) => {
+                        return Self::failed(denied(
+                            "an unprotected run cannot copy from an encrypted bucket",
+                        ));
                     }
                     Err(error) => return Err(CatalogError::Storage(error.to_string())),
                 };

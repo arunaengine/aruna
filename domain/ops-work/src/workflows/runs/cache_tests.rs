@@ -340,6 +340,18 @@ async fn follows_lineage() {
     drive(AppendLogOperation::new(first.run_id, begin), context)
         .await
         .unwrap();
+    drive(
+        super::ChangeRunOperation::new(
+            first.run_id,
+            vec![super::RunChange::Tools(vec![(
+                "reverse".into(),
+                "1".into(),
+            )])],
+        ),
+        context,
+    )
+    .await
+    .unwrap();
     let finish = FinishRunOperation::new(first.run_id, RunState::Succeeded, None);
     drive(finish, context).await.unwrap();
 
@@ -351,12 +363,31 @@ async fn follows_lineage() {
     assert_eq!(resumed.resumes_run_id, Some(first.run_id));
     assert_eq!(resumed.cache_scope, CacheScope::Group);
     assert_eq!(resumed.values_json, first.values_json);
+    assert_eq!(resumed.used_tools, vec![("reverse".into(), "1".into())]);
     let repeated = drive(resume(first.run_id, Follow::Repeat), context)
         .await
         .unwrap();
     assert_eq!(repeated.lineage, first.lineage);
     assert_eq!(repeated.repeats_run_id, Some(first.run_id));
     assert_eq!(repeated.cache_scope, CacheScope::Run);
+    assert!(repeated.used_tools.is_empty());
+
+    let tool = |version: &str| aruna_core::structs::execution::workflow::ToolRecord {
+        tool_id: "reverse".into(),
+        version: version.into(),
+        group_id: first.group_id,
+        title: "reverse".into(),
+        curation: Default::default(),
+        definition: "{}".into(),
+        files: Vec::new(),
+        created_by: first.created_by,
+        created_at_ms: 1,
+    };
+    let pinned = super::run::filter_tools(&resumed, vec![tool("1"), tool("2")]);
+    assert_eq!(pinned.len(), 1);
+    assert_eq!(pinned[0].version, "1");
+    let unpinned = super::run::filter_tools(&repeated, vec![tool("1"), tool("2")]);
+    assert_eq!(unpinned.len(), 2);
 
     assert!(matches!(runs.prepare(&resumed).await, Prepared::Ready(_)));
     assert!(matches!(runs.prepare(&repeated).await, Prepared::Ready(_)));

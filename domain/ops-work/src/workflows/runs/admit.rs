@@ -173,6 +173,8 @@ pub struct Lineage {
     pub cache_scope: CacheScope,
     /// The earlier run was protected, so this one is too.
     pub protected: bool,
+    /// Resolved `(tool_id, version)` pairs inherited by a resumed composed run.
+    pub used_tools: Vec<(String, String)>,
 }
 
 /// A run the caller started, and whether this request created it.
@@ -310,7 +312,7 @@ impl StartRunOperation {
         let access = ObjectAccessOperation::new(
             &self.auth,
             local,
-            (&output.bucket, output.prefix.trim_start_matches('/')),
+            (&output.bucket, output.prefix.trim_end_matches('/')),
             Permission::WRITE,
         );
         self.step = AdmitStep::Output(Box::new(view));
@@ -412,7 +414,7 @@ impl StartRunOperation {
             secrets: request.secrets.clone(),
             path_restrictions: self.auth.path_restrictions.clone(),
             captured_remote: std::mem::take(&mut self.captured),
-            used_tools: Vec::new(),
+            used_tools: self.lineage.used_tools.clone(),
         };
         let key = request.idempotency_key.as_ref().map(|key| {
             let row = self.key_row(key);
