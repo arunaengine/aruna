@@ -132,17 +132,19 @@ fn normalize_urls(graph: &mut [Value]) {
         let Some(current) = entity.get("url") else {
             continue;
         };
-        let extracted = match current {
-            Value::String(s) => Some(s.clone()),
-            Value::Object(obj) => obj.get("@id").and_then(Value::as_str).map(str::to_owned),
-            Value::Array(items) => items.iter().find_map(|item| match item {
-                Value::String(s) => Some(s.clone()),
-                Value::Object(obj) => obj.get("@id").and_then(Value::as_str).map(str::to_owned),
+        let candidate = |item: &Value| {
+            let text = match item {
+                Value::String(s) => Some(s.as_str()),
+                Value::Object(obj) => obj.get("@id").and_then(Value::as_str),
                 _ => None,
-            }),
-            _ => None,
+            };
+            text.filter(|url| has_uri_scheme(url)).map(str::to_owned)
         };
-        match extracted.filter(|url| has_uri_scheme(url)) {
+        let extracted = match current {
+            Value::Array(items) => items.iter().find_map(candidate),
+            other => candidate(other),
+        };
+        match extracted {
             Some(url) => entity["url"] = Value::String(url),
             None => {
                 if let Some(map) = entity.as_object_mut() {

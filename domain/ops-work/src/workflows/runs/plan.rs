@@ -11,10 +11,13 @@ use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::scheduling::ExecutionPlan;
 use aruna_core::structs::execution::job::input::{
-    ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource,
+    ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, TaskSecretBinding,
+    WORKFLOW_SECRETS_TAG, encode_workflow_secrets,
 };
 use aruna_core::structs::execution::workflow::{StoredWorkflowLanguage, ToolRecord};
-use aruna_core::structs::execution::workflow_run::{CacheScope, RunState, WorkflowRunRecord};
+use aruna_core::structs::execution::workflow_run::{
+    CacheScope, RunState, WorkflowRunRecord, WorkflowSecretScope,
+};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::workflow::WorkflowError;
 use aruna_workflow_contract::preflight::{
@@ -74,6 +77,14 @@ pub struct RunPlan {
     pub rejected: Vec<(NodeId, String)>,
 }
 
+/// What vault secret placement requirement a simulated task carries.
+#[derive(Clone, Debug, PartialEq)]
+enum VaultNeed {
+    None,
+    Known(BTreeMap<String, TaskSecretBinding>),
+    Unknown,
+}
+
 /// One task of the simulated run, as the preview reads it from the simulated graph.
 #[derive(Clone, Debug, PartialEq)]
 struct SimTask {
@@ -85,6 +96,7 @@ struct SimTask {
     upstream: Vec<u64>,
     resources: ComputeResources,
     seed: Option<String>,
+    vault: VaultNeed,
 }
 
 /// Where a planned task goes.
@@ -98,7 +110,7 @@ enum Placement {
     Runtime(Option<NodeId>),
 }
 
-/// Distinguishes preview rounds by inputs, compute ceilings, network mode, and placement tags.
+/// Distinguishes preview rounds by inputs, compute ceilings, network mode, vault scope, and tags.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct PreviewKey {
     inputs: Vec<(String, String, Option<NodeId>)>,
@@ -109,6 +121,7 @@ struct PreviewKey {
     preemptible: bool,
     gpus: Option<u32>,
     network_open: bool,
+    vault: (bool, bool),
     tags: Vec<(String, String)>,
 }
 
@@ -304,6 +317,7 @@ impl PlanRunOperation {
             }
             let step = task["step"].as_str().unwrap_or_default().to_owned();
             let settings = self.settings.get(&step);
+            let vault = self.vault_need(task);
             self.tasks.push(SimTask {
                 id,
                 inputs: pinned_reads(task, &pins),
@@ -315,6 +329,7 @@ impl PlanRunOperation {
                 image: task["image"].as_str().map(str::to_owned),
                 seed: task["task_key_seed"].as_str().map(str::to_owned),
                 step,
+                vault,
             });
         }
         if error {
@@ -323,7 +338,7 @@ impl PlanRunOperation {
             return Ok(Next::Done(std::mem::take(&mut self.plan)));
         }
         for task in &self.tasks {
-            if !task.upstream.is_empty() {
+            if !task.upstream.is_empty() || matches!(task.vault, VaultNeed::Unknown) {
                 continue;
             }
             let key = self.preview_key(task);
@@ -341,11 +356,46 @@ impl PlanRunOperation {
         self.next_preview()
     }
 
+    fn vault_need(&self, task: &Value) -> VaultNeed {
+        if self.request.secrets.is_empty() {
+            return VaultNeed::None;
+        }
+        let Some(names) = task.get("secrets").and_then(Value::as_array) else {
+            return VaultNeed::Unknown;
+        };
+        let mut bound = BTreeMap::new();
+        for item in names {
+            let Some(name) = item.as_str() else {
+                return VaultNeed::Unknown;
+            };
+            let Some(binding) = self.request.secrets.get(name) else {
+                return VaultNeed::Unknown;
+            };
+            bound.insert(
+                name.to_owned(),
+                TaskSecretBinding {
+                    workflow_id: self.request.workflow_id,
+                    scope: binding.scope,
+                    name: binding.name.clone(),
+                    field: binding.field.clone(),
+                },
+            );
+        }
+        VaultNeed::Known(bound)
+    }
+
     fn preview_key(&self, task: &SimTask) -> PreviewKey {
         let local = self.node.local;
         let settings = self.settings.get(&task.step);
         let tags = site_tags(None, settings, self.request.placement_site.clone());
         let network_open = settings.is_some_and(|s| s.execution.network == Some(true));
+        let vault = match &task.vault {
+            VaultNeed::Known(bound) => (
+                bound.values().any(|b| b.scope != WorkflowSecretScope::Node),
+                bound.values().any(|b| b.scope == WorkflowSecretScope::Node),
+            ),
+            VaultNeed::None | VaultNeed::Unknown => (false, false),
+        };
         let r = &task.resources;
         PreviewKey {
             inputs: task
@@ -360,6 +410,7 @@ impl PlanRunOperation {
             preemptible: r.preemptible,
             gpus: r.gpus,
             network_open,
+            vault,
             tags,
         }
     }
@@ -388,6 +439,12 @@ impl PlanRunOperation {
                 .collect();
         if settings.is_some_and(|s| s.execution.network == Some(true)) {
             tags.insert(NETWORK_TAG_KEY.to_owned(), "open".to_owned());
+        }
+        if let VaultNeed::Known(bound) = &task.vault
+            && !bound.is_empty()
+            && let Ok(encoded) = encode_workflow_secrets(bound)
+        {
+            tags.insert(WORKFLOW_SECRETS_TAG.to_owned(), encoded);
         }
         ExecutionSpec {
             group_id: self.request.group_id,
@@ -458,17 +515,16 @@ impl PlanRunOperation {
         let mut placements: BTreeMap<u64, Placement> = BTreeMap::new();
         let mut complete = self.markers.is_empty();
         for task in &self.tasks {
-            let placement = match task.upstream.is_empty() {
-                true => {
-                    let key = self.preview_key(task);
-                    planned(self.planned.get(&key).and_then(Option::as_ref))
-                }
-                false => {
-                    let hint = (task.upstream.iter())
-                        .filter_map(|upstream| placements.get(upstream))
-                        .find_map(Placement::node);
-                    Placement::Runtime(hint)
-                }
+            let placement = if matches!(task.vault, VaultNeed::Unknown) {
+                Placement::Runtime(None)
+            } else if task.upstream.is_empty() {
+                let key = self.preview_key(task);
+                planned(self.planned.get(&key).and_then(Option::as_ref))
+            } else {
+                let hint = (task.upstream.iter())
+                    .filter_map(|upstream| placements.get(upstream))
+                    .find_map(Placement::node);
+                Placement::Runtime(hint)
             };
             if matches!(placement, Placement::Runtime(_)) {
                 complete = false;

@@ -515,7 +515,7 @@ fn validates_uwe_crate() {
             {"@id": "#tool/echo", "@type": "SoftwareApplication",
                 "name": "echo", "url": {"@id": "Snakefile"}},
             {"@id": "#tool/ext", "@type": "SoftwareApplication",
-                "name": "ext", "url": {"@id": "https://example.org/tool"}},
+                "name": "ext", "url": [{"@id": "Snakefile"}, "https://example.org/tool"]},
             {"@id": "#image/0", "@type": "ContainerImage",
                 "additionalType": {"@id": "https://w3id.org/ro/terms/workflow-run#DockerImage"},
                 "registry": "docker.io", "name": "library/debian", "tag": "stable-slim",

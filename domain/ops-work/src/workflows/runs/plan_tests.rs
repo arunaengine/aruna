@@ -335,3 +335,53 @@ fn separates_distinct_resources() {
     assert_eq!(plan.tasks[1].node_id, Some(gpu_node));
     assert_eq!(plan.tasks[1].mode, DATA_TO_COMPUTE);
 }
+
+// Vault secret bindings propagate onto preview specs and keys, and fall back to runtime placement
+// when simulation cannot identify per-task secret bindings.
+#[test]
+fn previews_vault_constraints() {
+    use aruna_core::secrets::SecretName;
+    use aruna_core::structs::execution::job::input::parse_workflow_secrets;
+    use aruna_core::structs::execution::workflow_run::{
+        WorkflowSecretBinding, WorkflowSecretScope,
+    };
+
+    let data_node = node(2);
+    let reads = pin("reads", 1, data_node);
+    let mut planning = operation(vec![reads.clone()]);
+    planning.request.secrets.insert(
+        "GROUP_KEY".into(),
+        WorkflowSecretBinding {
+            scope: WorkflowSecretScope::Group,
+            name: SecretName::try_from("group-api".to_string()).unwrap(),
+            field: None,
+        },
+    );
+
+    // Explicit per-task secret arrays separate secret-bearing and plain tasks into distinct rounds.
+    let mut plain = task(1, "plain", &[&reads]);
+    plain["task"]["secrets"] = json!([]);
+    let mut secret_task = task(2, "call", &[&reads]);
+    secret_task["task"]["secrets"] = json!(["GROUP_KEY"]);
+    let graph = json!({"nodes": [plain, secret_task], "edges": []});
+    planning.simulated(&graph, &[]).unwrap();
+    assert_eq!(
+        planning.previews.len(),
+        1,
+        "secret-bearing task gets its own round"
+    );
+    let secret_spec = &planning.previews[0].1;
+    let parsed = parse_workflow_secrets(&secret_spec.tags).unwrap();
+    assert_eq!(parsed["GROUP_KEY"].scope, WorkflowSecretScope::Group);
+
+    // Without per-task secret identification, secret-bearing runs defer placement to runtime.
+    let mut unknown = operation(vec![reads.clone()]);
+    unknown.request.secrets = planning.request.secrets.clone();
+    let opaque = json!({"nodes": [task(1, "opaque", &[&reads])], "edges": []});
+    let Next::Done(plan) = unknown.simulated(&opaque, &[]).unwrap() else {
+        panic!("opaque secret task skips preview");
+    };
+    assert!(!plan.complete);
+    assert_eq!(plan.tasks[0].mode, PLACED_AT_RUNTIME);
+    assert_eq!(plan.tasks[0].node_id, None);
+}
