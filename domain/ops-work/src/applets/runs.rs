@@ -89,6 +89,7 @@ pub fn run_request(
         provenance_crate: false,
         idempotency_key: None,
         placement_site: None,
+        secrets: std::collections::BTreeMap::new(),
     })
 }
 

@@ -3,7 +3,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeMap;
+
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::compute::valid_vault_env;
 use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::job_request::{SubmitJobError, SubmitJobResult};
@@ -15,8 +18,8 @@ use aruna_core::structs::execution::job::identity::RETENTION_MS;
 use aruna_core::structs::execution::job::input::JobPayload;
 use aruna_core::structs::execution::job::local::{WorkspaceMode, user_dedup_key};
 use aruna_core::structs::execution::workflow_run::{
-    CacheScope, RunKeyRecord, RunOutput, RunState, WorkflowRunRecord, WorkflowRunSpec, run_key,
-    run_key_row,
+    CacheScope, RunKeyRecord, RunOutput, RunState, WorkflowRunRecord, WorkflowRunSpec,
+    WorkflowSecretBinding, run_key, run_key_row,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
@@ -58,23 +61,27 @@ pub struct RunRequest {
     pub idempotency_key: Option<String>,
     /// The site every task of the run must run at; `None` lets each task go where it fits.
     pub placement_site: Option<String>,
+    /// Vault secret bindings of the run, by workflow secret name; carries only references.
+    pub secrets: BTreeMap<String, WorkflowSecretBinding>,
 }
 
 impl RunRequest {
-    /// What a repeated key must ask for again: the workflow, its version, values, inputs and
-    /// output.
+    /// What a repeated key must ask for again: the workflow, its version, values, inputs,
+    /// output and secret bindings.
     pub fn digest(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"aruna-workflow-run-request-v1\0");
         hasher.update(&self.group_id.to_bytes());
         hasher.update(&self.workflow_id.to_bytes());
         hasher.update(&self.version.to_be_bytes());
+        let secrets = serde_json::to_string(&self.secrets).unwrap_or_default();
         for text in [
             self.values.to_string(),
             self.inputs_json.clone().unwrap_or_default(),
             (self.output.as_ref())
                 .map(|output| format!("{}\0{}", output.bucket, output.prefix))
                 .unwrap_or_default(),
+            secrets,
         ] {
             hasher.update(&(text.len() as u64).to_be_bytes());
             hasher.update(text.as_bytes());
@@ -289,6 +296,7 @@ impl StartRunOperation {
             placement_site: request.placement_site.clone(),
             protected,
             started_at_ms: None,
+            secrets: request.secrets.clone(),
         };
         let key = request.idempotency_key.as_ref().map(|key| {
             let row = self.key_row(key);
@@ -346,6 +354,30 @@ impl Operation for StartRunOperation {
                 "a run needs an output bucket: its task files are kept below the output prefix"
                     .into(),
             ));
+        }
+        if !self.request.secrets.is_empty() {
+            if self.auth.path_restrictions.is_some() {
+                return Err(CatalogError::Forbidden);
+            }
+            for (name, binding) in &self.request.secrets {
+                if !valid_vault_env(name) {
+                    return Err(CatalogError::Invalid(format!(
+                        "secret name `{name}` is not an allowed environment variable name"
+                    )));
+                }
+                if let Some(field) = &binding.field {
+                    let valid = !field.is_empty()
+                        && field.len() <= 32
+                        && field
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+                    if !valid {
+                        return Err(CatalogError::Invalid(format!(
+                            "secret `{name}` names an invalid field `{field}`"
+                        )));
+                    }
+                }
+            }
         }
         self.pending.reverse();
         self.step = AdmitStep::Group;

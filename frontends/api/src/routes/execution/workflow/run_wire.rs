@@ -71,6 +71,18 @@ pub struct ProvenanceBody {
     pub run_crate: Option<bool>,
 }
 
+/// One vault secret bound to a workflow run's secret name; carries only references.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct WorkflowSecretBody {
+    /// `user`, `group`, `realm` or `node`.
+    pub scope: String,
+    /// Name of the secret stored in the vault.
+    pub name: String,
+    /// Field name for multi-field secrets; optional for `bearer`, `header` and `hmac`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+}
+
 /// A run of one workflow version.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct WorkflowRunRequest {
@@ -89,6 +101,9 @@ pub struct WorkflowRunRequest {
     pub output: Option<RunOutputBody>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<ProvenanceBody>,
+    /// Vault secret bindings by workflow secret name; values never enter the coordinator.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secrets: BTreeMap<String, WorkflowSecretBody>,
 }
 
 /// A workflow run as lists and state changes show it.

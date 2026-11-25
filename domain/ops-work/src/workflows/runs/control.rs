@@ -7,7 +7,9 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::errors::AuthorizationError;
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::workflow_run::{CacheScope, WorkflowRunRecord};
+use aruna_core::structs::execution::workflow_run::{
+    CacheScope, WorkflowRunRecord, WorkflowSecretScope,
+};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use serde_json::Value;
@@ -110,6 +112,13 @@ impl FollowRunOperation {
             Some(text) => pins_of(&crate::workflows::from_text(text)?)?,
             None => Vec::new(),
         };
+        let has_user_secrets = source
+            .secrets
+            .values()
+            .any(|binding| binding.scope == WorkflowSecretScope::User);
+        if has_user_secrets && source.created_by != self.auth.user_id {
+            return Err(CatalogError::Forbidden);
+        }
         let request = RunRequest {
             group_id: source.group_id,
             workflow_id: source.workflow_id,
@@ -121,6 +130,7 @@ impl FollowRunOperation {
             provenance_crate: source.provenance_crate,
             idempotency_key: None,
             placement_site: source.placement_site.clone(),
+            secrets: source.secrets.clone(),
         };
         let lineage = match self.follow {
             Follow::Resume => Lineage {

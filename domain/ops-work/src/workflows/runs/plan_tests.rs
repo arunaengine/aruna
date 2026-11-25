@@ -51,6 +51,7 @@ fn operation(inputs: Vec<PinnedInput>) -> PlanRunOperation {
         provenance_crate: false,
         idempotency_key: None,
         placement_site: None,
+        secrets: BTreeMap::new(),
     };
     PlanRunOperation::new(&auth, node, request)
 }

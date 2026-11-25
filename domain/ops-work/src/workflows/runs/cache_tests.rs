@@ -121,6 +121,7 @@ fn narrows_scopes() {
     secret.secret_placeholders.push(SecretPlaceholder {
         name: "TOKEN".into(),
         placeholder: "@@TOKEN@@".into(),
+        env_name: None,
     });
     let mut unpinned = pinned_task();
     unpinned.direct_inputs[0].address = "aruna://reads/a.txt".into();

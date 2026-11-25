@@ -3,9 +3,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use aruna_core::structs::execution::workflow_run::{RunOutput, RunState, WorkflowRunRecord};
+use aruna_core::secrets::SecretName;
+use aruna_core::structs::execution::workflow_run::{
+    RunOutput, RunState, WorkflowRunRecord, WorkflowSecretBinding, WorkflowSecretScope,
+};
 use aruna_core::structs::identity::features::Feature;
 use aruna_ops_work::workflows::runs::admit::{PinnedInput, RunRequest, StartRunOperation};
 use aruna_ops_work::workflows::runs::cancel::{CancelRunOperation, DeleteRunOperation};
@@ -125,6 +129,30 @@ pub(super) fn run_request(
         }),
         None => None,
     };
+    let mut secrets = BTreeMap::new();
+    for (name, binding) in request.secrets {
+        let scope = match binding.scope.as_str() {
+            "user" => WorkflowSecretScope::User,
+            "group" => WorkflowSecretScope::Group,
+            "realm" => WorkflowSecretScope::Realm,
+            "node" => WorkflowSecretScope::Node,
+            other => {
+                return Err(ServerError::BadRequestReason(format!(
+                    "{other} is not a secret scope"
+                )));
+            }
+        };
+        let secret_name = SecretName::try_from(binding.name)
+            .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
+        secrets.insert(
+            name,
+            WorkflowSecretBinding {
+                scope,
+                name: secret_name,
+                field: binding.field,
+            },
+        );
+    }
     Ok(RunRequest {
         group_id: ulid(&request.group_id, "group_id")?,
         workflow_id: ulid(&request.workflow_id, "workflow_id")?,
@@ -141,6 +169,7 @@ pub(super) fn run_request(
         placement_site: (request.placement)
             .and_then(|placement| placement.site)
             .filter(|site| !site.trim().is_empty()),
+        secrets,
     })
 }
 

@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::compute::valid_vault_env;
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::id::NodeId;
@@ -21,7 +22,8 @@ use aruna_core::structs::execution::job::family::{JobProjection, LogicalJobSpec,
 use aruna_core::structs::execution::job::identity::{JobId, RETENTION_MS};
 use aruna_core::structs::execution::job::input::{
     ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, OutputDestination,
-    OutputSelection, WORKFLOW_RUN_TAG, WORKFLOW_TASK_TAG, run_area_bucket,
+    OutputSelection, TaskSecretBinding, WORKFLOW_RUN_TAG, WORKFLOW_SECRETS_TAG, WORKFLOW_TASK_TAG,
+    encode_workflow_secrets, run_area_bucket,
 };
 use aruna_core::structs::execution::job::local::WorkspaceMode;
 use aruna_core::structs::execution::workflow_run::{
@@ -207,6 +209,40 @@ pub fn task_spec(
     ]);
     if request.network_allowed {
         tags.insert(NETWORK_TAG_KEY.to_owned(), "open".to_owned());
+    }
+    if !request.secret_placeholders.is_empty() {
+        let mut bound = BTreeMap::new();
+        for placeholder in &request.secret_placeholders {
+            let binding =
+                record
+                    .secrets
+                    .get(&placeholder.name)
+                    .ok_or_else(|| ContractError::Denied {
+                        message: format!("secret `{}` is not bound to this run", placeholder.name),
+                    })?;
+            let env_name = placeholder.env_name.as_deref().unwrap_or(&placeholder.name);
+            if !valid_vault_env(env_name) {
+                return Err(ContractError::invalid(format!(
+                    "secret environment variable `{env_name}` is not allowed"
+                )));
+            }
+            let entry = TaskSecretBinding {
+                workflow_id: record.workflow_id,
+                scope: binding.scope,
+                name: binding.name.clone(),
+                field: binding.field.clone(),
+            };
+            if let Some(previous) = bound.insert(env_name.to_owned(), entry.clone())
+                && previous != entry
+            {
+                return Err(ContractError::invalid(format!(
+                    "secret environment variable `{env_name}` is bound twice"
+                )));
+            }
+        }
+        let encoded = encode_workflow_secrets(&bound)
+            .map_err(|error| ContractError::internal(error.to_string()))?;
+        tags.insert(WORKFLOW_SECRETS_TAG.to_owned(), encoded);
     }
     tags.extend(placement_tags(record, request));
     let resources = &request.resources;

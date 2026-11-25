@@ -190,6 +190,7 @@ impl PlanRunOperation {
             placement_site: request.placement_site.clone(),
             protected: false,
             started_at_ms: None,
+            secrets: request.secrets.clone(),
         }
     }
 

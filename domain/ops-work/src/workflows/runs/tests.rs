@@ -173,6 +173,7 @@ impl Runs {
             provenance_crate: false,
             idempotency_key: key.map(Into::into),
             placement_site: None,
+            secrets: BTreeMap::new(),
         }
     }
 
@@ -684,6 +685,7 @@ pub(super) fn sample_run() -> WorkflowRunRecord {
         placement_site: None,
         protected: false,
         started_at_ms: None,
+        secrets: BTreeMap::new(),
     }
 }
 
@@ -1000,4 +1002,74 @@ async fn restricted_needs_marker() {
     });
     let elsewhere = runs.start(&marked, remote).await;
     assert_eq!(elsewhere.unwrap_err(), CatalogError::Forbidden);
+}
+
+// Secret bindings flow from admission to coordinator start and child task spec; unbound or
+// reserved names and restricted tokens are refused.
+#[tokio::test]
+async fn binds_workflow_secrets() {
+    use aruna_core::secrets::SecretName;
+    use aruna_core::structs::execution::job::input::parse_workflow_secrets;
+    use aruna_core::structs::execution::workflow_run::{
+        WorkflowSecretBinding, WorkflowSecretScope,
+    };
+    use aruna_core::structs::identity::auth::{PathRestriction, Permission};
+    use aruna_workflow_contract::host::SecretPlaceholder;
+
+    let runs = runs().await;
+    let binding = |scope, name: &str| WorkflowSecretBinding {
+        scope,
+        name: SecretName::try_from(name.to_string()).unwrap(),
+        field: None,
+    };
+    let mut bad = runs.request(None, json!({}));
+    bad.secrets.insert(
+        "ARUNA_TOKEN".into(),
+        binding(WorkflowSecretScope::User, "tok"),
+    );
+    assert!(matches!(
+        runs.start(&runs.fixture.alice, bad).await,
+        Err(CatalogError::Invalid(_))
+    ));
+
+    let mut req = runs.request(None, json!({}));
+    req.secrets
+        .insert("API_KEY".into(), binding(WorkflowSecretScope::User, "tok"));
+    let mut restricted = runs.fixture.alice.clone();
+    restricted.path_restrictions = Some(vec![PathRestriction {
+        pattern: "/**".into(),
+        permission: Permission::WRITE,
+    }]);
+    assert_eq!(
+        runs.start(&restricted, req.clone()).await.unwrap_err(),
+        CatalogError::Forbidden
+    );
+
+    let admitted = runs.start(&runs.fixture.alice, req).await.unwrap().record;
+    assert!(matches!(runs.prepare(&admitted).await, Prepared::Ready(_)));
+    let sent = runs.host.sent();
+    let Some(HostToCoordinator::RunStart(start)) = sent.first() else {
+        panic!("expected RunStart, got {sent:?}");
+    };
+    assert!(start.network_isolated);
+    assert_eq!(start.secret_names, ["API_KEY"]);
+
+    let mut task = start_task();
+    task.secret_placeholders.push(SecretPlaceholder {
+        name: "API_KEY".into(),
+        placeholder: "__ARUNA_SECRET_x_API_KEY__".into(),
+        env_name: Some("MY_KEY".into()),
+    });
+    let spec = task_spec(&admitted, &task, "k").unwrap();
+    let parsed = parse_workflow_secrets(&spec.tags).unwrap();
+    assert_eq!(parsed["MY_KEY"].name.as_str(), "tok");
+    assert_eq!(parsed["MY_KEY"].scope, WorkflowSecretScope::User);
+
+    let mut unbound = start_task();
+    unbound.secret_placeholders.push(SecretPlaceholder {
+        name: "OTHER".into(),
+        placeholder: "__ARUNA_SECRET_x_OTHER__".into(),
+        env_name: None,
+    });
+    assert!(task_spec(&admitted, &unbound, "k").is_err());
 }
