@@ -247,3 +247,27 @@ async fn cancels_running_tasks() {
     assert!(host.receive().await.is_none());
     host.finished().await.expect("a clean end");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn isolates_step_network() {
+    let composed = COMPOSED
+        .replace("      execution:\n        network: false\n", "")
+        .replace(
+            "      placement:\n        site: giessen\n",
+            "      placement:\n        site: giessen\n      execution:\n        network: true\n",
+        );
+    let mut start = composed_start(&composed);
+    start.network_isolated = true;
+    let node = finished_run("run-net", start, input_node()).await;
+    let first = (node.tasks.iter())
+        .find(|task| task.step_id == "reverse")
+        .expect("reverse");
+    let second = (node.tasks.iter())
+        .find(|task| task.step_id == "shout")
+        .expect("shout");
+    assert!(
+        !first.network_allowed,
+        "isolated run keeps default steps offline"
+    );
+    assert!(second.network_allowed, "step opting into network gets it");
+}

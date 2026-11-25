@@ -85,6 +85,10 @@ async fn prepare_and_run(
     store.replay_log_pages(&payload.prior_log_pages, &relocation)?;
     let steps = composed::step_matches(&workspace.entry, &step_settings)
         .map_err(ContractError::workflow)?;
+    let allowed_steps: Vec<String> = (steps.iter())
+        .filter(|step| step.settings.execution.network == Some(true))
+        .flat_map(|step| step.names.iter().cloned())
+        .collect();
     let backend = CoordinatorBackend::new(
         rpc.clone(),
         run_id.clone(),
@@ -112,10 +116,6 @@ async fn prepare_and_run(
     settings.resume = payload.resume_lineage.map(uwe::Resume::Run);
     settings.max_pending = payload.max_pending.map(|pending| pending as usize);
     if payload.network_isolated {
-        let allowed_steps = (step_settings.iter())
-            .filter(|(_, settings)| settings.execution.network == Some(true))
-            .map(|(step, _)| step.clone())
-            .collect();
         settings.network = Some(NetworkRule {
             none_by_default: true,
             allowed_steps,
@@ -289,6 +289,7 @@ pub fn secret_placeholders(names: &[String]) -> Result<Vec<SecretPlaceholder>, C
         placeholders.push(SecretPlaceholder {
             name: name.clone(),
             placeholder: format!("__ARUNA_SECRET_{nonce}_{name}__"),
+            env_name: None,
         });
     }
     Ok(placeholders)

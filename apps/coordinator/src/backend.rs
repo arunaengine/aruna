@@ -121,7 +121,8 @@ impl CoordinatorBackend {
             .map_err(|error| ExecutorError::Unsupported(error.to_string()))?;
         let task_key_seed = String::from_utf8(canonical)
             .map_err(|_| ExecutorError::Unsupported("the task specification is no text".into()))?;
-        let spec_json = serde_json::to_value(spec)
+        let (clean, secret_placeholders) = extract_secrets(&self.secrets, spec)?;
+        let spec_json = serde_json::to_value(&clean)
             .map_err(|error| ExecutorError::Unsupported(error.to_string()))?;
         let folders = Folders {
             work: WORK_FOLDER,
@@ -130,7 +131,7 @@ impl CoordinatorBackend {
             outbox: "",
             owner: "",
         };
-        let script = wrapper::wrapper(spec, &folders);
+        let script = wrapper::wrapper(&clean, &folders);
         let settings = settings_for(&self.steps, &name.step).map_err(ExecutorError::Unsupported)?;
         let placement = job.placement;
         let mut resources = TaskResources {
@@ -181,7 +182,7 @@ impl CoordinatorBackend {
                     pattern: rule.pattern.clone(),
                 })
                 .collect(),
-            secret_placeholders: self.placeholders_in(spec),
+            secret_placeholders,
             step_settings: settings,
         })
     }
@@ -219,20 +220,6 @@ impl CoordinatorBackend {
             });
         }
         Ok(staged)
-    }
-
-    /// The placeholders of the run's secrets that the task's environment or command names.
-    fn placeholders_in(&self, spec: &task_model::TaskSpec) -> Vec<SecretPlaceholder> {
-        let mut texts: Vec<&str> = spec.arguments.iter().map(String::as_str).collect();
-        for value in spec.environment.values() {
-            if let EnvironmentValue::Literal(text) = value {
-                texts.push(text);
-            }
-        }
-        (self.secrets.iter())
-            .filter(|secret| texts.iter().any(|text| text.contains(&secret.placeholder)))
-            .cloned()
-            .collect()
     }
 
     /// The scratch folder of a finished attempt: the wrapper's control files and the outputs,
@@ -406,6 +393,50 @@ impl DynBackend for CoordinatorBackend {
     }
 }
 
+/// Moves secret placeholders out of the task environment so the wrapper never overwrites
+/// container `vault_env`, and refuses placeholders pasted into commands or partial strings.
+fn extract_secrets(
+    secrets: &[SecretPlaceholder],
+    spec: &task_model::TaskSpec,
+) -> Result<(task_model::TaskSpec, Vec<SecretPlaceholder>), ExecutorError> {
+    let mut clean = spec.clone();
+    if secrets.is_empty() {
+        return Ok((clean, Vec::new()));
+    }
+    for argument in &spec.arguments {
+        if let Some(secret) = (secrets.iter()).find(|secret| argument.contains(&secret.placeholder))
+        {
+            return Err(ExecutorError::Unsupported(format!(
+                "secret {} must be passed through the task environment, not command arguments",
+                secret.name
+            )));
+        }
+    }
+    let mut found = Vec::new();
+    for (env_name, value) in &spec.environment {
+        let EnvironmentValue::Literal(text) = value else {
+            continue;
+        };
+        let Some(secret) = (secrets.iter()).find(|secret| text.contains(&secret.placeholder))
+        else {
+            continue;
+        };
+        if text != &secret.placeholder {
+            return Err(ExecutorError::Unsupported(format!(
+                "secret {} must be the full value of an environment variable",
+                secret.name
+            )));
+        }
+        clean.environment.remove(env_name);
+        found.push(SecretPlaceholder {
+            name: secret.name.clone(),
+            placeholder: secret.placeholder.clone(),
+            env_name: (env_name != &secret.name).then(|| env_name.clone()),
+        });
+    }
+    Ok((clean, found))
+}
+
 /// Lets the step's settings decide size, site and network where they say anything.
 fn apply_settings(
     settings: &ArunaStepSettings,
@@ -424,8 +455,8 @@ fn apply_settings(
     if let Some(named) = &settings.placement.site {
         *site = Some(named.clone());
     }
-    if settings.execution.network == Some(false) {
-        *network = false;
+    if let Some(allowed) = settings.execution.network {
+        *network = allowed;
     }
 }
 
@@ -551,5 +582,76 @@ mod tests {
         assert_eq!(resources.disk_bytes, Some(7));
         assert_eq!((resources.gpus, resources.time_seconds), (1, Some(180)));
         assert_eq!((site.as_deref(), network), (Some("giessen"), false));
+        let open = ArunaStepSettings::from_value(serde_json::json!({
+            "execution": {"network": true},
+        }))
+        .expect("reads");
+        let mut isolated = false;
+        apply_settings(&open, &mut resources, &mut site, &mut isolated);
+        assert!(isolated);
+    }
+
+    #[test]
+    fn extracts_secret_env() {
+        let secret = SecretPlaceholder {
+            name: "TOKEN".into(),
+            placeholder: "__ARUNA_SECRET_abc_TOKEN__".into(),
+            env_name: None,
+        };
+        let secrets = [secret.clone()];
+        let mut spec = task_model::TaskSpec {
+            format: 1,
+            namespace: String::new(),
+            image: None,
+            arguments: vec!["echo".into(), "ok".into()],
+            workdir: None,
+            environment: Default::default(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            output_manifest: None,
+            stdin: None,
+            containers: Vec::new(),
+            replaces_entrypoint: false,
+            run_as: None,
+        };
+        spec.environment.insert(
+            "TOKEN".into(),
+            EnvironmentValue::Literal(secret.placeholder.clone()),
+        );
+        spec.environment.insert(
+            "ALT".into(),
+            EnvironmentValue::Literal(secret.placeholder.clone()),
+        );
+        spec.environment
+            .insert("PLAIN".into(), EnvironmentValue::Literal("hello".into()));
+        let (clean, extracted) = extract_secrets(&secrets, &spec).expect("extracts");
+        assert!(!clean.environment.contains_key("TOKEN"));
+        assert!(!clean.environment.contains_key("ALT"));
+        assert_eq!(
+            clean.environment.get("PLAIN"),
+            Some(&EnvironmentValue::Literal("hello".into()))
+        );
+        assert_eq!(extracted.len(), 2);
+        assert!(
+            extracted
+                .iter()
+                .any(|item| item.name == "TOKEN" && item.env_name.is_none())
+        );
+        assert!(
+            extracted
+                .iter()
+                .any(|item| item.name == "TOKEN" && item.env_name.as_deref() == Some("ALT"))
+        );
+
+        let mut in_args = spec.clone();
+        in_args.arguments.push(secret.placeholder.clone());
+        assert!(extract_secrets(&secrets, &in_args).is_err());
+
+        let mut partial = spec;
+        partial.environment.insert(
+            "HDR".into(),
+            EnvironmentValue::Literal(format!("Bearer {}", secret.placeholder)),
+        );
+        assert!(extract_secrets(&secrets, &partial).is_err());
     }
 }

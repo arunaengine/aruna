@@ -149,8 +149,12 @@ pub struct ExpectedOutput {
 /// An environment variable whose value stands in for a secret of the run.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecretPlaceholder {
+    /// The secret name in the run's secret bindings.
     pub name: String,
     pub placeholder: String,
+    /// Container environment variable carrying the secret when it differs from `name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_name: Option<String>,
 }
 
 /// The answer to one call; a refused call answers `Failed`.

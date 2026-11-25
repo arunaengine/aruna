@@ -290,6 +290,7 @@ fn start_task() -> StartTask {
         secret_placeholders: vec![SecretPlaceholder {
             name: "TOKEN".into(),
             placeholder: "__ARUNA_SECRET_x_TOKEN__".into(),
+            env_name: Some("API_TOKEN".into()),
         }],
         step_settings: Some(settings()),
     }
