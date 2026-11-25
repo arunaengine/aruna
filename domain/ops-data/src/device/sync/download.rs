@@ -104,6 +104,7 @@ impl Operation for FetchRemoteOperation {
             destination: None,
             known_refs: Vec::new(),
             range: None,
+            disallow_encrypted: false,
         };
         self.request = Some(request.clone());
         let read = ManagedReadOperation::new(self.node_id, request);

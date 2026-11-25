@@ -45,6 +45,7 @@ pub fn read_call(
         destination: None,
         known_refs: Vec::new(),
         range,
+        disallow_encrypted: !run.protected,
     };
     Some(IoCall::child(ManagedReadOperation::new(node, request)))
 }

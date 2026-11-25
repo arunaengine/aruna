@@ -300,6 +300,7 @@ impl FromHoldersOperation {
                 destination: None,
                 known_refs: Vec::new(),
                 range,
+                disallow_encrypted: false,
             },
             holders: holders.iter().copied().collect(),
             asked: None,

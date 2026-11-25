@@ -546,6 +546,9 @@ pub struct InputResolveRequest {
     /// Unix seconds the grants end at, bounded by this node's job retention.
     pub expires_at: u64,
     pub inputs: Vec<InputSelection>,
+    /// Refuse inputs whose resolved bucket is encrypted (unprotected workflow runs).
+    #[serde(default)]
+    pub disallow_encrypted: bool,
 }
 
 /// What a running job asks its host, the runtime that holds its stop signals, progress and

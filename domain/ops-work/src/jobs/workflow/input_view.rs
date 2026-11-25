@@ -592,6 +592,7 @@ impl ViewEntryOperation {
             destination: None,
             known_refs: Vec::new(),
             range: self.range.clone(),
+            disallow_encrypted: false,
         }
     }
 }

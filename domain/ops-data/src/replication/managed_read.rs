@@ -274,6 +274,7 @@ mod tests {
             destination: None,
             known_refs: Vec::new(),
             range: None,
+            disallow_encrypted: false,
         }
     }
 

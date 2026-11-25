@@ -136,6 +136,7 @@ impl StageInputOperation {
                     destination: None,
                     known_refs: Vec::new(),
                     range: None,
+                    disallow_encrypted: false,
                 };
                 let read = ManagedReadOperation::new(holder, request);
                 return Ok(Next::Call(IoCall::child(read)));

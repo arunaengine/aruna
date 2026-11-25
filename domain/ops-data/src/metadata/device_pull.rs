@@ -561,6 +561,7 @@ impl CommitPullOperation {
             destination: None,
             known_refs: Vec::new(),
             range: None,
+            disallow_encrypted: false,
         };
         self.stage = CommitStage::Read;
         let read = ManagedReadOperation::new(self.request.source.node_id, read);

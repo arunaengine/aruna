@@ -191,6 +191,7 @@ impl OpenBlobOperation {
             destination: None,
             known_refs: Vec::new(),
             range: None,
+            disallow_encrypted: false,
         };
         let read = ManagedReadOperation::new(source, request);
         Ok(Next::Call(IoCall::child(read)))

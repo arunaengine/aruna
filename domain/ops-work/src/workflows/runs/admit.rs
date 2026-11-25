@@ -424,6 +424,7 @@ impl StartRunOperation {
             created_by: self.auth.user_id,
             submission_id: job_request::submission_of(self.auth.user_id, &scope),
             expires_at: self.now_ms.saturating_add(RETENTION_MS) / 1000,
+            disallow_encrypted: !protected,
         };
         let resolve = RemoteInputsOperation::new(node, inputs, caller, self.token.clone());
         self.step = AdmitStep::Remote(Box::new(view), protected, local_only);

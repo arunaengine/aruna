@@ -664,7 +664,10 @@ impl IncomingBaoOperation {
 
     /// A sealed copy is offered only once its bucket admits the read; a locked bucket refuses.
     fn send_accepted(&mut self, location: BackendLocation) -> ServeTurn {
-        if self.request.metadata_only {
+        if self.request.disallow_encrypted && location.format.bucket_key().is_some() {
+            return self.send_refusal(BaoReadRefusal::ReadDenied);
+        }
+        if self.request.metadata_only && !self.request.disallow_encrypted {
             return self.offer_location(location);
         }
         if let Some(key) = location.format.bucket_key() {
@@ -675,6 +678,9 @@ impl IncomingBaoOperation {
         }
         // A plain copy of an encrypting bucket, not converted yet, needs the bucket unlocked too.
         let Some(version) = self.version_key.clone() else {
+            if self.request.disallow_encrypted {
+                return self.send_refusal(BaoReadRefusal::ReadDenied);
+            }
             return self.offer_location(location);
         };
         self.location = Some(location);
@@ -692,6 +698,12 @@ impl IncomingBaoOperation {
             Ok(settings) => settings,
             Err(error) => return self.fail(error.into()),
         };
+        if self.request.disallow_encrypted && settings.is_encrypted() {
+            return self.send_refusal(BaoReadRefusal::ReadDenied);
+        }
+        if self.request.metadata_only {
+            return self.offer_admitted(location);
+        }
         let Some(key) = settings.active_key() else {
             return self.offer_admitted(location);
         };

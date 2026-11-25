@@ -1131,6 +1131,7 @@ impl HolderReadOperation {
             destination: None,
             known_refs: Vec::new(),
             range: None,
+            disallow_encrypted: false,
         };
         self.step = HolderStep::Read;
         let managed = ManagedReadOperation::new(holder, request);

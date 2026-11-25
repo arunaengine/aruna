@@ -114,7 +114,7 @@ impl ServeInputsOperation {
             submission_id: self.request.submission_id,
             expires_at: self.expires_at(),
             bearer: Some(self.bearer.clone()),
-            disallow_encrypted: false,
+            disallow_encrypted: self.request.disallow_encrypted,
         };
         let capture = CaptureInputsOperation::new(caller, vec![input.clone()]);
         self.step = ServeStep::Capture(Box::new(input), link);
@@ -231,6 +231,7 @@ mod tests {
             submission_id: SubmissionId([4; 32]),
             expires_at: u64::MAX,
             inputs,
+            disallow_encrypted: false,
         };
         ServeInputsOperation::new(node(2), token, &here, request)
     }

@@ -179,6 +179,7 @@ fn failed_policy_closes() {
         destination: None,
         known_refs: Vec::new(),
         range: None,
+        disallow_encrypted: false,
     };
     let mut op = AnswerReadOperation::new(peer_stream(), request);
     op.first().unwrap();
@@ -513,6 +514,7 @@ async fn foreign_reads_denied() {
             destination: None,
             known_refs: Vec::new(),
             range: None,
+            disallow_encrypted: false,
         }
     };
 

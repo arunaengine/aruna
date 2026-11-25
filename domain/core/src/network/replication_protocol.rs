@@ -274,6 +274,9 @@ pub struct BaoReadRequest {
     pub known_refs: Vec<PlacementPolicyRef>,
     /// Reads only these bytes; bao verifies each chunk against the object's BLAKE3 root.
     pub range: Option<std::ops::Range<u64>>,
+    /// Refuse reads whose source copy or bucket is encrypted (unprotected workflow runs).
+    #[serde(default)]
+    pub disallow_encrypted: bool,
 }
 
 impl BaoReadRequest {
@@ -873,6 +876,7 @@ mod pure_tests {
             destination: None,
             known_refs: Vec::new(),
             range: None,
+            disallow_encrypted: false,
         });
         let accepted = VersionReplicationMessage::BaoReadAccepted {
             size: 42,

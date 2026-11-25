@@ -62,6 +62,7 @@ fn read_request(local_node: aruna_core::id::NodeId, hash: [u8; 32]) -> BaoReadRe
         destination: None,
         known_refs: Vec::new(),
         range: None,
+        disallow_encrypted: false,
     }
 }
 
@@ -1370,6 +1371,20 @@ fn unconverted_copy_refused() {
     assert!(
         matches!((asked(&turn)).as_blob(), Some(BlobEffect::ServeSealedRead { lease, .. }) if lease.key == key)
     );
+
+    // An unprotected workflow read refuses both sealed blobs and encrypting buckets.
+    let (mut operation, sealed_loc) = sealed_serve(bucket_id);
+    operation.request.disallow_encrypted = true;
+    let turn = operation.send_accepted(sealed_loc);
+    assert_eq!(refusal_from(&turn), BaoReadRefusal::ReadDenied);
+
+    let (mut operation, location) = plain();
+    operation.request.disallow_encrypted = true;
+    operation.request.metadata_only = true;
+    let turn = operation.send_accepted(location);
+    assert!(matches!(&turn, Ok(Next::Call(IoCall::Read(_)))));
+    let turn = operation.next(settings_row());
+    assert_eq!(refusal_from(&turn), BaoReadRefusal::ReadDenied);
 }
 
 #[test]

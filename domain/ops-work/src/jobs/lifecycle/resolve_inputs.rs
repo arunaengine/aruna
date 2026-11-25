@@ -204,6 +204,7 @@ impl ResolveInputsOperation {
             created_by: self.scope.caller.created_by,
             submission_id: self.scope.submission_id,
             expires_at: self.scope.expires_at,
+            disallow_encrypted: self.scope.disallow_encrypted,
         };
         let token = self.scope.token.clone();
         let ask = RemoteInputsOperation::new(node, inputs, caller, token);
