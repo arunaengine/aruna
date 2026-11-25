@@ -231,3 +231,34 @@ fn failed_skip_incomplete() {
     assert_eq!(execution.incomplete_ranges, 1);
     assert!(!execution.complete);
 }
+
+#[test]
+fn bucket_still_discovers() {
+    // A bucket filter on a distributed search must still run peer discovery because another node
+    // may own an independent ordinary bucket with the same name.
+    let mut query = request(ObjectQueryMode::DistributedBestEffort, None);
+    query.bucket = Some("data".to_string());
+    let mut search = started(query);
+    assert!(matches!(search.first(), Ok(Next::Call(IoCall::Group(_)))));
+    assert_eq!(search.stage, ObjectStage::Discovery);
+
+    // Local mode and explicit target_nodes still skip discovery.
+    let mut local = request(ObjectQueryMode::Local, None);
+    local.bucket = Some("data".to_string());
+    let mut local_search = started(local);
+    assert!(matches!(
+        local_search.first(),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    assert!(matches!(local_search.stage, ObjectStage::Fanout(_)));
+
+    let mut targeted = request(ObjectQueryMode::DistributedBestEffort, None);
+    targeted.bucket = Some("data".to_string());
+    targeted.target_nodes = Some(vec![node(1), node(2)]);
+    let mut targeted_search = started(targeted);
+    assert!(matches!(
+        targeted_search.first(),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    assert!(matches!(targeted_search.stage, ObjectStage::Fanout(_)));
+}
