@@ -4,7 +4,7 @@
 
 [package]
 name = "aruna-coordinator"
-version = "3.0.0-alpha.208"
+version = "3.0.0-alpha.209"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/arunaengine/aruna"

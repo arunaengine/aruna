@@ -777,7 +777,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-gateway"
-version = "3.0.0-alpha.208"
+version = "3.0.0-alpha.209"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -1232,7 +1232,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-workflow"
-version = "3.0.0-alpha.208"
+version = "3.0.0-alpha.209"
 dependencies = [
  "aruna-compute",
  "aruna-core",
@@ -1248,7 +1248,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-workflow-contract"
-version = "3.0.0-alpha.208"
+version = "3.0.0-alpha.209"
 dependencies = [
  "serde",
  "serde_json",
