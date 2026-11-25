@@ -15,7 +15,7 @@ use aruna_core::id::NodeId;
 use aruna_core::metadata::{AuthToken, MetadataError, MetadataSearchHit};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::GroupId;
 use tracing::Span;
 
@@ -40,6 +40,8 @@ use crate::metadata::text_search::LocalSearchOperation;
 use aruna_core::metadata::protocol::{
     MetadataTransportMessage, encode_message, metadata_read_error, peer_call, peer_reply,
 };
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::realm::peer_trust::is_sync_eligible;
 
 /// Where one node's search runs.
 #[derive(Clone, Debug, PartialEq)]
@@ -245,6 +247,7 @@ struct Unsigned {
 #[derive(Debug, PartialEq)]
 enum SearchStage {
     Start,
+    Config,
     Discovery,
     Fanout,
     Sign(Box<Unsigned>),
@@ -434,6 +437,12 @@ impl Operation for MetadataSearchOperation {
         self.checked()?;
         if self.request.cursor.is_none() {
             let targets = self.request.target_nodes.take();
+            if self.mode() == ApiQueryMode::Distributed && targets.is_none() {
+                self.stage = SearchStage::Config;
+                return Ok(Next::Call(IoCall::child(GetConfigOperation::new(
+                    self.realm_id,
+                ))));
+            }
             return self.fanout(targets, false);
         }
         // Check the full realm because capped fan-out may omit the cursor's signer.
@@ -460,6 +469,13 @@ impl Operation for MetadataSearchOperation {
     ) -> Result<Next<MetadataSearchExecution>, MetadataApiError> {
         match std::mem::replace(&mut self.stage, SearchStage::Start) {
             SearchStage::Start => Err(MetadataApiError::Internal("search not started".to_string())),
+            SearchStage::Config => {
+                let local_only = result
+                    .child::<RealmConfigDocument, GetConfigError>()?
+                    .is_ok_and(|config| sole_metadata_source(&config, self.local_node));
+                let targets = local_only.then(|| vec![self.local_node]);
+                self.fanout(targets, false)
+            }
             SearchStage::Discovery => {
                 let discovery = discovery_answer(result, self.local_node);
                 let (signers, discovery) =
@@ -557,6 +573,20 @@ pub(super) fn cursor_signers(
         failed: discovery.failed,
     };
     (signers, selected)
+}
+
+/// Whether `local_node` is the sole sync-eligible node in `config`, so no other peer can hold
+/// any historical or current metadata shard.
+pub(crate) fn sole_metadata_source(config: &RealmConfigDocument, local_node: NodeId) -> bool {
+    if !is_sync_eligible(config, local_node) {
+        return false;
+    }
+    let local = local_node.to_string();
+    config
+        .nodes
+        .iter()
+        .filter(|node| node.kind.is_sync_eligible())
+        .all(|node| node.node_id == local)
 }
 
 #[cfg(test)]
@@ -794,5 +824,40 @@ mod call_tests {
             (request.peer, request.timeout),
             (node(2), Duration::from_secs(3))
         );
+    }
+
+    #[test]
+    fn sole_node_local() {
+        use aruna_core::structs::identity::realm::RealmNodeKind;
+        use aruna_core::user::id::UserId;
+        use ulid::Ulid;
+        let mut config = RealmConfigDocument::default_for_realm(realm(), Vec::new());
+        config.seed_default_placement();
+        config.ensure_node(node(1), RealmNodeKind::Server);
+        let owner = UserId::local(Ulid::from_parts(1, 1), realm());
+        config.ensure_node(node(9), RealmNodeKind::User { owner });
+        assert!(sole_metadata_source(&config, node(1)));
+
+        let mut search = started(request(ApiQueryMode::Distributed, 5, None));
+        assert!(matches!(search.first(), Ok(Next::Call(IoCall::Child(_)))));
+        assert_eq!(search.stage, SearchStage::Config);
+        let answered = IoResult::Child(ChildOutcome::new(Ok::<_, GetConfigError>(config)));
+        let next = search.next(answered).unwrap();
+        assert!(matches!(next, Next::Call(IoCall::Child(_))));
+        assert_eq!(search.stage, SearchStage::Fanout);
+    }
+
+    #[test]
+    fn multi_node_fans() {
+        use aruna_core::structs::identity::realm::RealmNodeKind;
+        let mut config = RealmConfigDocument::default_for_realm(realm(), Vec::new());
+        config.seed_default_placement();
+        for seed in [1u8, 2, 3] {
+            config.ensure_node(node(seed), RealmNodeKind::Server);
+        }
+        // Even when every current shard is replicated across all 3 nodes, distributed fanout
+        // must remain active because another sync-eligible peer may hold historical or fresher
+        // metadata index entries.
+        assert!(!sole_metadata_source(&config, node(1)));
     }
 }

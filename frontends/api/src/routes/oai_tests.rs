@@ -999,3 +999,45 @@ fn form_type_checked() {
     );
     assert!(!is_form_encoded(&headers));
 }
+
+// A record export failure after an earlier entry already exceeds the page byte budget
+// must not fail the current page; it preserves the valid prefix and resumption cursor.
+#[tokio::test]
+async fn budget_skips_fault() {
+    let fixture = fixture(RoCrateLimits::default()).await;
+    let entries: Vec<_> = (0..4u64)
+        .map(|i| (Key::from(vec![i as u8]), registry_record(&fixture, i, true)))
+        .collect();
+    let mut body = "<ListRecords>".to_string();
+    let budget = body.len() + 100;
+    let (emitted, cursor) = assemble_records(&entries, budget, &mut body, |record| {
+        let index = record.updated_at_ms - 1_000;
+        async move {
+            match index {
+                0 => Ok("<record>0</record>".repeat(4)), // 72 bytes, fits
+                1 => Ok("<record>1</record>".repeat(4)), // 72 bytes, exceeds budget -> stops
+                _ => Err(OaiFault::Unavailable),
+            }
+        }
+    })
+    .await
+    .expect("trailing export error past budget must not fail page");
+    assert_eq!(emitted, 1);
+    assert_eq!(cursor, Some(Key::from(vec![0])));
+    assert!(body.contains("<record>0</record>"));
+    assert!(!body.contains("<record>1</record>"));
+
+    // An error reached while budget remains still propagates.
+    let mut body = "<ListRecords>".to_string();
+    let err = assemble_records(&entries, 1_000, &mut body, |record| {
+        let index = record.updated_at_ms - 1_000;
+        async move {
+            match index {
+                0 => Ok("<record>0</record>".to_string()),
+                _ => Err(OaiFault::Unavailable),
+            }
+        }
+    })
+    .await;
+    assert!(matches!(err, Err(OaiFault::Unavailable)));
+}
