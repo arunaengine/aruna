@@ -58,6 +58,18 @@ pub fn path_within(path: &str, root: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
+/// Whether `pattern` can match any path at or below `subtree_root` (fail-closed on globs).
+pub fn pattern_overlaps_subtree(pattern: &str, subtree_root: &str) -> bool {
+    let bound = bind_wildcards(pattern, subtree_root);
+    let bound = bound.as_ref();
+    let Some(glob_pos) = bound.find(GLOB_CHARS) else {
+        return path_within(bound.trim_end_matches('/'), subtree_root);
+    };
+    let literal = &bound[..glob_pos];
+    let dir = literal.trim_end_matches('/');
+    path_within(dir, subtree_root) || subtree_root.starts_with(literal)
+}
+
 /// The pattern with each whole `*` segment after a literal prefix taken from `path`, so a
 /// restriction naming any node yields this node's literal root.
 pub fn bind_wildcards<'a>(pattern: &'a str, path: &str) -> Cow<'a, str> {
@@ -529,5 +541,32 @@ mod tests {
     fn wildcard_grants_nothing() {
         let granted = granted(&[("/realm/g/group/data/node/study/*/imaging", Permission::READ)]);
         assert!(readable_roots(&granted, None, BUCKET).is_empty());
+    }
+
+    #[test]
+    fn detects_subtree_overlap() {
+        use super::pattern_overlaps_subtree;
+        let sub = "/r/g/G/data/n1/uploads/bakta";
+        for overlapping in [
+            "/**",
+            "/r/g/G/**",
+            "/r/g/G/data/**",
+            "/r/g/G/data/*/uploads/**",
+            "/r/g/G/data/n1/uploads/**",
+            "/r/g/G/data/n1/uploads/bak*/**",
+            "/r/g/G/data/n1/uploads/bakta/**",
+            "/r/g/G/data/n1/uploads/bakta/cd/**",
+            "/r/g/G/data/n1/uploads/bakta",
+        ] {
+            assert!(pattern_overlaps_subtree(overlapping, sub), "{overlapping}");
+        }
+        for disjoint in [
+            "/r/g/G/data/n1/uploads/ref/**",
+            "/r/g/G/data/n1/uploads/bakta_ref/**",
+            "/r/g/G/data/*/other/**",
+            "/r/g/G/data/n2/uploads/**",
+        ] {
+            assert!(!pattern_overlaps_subtree(disjoint, sub), "{disjoint}");
+        }
     }
 }

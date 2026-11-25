@@ -124,9 +124,10 @@ pub async fn request_approval(
     own.extend(applet.domains.iter().map(|domain| domain.host.as_str()));
     let origins = embedding_origins(&body.origins, &own, limit)
         .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
-    let grants = body
-        .grants
-        .grants(&role_subtree_root(auth.realm_id, applet.group_id))?;
+    let grants = body.grants.grants(
+        &role_subtree_root(auth.realm_id, applet.group_id),
+        applet.host_node,
+    )?;
     let request = AppletChange::RequestApproval {
         version: body.version,
         access: body.access.into(),

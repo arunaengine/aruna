@@ -348,8 +348,13 @@ impl From<&Grants> for GrantsBody {
 }
 
 impl GrantsBody {
-    /// The grants, with every read pattern confined to the group's own subtree.
-    pub fn grants(self, group_root: &str) -> Result<Grants, ServerError> {
+    /// The grants, with every read pattern confined to the group's own subtree and disjoint from
+    /// the per-visitor submission folder.
+    pub fn grants(
+        self,
+        group_root: &str,
+        host_node: aruna_core::id::NodeId,
+    ) -> Result<Grants, ServerError> {
         let confined =
             |pattern: &String| aruna_core::permission_path::role_path_confined(pattern, group_root);
         if let Some(pattern) = self
@@ -361,6 +366,23 @@ impl GrantsBody {
             return Err(ServerError::BadRequestReason(format!(
                 "{pattern} is not a path of the applet's group"
             )));
+        }
+        if let Some(sub) = &self.submissions {
+            let trimmed = sub.prefix.trim_matches('/');
+            let sub_root = match trimmed.is_empty() {
+                true => format!("{group_root}/data/{host_node}/{}", sub.bucket),
+                false => format!("{group_root}/data/{host_node}/{}/{trimmed}", sub.bucket),
+            };
+            if let Some(pattern) = self
+                .read
+                .iter()
+                .chain(&self.references)
+                .find(|p| aruna_core::permission_path::pattern_overlaps_subtree(p, &sub_root))
+            {
+                return Err(ServerError::BadRequestReason(format!(
+                    "{pattern} overlaps the visitor submission folder"
+                )));
+            }
         }
         let start = match self.start {
             Some(StartBody::Tool { tool_id, version }) => {

@@ -8,11 +8,12 @@ use aruna_core::applet::usage::caps;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
+use aruna_core::permission_path::pattern_overlaps_subtree;
 use aruna_core::structs::execution::workflow::workflow_permission_path;
 use aruna_core::structs::execution::workflow_run::{RunOutput, WorkflowRunRecord};
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::blob::object_permission_path;
+use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use serde_json::Value;
 use ulid::Ulid;
 
@@ -169,17 +170,35 @@ impl VisitRunOperation {
             request: Some(request),
         }
     }
-    /// Narrows the applet account to this visitor's submission folder plus approved reference paths
+    /// Narrows the applet account to this visitor's submission folder plus disjoint reference paths
     /// so file-valued workflow parameters cannot read another visitor's uploads.
     fn visitor_auth(&self) -> Result<AuthContext, AppletError> {
         let mut auth = applet_auth(&self.applet, self.node.1).ok_or(AppletError::Forbidden)?;
         let (bucket, folder) = visitor_folder(&self.applet, &self.visit)?;
+        let sub_prefix = self
+            .applet
+            .grants
+            .submissions
+            .as_ref()
+            .map(|sub| sub.prefix.trim_matches('/'))
+            .unwrap_or("");
+        let sub_root = match sub_prefix.is_empty() {
+            true => bucket_permission_path(self.node.1, self.applet.group_id, self.node.0, &bucket),
+            false => object_permission_path(
+                self.node.1,
+                self.applet.group_id,
+                self.node.0,
+                &bucket,
+                sub_prefix,
+            ),
+        };
         let mut restrictions: Vec<PathRestriction> = self
             .applet
             .grants
             .read
             .iter()
             .chain(&self.applet.grants.references)
+            .filter(|pattern| !pattern_overlaps_subtree(pattern, &sub_root))
             .map(|pattern| PathRestriction {
                 pattern: pattern.clone(),
                 permission: Permission::READ,
@@ -283,5 +302,53 @@ mod tests {
             start(&applet, "bakta/ab/x"),
             Err(AppletError::Conflict(_))
         ));
+
+        // Visitor auth drops read/reference patterns overlapping the submission folder.
+        let realm = aruna_core::structs::identity::realm::RealmId::from_bytes([7; 32]);
+        let root = aruna_core::permission_path::role_subtree_root(realm, applet.group_id);
+        let node = applet.host_node;
+        applet.account = Some(aruna_core::user::id::UserId::local(
+            Ulid::from_bytes([9; 16]),
+            realm,
+        ));
+        applet.role_id = Some(Ulid::from_bytes([8; 16]));
+        applet.grants.read = vec![
+            format!("{root}/data/{node}/uploads/**"),
+            format!("{root}/data/{node}/uploads/ref/**"),
+        ];
+        applet.grants.references = vec![
+            format!("{root}/data/*/uploads/bakta/**"),
+            format!("{root}/data/{node}/other/**"),
+        ];
+        let op = VisitRunOperation::new(
+            &applet,
+            visit,
+            (node, realm),
+            RunRequest {
+                group_id: applet.group_id,
+                workflow_id: Ulid::from_bytes([2; 16]),
+                version: 3,
+                values: Value::Object(Default::default()),
+                inputs: Vec::new(),
+                inputs_json: None,
+                output: None,
+                provenance_crate: false,
+                idempotency_key: None,
+                placement_site: None,
+                secrets: Default::default(),
+            },
+        );
+        let auth = op.visitor_auth().unwrap();
+        let patterns: Vec<&str> = auth
+            .path_restrictions
+            .as_deref()
+            .unwrap()
+            .iter()
+            .map(|r| r.pattern.as_str())
+            .collect();
+        assert!(patterns.contains(&format!("{root}/data/{node}/uploads/ref/**").as_str()));
+        assert!(patterns.contains(&format!("{root}/data/{node}/other/**").as_str()));
+        assert!(!patterns.contains(&format!("{root}/data/{node}/uploads/**").as_str()));
+        assert!(!patterns.contains(&format!("{root}/data/*/uploads/bakta/**").as_str()));
     }
 }

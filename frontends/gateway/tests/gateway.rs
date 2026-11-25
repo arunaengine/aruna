@@ -25,16 +25,17 @@ async fn host(headers: HeaderMap, Path(host): Path<String>) -> axum::response::R
     if headers.get("x-aruna-edge-key").is_none_or(|key| key != KEY) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let (id, access, serving) = match host.as_str() {
-        "pub.apps.test" => (PUBLIC_ID, "public", "live"),
-        "private.apps.test" => (PRIVATE_ID, "private", "live"),
-        "gone.apps.test" => (PUBLIC_ID, "public", "gone"),
+    let (id, access, serving, guests) = match host.as_str() {
+        "pub.apps.test" => (PUBLIC_ID, "public", "live", false),
+        "guest.apps.test" => (PUBLIC_ID, "public", "live", true),
+        "private.apps.test" => (PRIVATE_ID, "private", "live", false),
+        "gone.apps.test" => (PUBLIC_ID, "public", "gone", false),
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
     Json(serde_json::json!({
         "applet_id": id, "group_id": "g", "host_node": "n", "custom_domain": false,
         "serving": serving, "version": 1, "access": access, "frame_ancestors": [],
-        "guests": false, "guests_in_frames": false,
+        "guests": guests, "guests_in_frames": false,
         "portal_origin": "https://portal.test", "max_age_s": 30
     }))
     .into_response()
@@ -417,4 +418,26 @@ async fn embedded_popup_signin() {
             .filter_map(|v| v.to_str().ok())
             .any(|v| v.starts_with("__Host-aruna-visitor=") && v.contains("Partitioned"))
     );
+}
+
+#[tokio::test]
+async fn guests_stay_private() {
+    let base = start().await;
+    let first = visit(
+        &base,
+        "guest.apps.test",
+        "/",
+        &[("sec-fetch-dest", "document")],
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(header(&first, CACHE_CONTROL), "private, no-cache");
+    let guest_cookie = cookie(&first, "__Host-aruna-guest");
+    assert!(!guest_cookie.is_empty());
+
+    // A returning visitor with a guest cookie still gets private, no-cache on guest HTML.
+    let second = visit(&base, "guest.apps.test", "/", &[("cookie", &guest_cookie)]).await;
+    assert_eq!(second.status(), StatusCode::OK);
+    assert_eq!(header(&second, CACHE_CONTROL), "private, no-cache");
+    assert!(cookie(&second, "__Host-aruna-guest").is_empty());
 }

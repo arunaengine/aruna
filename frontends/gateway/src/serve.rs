@@ -189,14 +189,22 @@ async fn respond(
     let marked = decision.guests && !decision.guests_in_frames && top_load && html;
     if let Some(marker) = set_cookie(TOP, "1", TOP_SECONDS, Site::Strict).filter(|_| marked) {
         out.append(SET_COOKIE, marker);
-        out.insert(CACHE_CONTROL, HeaderValue::from_static("private, no-cache"));
-    }
-    // Mint the host-bound guest cookie on the initial HTML response before concurrent runtime calls.
-    if decision.guests && visit.token().is_none() && html {
-        let (_, guest_cookie) = crate::runtime::ensure_guest(gateway, visit, headers, top_load);
-        if let Some(cookie) = guest_cookie {
-            out.append(SET_COOKIE, cookie);
+        if portal.is_none() {
             out.insert(CACHE_CONTROL, HeaderValue::from_static("private, no-cache"));
+        }
+    }
+    // Guest-enabled HTML never enters shared caches so new visitors always hit the gateway to mint
+    // their host-bound guest cookie before concurrent runtime calls.
+    if decision.guests && html {
+        if portal.is_none() {
+            out.insert(CACHE_CONTROL, HeaderValue::from_static("private, no-cache"));
+        }
+        out.insert(VARY, HeaderValue::from_static("Cookie"));
+        if visit.token().is_none() {
+            let (_, guest_cookie) = crate::runtime::ensure_guest(gateway, visit, headers, top_load);
+            if let Some(cookie) = guest_cookie {
+                out.append(SET_COOKIE, cookie);
+            }
         }
     }
     policy::secure(out, frame);
