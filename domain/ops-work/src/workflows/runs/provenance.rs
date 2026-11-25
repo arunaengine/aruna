@@ -57,7 +57,7 @@ const CRATE_SPEC: &str = "https://w3id.org/ro/crate/1.2";
 const OLD_SPEC: &str = "https://w3id.org/ro/crate/1.1";
 const TERMS: &str = "https://w3id.org/aruna/terms/";
 const DESCRIPTOR: &str = "ro-crate-metadata.json";
-const ROOT: &str = "./";
+pub(crate) const ROOT: &str = "./";
 
 /// The `@id` of a run's workflow action, which the portal links to the run's page.
 pub fn action_id(run_id: Ulid) -> String {
@@ -104,6 +104,16 @@ pub fn crate_json(
     }
     for task in tasks {
         describe_task(&mut graph, record, task);
+    }
+    let parts: Vec<String> = graph
+        .iter()
+        .filter(|entity| has_type(entity, "File"))
+        .filter_map(|entity| entity["@id"].as_str().map(str::to_owned))
+        .collect();
+    if let Some(root) = entity(&mut graph, ROOT) {
+        for id in parts {
+            push_ref(root, "hasPart", &id);
+        }
     }
     json!({
         "@context": [CRATE_CONTEXT, WORKFLOW_RUN_CONTEXT],
@@ -158,7 +168,16 @@ fn describe_root(graph: &mut Vec<Value>, record: &WorkflowRunRecord, action: &st
         "name",
         json!(format!("Run {} of {}", record.run_id, record.workflow_name)),
     );
-    if let Some(published) = record.finished_at_ms.and_then(time_text) {
+    set_missing(
+        root,
+        "description",
+        json!(format!(
+            "Workflow run {} of {} version {}",
+            record.run_id, record.workflow_name, record.version
+        )),
+    );
+    let published_ms = record.finished_at_ms.unwrap_or(record.created_at_ms);
+    if let Some(published) = time_text(published_ms) {
         set_missing(root, "datePublished", json!(published));
     }
     let dataset = (record.output.as_ref())
@@ -203,6 +222,15 @@ fn describe_action(graph: &mut Vec<Value>, record: &WorkflowRunRecord, action: &
     let agent = format!("#agent-{}", record.created_by);
     let person = upsert(graph, &agent, "Person");
     set_missing(person, "identifier", json!(record.created_by.to_string()));
+    let fallback_instrument = format!("#workflow-{}-v{}", record.workflow_id, record.version);
+    let instrument = ensure_instrument(
+        graph,
+        action,
+        &fallback_instrument,
+        &record.workflow_name,
+        record.version,
+        Some(record.workflow_id),
+    );
     let mut properties = vec![
         ("node-id", "Coordinator node", record.node_id.to_string()),
         ("lineage", "Lineage", record.lineage.to_string()),
@@ -230,6 +258,15 @@ fn describe_action(graph: &mut Vec<Value>, record: &WorkflowRunRecord, action: &
         "name",
         json!(format!("Run {} of {}", record.run_id, record.workflow_name)),
     );
+    set_missing(
+        entity,
+        "description",
+        json!(format!(
+            "Workflow run {} of {}",
+            record.run_id, record.workflow_name
+        )),
+    );
+    set_missing(entity, "instrument", json!({ "@id": instrument }));
     entity["url"] = json!(run_path(record.run_id));
     entity["identifier"] = json!(record.run_id.to_string());
     entity["agent"] = json!({ "@id": agent });
@@ -290,6 +327,25 @@ fn describe_task(graph: &mut Vec<Value>, record: &WorkflowRunRecord, task: &Work
             results.extend(upsert_file(graph, record, file));
         }
     }
+    let safe_step: String = task
+        .step
+        .chars()
+        .map(
+            |ch| match ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                true => ch,
+                false => '-',
+            },
+        )
+        .collect();
+    let fallback_instrument = format!("#step-{safe_step}");
+    let instrument = ensure_instrument(
+        graph,
+        &id,
+        &fallback_instrument,
+        &task.step,
+        record.version,
+        None,
+    );
     let entity = upsert(graph, &id, "CreateAction");
     if !known {
         entity["name"] = json!(task.name);
@@ -305,6 +361,7 @@ fn describe_task(graph: &mut Vec<Value>, record: &WorkflowRunRecord, task: &Work
             entity["error"] = json!(error);
         }
     }
+    set_missing(entity, "instrument", json!({ "@id": instrument }));
     for id in objects {
         push_ref(entity, "object", &id);
     }
@@ -396,6 +453,48 @@ fn add_properties(
     ids
 }
 
+fn ensure_type(entity: &mut Value, kind: &str) {
+    if has_type(entity, kind) {
+        return;
+    }
+    match entity.get_mut("@type") {
+        Some(Value::String(existing)) => {
+            let prev = existing.clone();
+            entity["@type"] = json!([prev, kind]);
+        }
+        Some(Value::Array(items)) => items.push(json!(kind)),
+        _ => entity["@type"] = json!(kind),
+    }
+}
+
+fn ensure_instrument(
+    graph: &mut Vec<Value>,
+    action: &str,
+    fallback: &str,
+    name: &str,
+    version: u32,
+    workflow_id: Option<Ulid>,
+) -> String {
+    let existing = graph
+        .iter()
+        .find(|entity| entity["@id"] == action)
+        .and_then(|entity| entity["instrument"]["@id"].as_str().map(str::to_owned));
+    if let Some(id) = existing {
+        if let Some(target) = entity(graph, &id) {
+            ensure_type(target, "SoftwareApplication");
+        }
+        return id;
+    }
+    let software = upsert(graph, fallback, "SoftwareApplication");
+    if let Some(workflow_id) = workflow_id {
+        ensure_type(software, "ComputationalWorkflow");
+        set_missing(software, "identifier", json!(workflow_id.to_string()));
+    }
+    set_missing(software, "name", json!(name));
+    set_missing(software, "softwareVersion", json!(version.to_string()));
+    fallback.to_owned()
+}
+
 fn has_type(entity: &Value, expected: &str) -> bool {
     match &entity["@type"] {
         Value::String(kind) => kind == expected,
@@ -459,7 +558,7 @@ fn one_or_many(mut values: Vec<Value>) -> Value {
 }
 
 /// Renames the entity `old` and every reference to it.
-fn rename(graph: &mut [Value], old: &str, new: &str) {
+pub(crate) fn rename(graph: &mut [Value], old: &str, new: &str) {
     for entity in graph {
         rename_value(entity, old, new);
     }

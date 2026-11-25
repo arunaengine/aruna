@@ -407,6 +407,7 @@ async fn writes_run_crate() {
         "https://spdx.org/licenses/CC-BY-4.0"
     );
     assert_eq!(ids(&root["mentions"]), [action_id(run.run_id)]);
+    assert!(root["description"].as_str().is_some_and(|d| !d.is_empty()));
     let action = by_id(&stored, &action_id(run.run_id));
     assert_eq!(
         action["url"],
@@ -425,6 +426,7 @@ async fn writes_run_crate() {
     )
     .unwrap()
     .to_w3id();
+    assert_eq!(ids(&root["hasPart"]), std::slice::from_ref(&arn));
     assert_eq!(ids(&action["result"]), std::slice::from_ref(&arn));
     let file = by_id(&stored, &arn);
     assert_eq!(file["identifier"], content_id(hash));
