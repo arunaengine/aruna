@@ -197,6 +197,97 @@ fn rules_per_scope() {
 }
 
 #[test]
+fn workflow_rules_checked() {
+    let wf = SecretConsumer::Workflow {
+        workflow_id: Ulid::from_bytes([9; 16]),
+    };
+    let rule = |delivery, groups| UseRule {
+        consumer: wf.clone(),
+        delivery,
+        origins: Vec::new(),
+        paths: Vec::new(),
+        methods: Vec::new(),
+        response: ResponseExposure::Status,
+        groups,
+    };
+    let bearer = kind("bearer");
+    assert_eq!(
+        check_rules(
+            SecretScope::Group(GROUP),
+            &bearer,
+            &[rule(Delivery::Value, vec![])]
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        check_rules(
+            SecretScope::Realm,
+            &bearer,
+            &[rule(Delivery::Value, vec![GROUP])]
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        check_rules(
+            SecretScope::Group(GROUP),
+            &bearer,
+            &[rule(Delivery::Inject, vec![])]
+        ),
+        Err(SecretError::Rule)
+    );
+    assert_eq!(
+        check_rules(
+            SecretScope::Group(GROUP),
+            &bearer,
+            &[rule(Delivery::Verify, vec![])]
+        ),
+        Err(SecretError::Rule)
+    );
+    let ask = UseRequest {
+        consumer: &wf,
+        delivery: Delivery::Value,
+        group: Some(GROUP),
+        target: None,
+    };
+    assert!(
+        check_use(
+            SecretScope::Group(GROUP),
+            &[rule(Delivery::Value, vec![])],
+            &ask
+        )
+        .is_ok()
+    );
+    let bearer_fields = fields(&[("token", CANARY)]);
+    assert_eq!(
+        bearer_fields.resolve_field(&bearer, None).unwrap().expose(),
+        CANARY
+    );
+    assert_eq!(
+        bearer_fields
+            .resolve_field(&bearer, Some("token"))
+            .unwrap()
+            .expose(),
+        CANARY
+    );
+    assert_eq!(
+        bearer_fields.resolve_field(&bearer, Some("missing")),
+        Err(SecretError::Fields)
+    );
+    let multi = fields(&[("a", "1"), ("b", "2")]);
+    assert_eq!(
+        multi.resolve_field(&kind("fields"), None),
+        Err(SecretError::Fields)
+    );
+    assert_eq!(
+        multi
+            .resolve_field(&kind("fields"), Some("b"))
+            .unwrap()
+            .expose(),
+        "2"
+    );
+}
+
+#[test]
 fn use_matches_rule() {
     let rules = [inject_rule(vec![])];
     let scope = SecretScope::Group(GROUP);

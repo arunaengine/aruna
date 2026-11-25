@@ -3,16 +3,37 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeMap;
+
 use aruna_workflow_contract::preflight::RunLogPage;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::errors::ConversionError;
 use crate::id::NodeId;
+use crate::secrets::SecretName;
 use crate::structs::execution::job::identity::JobId;
 use crate::structs::identity::realm::RealmId;
 use crate::types::{GroupId, Key};
 use crate::user::id::UserId;
+
+/// Which secret store a workflow secret binding reads from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowSecretScope {
+    User,
+    Group,
+    Realm,
+    Node,
+}
+
+/// One vault secret bound to a workflow run's secret name; carries only references, never values.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowSecretBinding {
+    pub scope: WorkflowSecretScope,
+    pub name: SecretName,
+    pub field: Option<String>,
+}
 
 /// What the run job of a workflow run carries; the run record holds everything else.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,6 +285,9 @@ pub struct WorkflowRunRecord {
     /// When the run first turned running.
     #[serde(default)]
     pub started_at_ms: Option<u64>,
+    /// Vault secret bindings of the run, by workflow secret name; carries only references.
+    #[serde(default)]
+    pub secrets: BTreeMap<String, WorkflowSecretBinding>,
 }
 
 /// One task of a run, with the state of its newest attempt.
