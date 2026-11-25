@@ -6,25 +6,38 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use aruna_compute::registry::ExecutorRegistry;
+use aruna_core::compute::Secret;
 use aruna_core::effects::StorageEffect;
 use aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE;
-use aruna_core::secrets::SecretName;
+use aruna_core::node::vault::NodeVaultKey;
+use aruna_core::secrets::{
+    Delivery, ResponseExposure, SecretConsumer, SecretFields, SecretKind, SecretName, UseRule,
+};
 use aruna_core::stream::{BackendStream, StreamError};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::parse_workflow_secrets;
 use aruna_core::structs::execution::workflow::{StoredWorkflowLanguage, WorkflowVisibility};
 use aruna_core::structs::execution::workflow_run::{
     RunFile, RunOutput, RunState, WorkflowSecretBinding, WorkflowSecretScope,
 };
 use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode};
-use aruna_core::structs::storage::routing::RoutingSnapshot;
+use aruna_core::structs::storage::routing::{NodeRouting, RoutingSnapshot};
 use aruna_core::types::GroupId;
 use aruna_core::user::id::UserId;
 use aruna_core::workflow::{WorkflowAnswer, WorkflowEffect, WorkflowHost};
 use aruna_ops_data::metadata::record_reads::DocumentRecordOperation;
 use aruna_ops_data::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+use aruna_ops_identity::secrets::SecretChange;
+use aruna_ops_identity::secrets::node::{NodeChange, NodeSecretOperation};
+use aruna_ops_work::jobs::workflow::credential::RunIdentity;
+use aruna_ops_work::jobs::workflow::vault_secrets::ReleaseVaultSecrets;
 use aruna_ops_work::workflows::CatalogError;
 use aruna_ops_work::workflows::import::{CreateWorkflowOperation, NewWorkflow, SourceInput};
 use aruna_ops_work::workflows::runs::admit::{PinnedInput, RunRequest, StartRunOperation};
 use aruna_ops_work::workflows::runs::control::{Follow, FollowRunOperation};
+use aruna_ops_work::workflows::runs::data::{
+    Target, WriteBody, WriteObjectOperation, delivery_target,
+};
 use aruna_ops_work::workflows::runs::events::ReadEventsOperation;
 use aruna_ops_work::workflows::runs::provenance::{
     RunCrateOperation, WriteProvenanceOperation, status,
@@ -32,17 +45,20 @@ use aruna_ops_work::workflows::runs::provenance::{
 use aruna_ops_work::workflows::runs::run::{
     ApplyEventOperation, FinishRunOperation, PrepareRunOperation, Prepared,
 };
+use aruna_ops_work::workflows::runs::tasks::{task_key_of, task_spec};
 use aruna_ops_work::workflows::runs::{ChangeRunOperation, RunChange};
 use aruna_ops_work::workflows::versions::GetVersionOperation;
 use aruna_runner::driver::{DriverContext, drive};
 use aruna_runner::testing::seed_bucket;
+use aruna_workflow_contract::HostRpcResult;
+use aruna_workflow_contract::host::{SecretPlaceholder, StartTask, TaskFolders, TaskResources};
 use aruna_workflow_contract::message::{LiveWorkflowEvent, TaskChange, TaskState};
 use aruna_workflow_contract::preflight::{GraphNode, NodeKind, SourceFile, WorkflowGraph};
 use aruna_workflow_contract::{ContractError, PreflightKind, PreflightResult};
 use serde_json::json;
 use ulid::Ulid;
 
-use crate::topology::{TestNode, TestResult, Topology};
+use crate::topology::{TestNode, TestResult, Topology, wait_until};
 
 const CWL: &str = "cwlVersion: v1.2\nclass: CommandLineTool\nbaseCommand: echo\n";
 const SAMPLE: &[u8] = b"sample-input\n";
@@ -161,7 +177,7 @@ async fn drives_workflow_lifecycle() -> TestResult<()> {
     let other = realm.auth_for(other_user);
     seed_bucket(&ctx, "results", group_id, realm.user_id, Vec::new()).await;
     let input_ver = put_object(&realm, node, group_id, "results", "in.txt", SAMPLE).await?;
-    let out_ver = put_object(&realm, node, group_id, "results", "out/said.txt", SAMPLE).await?;
+    ctx.storage_handle.open_vault(NodeVaultKey::random());
 
     let created = drive(
         CreateWorkflowOperation::new(&owner, node.node_id(), new_workflow(group_id)),
@@ -175,12 +191,53 @@ async fn drives_workflow_lifecycle() -> TestResult<()> {
     .await?;
     assert_eq!(view.workflow.name, "hello");
 
+    drive(
+        NodeSecretOperation::new(NodeChange {
+            realm_id: realm.realm_id,
+            node_id: node.node_id(),
+            actor: realm.user_id,
+            change: SecretChange::Create {
+                name: SecretName::try_from("node-token".to_owned())?,
+                kind: SecretKind::parse("bearer").unwrap(),
+                description: String::new(),
+                settings: BTreeMap::new(),
+                uses: vec![UseRule {
+                    consumer: SecretConsumer::Workflow {
+                        workflow_id: created.workflow_id,
+                    },
+                    delivery: Delivery::Value,
+                    origins: Vec::new(),
+                    paths: Vec::new(),
+                    methods: Vec::new(),
+                    response: ResponseExposure::Status,
+                    groups: vec![group_id],
+                }],
+                fields: SecretFields::new(BTreeMap::from([(
+                    "token".to_owned(),
+                    Secret::new("synthetic-workflow-secret".to_owned()),
+                )])),
+            },
+            now_ms: aruna_core::time::unix_timestamp_millis(),
+            write_id: Ulid::generate(),
+        }),
+        &ctx,
+    )
+    .await?;
+
     let mut secrets = BTreeMap::new();
     secrets.insert(
         "API_TOKEN".to_owned(),
         WorkflowSecretBinding {
             scope: WorkflowSecretScope::User,
             name: SecretName::try_from("my-token".to_owned())?,
+            field: None,
+        },
+    );
+    secrets.insert(
+        "NODE_TOKEN".to_owned(),
+        WorkflowSecretBinding {
+            scope: WorkflowSecretScope::Node,
+            name: SecretName::try_from("node-token".to_owned())?,
             field: None,
         },
     );
@@ -227,6 +284,91 @@ async fn drives_workflow_lifecycle() -> TestResult<()> {
     .await?;
     assert!(matches!(prepared, Prepared::Ready(_)));
 
+    // Build a real secret-bearing child spec and release its vault secret against the stored run.
+    let task_req = StartTask {
+        task_id: Some(1),
+        step_id: "echo".into(),
+        name: "echo-1".into(),
+        attempt: 1,
+        task_key_seed: "echo-seed".into(),
+        spec_json: json!({}),
+        image: Some("debian:stable-slim".into()),
+        command_wrapper_bytes: b"#!/bin/sh\necho ok\n".to_vec(),
+        folders: TaskFolders {
+            work: "/work".into(),
+            control: "/control".into(),
+            home: "/home".into(),
+        },
+        direct_inputs: Vec::new(),
+        staged_files: Vec::new(),
+        expected_outputs: Vec::new(),
+        resources: TaskResources {
+            cpus: 1,
+            memory_bytes: None,
+            disk_bytes: None,
+            gpus: 0,
+            time_seconds: None,
+        },
+        site: None,
+        step_settings: None,
+        network_allowed: false,
+        secret_placeholders: vec![SecretPlaceholder {
+            name: "NODE_TOKEN".into(),
+            placeholder: "aruna-secret:NODE_TOKEN".into(),
+            env_name: Some("NODE_TOKEN".into()),
+        }],
+    };
+    let child_spec = task_spec(&admitted.record, &task_req, &task_key_of("echo-seed"))?;
+    let child_bindings = parse_workflow_secrets(&child_spec.tags)?;
+    let released = drive(
+        ReleaseVaultSecrets::new(
+            RunIdentity {
+                job_id: JobId::from_bytes([7; 16]),
+                user_id: realm.user_id,
+                group_id,
+                realm_id: realm.realm_id,
+                node_id: node.node_id(),
+            },
+            run_id,
+            child_bindings,
+        ),
+        &ctx,
+    )
+    .await
+    .map_err(|error| format!("secret release failed: {error:?}"))?;
+    assert_eq!(released["NODE_TOKEN"].expose(), "synthetic-workflow-secret");
+
+    // Deliver the task output through the workflow object writer to the run's output prefix.
+    let target = delivery_target(&admitted.record, "said.txt")?;
+    let source = Target {
+        bucket: "results".into(),
+        key: "in.txt".into(),
+        version: Some(input_ver),
+        owned: false,
+        node: Some(node.node_id()),
+    };
+    let ack = drive(
+        WriteObjectOperation::new(
+            (admitted.record.clone(), node.node_id()),
+            NodeRouting::default(),
+            target,
+            WriteBody::Copy(source),
+        ),
+        &ctx,
+    )
+    .await?;
+    let HostRpcResult::UploadAck {
+        receipt: Some(receipt),
+        ..
+    } = ack
+    else {
+        return Err(format!("expected delivery receipt, got {ack:?}").into());
+    };
+    let out_ver = receipt
+        .version
+        .ok_or("delivered output must carry a version id")?;
+    assert_eq!(receipt.size, SAMPLE.len() as u64);
+
     let task_done = LiveWorkflowEvent::TaskChanged(TaskChange {
         task_id: 1,
         step: "echo".into(),
@@ -246,9 +388,9 @@ async fn drives_workflow_lifecycle() -> TestResult<()> {
             name: "said.txt".into(),
             bucket: Some("results".into()),
             key: Some("out/said.txt".into()),
-            version_id: Some(out_ver.to_string()),
+            version_id: Some(out_ver),
             node_id: Some(node.node_id()),
-            size: Some(SAMPLE.len() as u64),
+            size: Some(receipt.size),
             digest: Some(blake3::hash(SAMPLE).to_hex().to_string()),
         },
         origin: None,
@@ -267,19 +409,25 @@ async fn drives_workflow_lifecycle() -> TestResult<()> {
         .provenance_document_id
         .ok_or("written workflow crate has a document id")?;
 
-    let mut stored_doc = false;
-    for member in &realm.nodes {
-        if let Ok(Some(record)) = drive(
-            DocumentRecordOperation::new(doc_id),
-            member.context.as_ref(),
-        )
-        .await
-        {
-            assert_eq!(record.group_id, group_id);
-            stored_doc = true;
-        }
-    }
-    assert!(stored_doc, "published workflow RO-Crate exists in realm");
+    wait_until(
+        "published workflow RO-Crate reaches realm",
+        node.node_id(),
+        || async {
+            for member in &realm.nodes {
+                if let Ok(Some(record)) = drive(
+                    DocumentRecordOperation::new(doc_id),
+                    member.context.as_ref(),
+                )
+                .await
+                {
+                    assert_eq!(record.group_id, group_id);
+                    return true;
+                }
+            }
+            false
+        },
+    )
+    .await?;
 
     let events = drive(ReadEventsOperation::new(&owner, run_id, 0, 32), &ctx).await?;
     assert!(
@@ -302,7 +450,7 @@ async fn drives_workflow_lifecycle() -> TestResult<()> {
     )
     .await?;
     assert_eq!(repeated.repeats_run_id, Some(run_id));
-    assert_eq!(repeated.secrets.len(), 1);
+    assert_eq!(repeated.secrets.len(), 2);
     Ok(())
 }
 

@@ -9,16 +9,14 @@ use aruna_compute::registry::ExecutorRegistry;
 use aruna_core::compute::quota::{ComputeDemandSnapshot, ComputeReservationSnapshot};
 use aruna_core::compute::{ExecutorAvailability, ExecutorCapability, ResourceEnvelope};
 use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::heartbeat::{HeldHeartbeat, NodeHeartbeat};
 use aruna_core::id::NodeId;
-use aruna_core::keyspaces::{
-    NODE_INFO_KEYSPACE, WORKFLOW_KEYSPACE, WORKFLOW_SOURCE_KEYSPACE, WORKFLOW_VERSION_KEYSPACE,
-};
+use aruna_core::job_request::SubmissionScope;
+use aruna_core::keyspaces::NODE_INFO_KEYSPACE;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::execution::workflow::{
-    StoredWorkflowLanguage, WorkflowVisibility, version_key, workflow_key,
-};
+use aruna_core::structs::execution::job::identity::RETENTION_MS;
+use aruna_core::structs::execution::job::local::WorkspaceMode;
+use aruna_core::structs::execution::workflow::{StoredWorkflowLanguage, WorkflowVisibility};
 use aruna_core::structs::execution::workflow_run::{RunOutput, RunState};
 use aruna_core::structs::placement::policy::PlacementSubject;
 use aruna_core::structs::storage::node_info::{
@@ -30,7 +28,9 @@ use aruna_core::types::GroupId;
 use aruna_core::user::id::UserId;
 use aruna_core::workflow::{WorkflowAnswer, WorkflowEffect, WorkflowError, WorkflowHost};
 use aruna_ops_data::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
-use aruna_ops_work::jobs::lifecycle::submit_external::IngressNode;
+use aruna_ops_work::jobs::lifecycle::submit_external::{
+    ExternalSubmission, IngressNode, SubmitExternalOperation,
+};
 use aruna_ops_work::workflows::CatalogError;
 use aruna_ops_work::workflows::import::{CreateWorkflowOperation, NewWorkflow, SourceInput};
 use aruna_ops_work::workflows::runs::admit::{PinnedInput, RunRequest, StartRunOperation};
@@ -43,9 +43,11 @@ use aruna_ops_work::workflows::runs::reads::{ListRunsOperation, RunFilter, RunSn
 use aruna_ops_work::workflows::runs::replica::{
     ReplicateLogOperation, UNREACHABLE, record_holders, replica_note,
 };
+use aruna_ops_work::workflows::runs::tasks::{task_key_of, task_spec};
 use aruna_ops_work::workflows::runs::{ChangeRunOperation, RunChange};
 use aruna_runner::driver::{DriverContext, drive};
 use aruna_runner::testing::seed_bucket;
+use aruna_workflow_contract::host::{DirectInput, StartTask, TaskFolders, TaskResources};
 use aruna_workflow_contract::preflight::{RunLogEntry, SourceFile, WorkflowGraph};
 use aruna_workflow_contract::{ContractError, PreflightKind, PreflightResult};
 use serde_json::{Value, json};
@@ -261,39 +263,6 @@ async fn advertise_executor(
     })
 }
 
-async fn copy_workflow(from: &TestNode, to: &TestNode, workflow_id: Ulid) {
-    let ver = version_key(workflow_id, 1);
-    for (space, key) in [
-        (WORKFLOW_KEYSPACE, workflow_key(workflow_id)),
-        (WORKFLOW_VERSION_KEYSPACE, ver.clone()),
-        (WORKFLOW_SOURCE_KEYSPACE, ver),
-    ] {
-        let ev = from
-            .context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Read {
-                key_space: space.to_owned(),
-                key: key.clone(),
-                txn_id: None,
-            })
-            .await;
-        if let Event::Storage(StorageEvent::ReadResult {
-            value: Some(val), ..
-        }) = ev
-        {
-            to.context
-                .storage_handle
-                .send_storage_effect(StorageEffect::Write {
-                    key_space: space.to_owned(),
-                    key,
-                    value: val,
-                    txn_id: None,
-                })
-                .await;
-        }
-    }
-}
-
 /// Replicates an active workflow run and its log pages over real P2P to a group record holder,
 /// shows the unreachable note there, refuses non-owner resume, and resumes the lineage as owner.
 #[tokio::test]
@@ -389,12 +358,12 @@ async fn replicates_workflow_run() -> TestResult<()> {
         .await?;
     }
 
-    let sent = drive(
+    let next_page = drive(
         ReplicateLogOperation::new(run_id, coord_serving, 0),
         &coord_ctx,
     )
     .await?;
-    assert!(sent >= 1, "replicated pages: {sent}");
+    assert_eq!(next_page, 0, "cursor stays on the mutable tail page");
 
     let coord_pages = drive(LoadLogOperation::new(run_id), &coord_ctx).await?;
     let replica_pages = drive(LoadLogOperation::new(run_id), &surviving_ctx).await?;
@@ -415,7 +384,7 @@ async fn replicates_workflow_run() -> TestResult<()> {
     .await;
     assert_eq!(refused, Err(CatalogError::Forbidden));
 
-    copy_workflow(coord, surviving, wf.workflow_id).await;
+    // Surviving holder resumes directly from the workflow + log records copied by replication.
     let resumed = drive(
         FollowRunOperation::new(&owner, surviving_serving, run_id, Follow::Resume),
         &surviving_ctx,
@@ -465,7 +434,13 @@ async fn plans_multi_node() -> TestResult<()> {
         let inputs: Vec<Value> = reads
             .iter()
             .map(|p| {
-                let src = format!("aruna://{}/{}?version={}", p.bucket, p.key, p.version_id);
+                let src = match p.source_node_id.filter(|n| *n != planner.node_id()) {
+                    Some(node) => format!(
+                        "aruna://{}/{}?version={}&node={node}",
+                        p.bucket, p.key, p.version_id
+                    ),
+                    None => format!("aruna://{}/{}?version={}", p.bucket, p.key, p.version_id),
+                };
                 json!({"path": p.key, "source": src, "directory": false})
             })
             .collect();
@@ -505,13 +480,28 @@ async fn plans_multi_node() -> TestResult<()> {
         now_ms,
         fresh,
     };
+    let inputs_json = json!({
+        "big": {
+            "bucket": big_pin.bucket,
+            "key": big_pin.key,
+            "version_id": big_pin.version_id.to_string(),
+            "source_node_id": big_pin.source_node_id.map(|n| n.to_string()),
+        },
+        "small": {
+            "bucket": small_pin.bucket,
+            "key": small_pin.key,
+            "version_id": small_pin.version_id.to_string(),
+            "source_node_id": small_pin.source_node_id.map(|n| n.to_string()),
+        }
+    })
+    .to_string();
     let request = RunRequest {
         group_id,
         workflow_id: created.workflow_id,
         version: created.version,
         values: json!({}),
         inputs: vec![big_pin, small_pin],
-        inputs_json: None,
+        inputs_json: Some(inputs_json),
         output: None,
         provenance_crate: false,
         idempotency_key: None,
@@ -519,7 +509,8 @@ async fn plans_multi_node() -> TestResult<()> {
         secrets: BTreeMap::new(),
     };
     let plan = drive(
-        PlanRunOperation::new(&owner, ingress, request).with_token(Some(realm.bearer_token())),
+        PlanRunOperation::new(&owner, ingress.clone(), request.clone())
+            .with_token(Some(realm.bearer_token())),
         &ctx,
     )
     .await?;
@@ -552,5 +543,88 @@ async fn plans_multi_node() -> TestResult<()> {
     )
     .await?;
     assert_eq!(listed.total, 0, "planning must not admit any runs");
+
+    // Admitting the same remote-pinned run captures input-scoped grants so a child job submits
+    // without a bearer token and resolves its remote direct input cleanly.
+    seed_bucket(&ctx, "results", group_id, realm.user_id, Vec::new()).await;
+    let mut start_req = request;
+    start_req.output = Some(RunOutput {
+        bucket: "results".to_owned(),
+        prefix: "plan/".to_owned(),
+        node_id: None,
+        dataset_json: None,
+    });
+    let admitted = drive(
+        StartRunOperation::new(&owner, (planner.node_id(), realm.realm_id), start_req)
+            .with_token(Some(realm.bearer_token())),
+        &ctx,
+    )
+    .await?;
+    assert_eq!(admitted.record.captured_remote.len(), 2);
+    assert!(
+        admitted
+            .record
+            .captured_remote
+            .iter()
+            .all(|capture| capture.grant.is_some()),
+        "remote pins carry signed read grants"
+    );
+    let child_req = StartTask {
+        task_id: Some(1),
+        step_id: "align".into(),
+        name: "align-1".into(),
+        attempt: 1,
+        task_key_seed: "align-seed".into(),
+        spec_json: json!({}),
+        image: Some("tool:1".into()),
+        command_wrapper_bytes: b"#!/bin/sh\necho ok\n".to_vec(),
+        folders: TaskFolders {
+            work: "/work".into(),
+            control: "/control".into(),
+            home: "/home".into(),
+        },
+        direct_inputs: vec![DirectInput {
+            path: "big.bin".into(),
+            address: format!(
+                "aruna://data/big.bin?version={big_ver}&node={}",
+                data_node.node_id()
+            ),
+            digest: String::new(),
+            size: BIG_BYTES as u64,
+            executable: false,
+            aruna_id: None,
+            endpoints: Vec::new(),
+        }],
+        staged_files: Vec::new(),
+        expected_outputs: Vec::new(),
+        resources: TaskResources {
+            cpus: 2,
+            memory_bytes: None,
+            disk_bytes: None,
+            gpus: 0,
+            time_seconds: None,
+        },
+        site: None,
+        step_settings: None,
+        network_allowed: false,
+        secret_placeholders: Vec::new(),
+    };
+    let spec = task_spec(&admitted.record, &child_req, &task_key_of("align-seed"))?;
+    let submission = ExternalSubmission {
+        spec,
+        created_by: realm.user_id,
+        scope: SubmissionScope::Keyed("workflow-task/test/align/1/1".into()),
+        workspace_mode: WorkspaceMode::None,
+        workspace_bucket: None,
+        retention_ms: RETENTION_MS,
+        auth_token: None,
+    };
+    let accepted = drive(
+        SubmitExternalOperation::new(submission, Some(ingress))
+            .with_precaptured(admitted.record.captured_remote.clone()),
+        &ctx,
+    )
+    .await?;
+    assert!(!accepted.job_id.to_string().is_empty());
     Ok(())
 }
