@@ -2408,6 +2408,33 @@ mod sealed {
     }
 
     #[test]
+    fn disallows_encrypted_read() {
+        // Plain copy in an encrypting bucket is refused inside GetObjectOperation when disallowed.
+        let mut op = operation().with_disallow_encrypted(true);
+        let mut location = sealed_location();
+        location.format = StoredFormat::default();
+        op.location = Some(location);
+        assert!(matches!(op.read_blob(), Ok(Next::Call(IoCall::Read(_)))));
+        let row = encrypting().to_bytes().unwrap();
+        assert_eq!(
+            op.next(IoResult::Values(vec![Some(row.clone().into())]))
+                .err(),
+            Some(GetObjectError::EncryptedDisallowed)
+        );
+        // Reference in an encrypting bucket is refused before HEADing the source.
+        assert_eq!(
+            op.reference_settings_read(Some(row.into())).err(),
+            Some(GetObjectError::EncryptedDisallowed)
+        );
+        // A sealed copy is refused before admitting a bucket key lease.
+        op.location = Some(sealed_location());
+        assert_eq!(
+            op.read_blob().err(),
+            Some(GetObjectError::EncryptedDisallowed)
+        );
+    }
+
+    #[test]
     fn pending_token_promotes() {
         // With a token, a pending version ends the read typed, so the caller promotes it.
         let mut operation = operation().with_token(true);

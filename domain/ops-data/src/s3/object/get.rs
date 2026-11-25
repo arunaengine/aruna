@@ -209,6 +209,9 @@ pub enum GetObjectError {
     /// The version is a link: the caller reads its target under its own rights there.
     #[error("The version links to another object.")]
     Link(Box<(VersionSourceBinding, SourceMetadata)>),
+    /// The read forbade encrypted buckets or sealed copies (unprotected workflow runs).
+    #[error("Encrypted inputs require a protected workflow run.")]
+    EncryptedDisallowed,
     #[error(transparent)]
     Abe(#[from] aruna_core::structs::storage::abe::AbeError),
 }
@@ -331,6 +334,8 @@ pub struct GetObjectOperation {
     reference_lease: Option<ReadLease>,
     /// The request has a token, so a pending version answers `PendingContent`.
     token: bool,
+    /// Refuse reads of sealed blobs or objects in encrypting buckets inside this read snapshot.
+    disallow_encrypted: bool,
     object: Option<(
         aruna_core::structs::storage::abe::ObjectEnvelope,
         aruna_core::structs::storage::abe::EnvelopeArchive,
@@ -382,8 +387,15 @@ impl GetObjectOperation {
             reference_key: None,
             reference_lease: None,
             token: false,
+            disallow_encrypted: false,
             object: None,
         }
+    }
+
+    /// Refuses sealed copies and encrypting buckets atomically within the read snapshot.
+    pub fn with_disallow_encrypted(mut self, disallow: bool) -> Self {
+        self.disallow_encrypted = disallow;
+        self
     }
 
     pub fn with_restrictions(mut self, restrictions: Option<Vec<PathRestriction>>) -> Self {
@@ -939,6 +951,9 @@ impl GetObjectOperation {
         };
         // A sealed copy is read only under a lease of its key, admitted after the record reads.
         if let Some(key) = location.format.bucket_key() {
+            if self.disallow_encrypted {
+                return Err(GetObjectError::EncryptedDisallowed);
+            }
             let archive = ArchiveKey::of(&location);
             let admit = if let Some((envelope, mapping, private)) = self.object.take() {
                 if mapping.archive != archive
@@ -982,6 +997,9 @@ impl GetObjectOperation {
 
     fn content_settings_read(&mut self, value: Option<Value>) -> Turn {
         let settings = BucketEncryption::from_row(value.as_deref())?;
+        if self.disallow_encrypted && settings.is_encrypted() {
+            return Err(GetObjectError::EncryptedDisallowed);
+        }
         let (Some(read_effect), Some(location)) = (self.plain_read(), self.location.as_ref())
         else {
             return Err(GetObjectError::GetObjectFailed);
@@ -1078,6 +1096,9 @@ impl GetObjectOperation {
     /// this read serves, advances the binding, or 404s. A locked bucket refuses first.
     fn reference_settings_read(&mut self, value: Option<Value>) -> Turn {
         let settings = BucketEncryption::from_row(value.as_deref())?;
+        if self.disallow_encrypted && settings.is_encrypted() {
+            return Err(GetObjectError::EncryptedDisallowed);
+        }
         self.reference_key = settings.active_key();
         self.reading = false;
         if let Some(key) = self.reference_key {

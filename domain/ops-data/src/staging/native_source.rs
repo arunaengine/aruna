@@ -412,7 +412,8 @@ impl ReadExactOperation {
             user_identity: self.auth.user_id,
             realm_id: self.auth.realm_id,
             node_id: self.node_id,
-        });
+        })
+        .with_disallow_encrypted(request.disallow_encrypted);
         self.step = ReadStep::Get;
         Ok(Next::Call(IoCall::child(get)))
     }
@@ -594,6 +595,7 @@ fn map_get_error(error: GetObjectError) -> NativeReferenceReject {
         // Drift and exhausted bindings remain retryable through rebinding.
         | GetObjectError::HistoricalReferenceUnavailable
         | GetObjectError::ReferenceChecksumMismatch => NativeReferenceReject::NotFound,
+        GetObjectError::EncryptedDisallowed => NativeReferenceReject::AccessDenied,
         GetObjectError::ReferenceSourceChanged | GetObjectError::ReferenceAdvanceExhausted => {
             NativeReferenceReject::Unavailable(error.to_string())
         }

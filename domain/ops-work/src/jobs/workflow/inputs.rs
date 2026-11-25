@@ -10,7 +10,6 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::TaskInput;
 use aruna_core::effects::Effect;
 use aruna_core::errors::StagingSourceError;
-use aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE;
 use aruna_core::native_reference::GrantedBody;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::identity::JobId;
@@ -22,11 +21,10 @@ use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::HashIndex;
 use aruna_core::structs::storage::distribution::source_root::{RootEntry, SourceRoot};
-use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::origin::SourcePin;
 use aruna_core::structs::storage::read_grant::READ_OPERATION;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
-use aruna_core::types::{GroupId, Key};
+use aruna_core::types::GroupId;
 use tracing::warn;
 use ulid::Ulid;
 
@@ -64,11 +62,9 @@ fn creator_auth(run: &RunIdentity) -> AuthContext {
 enum SourceStep {
     Role(aruna_core::id::NodeId),
     Authorize,
-    Encryption(GroupId),
     Read,
     Copies,
     CopyAuthorize(SourceObject),
-    CopyEncryption(SourceObject, GroupId),
     CopyRead,
     Stage,
     Granted,
@@ -143,16 +139,19 @@ impl InputSourceOperation {
     }
 
     fn get_call(&self, source: &SourceObject, group_id: GroupId) -> IoCall {
-        IoCall::child(GetObjectOperation::new(GetObjectInput {
-            bucket: source.bucket.clone(),
-            key: source.key.clone(),
-            version_id: source.version,
-            range: None,
-            group_id,
-            user_identity: self.run.user_id,
-            realm_id: self.run.realm_id,
-            node_id: self.run.node_id,
-        }))
+        IoCall::child(
+            GetObjectOperation::new(GetObjectInput {
+                bucket: source.bucket.clone(),
+                key: source.key.clone(),
+                version_id: source.version,
+                range: None,
+                group_id,
+                user_identity: self.run.user_id,
+                realm_id: self.run.realm_id,
+                node_id: self.run.node_id,
+            })
+            .with_disallow_encrypted(self.disallow_encrypted()),
+        )
     }
 
     /// Stages one exact version from a legal holder. The stored version and hash are resolved
@@ -321,42 +320,14 @@ impl Operation for InputSourceOperation {
                 let group = result
                     .child::<GroupId, SourceReadError>()?
                     .map_err(|error| authorize_error(&self.source, error))?;
-                if self.disallow_encrypted() {
-                    let key = Key::from(self.source.bucket.as_bytes().to_vec());
-                    return self.call(
-                        SourceStep::Encryption(group),
-                        IoCall::Read(vec![(BUCKET_ENCRYPTION_KEYSPACE.to_string(), key)]),
-                    );
-                }
-                let read = self.get_call(&self.source, group);
-                self.call(SourceStep::Read, read)
-            }
-            SourceStep::Encryption(group) => {
-                let row = result.value()?;
-                let settings = BucketEncryption::from_row(row.as_deref())
-                    .map_err(|error| JobError::retryable(error.to_string()))?;
-                if settings.is_encrypted() {
-                    return Err(JobError::permanent(
-                        "encrypted inputs require a protected workflow run",
-                    ));
-                }
                 let read = self.get_call(&self.source, group);
                 self.call(SourceStep::Read, read)
             }
             SourceStep::Read => match result.child::<GetObjectResult, GetObjectError>()? {
-                Ok(get) => {
-                    if self.disallow_encrypted()
-                        && get
-                            .location
-                            .as_ref()
-                            .is_some_and(|loc| loc.format.bucket_key().is_some())
-                    {
-                        return Err(JobError::permanent(
-                            "encrypted inputs require a protected workflow run",
-                        ));
-                    }
-                    Ok(Next::Done(StagedSource::from_local(get)))
-                }
+                Ok(get) => Ok(Next::Done(StagedSource::from_local(get))),
+                Err(GetObjectError::EncryptedDisallowed) => Err(JobError::permanent(
+                    "encrypted inputs require a protected workflow run",
+                )),
                 Err(failure) => self.local_read_failed(failure),
             },
             SourceStep::Copies => {
@@ -368,41 +339,13 @@ impl Operation for InputSourceOperation {
             }
             SourceStep::CopyAuthorize(copy) => match result.child::<GroupId, SourceReadError>()? {
                 Ok(group) => {
-                    if self.disallow_encrypted() {
-                        let key = Key::from(copy.bucket.as_bytes().to_vec());
-                        return self.call(
-                            SourceStep::CopyEncryption(copy, group),
-                            IoCall::Read(vec![(BUCKET_ENCRYPTION_KEYSPACE.to_string(), key)]),
-                        );
-                    }
                     let read = self.get_call(&copy, group);
                     self.call(SourceStep::CopyRead, read)
                 }
                 Err(_) => self.next_copy(),
             },
-            SourceStep::CopyEncryption(copy, group) => {
-                let row = result.value()?;
-                let encrypted = BucketEncryption::from_row(row.as_deref())
-                    .map(|settings| settings.is_encrypted())
-                    .unwrap_or(true);
-                if encrypted {
-                    return self.next_copy();
-                }
-                let read = self.get_call(&copy, group);
-                self.call(SourceStep::CopyRead, read)
-            }
             SourceStep::CopyRead => match result.child::<GetObjectResult, GetObjectError>()? {
-                Ok(get) => {
-                    if self.disallow_encrypted()
-                        && get
-                            .location
-                            .as_ref()
-                            .is_some_and(|loc| loc.format.bucket_key().is_some())
-                    {
-                        return self.next_copy();
-                    }
-                    Ok(Next::Done(StagedSource::from_local(get)))
-                }
+                Ok(get) => Ok(Next::Done(StagedSource::from_local(get))),
                 Err(_) => self.next_copy(),
             },
             SourceStep::Stage => match result.child::<StagedInput, StageError>()? {
