@@ -11,9 +11,10 @@ use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::input::{CapturedInput, ExecutionSpec};
+use aruna_core::structs::execution::job::input::ExecutionSpec;
 use aruna_core::structs::execution::job::local::WorkspaceMode;
 use aruna_core::structs::execution::job::pages::PageManifest;
+use aruna_core::structs::execution::workflow_run::PrecapturedInput;
 use aruna_core::structs::identity::auth::PathRestriction;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::LabelMatch;
@@ -127,7 +128,7 @@ pub struct SubmitExternalOperation {
     submission: ExternalSubmission,
     node: Option<IngressNode>,
     labels: Vec<LabelMatch>,
-    precaptured: Vec<CapturedInput>,
+    precaptured: Vec<PrecapturedInput>,
     path_restrictions: Option<Vec<PathRestriction>>,
     disallow_encrypted: bool,
     ids: IdMint,
@@ -156,7 +157,7 @@ impl SubmitExternalOperation {
     }
 
     /// Reuses remote inputs already captured and granted during workflow admission.
-    pub fn with_precaptured(mut self, precaptured: Vec<CapturedInput>) -> Self {
+    pub fn with_precaptured(mut self, precaptured: Vec<PrecapturedInput>) -> Self {
         self.precaptured = precaptured;
         self
     }

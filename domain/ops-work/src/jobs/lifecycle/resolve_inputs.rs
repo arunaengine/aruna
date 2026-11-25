@@ -13,6 +13,7 @@ use aruna_core::structs::execution::job::family::SubmissionId;
 use aruna_core::structs::execution::job::input::{
     CapturedInput, ExecutionSpec, InputSelection, InputSource,
 };
+use aruna_core::structs::execution::workflow_run::PrecapturedInput;
 use aruna_core::structs::identity::auth::PathRestriction;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
@@ -38,8 +39,8 @@ pub(super) struct ResolveScope {
     /// Sync-eligible realm servers allowed to receive credential-bearing input resolve requests.
     pub(super) allowed_remote: Option<BTreeSet<NodeId>>,
     /// Remote inputs already captured and granted at workflow admission.
-    pub(super) precaptured: Vec<CapturedInput>,
-    /// Refuse locally resolved inputs whose final bucket is encrypted (unprotected workflow runs).
+    pub(super) precaptured: Vec<PrecapturedInput>,
+    /// Refuse resolved inputs whose final bucket is encrypted (unprotected workflow runs).
     pub(super) disallow_encrypted: bool,
 }
 
@@ -54,7 +55,7 @@ impl ResolveScope {
         self
     }
 
-    pub(super) fn with_precaptured(mut self, precaptured: Vec<CapturedInput>) -> Self {
+    pub(super) fn with_precaptured(mut self, precaptured: Vec<PrecapturedInput>) -> Self {
         self.precaptured = precaptured;
         self
     }
@@ -211,7 +212,11 @@ impl ResolveInputsOperation {
         Ok(Next::Call(IoCall::child(ask)))
     }
 
-    fn take_precaptured(&self, node: NodeId, input: &InputSelection) -> Option<CapturedInput> {
+    fn take_precaptured(
+        &self,
+        node: NodeId,
+        input: &InputSelection,
+    ) -> Option<(InputSelection, CapturedInput)> {
         let InputSource::S3 {
             bucket,
             key,
@@ -220,20 +225,21 @@ impl ResolveInputsOperation {
         else {
             return None;
         };
-        let target_key = format!("{bucket}/{key}");
-        self.scope
-            .precaptured
-            .iter()
-            .find(|captured| {
-                captured.source_node_id == node
-                    && captured.version_id.to_string() == *version
-                    && captured.destination_key == target_key
-            })
-            .cloned()
-            .map(|mut captured| {
-                captured.destination_key = input.dest_key.clone();
-                captured
-            })
+        let entry = self.scope.precaptured.iter().find(|entry| {
+            entry.pin_node_id == node
+                && entry.pin_bucket == *bucket
+                && entry.pin_key == *key
+                && entry.pin_version_id.to_string() == *version
+        })?;
+        let mut resolved = entry.resolved.clone();
+        resolved.dest_key = input.dest_key.clone();
+        resolved.container_path = input.container_path.clone();
+        resolved.mode = input.mode;
+        resolved.name = input.name.clone();
+        resolved.description = input.description.clone();
+        let mut captured = entry.captured.clone();
+        captured.destination_key = input.dest_key.clone();
+        Some((resolved, captured))
     }
 
     /// The captures in input order, each with the first link its walk met, here or remotely.
@@ -275,8 +281,8 @@ impl Operation for ResolveInputsOperation {
             match input.source_node_id.filter(|node| *node != self.local()) {
                 Some(node) => {
                     exact_version(&input)?;
-                    if let Some(captured) = self.take_precaptured(node, &input) {
-                        self.answered.push(input);
+                    if let Some((resolved, captured)) = self.take_precaptured(node, &input) {
+                        self.answered.push(resolved);
                         self.captured.push(captured);
                     } else {
                         self.remote.entry(node).or_default().push(input);
@@ -457,5 +463,65 @@ mod tests {
             resolve.next(answer),
             Err(SubmitJobError::PlacementUnavailable(_))
         ));
+    }
+
+    // Precaptured remote link pins match by the original link pin and emit the resolved target.
+    #[test]
+    fn reuses_precaptured_link() {
+        let link_ver = Ulid::from_parts(2, 1);
+        let target_ver = Ulid::from_parts(3, 1);
+        let asked = input("alias.link", Some(&link_ver.to_string()), Some(node(2)));
+        let resolved_target = input("real.dat", Some(&target_ver.to_string()), Some(node(2)));
+        let mut captured = captured_input(&resolved_target, node(2));
+        captured.version_id = target_ver;
+        captured.link = Some(arn("alias.link"));
+        let mut spec = payload();
+        spec.inputs = vec![asked];
+        let scope = ResolveScope {
+            caller: InputCaller {
+                created_by: user(),
+                realm_id: REALM,
+                local: node(1),
+                path_restrictions: None,
+            },
+            submission_id: SubmissionId([4; 32]),
+            expires_at: 10,
+            token: None,
+            allowed_remote: None,
+            precaptured: vec![PrecapturedInput {
+                pin_node_id: node(2),
+                pin_bucket: "b".to_string(),
+                pin_key: "alias.link".to_string(),
+                pin_version_id: link_ver,
+                resolved: resolved_target,
+                captured,
+            }],
+            disallow_encrypted: false,
+        };
+        let mut resolve = ResolveInputsOperation::new(&spec, scope);
+        // No remote RPC is issued: local capture is empty, then policies finish immediately.
+        calls_child(resolve.first());
+        assert_eq!(resolve.step, ResolveStep::Capture);
+        calls_child(resolve.next(child(Vec::<CapturedInput>::new())));
+        assert_eq!(resolve.step, ResolveStep::Policies);
+        let Ok(Next::Done(done)) = resolve.next(child(Vec::<PlacementPolicyRef>::new())) else {
+            panic!("precaptured link should resolve without remote call");
+        };
+        assert_eq!(done.inputs.len(), 1);
+        assert_eq!(done.inputs[0].dest_key, "alias.link");
+        assert_eq!(
+            done.inputs[0].container_path.as_deref(),
+            Some("/in/alias.link")
+        );
+        let InputSource::S3 {
+            key, version_id, ..
+        } = &done.inputs[0].source
+        else {
+            panic!("expected S3 target");
+        };
+        assert_eq!(key, "real.dat");
+        assert_eq!(version_id.as_deref(), Some(target_ver.to_string().as_str()));
+        assert_eq!(done.captured[0].version_id, target_ver);
+        assert_eq!(done.captured[0].destination_key, "alias.link");
     }
 }

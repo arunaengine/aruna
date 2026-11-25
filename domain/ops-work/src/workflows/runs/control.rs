@@ -131,7 +131,8 @@ impl FollowRunOperation {
         let mut output = source.output.clone();
         // A cross-node failover resume rebinds an output targeting the original coordinator to this
         // surviving holder; admission still checks the bucket exists and is writable here.
-        if source.node_id != self.node.0
+        if self.follow == Follow::Resume
+            && source.node_id != self.node.0
             && let Some(out) = &mut output
             && out.node_id == Some(source.node_id)
         {

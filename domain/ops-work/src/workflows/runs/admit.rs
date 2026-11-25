@@ -21,8 +21,8 @@ use aruna_core::structs::execution::job::input::{
 };
 use aruna_core::structs::execution::job::local::{WorkspaceMode, user_dedup_key};
 use aruna_core::structs::execution::workflow_run::{
-    CacheScope, RunKeyRecord, RunOutput, RunState, WorkflowRunRecord, WorkflowRunSpec,
-    WorkflowSecretBinding, WorkflowSecretScope, run_key, run_key_row,
+    CacheScope, PrecapturedInput, RunKeyRecord, RunOutput, RunState, WorkflowRunRecord,
+    WorkflowRunSpec, WorkflowSecretBinding, WorkflowSecretScope, run_key, run_key_row,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -124,9 +124,9 @@ impl RunRequest {
     }
 }
 
-/// Extracts `aruna://` and `s3://` addresses from workflow values so local encryption and access
-/// checks cover file-valued parameters under every scheme the coordinator serves.
-fn value_refs(value: &Value, out: &mut Vec<(String, String, Option<NodeId>)>) {
+/// Extracts `aruna://` and `s3://` addresses from workflow values so access, encryption, and
+/// remote capture checks cover file-valued parameters under every scheme the coordinator serves.
+fn value_refs(value: &Value, out: &mut Vec<(String, String, Option<Ulid>, Option<NodeId>)>) {
     match value {
         Value::String(text) => {
             let rest = text
@@ -134,13 +134,18 @@ fn value_refs(value: &Value, out: &mut Vec<(String, String, Option<NodeId>)>) {
                 .or_else(|| text.strip_prefix("s3://"));
             if let Some(rest) = rest {
                 let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
-                let node = query
-                    .split('&')
-                    .find_map(|pair| pair.strip_prefix("node="))
-                    .and_then(|text| text.parse::<NodeId>().ok());
+                let mut version = None;
+                let mut node = None;
+                for pair in query.split('&') {
+                    if let Some(val) = pair.strip_prefix("version=") {
+                        version = Ulid::from_string(val).ok();
+                    } else if let Some(val) = pair.strip_prefix("node=") {
+                        node = val.parse::<NodeId>().ok();
+                    }
+                }
                 let (bucket, key) = path.split_once('/').unwrap_or((path, ""));
                 if !bucket.is_empty() {
-                    out.push((bucket.to_owned(), key.to_owned(), node));
+                    out.push((bucket.to_owned(), key.to_owned(), version, node));
                 }
             }
         }
@@ -203,8 +208,9 @@ pub struct StartRunOperation {
     request: RunRequest,
     lineage: Lineage,
     pending: Vec<PinnedInput>,
-    remote: BTreeMap<NodeId, Vec<InputSelection>>,
-    captured: Vec<CapturedInput>,
+    pub(super) remote: BTreeMap<NodeId, Vec<(PinnedInput, InputSelection)>>,
+    asked: Vec<PinnedInput>,
+    pub(super) captured: Vec<PrecapturedInput>,
     ids: IdMint,
     now_ms: u64,
     step: AdmitStep,
@@ -217,12 +223,12 @@ impl StartRunOperation {
         let mut pending = request.inputs.clone();
         let mut refs = Vec::new();
         value_refs(&request.values, &mut refs);
-        for (bucket, key, source_node_id) in refs {
+        for (bucket, key, version, source_node_id) in refs {
             pending.push(PinnedInput {
                 name: String::new(),
                 bucket,
                 key,
-                version_id: Ulid::nil(),
+                version_id: version.unwrap_or_else(Ulid::nil),
                 source_node_id,
             });
         }
@@ -234,6 +240,7 @@ impl StartRunOperation {
             request,
             lineage: Lineage::default(),
             remote: BTreeMap::new(),
+            asked: Vec::new(),
             captured: Vec::new(),
             ids: IdMint::default(),
             now_ms: 0,
@@ -248,7 +255,7 @@ impl StartRunOperation {
     }
 
     /// Reuses remote inputs already captured and granted for an earlier run in the lineage.
-    pub fn with_captured(mut self, captured: Vec<CapturedInput>) -> Self {
+    pub fn with_captured(mut self, captured: Vec<PrecapturedInput>) -> Self {
         self.captured = captured;
         self
     }
@@ -320,8 +327,8 @@ impl StartRunOperation {
             .map(|input| input.bucket.clone())
             .chain(
                 refs.into_iter()
-                    .filter(|(_, _, node)| node.is_none_or(|n| n == local))
-                    .map(|(bucket, _, _)| bucket),
+                    .filter(|(_, _, _, node)| node.is_none_or(|n| n == local))
+                    .map(|(bucket, _, _, _)| bucket),
             )
             .collect();
         buckets.sort_unstable();
@@ -416,9 +423,11 @@ impl StartRunOperation {
     }
 
     fn next_remote(&mut self, view: VersionView, protected: bool, local_only: bool) -> AdmitNext {
-        let Some((node, inputs)) = self.remote.pop_first() else {
+        let Some((node, pairs)) = self.remote.pop_first() else {
             return self.record(view, protected, local_only);
         };
+        let (pins, inputs): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
+        self.asked = pins;
         let scope = SubmissionScope::Unkeyed(Ulid::nil());
         let caller = ResolveCaller {
             created_by: self.auth.user_id,
@@ -431,7 +440,7 @@ impl StartRunOperation {
         Ok(Next::Call(IoCall::child(resolve)))
     }
 
-    fn queue_remote(
+    pub(super) fn queue_remote(
         &mut self,
         cfg: &RealmConfigDocument,
         local_only: bool,
@@ -440,7 +449,31 @@ impl StartRunOperation {
             return Ok(());
         }
         let local = self.node.0;
-        for pin in &self.request.inputs {
+        let now_secs = self.now_ms / 1000;
+        let mut pins = self.request.inputs.clone();
+        let mut refs = Vec::new();
+        value_refs(&self.request.values, &mut refs);
+        for (bucket, key, version, source_node_id) in refs {
+            if let Some(version_id) = version {
+                pins.push(PinnedInput {
+                    name: String::new(),
+                    bucket,
+                    key,
+                    version_id,
+                    source_node_id,
+                });
+            }
+        }
+        if self.token.is_some() || self.lineage.resumes.is_none() {
+            self.captured.retain(|entry| {
+                entry
+                    .captured
+                    .grant
+                    .as_ref()
+                    .is_none_or(|g| g.grant.expires_at > now_secs)
+            });
+        }
+        for pin in pins {
             let Some(node) = pin.source_node_id.filter(|n| *n != local) else {
                 continue;
             };
@@ -452,15 +485,29 @@ impl StartRunOperation {
                     "input node {node} is not an eligible realm server"
                 )));
             }
-            let dest_key = format!("{}/{}", pin.bucket, pin.key);
-            let already = self.captured.iter().any(|c| {
-                c.source_node_id == node
-                    && c.version_id == pin.version_id
-                    && c.destination_key == dest_key
+            let already = self.captured.iter().any(|entry| {
+                entry.pin_node_id == node
+                    && entry.pin_bucket == pin.bucket
+                    && entry.pin_key == pin.key
+                    && entry.pin_version_id == pin.version_id
+                    && entry
+                        .captured
+                        .grant
+                        .as_ref()
+                        .is_none_or(|g| g.grant.expires_at > now_secs)
             });
-            if already || self.token.is_none() {
+            if already {
                 continue;
             }
+            if self.token.is_none() {
+                if self.lineage.resumes.is_some() {
+                    continue;
+                }
+                return Err(CatalogError::Invalid(
+                    "an input on another node requires a bearer token".into(),
+                ));
+            }
+            let dest_key = format!("{}/{}", pin.bucket, pin.key);
             let version_text = pin.version_id.to_string();
             let selection = InputSelection {
                 source: InputSource::S3 {
@@ -476,15 +523,13 @@ impl StartRunOperation {
                 description: None,
             };
             let entry = self.remote.entry(node).or_default();
-            let duplicate = entry.iter().any(|existing| {
-                existing.dest_key == dest_key
-                    && matches!(
-                        &existing.source,
-                        InputSource::S3 { version_id: Some(v), .. } if v == &version_text
-                    )
+            let duplicate = entry.iter().any(|(existing, _)| {
+                existing.bucket == pin.bucket
+                    && existing.key == pin.key
+                    && existing.version_id == pin.version_id
             });
             if !duplicate {
-                entry.push(selection);
+                entry.push((pin, selection));
             }
         }
         Ok(())
@@ -674,10 +719,27 @@ impl Operation for StartRunOperation {
             AdmitStep::Remote(view, protected, local_only) => {
                 type Answers = Vec<(InputSelection, CapturedInput)>;
                 let answers = result.child::<Answers, SubmitJobError>()?;
+                let asked = std::mem::take(&mut self.asked);
                 match answers {
                     Ok(answers) => {
-                        for (_, captured) in answers {
-                            self.captured.push(captured);
+                        for (pin, (resolved, captured)) in asked.into_iter().zip(answers) {
+                            let Some(node) = pin.source_node_id else {
+                                continue;
+                            };
+                            self.captured.retain(|entry| {
+                                !(entry.pin_node_id == node
+                                    && entry.pin_bucket == pin.bucket
+                                    && entry.pin_key == pin.key
+                                    && entry.pin_version_id == pin.version_id)
+                            });
+                            self.captured.push(PrecapturedInput {
+                                pin_node_id: node,
+                                pin_bucket: pin.bucket,
+                                pin_key: pin.key,
+                                pin_version_id: pin.version_id,
+                                resolved,
+                                captured,
+                            });
                         }
                     }
                     Err(SubmitJobError::AuthorityDenied | SubmitJobError::InputDenied(_)) => {

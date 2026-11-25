@@ -1084,3 +1084,181 @@ async fn binds_workflow_secrets() {
     });
     assert!(task_spec(&admitted, &unbound, "k").is_err());
 }
+
+// Remote pins in `values` or `inputs` require a bearer token on new runs and refresh expired
+// grants on repeat instead of reusing stale grants.
+#[tokio::test]
+async fn refreshes_remote_grants() {
+    use aruna_core::id::NodeId;
+    use aruna_core::metadata::AuthToken;
+    use aruna_core::structs::execution::job::family::SubmissionId;
+    use aruna_core::structs::execution::job::input::{
+        CapturedInput, InputContent, InputMode, InputSelection, InputSource,
+    };
+    use aruna_core::structs::execution::workflow_run::PrecapturedInput;
+    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNode, RealmNodeKind};
+    use aruna_core::structs::storage::read_grant::{GrantScope, ReadGrant};
+    use aruna_core::structs::storage::replication::VersionedObjectArn;
+
+    let runs = runs().await;
+    let realm_id = runs.fixture.alice.realm_id;
+    let group_id = runs.fixture.group_a;
+    let peer: NodeId = aruna_ops_identity::testing::node(8);
+    let mut cfg = RealmConfigDocument::new(realm_id, Vec::new(), 1);
+    cfg.nodes.push(RealmNode {
+        node_id: runs.fixture.node.to_string(),
+        kind: RealmNodeKind::Server,
+    });
+    cfg.nodes.push(RealmNode {
+        node_id: peer.to_string(),
+        kind: RealmNodeKind::Server,
+    });
+    let ver = Ulid::from_bytes([6; 16]);
+    let mut req = runs.request(
+        None,
+        json!({"file": format!("aruna://data/f.bin?version={ver}&node={peer}")}),
+    );
+    // New run with remote file-valued parameter and no bearer token is rejected at admission.
+    let mut no_bearer = StartRunOperation::new(&runs.fixture.alice, runs.serving(), req.clone());
+    no_bearer.stamp(10_000);
+    assert!(matches!(
+        no_bearer.queue_remote(&cfg, false),
+        Err(CatalogError::Invalid(_))
+    ));
+
+    // With a bearer token, an expired grant is dropped and queued for refresh from the holder.
+    let expired_grant = ReadGrant {
+        realm_id,
+        issuer: peer,
+        submission_id: SubmissionId([1; 32]),
+        user_id: runs.fixture.alice.user_id,
+        restrictions: None,
+        scope: GrantScope::Version(VersionedObjectArn {
+            realm_id,
+            node_id: peer,
+            bucket: "data".into(),
+            key: "f.bin".into(),
+            version: ver,
+        }),
+        operations: vec!["s3.GetObject".into()],
+        expires_at: 5,
+    }
+    .sign(&iroh::SecretKey::from_bytes(&[8; 32]))
+    .unwrap();
+    let selection = InputSelection {
+        source: InputSource::S3 {
+            bucket: "data".into(),
+            key: "f.bin".into(),
+            version_id: Some(ver.to_string()),
+        },
+        source_node_id: Some(peer),
+        dest_key: "data/f.bin".into(),
+        mode: InputMode::Snapshot,
+        container_path: Some("/data/f.bin".into()),
+        name: None,
+        description: None,
+    };
+    let stale = PrecapturedInput {
+        pin_node_id: peer,
+        pin_bucket: "data".into(),
+        pin_key: "f.bin".into(),
+        pin_version_id: ver,
+        resolved: selection,
+        captured: CapturedInput {
+            destination_key: "data/f.bin".into(),
+            source_node_id: peer,
+            version_id: ver,
+            content: InputContent::Reference {
+                etag: None,
+                range_bound: false,
+            },
+            bytes: 10,
+            policies: Vec::new(),
+            source_group_id: group_id,
+            public: false,
+            link: None,
+            source_pin: None,
+            served_by: None,
+            database: None,
+            releases: Vec::new(),
+            releases_complete: false,
+            grant: Some(expired_grant),
+        },
+    };
+    let bearer = Some(AuthToken::bearer("fresh-token").unwrap());
+    let mut refresh = StartRunOperation::new(&runs.fixture.alice, runs.serving(), req.clone())
+        .with_token(bearer)
+        .with_captured(vec![stale]);
+    refresh.stamp(10_000);
+    refresh.queue_remote(&cfg, false).unwrap();
+    assert!(refresh.captured.is_empty(), "expired grant must be dropped");
+    assert_eq!(refresh.remote.get(&peer).map(Vec::len), Some(1));
+
+    // Fresh grant is reused without re-queuing.
+    let mut fresh_grant = ReadGrant {
+        realm_id,
+        issuer: peer,
+        submission_id: SubmissionId([1; 32]),
+        user_id: runs.fixture.alice.user_id,
+        restrictions: None,
+        scope: GrantScope::Version(VersionedObjectArn {
+            realm_id,
+            node_id: peer,
+            bucket: "data".into(),
+            key: "f.bin".into(),
+            version: ver,
+        }),
+        operations: vec!["s3.GetObject".into()],
+        expires_at: 999,
+    }
+    .sign(&iroh::SecretKey::from_bytes(&[8; 32]))
+    .unwrap();
+    let mut reused = PrecapturedInput {
+        pin_node_id: peer,
+        pin_bucket: "data".into(),
+        pin_key: "f.bin".into(),
+        pin_version_id: ver,
+        resolved: InputSelection {
+            source: InputSource::S3 {
+                bucket: "data".into(),
+                key: "f.bin".into(),
+                version_id: Some(ver.to_string()),
+            },
+            source_node_id: Some(peer),
+            dest_key: "data/f.bin".into(),
+            mode: InputMode::Snapshot,
+            container_path: Some("/data/f.bin".into()),
+            name: None,
+            description: None,
+        },
+        captured: CapturedInput {
+            destination_key: "data/f.bin".into(),
+            source_node_id: peer,
+            version_id: ver,
+            content: InputContent::Reference {
+                etag: None,
+                range_bound: false,
+            },
+            bytes: 10,
+            policies: Vec::new(),
+            source_group_id: group_id,
+            public: false,
+            link: None,
+            source_pin: None,
+            served_by: None,
+            database: None,
+            releases: Vec::new(),
+            releases_complete: false,
+            grant: Some(fresh_grant.clone()),
+        },
+    };
+    fresh_grant.grant.expires_at = 999;
+    reused.captured.grant = Some(fresh_grant);
+    req.values = json!({"file": format!("s3://data/f.bin?version={ver}&node={peer}")});
+    let mut keep = StartRunOperation::new(&runs.fixture.alice, runs.serving(), req)
+        .with_captured(vec![reused]);
+    keep.stamp(10_000);
+    keep.queue_remote(&cfg, false).unwrap();
+    assert_eq!(keep.captured.len(), 1);
+    assert!(keep.remote.is_empty());
+}
