@@ -120,7 +120,7 @@ async fn resumes_copied_run() {
             first_page,
             pages,
             workflow: None,
-            reading: true,
+            step: WriteStep::Read,
             kept: 0,
         };
     let kept = drive(write(&copy, 0, encoded(&pages[..2])), context)
@@ -229,7 +229,7 @@ async fn guards_replica_gaps() {
             first_page,
             pages,
             workflow: None,
-            reading: true,
+            step: WriteStep::Read,
             kept: 0,
         };
     let page = |entries: Vec<RunLogEntry>| vec![encode_page(&RunLogPage { entries }).unwrap()];
@@ -257,4 +257,259 @@ async fn guards_replica_gaps() {
         .unwrap();
     assert_eq!(loaded.len(), 1);
     assert_eq!(loaded[0].entries, newer);
+
+    // Delayed non-terminal snapshots never overwrite a terminal run record on the replica.
+    let mut done_copy = copy.clone();
+    done_copy.state = RunState::Succeeded;
+    done_copy.last_event_seq = 5;
+    drive(write(&done_copy, 0, Vec::new()), context)
+        .await
+        .unwrap();
+    let mut stale = copy.clone();
+    stale.state = RunState::Running;
+    stale.last_event_seq = 2;
+    drive(write(&stale, 0, Vec::new()), context).await.unwrap();
+    let stored = drive(
+        super::super::reads::RunSnapshotOperation::new(&runs.fixture.alice, copy.run_id),
+        context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(stored.record.state, RunState::Succeeded);
+    assert_eq!(stored.record.last_event_seq, 5);
+
+    // Cross-node Repeat never silently rebinds an output pinned to the original coordinator.
+    let mut pinned = done_copy.clone();
+    pinned.run_id = Ulid::from_bytes([43; 16]);
+    pinned.lineage = pinned.run_id;
+    pinned.output = Some(aruna_core::structs::execution::workflow_run::RunOutput {
+        bucket: "results".into(),
+        prefix: "out/".into(),
+        node_id: Some(gone),
+        dataset_json: None,
+    });
+    drive(write(&pinned, 0, Vec::new()), context).await.unwrap();
+    let repeated = drive(
+        FollowRunOperation::new(
+            &runs.fixture.alice,
+            runs.serving(),
+            pinned.run_id,
+            Follow::Repeat,
+        ),
+        context,
+    )
+    .await;
+    assert!(
+        matches!(repeated, Err(CatalogError::Invalid(_))),
+        "{repeated:?}"
+    );
+    let resumed = drive(
+        FollowRunOperation::new(
+            &runs.fixture.alice,
+            runs.serving(),
+            pinned.run_id,
+            Follow::Resume,
+        ),
+        context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(resumed.output.unwrap().node_id, Some(here));
+}
+
+// Large workflow sources and updated tools transfer across bounded frames and only expose the
+// copy as resumable once the final metadata frame commits.
+#[tokio::test]
+async fn chunks_large_replicas() {
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::structs::execution::workflow::{StoredFile, WorkflowFiles};
+
+    let runs = runs().await;
+    let context = &runs.fixture.context;
+    let here = runs.fixture.node;
+    let gone = aruna_ops_identity::testing::node(9);
+    let own = runs.started().await;
+    let copy = copy_of(&own, gone);
+    let wf_id = Ulid::from_bytes([77; 16]);
+    let mut remote = copy.clone();
+    remote.run_id = Ulid::from_bytes([78; 16]);
+    remote.lineage = remote.run_id;
+    remote.workflow_id = wf_id;
+    remote.version = 1;
+
+    let wf = WorkflowRecord {
+        workflow_id: wf_id,
+        group_id: remote.group_id,
+        name: "chunked".into(),
+        description: None,
+        language: StoredWorkflowLanguage::Uwe,
+        visibility: aruna_core::structs::execution::workflow::WorkflowVisibility::Group,
+        version_count: 1,
+        edam_formats: Vec::new(),
+        created_by: remote.created_by,
+        created_at_ms: 1,
+        updated_at_ms: 1,
+    };
+    let ver = WorkflowVersionRecord {
+        workflow_id: wf_id,
+        version: 1,
+        language: StoredWorkflowLanguage::Uwe,
+        entrypoint: "workflow.uwe.yaml".into(),
+        files: vec!["workflow.uwe.yaml".into()],
+        digest: "blake3:chunk".into(),
+        commit: None,
+        message: None,
+        uwe_yaml: Some("steps:\n  a:\n    tool: bigtool\n".into()),
+        images: Default::default(),
+        inspection: Default::default(),
+        created_by: remote.created_by,
+        created_at_ms: 1,
+    };
+    let source_files = WorkflowFiles {
+        files: vec![StoredFile {
+            path: "workflow.uwe.yaml".into(),
+            content: vec![b'x'; 2500],
+            executable: false,
+        }],
+    };
+    let tool_v1 = ToolRecord {
+        tool_id: "bigtool".into(),
+        version: "1.0".into(),
+        group_id: remote.group_id,
+        title: "bigtool".into(),
+        curation: Default::default(),
+        definition: serde_json::json!({"id": "bigtool", "rev": 1}).to_string(),
+        files: vec![StoredFile {
+            path: "run.sh".into(),
+            content: vec![b't'; 2200],
+            executable: true,
+        }],
+        created_by: remote.created_by,
+        created_at_ms: 10,
+    };
+    let mut tool_v2 = tool_v1.clone();
+    tool_v2.definition = serde_json::json!({"id": "bigtool", "rev": 2}).to_string();
+    tool_v2.created_at_ms = 20;
+
+    // Seed an older tool definition first to verify replica updates replace stale tool rows.
+    context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: WORKFLOW_TOOL_KEYSPACE.to_string(),
+            key: tool_key(&tool_v1.tool_id, &tool_v1.version, tool_v1.group_id),
+            value: tool_v1.to_bytes().unwrap().into(),
+            txn_id: None,
+        })
+        .await;
+
+    let bundle = ReplicatedWorkflow {
+        workflow: wf.to_bytes().unwrap(),
+        version: ver.to_bytes().unwrap(),
+        source: Some(source_files.to_bytes().unwrap()),
+        tools: vec![tool_v2.to_bytes().unwrap()],
+        chunks: Vec::new(),
+        more: false,
+    };
+    let send = ReplicateLogOperation::new(remote.run_id, (gone, remote.realm_id), 0);
+    let log = pages(3);
+    let limit = 2048;
+    let frames = send
+        .frames_bounded(0, &remote, &log, Some(bundle), limit)
+        .unwrap();
+    assert!(frames.len() >= 4, "expected bounded multi-frame transfer");
+    for frame in &frames {
+        assert!(
+            frame.len() <= limit,
+            "frame {} exceeds limit {limit}",
+            frame.len()
+        );
+    }
+
+    // Apply all `more: true` frames first and confirm the run is not visible/resumable yet.
+    let mut applied_more = 0;
+    for frame in &frames {
+        let MetadataTransportMessage::StoreRunLog {
+            run,
+            first_page,
+            pages,
+            workflow,
+        } = decode_message(frame).unwrap()
+        else {
+            panic!("expected StoreRunLog");
+        };
+        let is_more = workflow.as_ref().is_some_and(|w| w.more);
+        drive(
+            WriteReplicaOperation {
+                local: here,
+                run,
+                first_page,
+                pages,
+                workflow,
+                step: WriteStep::Read,
+                kept: 0,
+            },
+            context,
+        )
+        .await
+        .unwrap();
+        if is_more {
+            applied_more += 1;
+            let hidden = drive(
+                super::super::reads::RunSnapshotOperation::new(&runs.fixture.alice, remote.run_id),
+                context,
+            )
+            .await;
+            assert_eq!(hidden, Err(CatalogError::NotFound));
+        }
+    }
+    assert!(applied_more >= 2);
+    let stored = drive(
+        super::super::reads::RunSnapshotOperation::new(&runs.fixture.alice, remote.run_id),
+        context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(stored.record.run_id, remote.run_id);
+    assert_eq!(
+        drive(LoadLogOperation::new(remote.run_id), context)
+            .await
+            .unwrap(),
+        log
+    );
+    let stored_tool = drive(
+        crate::workflows::ScanOperation::<ToolRecord>::of_groups(Some([remote.group_id].into())),
+        context,
+    )
+    .await
+    .unwrap();
+    let updated = stored_tool
+        .into_iter()
+        .find(|(_, t)| t.tool_id == "bigtool")
+        .unwrap()
+        .1;
+    assert_eq!(updated.definition, tool_v2.definition);
+
+    // Missing source row on a replacement holder triggers NotFound so sender backfills from 0.
+    context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Delete {
+            key_space: WORKFLOW_SOURCE_KEYSPACE.to_string(),
+            key: version_key(wf_id, 1),
+            txn_id: None,
+        })
+        .await;
+    let missing_src = drive(
+        WriteReplicaOperation {
+            local: here,
+            run: Box::new(remote),
+            first_page: 0,
+            pages: Vec::new(),
+            workflow: None,
+            step: WriteStep::Read,
+            kept: 0,
+        },
+        context,
+    )
+    .await;
+    assert_eq!(missing_src, Err(CatalogError::NotFound));
 }
