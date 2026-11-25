@@ -130,6 +130,7 @@ async fn releases_workflow_secrets() {
         .await
         .unwrap();
 
+    let run_id = Ulid::from_bytes([9; 16]);
     let bindings = BTreeMap::from([
         (
             "USER_TOKEN".to_string(),
@@ -150,34 +151,18 @@ async fn releases_workflow_secrets() {
             },
         ),
     ]);
-    let run_id = Ulid::from_bytes([9; 16]);
-    let released = drive(ReleaseVaultSecrets::new(run, run_id, bindings), ctx)
-        .await
-        .unwrap();
-    assert_eq!(released["USER_TOKEN"].expose(), "user-secret-val");
-    assert_eq!(released["NODE_TOKEN"].expose(), "node-secret-val");
-
-    let denied = BTreeMap::from([(
-        "LOCKED".to_string(),
-        TaskSecretBinding {
-            workflow_id,
-            scope: WorkflowSecretScope::Group,
-            name: secret_name("locked-key"),
-            field: None,
-        },
-    )]);
-    let err = drive(ReleaseVaultSecrets::new(run, run_id, denied), ctx)
+    // Without a stored run record, release fails closed instead of trusting task tags.
+    let missing = drive(ReleaseVaultSecrets::new(run, run_id, bindings.clone()), ctx)
         .await
         .unwrap_err();
-    assert!(err.message.contains("refused"), "{err:?}");
+    assert!(missing.message.contains("not found"), "{missing:?}");
 
-    // A stored run record must match the claimed workflow and secret bindings.
-    let run_record = WorkflowRunRecord {
+    let mut valid_record = WorkflowRunRecord {
         run_id,
         realm_id,
         group_id,
-        workflow_id: Ulid::from_bytes([1; 16]),
-        workflow_name: "other".to_string(),
+        workflow_id,
+        workflow_name: "demo".to_string(),
         version: 1,
         lineage: run_id,
         state: aruna_core::structs::execution::workflow_run::RunState::Running,
@@ -206,7 +191,32 @@ async fn releases_workflow_secrets() {
         placement_site: None,
         protected: false,
         started_at_ms: Some(10),
-        secrets: BTreeMap::new(),
+        secrets: BTreeMap::from([
+            (
+                "USER_TOKEN".to_string(),
+                aruna_core::structs::execution::workflow_run::WorkflowSecretBinding {
+                    scope: WorkflowSecretScope::User,
+                    name: secret_name("my-api-key"),
+                    field: None,
+                },
+            ),
+            (
+                "NODE_TOKEN".to_string(),
+                aruna_core::structs::execution::workflow_run::WorkflowSecretBinding {
+                    scope: WorkflowSecretScope::Node,
+                    name: secret_name("node-token"),
+                    field: None,
+                },
+            ),
+            (
+                "LOCKED".to_string(),
+                aruna_core::structs::execution::workflow_run::WorkflowSecretBinding {
+                    scope: WorkflowSecretScope::Group,
+                    name: secret_name("locked-key"),
+                    field: None,
+                },
+            ),
+        ]),
         path_restrictions: None,
         captured_remote: Vec::new(),
     };
@@ -214,7 +224,39 @@ async fn releases_workflow_secrets() {
         .send_storage_effect(StorageEffect::Write {
             key_space: WORKFLOW_RUN_KEYSPACE.to_string(),
             key: run_key(run_id),
-            value: run_record.to_bytes().unwrap().into(),
+            value: valid_record.to_bytes().unwrap().into(),
+            txn_id: None,
+        })
+        .await;
+
+    let released = drive(ReleaseVaultSecrets::new(run, run_id, bindings), ctx)
+        .await
+        .unwrap();
+    assert_eq!(released["USER_TOKEN"].expose(), "user-secret-val");
+    assert_eq!(released["NODE_TOKEN"].expose(), "node-secret-val");
+
+    let denied = BTreeMap::from([(
+        "LOCKED".to_string(),
+        TaskSecretBinding {
+            workflow_id,
+            scope: WorkflowSecretScope::Group,
+            name: secret_name("locked-key"),
+            field: None,
+        },
+    )]);
+    let err = drive(ReleaseVaultSecrets::new(run, run_id, denied), ctx)
+        .await
+        .unwrap_err();
+    assert!(err.message.contains("refused"), "{err:?}");
+
+    // A stored run record must match the claimed workflow and secret bindings.
+    valid_record.workflow_id = Ulid::from_bytes([1; 16]);
+    valid_record.secrets.clear();
+    ctx.storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: WORKFLOW_RUN_KEYSPACE.to_string(),
+            key: run_key(run_id),
+            value: valid_record.to_bytes().unwrap().into(),
             txn_id: None,
         })
         .await;

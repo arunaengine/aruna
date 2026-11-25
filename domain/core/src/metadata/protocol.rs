@@ -778,6 +778,18 @@ pub enum MetadataTransportMessage {
     AppletStored {
         result: Result<u64, MetadataReadError>,
     },
+    /// An executor asks an authoritative realm server for a workflow run record to verify secrets.
+    ReadWorkflowRun {
+        run_id: Ulid,
+        group_id: GroupId,
+    },
+    /// The authoritative run record, or `None` when the server holds no matching run.
+    WorkflowRunRead {
+        result: Result<
+            Option<Box<crate::structs::execution::workflow_run::WorkflowRunRecord>>,
+            MetadataReadError,
+        >,
+    },
 }
 
 /// PKCS8 PEM of the realm signing key; Debug never prints it.
@@ -1316,6 +1328,8 @@ pub fn transport_message_kind(message: &MetadataTransportMessage) -> &'static st
         MetadataTransportMessage::RunLogStored { .. } => "run_log_stored",
         MetadataTransportMessage::StoreApplet { .. } => "store_applet",
         MetadataTransportMessage::AppletStored { .. } => "applet_stored",
+        MetadataTransportMessage::ReadWorkflowRun { .. } => "read_workflow_run",
+        MetadataTransportMessage::WorkflowRunRead { .. } => "workflow_run_read",
     }
 }
 

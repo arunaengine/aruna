@@ -28,7 +28,7 @@ use crate::jobs::node_inputs::{ingress_node, launch_node};
 use crate::jobs::records::pages::{PageReadError, ServePageOperation};
 use crate::jobs::records::transport::{ServeLaunchOperation, ServeRecordOperation};
 use crate::plugins::peer::{AnswerPeer, PeerAnswer as PluginAnswer};
-use crate::workflows::runs::replica::StoreReplicaOperation;
+use crate::workflows::runs::replica::{ServeRunOperation, StoreReplicaOperation};
 use aruna_ops_data::metadata::serve::forwards::needs_view;
 use aruna_ops_data::metadata::serve::{ServeNode, ServeRequestOperation, ServedReply};
 
@@ -88,6 +88,8 @@ enum Asked {
     Page,
     /// The run's node hands this holder a copy of a run and its log pages.
     RunLog,
+    /// A realm executor asks an authoritative server for a run record to verify secrets.
+    RunRead,
     /// An applet's host node hands this holder a copy of the applet.
     Applet,
     Serve,
@@ -207,6 +209,10 @@ impl MetadataPeerOperation {
                 let store = StoreAppletOperation::new(peer, self.local, applet);
                 self.ask(Asked::Applet, store)
             }
+            Message::ReadWorkflowRun { run_id, group_id } => {
+                let serve = ServeRunOperation::new(peer, self.local, run_id, group_id);
+                self.ask(Asked::RunRead, serve)
+            }
             message => {
                 let serving = ServeNode {
                     local: serving,
@@ -282,6 +288,12 @@ impl Operation for MetadataPeerOperation {
             }
             Asked::RunLog => Message::RunLogStored {
                 result: result.child::<u32, MetadataReadError>()?,
+            },
+            Asked::RunRead => Message::WorkflowRunRead {
+                result:
+                    result.child::<Option<
+                        Box<aruna_core::structs::execution::workflow_run::WorkflowRunRecord>,
+                    >, MetadataReadError>()?,
             },
             Asked::Applet => Message::AppletStored {
                 result: result.child::<u64, MetadataReadError>()?,

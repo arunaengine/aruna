@@ -7,11 +7,19 @@ use std::collections::BTreeMap;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::{Secret, SecretBytes};
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{NODE_SECRETS_KEYSPACE, WORKFLOW_RUN_KEYSPACE};
+use aruna_core::metadata::protocol::{
+    METADATA_IO_TIMEOUT, MetadataReadError, MetadataTransportMessage, encode_message, peer_call,
+    peer_reply,
+};
 use aruna_core::operation::Operation;
+use aruna_core::placement::plan_target_placement;
+use aruna_core::placement::resolver::PlacementResolutionContext;
 use aruna_core::realm_vault::{RealmSealed, RealmSecretRef, RealmVaultError, RealmVaultRecord};
 use aruna_core::request_policy::PolicyRequest;
 use aruna_core::secret_registers::{SecretBody, SecretEntry, SecretOwner};
@@ -58,6 +66,12 @@ struct Candidate {
 enum Step {
     Idle,
     VerifyRun,
+    RunConfig,
+    PeerRun {
+        peer: NodeId,
+        rest: Vec<NodeId>,
+        transient: bool,
+    },
     OwnerEntry {
         env_name: String,
         binding: TaskSecretBinding,
@@ -119,6 +133,48 @@ impl ReleaseVaultSecrets {
             WorkflowSecretScope::Realm => SecretScope::Realm,
             WorkflowSecretScope::Node => SecretScope::Node,
         }
+    }
+
+    fn verify_record(&self, record: &WorkflowRunRecord, remote: bool) -> Result<(), JobError> {
+        let valid = record.realm_id == self.run.realm_id
+            && record.group_id == self.run.group_id
+            && record.created_by == self.run.user_id
+            && (!remote || !record.local_only)
+            && self.pending.iter().all(|(_, binding)| {
+                binding.workflow_id == record.workflow_id
+                    && record.secrets.values().any(|bound| {
+                        bound.scope == binding.scope
+                            && bound.name == binding.name
+                            && bound.field == binding.field
+                    })
+            });
+        if !valid {
+            return Err(JobError::permanent(
+                "workflow secret binding does not match the run record",
+            ));
+        }
+        Ok(())
+    }
+
+    fn next_peer(&mut self, mut peers: Vec<NodeId>, transient: bool) -> SecretNext {
+        let Some(peer) = peers.pop() else {
+            return Err(match transient {
+                true => JobError::retryable("workflow run record is temporarily unavailable"),
+                false => JobError::permanent("workflow run record not found for secret release"),
+            });
+        };
+        let message = MetadataTransportMessage::ReadWorkflowRun {
+            run_id: self.run_id,
+            group_id: self.run.group_id,
+        };
+        let frame = encode_message(&message)
+            .map_err(|error| JobError::retryable(format!("run record request encode: {error}")))?;
+        self.step = Step::PeerRun {
+            peer,
+            rest: peers,
+            transient,
+        };
+        Ok(Next::Call(peer_call(peer, frame, METADATA_IO_TIMEOUT)))
     }
 
     fn next_secret(&mut self) -> SecretNext {
@@ -323,23 +379,60 @@ impl Operation for ReleaseVaultSecrets {
                     let record = WorkflowRunRecord::from_bytes(&bytes).map_err(|error| {
                         JobError::permanent(format!("workflow run record is corrupt: {error}"))
                     })?;
-                    let valid = record.group_id == self.run.group_id
-                        && record.created_by == self.run.user_id
-                        && self.pending.iter().all(|(_, binding)| {
-                            binding.workflow_id == record.workflow_id
-                                && record.secrets.values().any(|bound| {
-                                    bound.scope == binding.scope
-                                        && bound.name == binding.name
-                                        && bound.field == binding.field
-                                })
-                        });
-                    if !valid {
-                        return Err(JobError::permanent(
-                            "workflow secret binding does not match the run record",
-                        ));
+                    self.verify_record(&record, false)?;
+                    return self.next_secret();
+                }
+                self.step = Step::RunConfig;
+                let read = GetConfigOperation::new(self.run.realm_id);
+                Ok(Next::Call(IoCall::child(read)))
+            }
+            Step::RunConfig => {
+                let config = result
+                    .child::<RealmConfigDocument, GetConfigError>()
+                    .map_err(|error| JobError::retryable(error.to_string()))?
+                    .map_err(|error| JobError::retryable(error.to_string()))?;
+                let target = DocumentTarget::Group {
+                    group_id: self.run.group_id,
+                };
+                let ctx = PlacementResolutionContext {
+                    group_id: Some(self.run.group_id),
+                    metadata_path: None,
+                };
+                let mut peers: Vec<NodeId> = plan_target_placement(&config, &target, ctx)
+                    .ok()
+                    .flatten()
+                    .map(|plan| plan.holders)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|node| *node != self.run.node_id)
+                    .collect();
+                for node in config.sync_eligible_nodes().unwrap_or_default() {
+                    if node != self.run.node_id && !peers.contains(&node) {
+                        peers.push(node);
                     }
                 }
-                self.next_secret()
+                peers.reverse();
+                self.next_peer(peers, false)
+            }
+            Step::PeerRun {
+                peer,
+                rest,
+                transient,
+            } => {
+                let reply = peer_reply(peer, result)
+                    .map_err(|error| JobError::retryable(error.to_string()))?;
+                match reply {
+                    Ok(MetadataTransportMessage::WorkflowRunRead {
+                        result: Ok(Some(record)),
+                    }) => {
+                        self.verify_record(&record, true)?;
+                        self.next_secret()
+                    }
+                    Ok(MetadataTransportMessage::WorkflowRunRead {
+                        result: Ok(None) | Err(MetadataReadError::Forbidden),
+                    }) => self.next_peer(rest, transient),
+                    _ => self.next_peer(rest, true),
+                }
             }
             Step::OwnerEntry {
                 env_name,

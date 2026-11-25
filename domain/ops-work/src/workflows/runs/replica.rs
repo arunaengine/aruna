@@ -635,6 +635,86 @@ impl Operation for WriteReplicaOperation {
     }
 }
 
+#[derive(Debug, PartialEq)]
+enum ServeRunStep {
+    Config,
+    Read(Box<RealmConfigDocument>),
+}
+
+/// Serves an authoritative workflow run record to a sync-eligible realm executor verifying vault
+/// secret bindings before release.
+#[derive(Debug, PartialEq)]
+pub struct ServeRunOperation {
+    peer: NodeId,
+    local: (NodeId, RealmId),
+    run_id: Ulid,
+    group_id: GroupId,
+    step: ServeRunStep,
+}
+
+impl ServeRunOperation {
+    pub fn new(peer: NodeId, local: (NodeId, RealmId), run_id: Ulid, group_id: GroupId) -> Self {
+        Self {
+            peer,
+            local,
+            run_id,
+            group_id,
+            step: ServeRunStep::Config,
+        }
+    }
+}
+
+impl Operation for ServeRunOperation {
+    type Output = Option<Box<WorkflowRunRecord>>;
+    type Error = MetadataReadError;
+
+    fn first(&mut self) -> Result<Next<Self::Output>, MetadataReadError> {
+        let read = GetConfigOperation::new(self.local.1);
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, MetadataReadError> {
+        match std::mem::replace(&mut self.step, ServeRunStep::Config) {
+            ServeRunStep::Config => {
+                let config = result
+                    .child::<RealmConfigDocument, GetConfigError>()
+                    .map_err(|_| MetadataReadError::Unavailable)?
+                    .map_err(|_| MetadataReadError::Unavailable)?;
+                if !config
+                    .node_kind(&self.peer)
+                    .is_some_and(|kind| kind.is_sync_eligible())
+                {
+                    return Err(MetadataReadError::Forbidden);
+                }
+                self.step = ServeRunStep::Read(Box::new(config));
+                Ok(Next::Call(read_run(self.run_id)))
+            }
+            ServeRunStep::Read(config) => {
+                let Some(record) =
+                    run_answer(result).map_err(|_| MetadataReadError::Unavailable)?
+                else {
+                    return Ok(Next::Done(None));
+                };
+                let authoritative = record.node_id == self.local.0
+                    || record_holders(&config, self.group_id, record.node_id)
+                        .contains(&self.local.0);
+                if record.realm_id != self.local.1
+                    || record.group_id != self.group_id
+                    || record.local_only
+                    || !authoritative
+                {
+                    return Ok(Next::Done(None));
+                }
+                Ok(Next::Done(Some(Box::new(record))))
+            }
+        }
+    }
+
+    fn expected_error(error: &MetadataReadError) -> bool {
+        matches!(error, MetadataReadError::Forbidden)
+    }
+}
+
 #[cfg(test)]
 #[path = "replica_tests.rs"]
 mod tests;
