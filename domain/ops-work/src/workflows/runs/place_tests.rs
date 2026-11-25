@@ -159,7 +159,7 @@ fn reads_remote_outputs() {
     let mut task = RunTaskOperation::new(run.clone(), ingress(), Box::new(start_task()));
     task.placed = Placed::of(&ran, &fixture.spec());
 
-    let file = task.output_file(&ran, "out.txt");
+    let file = task.output_file(&ChildSummary::from_projection(&ran), "out.txt");
     assert_eq!(file.node_id, Some(executor));
     assert_eq!(file.version_id, Some(version.to_string()));
     assert_eq!(

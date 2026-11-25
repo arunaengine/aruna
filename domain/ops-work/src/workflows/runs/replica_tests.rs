@@ -79,6 +79,16 @@ fn frames_log_pages() {
     copy.first().unwrap();
     let stored = IoResult::Values(vec![Some(record.to_bytes().unwrap().into())]);
     assert_eq!(copy.next(stored).unwrap(), Next::Done(0));
+    // A local device run never replicates and a holder refuses it.
+    let mut local_run = record.clone();
+    local_run.local_only = true;
+    let mut send_local = ReplicateLogOperation::new(local_run.run_id, local, 0);
+    send_local.first().unwrap();
+    let stored = IoResult::Values(vec![Some(local_run.to_bytes().unwrap().into())]);
+    assert_eq!(send_local.next(stored).unwrap(), Next::Done(0));
+    let mut store_local =
+        StoreReplicaOperation::new(local_run.node_id, local, Box::new(local_run), 0, Vec::new());
+    assert_eq!(store_local.first(), Err(MetadataReadError::Forbidden));
     // A sender that is not the run's node is refused before anything is read.
     let peer = aruna_ops_identity::testing::node(9);
     let mut store = StoreReplicaOperation::new(peer, local, Box::new(record), 0, Vec::new());

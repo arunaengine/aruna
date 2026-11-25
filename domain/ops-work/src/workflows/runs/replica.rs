@@ -158,8 +158,8 @@ impl Operation for ReplicateLogOperation {
         match std::mem::replace(&mut self.step, SendStep::Run) {
             SendStep::Run => {
                 let run = run_answer(result)?.ok_or(CatalogError::NotFound)?;
-                // Only the run's own node hands out copies; a copy is never copied on.
-                if run.node_id != self.local.0 {
+                // Only the run's own realm node hands out copies; copies and local device runs stay.
+                if run.node_id != self.local.0 || run.local_only {
                     return Ok(Next::Done(self.from_page));
                 }
                 self.step = SendStep::Config(Box::new(run));
@@ -250,7 +250,8 @@ impl Operation for StoreReplicaOperation {
     type Error = MetadataReadError;
 
     fn first(&mut self) -> Result<Next<u32>, MetadataReadError> {
-        if self.run.node_id != self.peer || self.run.realm_id != self.local.1 {
+        if self.run.node_id != self.peer || self.run.realm_id != self.local.1 || self.run.local_only
+        {
             return Err(MetadataReadError::Forbidden);
         }
         let read = GetConfigOperation::new(self.local.1);

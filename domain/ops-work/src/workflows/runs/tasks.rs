@@ -13,19 +13,21 @@ use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::id::NodeId;
 use aruna_core::job_request::LABEL_TAG_PREFIX;
-use aruna_core::job_request::{SubmissionScope, SubmitJobError};
+use aruna_core::job_request::{SubmissionScope, SubmitJobError, SubmitJobResult};
 use aruna_core::jobs::{JobEffect, JobEvent};
 use aruna_core::keyspaces::WORKFLOW_TASK_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::execution::job::family::{JobProjection, LogicalJobSpec, LogicalJobState};
-use aruna_core::structs::execution::job::identity::{JobId, RETENTION_MS};
+use aruna_core::structs::execution::job::identity::{JobId, JobState, RETENTION_MS};
 use aruna_core::structs::execution::job::input::{
     ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, OutputDestination,
     OutputSelection, TaskSecretBinding, WORKFLOW_RUN_TAG, WORKFLOW_SECRETS_TAG, WORKFLOW_TASK_TAG,
     encode_workflow_secrets, run_area_bucket,
 };
-use aruna_core::structs::execution::job::local::WorkspaceMode;
+use aruna_core::structs::execution::job::local::{
+    JobRecord, JobResultPayload, OutputObject, WorkspaceMode,
+};
 use aruna_core::structs::execution::workflow_run::{
     CacheScope, RunFile, RunState, WorkflowRunRecord, WorkflowTaskRecord, named_task, task_key,
 };
@@ -52,7 +54,10 @@ use crate::jobs::lifecycle::family_reads::{FamilyProjectionOperation, FamilyView
 use crate::jobs::lifecycle::submit_external::{
     ExternalSubmission, IngressNode, SubmitExternalOperation,
 };
+use crate::jobs::local_run::{LocalExecutionConfig, LocalExecutionError, LocalRunOperation};
 use crate::jobs::route::JobRouteError;
+use crate::jobs::store::mutation_error::JobMutationError;
+use crate::jobs::store::row_calls;
 use crate::jobs::workflow::prepare::NETWORK_TAG_KEY;
 use crate::workflows::CatalogError;
 
@@ -246,9 +251,9 @@ pub fn task_spec(
     }
     tags.extend(placement_tags(record, request));
     let resources = &request.resources;
-    let work = match record.protected {
-        // A protected run keeps its work files in its encrypted output bucket, never in the
-        // plain run area of the node that runs the task.
+    let work = match record.protected || record.local_only {
+        // Protected and local device runs keep work files in the output bucket, never in a realm
+        // run area.
         true => OutputDestination::S3 {
             bucket: bucket.clone(),
             key: format!("{folder}work"),
@@ -393,6 +398,65 @@ struct Copying {
     copied: Vec<RunFile>,
 }
 
+/// The terminal facts of a finished child job, whether it ran through the realm or locally.
+#[derive(Debug, PartialEq)]
+struct ChildSummary {
+    job_id: JobId,
+    exit_code: Option<i32>,
+    stdout: Option<String>,
+    stderr: Option<String>,
+    outputs: Vec<OutputObject>,
+}
+
+impl ChildSummary {
+    fn from_projection(projection: &JobProjection) -> Self {
+        let result = (projection.canonical_execution_id)
+            .and_then(|id| {
+                projection
+                    .executions
+                    .iter()
+                    .find(|run| run.execution_id == id)
+            })
+            .and_then(|run| run.result.as_ref());
+        Self {
+            job_id: projection.canonical_job_id,
+            exit_code: result.and_then(|result| result.exit_code),
+            stdout: result
+                .and_then(|result| result.stdout.as_ref())
+                .map(|tail| tail.as_str().to_owned()),
+            stderr: result
+                .and_then(|result| result.stderr.as_ref())
+                .map(|tail| tail.as_str().to_owned()),
+            outputs: projection.outputs.as_slice().to_vec(),
+        }
+    }
+
+    fn from_local(record: &JobRecord) -> Self {
+        let (exit_code, stdout, stderr, outputs) = match &record.result {
+            Some(JobResultPayload::Execution {
+                exit_code,
+                outputs,
+                stdout,
+                stderr,
+                ..
+            }) => (
+                *exit_code,
+                (!stdout.is_empty()).then(|| stdout.clone()),
+                (!stderr.is_empty()).then(|| stderr.clone()),
+                outputs.clone(),
+            ),
+            _ => (None, None, None, Vec::new()),
+        };
+        Self {
+            job_id: record.job_id,
+            exit_code,
+            stdout,
+            stderr,
+            outputs,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 enum TaskStep {
     Stored,
@@ -404,7 +468,7 @@ enum TaskStep {
     Poll(JobId),
     Wait(JobId),
     Started(JobId),
-    Control(Box<JobProjection>),
+    Control(Box<ChildSummary>),
     Pin(Box<(WorkflowTaskRecord, TaskFinished)>),
     Finished(Box<TaskFinished>),
 }
@@ -657,6 +721,21 @@ impl RunTaskOperation {
             occurrence,
             self.request.attempt,
         );
+        if self.run.local_only {
+            let local = LocalRunOperation::new(
+                LocalExecutionConfig {
+                    spec,
+                    owner: self.run.created_by,
+                    node_id: self.run.node_id,
+                    idempotency_key: Some(key),
+                    workspace_mode: WorkspaceMode::None,
+                    retention_ms: RETENTION_MS,
+                },
+                None,
+            );
+            self.step = TaskStep::Submit;
+            return Ok(Next::Call(IoCall::child(local)));
+        }
         let submission = ExternalSubmission {
             spec,
             created_by: self.run.created_by,
@@ -674,6 +753,9 @@ impl RunTaskOperation {
     }
 
     fn submitted(&mut self, result: IoResult) -> TaskNext {
+        if self.run.local_only {
+            return self.submitted_local(result);
+        }
         let job_id = match result.child::<AcceptedSubmission, SubmitJobError>()? {
             Ok(accepted) => accepted.job_id,
             // Another attempt of this node submitted the child already; it is the same task.
@@ -698,14 +780,50 @@ impl RunTaskOperation {
         self.change(task, TaskStep::Adopted(job_id))
     }
 
+    fn submitted_local(&mut self, result: IoResult) -> TaskNext {
+        let job_id = match result.child::<SubmitJobResult, LocalExecutionError>()? {
+            Ok(submitted) => submitted.job_id,
+            Err(LocalExecutionError::Submit(SubmitJobError::JobPlanConflict {
+                existing_job_id,
+            })) => existing_job_id,
+            Err(LocalExecutionError::Submit(SubmitJobError::ActiveJobLimit { limit })) => {
+                self.waits += 1;
+                let delay = POLL_DELAY.saturating_mul(1 << self.waits.min(5));
+                warn!(run = %self.run.run_id, task = %self.request.name, limit, "waiting for local slot");
+                self.step = TaskStep::Queued;
+                return Ok(Next::Call(IoCall::Delay(delay.min(QUOTA_DELAY_CAP))));
+            }
+            Err(
+                error @ (LocalExecutionError::NotADevice
+                | LocalExecutionError::NotOwner
+                | LocalExecutionError::Unsupported(_)
+                | LocalExecutionError::Refused(_)
+                | LocalExecutionError::InputNotLocal { .. }
+                | LocalExecutionError::InputRefused { .. }),
+            ) => return self.refuse(error.to_string(), false),
+            Err(error) => return self.refuse(error.to_string(), true),
+        };
+        let mut task = self.record(RunState::Queued);
+        task.child_job_id = Some(job_id);
+        self.change(task, TaskStep::Adopted(job_id))
+    }
+
     fn poll(&mut self, job_id: JobId) -> TaskNext {
+        self.step = TaskStep::Poll(job_id);
+        if self.run.local_only {
+            return Ok(Next::Call(IoCall::child(row_calls::read_job_record(
+                job_id,
+            ))));
+        }
         let read =
             FamilyProjectionOperation::new(job_id, self.now_ms).for_reader(self.run.created_by);
-        self.step = TaskStep::Poll(job_id);
         Ok(Next::Call(IoCall::child(read)))
     }
 
     fn polled(&mut self, job_id: JobId, result: IoResult) -> TaskNext {
+        if self.run.local_only {
+            return self.polled_local(job_id, result);
+        }
         let view = match result.child::<Option<FamilyView>, JobRouteError>()? {
             Ok(view) => view,
             Err(error) => {
@@ -745,16 +863,64 @@ impl RunTaskOperation {
                 self.refuse("the node that ran the task left the realm".into(), true)
             }
             LogicalJobState::Succeeded | LogicalJobState::Failed => {
-                let (bucket, folder) =
-                    attempt_folder(&self.run, &self.request.name).ok_or_else(|| {
-                        CatalogError::Invalid("the run names no output bucket".into())
-                    })?;
-                let read =
-                    ControlFilesOperation::new(&self.run, bucket, format!("{folder}control/"));
-                self.step = TaskStep::Control(Box::new(projection));
-                Ok(Next::Call(IoCall::child(read)))
+                self.read_control(ChildSummary::from_projection(&projection))
             }
         }
+    }
+
+    fn polled_local(&mut self, job_id: JobId, result: IoResult) -> TaskNext {
+        let record = match result.child::<Option<JobRecord>, JobMutationError>()? {
+            Ok(Some(record)) => record,
+            Ok(None) => return self.wait(job_id),
+            Err(error) => {
+                warn!(%error, run = %self.run.run_id, "a local child job could not be read; waiting");
+                return self.wait(job_id);
+            }
+        };
+        self.placed = Some(Placed {
+            node_id: self.run.node_id,
+            mode: "local",
+            staged_bytes: 0,
+        });
+        match record.state {
+            JobState::Queued
+            | JobState::Claimed
+            | JobState::Preparing
+            | JobState::Ready
+            | JobState::Cancelling
+            | JobState::Indeterminate
+            | JobState::AwaitingKey => self.wait(job_id),
+            JobState::Running if self.started => self.wait(job_id),
+            JobState::Running => {
+                self.started = true;
+                let mut task = self.record(RunState::Running);
+                task.child_job_id = Some(job_id);
+                task.started_at_ms = Some(self.now_ms);
+                self.change(task, TaskStep::Started(job_id))
+            }
+            JobState::Cancelled => {
+                let mut task = self.record(RunState::Cancelled);
+                task.child_job_id = Some(job_id);
+                task.finished_at_ms = Some(self.now_ms);
+                let finished = TaskFinished {
+                    cancelled: true,
+                    ..TaskFinished::default()
+                };
+                self.change(task, TaskStep::Finished(Box::new(finished)))
+            }
+            JobState::NotRun => self.refuse("the local child job could not run".into(), true),
+            JobState::Succeeded | JobState::Failed => {
+                self.read_control(ChildSummary::from_local(&record))
+            }
+        }
+    }
+
+    fn read_control(&mut self, summary: ChildSummary) -> TaskNext {
+        let (bucket, folder) = attempt_folder(&self.run, &self.request.name)
+            .ok_or_else(|| CatalogError::Invalid("the run names no output bucket".into()))?;
+        let read = ControlFilesOperation::new(&self.run, bucket, format!("{folder}control/"));
+        self.step = TaskStep::Control(Box::new(summary));
+        Ok(Next::Call(IoCall::child(read)))
     }
 
     fn wait(&mut self, job_id: JobId) -> TaskNext {
@@ -765,14 +931,14 @@ impl RunTaskOperation {
     /// Where an output the manifest names lies: an absolute path in the control folder on the
     /// run's node, a relative one in the run area of the node that ran the task. The child's
     /// output records give the exact version, its size and digest.
-    fn output_file(&self, projection: &JobProjection, path: &str) -> RunFile {
+    fn output_file(&self, summary: &ChildSummary, path: &str) -> RunFile {
         let (bucket, folder) = attempt_folder(&self.run, &self.request.name).unwrap_or_default();
         let (bucket, key, node) = match path.strip_prefix('/') {
             Some(absolute) => {
                 let key = format!("{folder}control/root/{absolute}");
                 (bucket, key, self.run.node_id)
             }
-            None if self.run.protected => {
+            None if self.run.protected || self.run.local_only => {
                 let key = format!("{folder}work/{path}");
                 (bucket, key, self.run.node_id)
             }
@@ -783,8 +949,8 @@ impl RunTaskOperation {
                 (bucket, key, node)
             }
         };
-        let written = (projection.outputs.as_slice().iter())
-            .find(|object| object.bucket == bucket && object.key == key);
+        let written =
+            (summary.outputs.iter()).find(|object| object.bucket == bucket && object.key == key);
         RunFile {
             name: path.to_owned(),
             bucket: Some(bucket),
@@ -798,39 +964,21 @@ impl RunTaskOperation {
 
     /// The answer of an ended child, from the wrapper's control files where they exist and the
     /// child's own result where they do not.
-    fn collected(
-        &mut self,
-        projection: JobProjection,
-        files: BTreeMap<String, Vec<u8>>,
-    ) -> TaskNext {
+    fn collected(&mut self, summary: ChildSummary, files: BTreeMap<String, Vec<u8>>) -> TaskNext {
         let text = |name: &str| {
             files
                 .get(name)
                 .map(|bytes| String::from_utf8_lossy(bytes).trim().to_owned())
         };
-        let result = (projection.canonical_execution_id)
-            .and_then(|id| {
-                projection
-                    .executions
-                    .iter()
-                    .find(|run| run.execution_id == id)
-            })
-            .and_then(|run| run.result.as_ref());
         let exit_code = text("exit")
             .and_then(|code| code.parse().ok())
-            .or_else(|| result.and_then(|result| result.exit_code));
+            .or(summary.exit_code);
         let tail = |name: &str, fallback: Option<&String>| {
             files
                 .get(name)
                 .cloned()
                 .unwrap_or_else(|| fallback.cloned().unwrap_or_default().into_bytes())
         };
-        let stdout = result
-            .and_then(|result| result.stdout.as_ref())
-            .map(|tail| tail.as_str().to_owned());
-        let stderr = result
-            .and_then(|result| result.stderr.as_ref())
-            .map(|tail| tail.as_str().to_owned());
         let manifest: Vec<(String, bool)> = (text("manifest").unwrap_or_default().lines())
             .filter_map(|line| line.split_once(' '))
             .filter(|(kind, path)| {
@@ -842,7 +990,7 @@ impl RunTaskOperation {
             .map(|(kind, path)| (path.to_owned(), kind == "directory"))
             .collect();
         let files: Vec<RunFile> = (manifest.iter())
-            .map(|(path, _)| self.output_file(&projection, path))
+            .map(|(path, _)| self.output_file(&summary, path))
             .collect();
         let outputs = (files.iter().zip(&manifest))
             .map(|(file, (_, directory))| TaskOutput {
@@ -860,8 +1008,8 @@ impl RunTaskOperation {
             retryable: false,
             cancelled: false,
             outputs,
-            stdout_tail: tail("stdout", stdout.as_ref()),
-            stderr_tail: tail("stderr", stderr.as_ref()),
+            stdout_tail: tail("stdout", summary.stdout.as_ref()),
+            stderr_tail: tail("stderr", summary.stderr.as_ref()),
             started: seconds("start"),
             ended: seconds("end"),
             usage: None,
@@ -871,7 +1019,7 @@ impl RunTaskOperation {
             _ => RunState::Failed,
         };
         let mut task = self.record(state);
-        task.child_job_id = Some(projection.canonical_job_id);
+        task.child_job_id = Some(summary.job_id);
         task.exit_code = exit_code;
         task.started_at_ms = finished.started.map(|seconds| (seconds * 1000.0) as u64);
         task.finished_at_ms = Some(self.now_ms);

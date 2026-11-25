@@ -22,9 +22,11 @@ use aruna_core::structs::execution::workflow_run::{
     WorkflowSecretBinding, run_key, run_key_row,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::types::{GroupId, Key};
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::realm::mutate_placement::node_kind;
 use byteview::ByteView;
 use serde_json::Value;
 use ulid::Ulid;
@@ -118,6 +120,7 @@ enum AdmitStep {
     Inputs(Box<VersionView>),
     Output(Box<VersionView>),
     Encryption(Box<VersionView>),
+    Config(Box<VersionView>, bool),
     Record,
     Submit(Box<WorkflowRunRecord>),
     Job(Box<WorkflowRunRecord>),
@@ -256,7 +259,7 @@ impl StartRunOperation {
         Ok(self.lineage.protected || output || encrypted.contains(&true))
     }
 
-    fn record(&mut self, view: VersionView, protected: bool) -> AdmitNext {
+    fn record(&mut self, view: VersionView, protected: bool, local_only: bool) -> AdmitNext {
         let run_id = self.ids.mint(self.now_ms);
         let request = &self.request;
         let record = WorkflowRunRecord {
@@ -281,7 +284,7 @@ impl StartRunOperation {
             provenance_document_id: None,
             provenance_status: None,
             last_event_seq: 0,
-            local_only: false,
+            local_only,
             origin: None,
             parent_job_id: None,
             claim_token_digest: None,
@@ -326,7 +329,7 @@ impl StartRunOperation {
             workspace_bucket: None,
             active_cap: None,
         };
-        let serving = Some(self.node);
+        let serving = (!record.local_only).then_some(self.node);
         let submit = SubmitLocalOperation::new(spec, self.node.1, serving);
         self.step = AdmitStep::Submit(Box::new(record));
         Ok(Next::Call(IoCall::child(submit)))
@@ -451,7 +454,24 @@ impl Operation for StartRunOperation {
             }
             AdmitStep::Encryption(view) => {
                 let protected = self.protection(result)?;
-                self.record(*view, protected)
+                self.step = AdmitStep::Config(view, protected);
+                Ok(Next::Call(IoCall::child(GetConfigOperation::new(
+                    self.node.1,
+                ))))
+            }
+            AdmitStep::Config(view, protected) => {
+                let config = result.child::<RealmConfigDocument, GetConfigError>()?;
+                let local_only = match config.ok().and_then(|cfg| node_kind(&cfg, self.node.0)) {
+                    Some(kind) => match kind.owner() {
+                        Some(owner) if owner != self.auth.user_id => {
+                            return Err(CatalogError::Forbidden);
+                        }
+                        Some(_) => true,
+                        None => false,
+                    },
+                    None => false,
+                };
+                self.record(*view, protected, local_only)
             }
             AdmitStep::Record => {
                 let admitted = result.child::<AdmittedRun, CatalogError>()??;

@@ -48,6 +48,7 @@ enum CancelStep {
     Stopped(Box<WorkflowRunRecord>),
     Tasks(Box<WorkflowRunRecord>),
     Child(Box<WorkflowRunRecord>, Vec<JobId>),
+    LocalChild(Box<WorkflowRunRecord>, Vec<JobId>),
 }
 
 /// Cancels an active run: the run turns `cancelling`, its job is cancelled, and every child job
@@ -90,6 +91,11 @@ impl CancelRunOperation {
                 running: std::mem::take(&mut self.running),
             }));
         };
+        if record.local_only {
+            let cancel = CancelOwnedOperation::new(record.created_by, job_id, self.now_ms);
+            self.step = CancelStep::LocalChild(record, jobs);
+            return Ok(Next::Call(IoCall::child(cancel)));
+        }
         let cancel = CancelFamilyOperation::new(
             &creator_auth(&record),
             job_id,
@@ -177,6 +183,15 @@ impl Operation for CancelRunOperation {
                     Ok(_) => {}
                     Err(error) => {
                         warn!(%error, run = %self.run_id, "a child job was not cancelled")
+                    }
+                }
+                self.next_child(record, jobs)
+            }
+            CancelStep::LocalChild(record, jobs) => {
+                match result.child::<CancelReport<CancelJobOutcome>, JobReadError>()? {
+                    Ok(report) => self.running.extend(report.running),
+                    Err(error) => {
+                        warn!(%error, run = %self.run_id, "a local child job was not cancelled")
                     }
                 }
                 self.next_child(record, jobs)
