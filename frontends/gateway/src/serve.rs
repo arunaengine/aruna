@@ -87,7 +87,7 @@ pub async fn file(gateway: &Gateway, visit: &Visit, request: Request) -> Respons
         }
     };
     match upstream.status() {
-        status if status.is_success() => respond(visit, headers, path, upstream).await,
+        status if status.is_success() => respond(gateway, visit, headers, path, upstream).await,
         StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED if visit.token().is_none() => {
             signin_needed(visit, &request)
         }
@@ -125,6 +125,7 @@ async fn fetch(
 }
 
 async fn respond(
+    gateway: &Gateway,
     visit: &Visit,
     headers: &HeaderMap,
     path: &str,
@@ -189,6 +190,14 @@ async fn respond(
     if let Some(marker) = set_cookie(TOP, "1", TOP_SECONDS, Site::Strict).filter(|_| marked) {
         out.append(SET_COOKIE, marker);
         out.insert(CACHE_CONTROL, HeaderValue::from_static("private, no-cache"));
+    }
+    // Mint the host-bound guest cookie on the initial HTML response before concurrent runtime calls.
+    if decision.guests && visit.token().is_none() && html {
+        let (_, guest_cookie) = crate::runtime::ensure_guest(gateway, visit, headers, top_load);
+        if let Some(cookie) = guest_cookie {
+            out.append(SET_COOKIE, cookie);
+            out.insert(CACHE_CONTROL, HeaderValue::from_static("private, no-cache"));
+        }
     }
     policy::secure(out, frame);
     response

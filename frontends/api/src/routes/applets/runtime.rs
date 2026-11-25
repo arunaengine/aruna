@@ -330,6 +330,10 @@ pub struct RunInputBody {
     pub version_id: String,
 }
 
+fn empty_values() -> serde_json::Value {
+    serde_json::json!({})
+}
+
 #[derive(Clone, Debug, Deserialize, ToSchema)]
 #[schema(as = AppletRunRequest, example = json!({
     "values": {"genus": "Escherichia"},
@@ -337,7 +341,7 @@ pub struct RunInputBody {
         "key": "bakta/4f0c9d1e2b3a495867788990aabbccdd/1764000000000-reads.fasta"}]
 }))]
 pub struct RunRequestBody {
-    #[serde(default)]
+    #[serde(default = "empty_values")]
     pub values: serde_json::Value,
     #[serde(default)]
     pub inputs: Vec<RunInputBody>,

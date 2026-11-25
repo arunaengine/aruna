@@ -8,8 +8,11 @@ use aruna_core::applet::usage::caps;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
+use aruna_core::structs::execution::workflow::workflow_permission_path;
 use aruna_core::structs::execution::workflow_run::{RunOutput, WorkflowRunRecord};
+use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::blob::object_permission_path;
 use serde_json::Value;
 use ulid::Ulid;
 
@@ -166,6 +169,41 @@ impl VisitRunOperation {
             request: Some(request),
         }
     }
+    /// Narrows the applet account to this visitor's submission folder plus approved reference paths
+    /// so file-valued workflow parameters cannot read another visitor's uploads.
+    fn visitor_auth(&self) -> Result<AuthContext, AppletError> {
+        let mut auth = applet_auth(&self.applet, self.node.1).ok_or(AppletError::Forbidden)?;
+        let (bucket, folder) = visitor_folder(&self.applet, &self.visit)?;
+        let mut restrictions: Vec<PathRestriction> = self
+            .applet
+            .grants
+            .read
+            .iter()
+            .chain(&self.applet.grants.references)
+            .map(|pattern| PathRestriction {
+                pattern: pattern.clone(),
+                permission: Permission::READ,
+            })
+            .collect();
+        let prefix = folder.trim_end_matches('/');
+        let path = object_permission_path(
+            self.node.1,
+            self.applet.group_id,
+            self.node.0,
+            &bucket,
+            prefix,
+        );
+        restrictions.push(PathRestriction {
+            pattern: format!("{path}/**"),
+            permission: Permission::WRITE,
+        });
+        restrictions.push(PathRestriction {
+            pattern: workflow_permission_path(self.node.1, self.applet.group_id),
+            permission: Permission::WRITE,
+        });
+        auth.path_restrictions = Some(restrictions);
+        Ok(auth)
+    }
 }
 
 impl Operation for VisitRunOperation {
@@ -173,7 +211,7 @@ impl Operation for VisitRunOperation {
     type Error = AppletError;
 
     fn first(&mut self) -> Result<Next<AdmittedRun>, AppletError> {
-        applet_auth(&self.applet, self.node.1).ok_or(AppletError::Forbidden)?;
+        self.visitor_auth()?;
         let caps = caps(&self.applet, self.visit.guest);
         let id = self.applet.applet_id;
         let count = CountVisitOperation::new(id, &self.visit.pseudonym, caps);
@@ -186,7 +224,7 @@ impl Operation for VisitRunOperation {
             return admitted.map(Next::Done).map_err(catalog_error);
         };
         result.child::<(), AppletError>()??;
-        let auth = applet_auth(&self.applet, self.node.1).ok_or(AppletError::Forbidden)?;
+        let auth = self.visitor_auth()?;
         let start = StartRunOperation::new(&auth, self.node, request);
         Ok(Next::Call(IoCall::child(start)))
     }

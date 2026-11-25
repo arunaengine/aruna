@@ -22,6 +22,40 @@ use crate::upstream::Serving;
 use crate::visit::{Visit, plain_id};
 use crate::{Gateway, policy, preview, signin};
 
+/// Resolves the caller's sealed guest session id, minting a host-bound cookie when absent.
+pub(crate) fn ensure_guest(
+    gateway: &Gateway,
+    visit: &Visit,
+    headers: &HeaderMap,
+    top: bool,
+) -> (String, Option<HeaderValue>) {
+    let now = now_seconds();
+    let applet_id = visit.answer.decision.applet_id.as_str();
+    if let Some(existing) = cookies(headers, GUEST)
+        .find_map(|text| gateway.sealer.open_guest(&visit.host, text, now))
+        .filter(|guest| guest.applet_id == applet_id)
+    {
+        return (existing.id, None);
+    }
+    let id = new_guest_id();
+    let guest = GuestSession {
+        applet_id: applet_id.to_owned(),
+        id: id.clone(),
+        expires: now.saturating_add(GUEST_TTL_SECS),
+    };
+    let cookie = gateway
+        .sealer
+        .seal_guest(&visit.host, &guest)
+        .and_then(|sealed| {
+            let site = match framed(headers) || !top {
+                true => Site::Framed,
+                false => Site::Lax,
+            };
+            set_cookie(GUEST, &sealed, GUEST_TTL_SECS, site)
+        });
+    (id, cookie)
+}
+
 /// The runtime routes an applet page may call on its own origin.
 const ROUTES: [&str; 4] = ["session", "uploads", "submissions", "runs"];
 
@@ -90,28 +124,8 @@ async fn proxy(gateway: &Gateway, visit: &Visit, rest: &str, request: Request) -
     if let Some(token) = token {
         sent = sent.header("x-aruna-visitor", token);
     } else {
-        let now = now_seconds();
-        let applet_id = decision.applet_id.as_str();
-        let guest_id = cookies(headers, GUEST)
-            .find_map(|text| gateway.sealer.open_guest(&visit.host, text, now))
-            .filter(|guest| guest.applet_id == applet_id)
-            .map(|guest| guest.id)
-            .unwrap_or_else(|| {
-                let id = new_guest_id();
-                let guest = GuestSession {
-                    applet_id: applet_id.to_owned(),
-                    id: id.clone(),
-                    expires: now.saturating_add(GUEST_TTL_SECS),
-                };
-                if let Some(sealed) = gateway.sealer.seal_guest(&visit.host, &guest) {
-                    let site = match framed(headers) || !top {
-                        true => Site::Framed,
-                        false => Site::Lax,
-                    };
-                    guest_cookie = set_cookie(GUEST, &sealed, GUEST_TTL_SECS, site);
-                }
-                id
-            });
+        let (guest_id, cookie) = ensure_guest(gateway, visit, headers, top);
+        guest_cookie = cookie;
         sent = sent.header("x-aruna-guest", guest_id);
     }
     if let Some(client) = client_ip(gateway, &request) {
