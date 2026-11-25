@@ -175,23 +175,15 @@ impl VisitRunOperation {
     fn visitor_auth(&self) -> Result<AuthContext, AppletError> {
         let mut auth = applet_auth(&self.applet, self.node.1).ok_or(AppletError::Forbidden)?;
         let (bucket, folder) = visitor_folder(&self.applet, &self.visit)?;
-        let sub_prefix = self
+        let sub_root = self
             .applet
             .grants
             .submissions
             .as_ref()
-            .map(|sub| sub.prefix.trim_matches('/'))
-            .unwrap_or("");
-        let sub_root = match sub_prefix.is_empty() {
-            true => bucket_permission_path(self.node.1, self.applet.group_id, self.node.0, &bucket),
-            false => object_permission_path(
-                self.node.1,
-                self.applet.group_id,
-                self.node.0,
-                &bucket,
-                sub_prefix,
-            ),
-        };
+            .map(|sub| sub.permission_root(self.node.1, self.applet.group_id, self.node.0))
+            .unwrap_or_else(|| {
+                bucket_permission_path(self.node.1, self.applet.group_id, self.node.0, &bucket)
+            });
         let mut restrictions: Vec<PathRestriction> = self
             .applet
             .grants
@@ -314,6 +306,7 @@ mod tests {
         applet.role_id = Some(Ulid::from_bytes([8; 16]));
         applet.grants.read = vec![
             format!("{root}/data/{node}/uploads/**"),
+            format!("{root}/data/{node}/uploads/b\\akta/**"),
             format!("{root}/data/{node}/uploads/ref/**"),
         ];
         applet.grants.references = vec![
@@ -349,6 +342,46 @@ mod tests {
         assert!(patterns.contains(&format!("{root}/data/{node}/uploads/ref/**").as_str()));
         assert!(patterns.contains(&format!("{root}/data/{node}/other/**").as_str()));
         assert!(!patterns.contains(&format!("{root}/data/{node}/uploads/**").as_str()));
+        assert!(!patterns.contains(&format!("{root}/data/{node}/uploads/b\\akta/**").as_str()));
         assert!(!patterns.contains(&format!("{root}/data/*/uploads/bakta/**").as_str()));
+
+        // A leading slash in the submission prefix matches intake_key rather than being trimmed.
+        applet.grants.submissions = Some(Folder {
+            bucket: "uploads".into(),
+            prefix: "/bakta/".into(),
+        });
+        applet.grants.read = vec![format!("{root}/data/{node}/uploads//bakta/**")];
+        applet.grants.references = Vec::new();
+        let leading = VisitRunOperation::new(
+            &applet,
+            Visit {
+                pseudonym: "ab".into(),
+                guest: false,
+            },
+            (node, realm),
+            RunRequest {
+                group_id: applet.group_id,
+                workflow_id: Ulid::from_bytes([2; 16]),
+                version: 3,
+                values: Value::Object(Default::default()),
+                inputs: Vec::new(),
+                inputs_json: None,
+                output: None,
+                provenance_crate: false,
+                idempotency_key: None,
+                placement_site: None,
+                secrets: Default::default(),
+            },
+        )
+        .visitor_auth()
+        .unwrap();
+        let leading_pats: Vec<&str> = leading
+            .path_restrictions
+            .as_deref()
+            .unwrap()
+            .iter()
+            .map(|r| r.pattern.as_str())
+            .collect();
+        assert!(!leading_pats.contains(&format!("{root}/data/{node}/uploads//bakta/**").as_str()));
     }
 }

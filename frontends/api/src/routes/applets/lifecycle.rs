@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use aruna_core::applet::hosts::embedding_origins;
 use aruna_core::applet::record::Applet;
-use aruna_core::permission_path::role_subtree_root;
 use aruna_ops_work::applets::change::{AppletChange, ChangeAppletOperation};
 use aruna_ops_work::applets::{AppletAccessOperation, Need};
 use aruna_runner::driver::drive;
@@ -124,10 +123,9 @@ pub async fn request_approval(
     own.extend(applet.domains.iter().map(|domain| domain.host.as_str()));
     let origins = embedding_origins(&body.origins, &own, limit)
         .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
-    let grants = body.grants.grants(
-        &role_subtree_root(auth.realm_id, applet.group_id),
-        applet.host_node,
-    )?;
+    let grants = body
+        .grants
+        .grants(auth.realm_id, applet.group_id, applet.host_node)?;
     let request = AppletChange::RequestApproval {
         version: body.version,
         access: body.access.into(),

@@ -352,11 +352,14 @@ impl GrantsBody {
     /// the per-visitor submission folder.
     pub fn grants(
         self,
-        group_root: &str,
+        realm_id: aruna_core::structs::identity::realm::RealmId,
+        group_id: aruna_core::types::GroupId,
         host_node: aruna_core::id::NodeId,
     ) -> Result<Grants, ServerError> {
-        let confined =
-            |pattern: &String| aruna_core::permission_path::role_path_confined(pattern, group_root);
+        let group_root = aruna_core::permission_path::role_subtree_root(realm_id, group_id);
+        let confined = |pattern: &String| {
+            aruna_core::permission_path::role_path_confined(pattern, &group_root)
+        };
         if let Some(pattern) = self
             .read
             .iter()
@@ -367,12 +370,12 @@ impl GrantsBody {
                 "{pattern} is not a path of the applet's group"
             )));
         }
-        if let Some(sub) = &self.submissions {
-            let trimmed = sub.prefix.trim_matches('/');
-            let sub_root = match trimmed.is_empty() {
-                true => format!("{group_root}/data/{host_node}/{}", sub.bucket),
-                false => format!("{group_root}/data/{host_node}/{}/{trimmed}", sub.bucket),
-            };
+        let submissions = self.submissions.map(|folder| Folder {
+            bucket: folder.bucket,
+            prefix: folder.prefix,
+        });
+        if let Some(sub) = &submissions {
+            let sub_root = sub.permission_root(realm_id, group_id, host_node);
             if let Some(pattern) = self
                 .read
                 .iter()
@@ -402,10 +405,7 @@ impl GrantsBody {
             read: self.read,
             references: self.references,
             start,
-            submissions: self.submissions.map(|folder| Folder {
-                bucket: folder.bucket,
-                prefix: folder.prefix,
-            }),
+            submissions,
             limits: Limits {
                 cpu_cores: limits.cpu_cores,
                 ram_bytes: limits.ram_bytes,

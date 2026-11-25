@@ -9,7 +9,7 @@ use crate::errors::ConversionError;
 use crate::id::NodeId;
 use crate::structs::identity::auth::Permission;
 use crate::structs::identity::realm::RealmId;
-use crate::structs::storage::blob::object_permission_path;
+use crate::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use crate::types::{GroupId, Key, RoleId};
 use crate::user::id::UserId;
 
@@ -110,6 +110,16 @@ pub enum StartGrant {
 pub struct Folder {
     pub bucket: String,
     pub prefix: String,
+}
+
+impl Folder {
+    /// Permission-path root matching `intake_key` and `visitor_folder` (trims trailing `/` only).
+    pub fn permission_root(&self, realm_id: RealmId, group_id: GroupId, node: NodeId) -> String {
+        match self.prefix.trim_end_matches('/') {
+            "" => bucket_permission_path(realm_id, group_id, node, &self.bucket),
+            prefix => object_permission_path(realm_id, group_id, node, &self.bucket, prefix),
+        }
+    }
 }
 
 /// Bounds of one run and of the run counts an applet may start.

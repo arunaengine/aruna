@@ -58,8 +58,12 @@ pub fn path_within(path: &str, root: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
-/// Whether `pattern` can match any path at or below `subtree_root` (fail-closed on globs).
+/// Whether `pattern` can match any path at or below `subtree_root` (fail-closed on globs and
+/// backslash escapes, which `globset` interprets at match time).
 pub fn pattern_overlaps_subtree(pattern: &str, subtree_root: &str) -> bool {
+    if pattern.contains('\\') || compile_permission_matcher(pattern).is_err() {
+        return true;
+    }
     let bound = bind_wildcards(pattern, subtree_root);
     let bound = bound.as_ref();
     let Some(glob_pos) = bound.find(GLOB_CHARS) else {
@@ -555,6 +559,7 @@ mod tests {
             "/r/g/G/data/n1/uploads/**",
             "/r/g/G/data/n1/uploads/bak*/**",
             "/r/g/G/data/n1/uploads/bakta/**",
+            "/r/g/G/data/n1/uploads/b\\akta/**",
             "/r/g/G/data/n1/uploads/bakta/cd/**",
             "/r/g/G/data/n1/uploads/bakta",
         ] {
