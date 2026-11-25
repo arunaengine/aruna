@@ -15,7 +15,7 @@ use aruna_core::id::NodeId;
 use aruna_core::job_request::LABEL_TAG_PREFIX;
 use aruna_core::job_request::{SubmissionScope, SubmitJobError, SubmitJobResult};
 use aruna_core::jobs::{JobEffect, JobEvent};
-use aruna_core::keyspaces::WORKFLOW_TASK_KEYSPACE;
+use aruna_core::keyspaces::{BUCKET_ENCRYPTION_KEYSPACE, WORKFLOW_TASK_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::execution::job::family::{JobProjection, LogicalJobSpec, LogicalJobState};
@@ -31,10 +31,13 @@ use aruna_core::structs::execution::job::local::{
 use aruna_core::structs::execution::workflow_run::{
     CacheScope, RunFile, RunState, WorkflowRunRecord, WorkflowTaskRecord, named_task, task_key,
 };
+use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::node_info::{LOCATION_LABEL_KEY, NODE_LABEL_KEY};
 use aruna_core::structs::storage::object_read::ObjectRangeRequest;
 use aruna_core::structs::storage::routing::NodeRouting;
+use aruna_core::types::Key;
 use aruna_ops_data::s3::object::get::{
     GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult,
 };
@@ -46,7 +49,10 @@ use ulid::Ulid;
 use super::cache::{
     CacheEntry, CacheHit, LookupCacheOperation, StoreCacheOperation, deterministic, task_scope,
 };
-use super::data::{Target, WriteBody, WriteObjectOperation, area_of, file_address, resolve};
+use super::data::{
+    ObjectAccessOperation, Target, WriteBody, WriteObjectOperation, area_of, bucket_answer,
+    file_address, resolve,
+};
 use super::{RunChange, RunTasksOperation, change_call, changed, creator_auth, tasks_answer};
 use crate::jobs::job::cancel::{CancelJobOutcome, CancelOwnedOperation, CancelReport};
 use crate::jobs::job::reads::JobReadError;
@@ -483,6 +489,8 @@ enum TaskStep {
     Lookup,
     Copy(Box<Copying>, RunFile),
     Queued,
+    CheckAccess(Box<ExecutionSpec>, Vec<(String, String)>),
+    CheckEncryption(Box<ExecutionSpec>),
     Submit,
     Adopted(JobId),
     Poll(JobId),
@@ -734,6 +742,92 @@ impl RunTaskOperation {
             Ok(spec) => spec,
             Err(error) => return self.refuse(error.to_string(), false),
         };
+        if self.run.path_restrictions.is_some() {
+            let local = self.run.node_id;
+            let area = area_of(&self.run);
+            let mut checks = Vec::new();
+            for item in &spec.inputs {
+                let InputSource::S3 { bucket, key, .. } = &item.source else {
+                    continue;
+                };
+                if item.source_node_id.is_some_and(|node| node != local) {
+                    return self.refuse(
+                        "a restricted run may not read inputs from another node".into(),
+                        false,
+                    );
+                }
+                let owned = area
+                    .as_ref()
+                    .is_some_and(|(ab, ap)| ab == bucket && key.starts_with(ap));
+                if !owned {
+                    checks.push((bucket.clone(), key.clone()));
+                }
+            }
+            if !checks.is_empty() {
+                return self.check_access(Box::new(spec), checks);
+            }
+        }
+        self.check_encryption(Box::new(spec))
+    }
+
+    fn check_access(
+        &mut self,
+        spec: Box<ExecutionSpec>,
+        mut pending: Vec<(String, String)>,
+    ) -> TaskNext {
+        let Some((bucket, key)) = pending.pop() else {
+            return self.check_encryption(spec);
+        };
+        let access = ObjectAccessOperation::new(
+            &creator_auth(&self.run),
+            self.run.node_id,
+            (&bucket, &key),
+            Permission::READ,
+        );
+        self.step = TaskStep::CheckAccess(spec, pending);
+        Ok(Next::Call(IoCall::child(access)))
+    }
+
+    fn check_encryption(&mut self, spec: Box<ExecutionSpec>) -> TaskNext {
+        if self.run.protected {
+            return self.submit_spec(*spec);
+        }
+        let local = self.run.node_id;
+        let area = area_of(&self.run);
+        let mut buckets: Vec<String> = spec
+            .inputs
+            .iter()
+            .filter_map(|item| match &item.source {
+                InputSource::S3 { bucket, key, .. }
+                    if item.source_node_id.is_none_or(|n| n == local)
+                        && !area
+                            .as_ref()
+                            .is_some_and(|(ab, ap)| ab == bucket && key.starts_with(ap)) =>
+                {
+                    Some(bucket.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        buckets.sort_unstable();
+        buckets.dedup();
+        if buckets.is_empty() {
+            return self.submit_spec(*spec);
+        }
+        let rows = buckets
+            .into_iter()
+            .map(|bucket| {
+                (
+                    BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+                    Key::from(bucket.into_bytes()),
+                )
+            })
+            .collect();
+        self.step = TaskStep::CheckEncryption(spec);
+        Ok(Next::Call(IoCall::Read(rows)))
+    }
+
+    fn submit_spec(&mut self, spec: ExecutionSpec) -> TaskNext {
         let occurrence = task_number(&self.request);
         let key = child_key(
             self.run.run_id,
@@ -767,7 +861,8 @@ impl RunTaskOperation {
         };
         let mut node = self.node.clone();
         node.now_ms = self.now_ms.max(node.now_ms);
-        let submit = SubmitExternalOperation::new(submission, Some(node));
+        let submit = SubmitExternalOperation::new(submission, Some(node))
+            .with_precaptured(self.run.captured_remote.clone());
         self.step = TaskStep::Submit;
         Ok(Next::Call(IoCall::child(submit)))
     }
@@ -1113,6 +1208,26 @@ impl Operation for RunTaskOperation {
                     changed(result)?;
                 }
                 self.submit()
+            }
+            TaskStep::CheckAccess(spec, pending) => match bucket_answer(result) {
+                Ok(_) => self.check_access(spec, pending),
+                Err(CatalogError::Forbidden | CatalogError::NotFound) => {
+                    self.refuse("the run's creator may not read a task input".into(), false)
+                }
+                Err(error) => Err(error),
+            },
+            TaskStep::CheckEncryption(spec) => {
+                for row in result.values()? {
+                    let settings = BucketEncryption::from_row(row.as_deref())
+                        .map_err(|error| CatalogError::Storage(error.to_string()))?;
+                    if settings.is_encrypted() {
+                        return self.refuse(
+                            "encrypted inputs require a protected workflow run".into(),
+                            false,
+                        );
+                    }
+                }
+                self.submit_spec(*spec)
             }
             TaskStep::Submit => self.submitted(result),
             TaskStep::Adopted(job_id) | TaskStep::Started(job_id) => {

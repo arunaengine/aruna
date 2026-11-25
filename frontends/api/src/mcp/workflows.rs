@@ -198,9 +198,11 @@ impl McpServer {
             .await?;
         let body = body_of(input.body)?;
         let headers = axum::http::HeaderMap::new();
+        let bearer = axum::extract::Extension(super::compute::request_bearer(&parts));
         let started = runs::start_run(
             self.handler_state(),
             RealmAuth(auth),
+            bearer,
             headers,
             axum::Json(body),
         );

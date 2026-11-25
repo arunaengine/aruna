@@ -13,9 +13,19 @@ use crate::errors::ConversionError;
 use crate::id::NodeId;
 use crate::secrets::SecretName;
 use crate::structs::execution::job::identity::JobId;
+use crate::structs::execution::job::input::CapturedInput;
+use crate::structs::identity::auth::PathRestriction;
 use crate::structs::identity::realm::RealmId;
 use crate::types::{GroupId, Key};
 use crate::user::id::UserId;
+
+/// Immutable catalog records copied alongside a run so a surviving holder can resume it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicatedWorkflow {
+    pub workflow: Vec<u8>,
+    pub version: Vec<u8>,
+    pub source: Option<Vec<u8>>,
+}
 
 /// Which secret store a workflow secret binding reads from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -288,6 +298,12 @@ pub struct WorkflowRunRecord {
     /// Vault secret bindings of the run, by workflow secret name; carries only references.
     #[serde(default)]
     pub secrets: BTreeMap<String, WorkflowSecretBinding>,
+    /// Caller path restrictions captured at admission and enforced throughout execution.
+    #[serde(default)]
+    pub path_restrictions: Option<Vec<PathRestriction>>,
+    /// Remote pinned inputs resolved and granted at admission for reuse by child tasks.
+    #[serde(default)]
+    pub captured_remote: Vec<CapturedInput>,
 }
 
 /// One task of a run, with the state of its newest attempt.

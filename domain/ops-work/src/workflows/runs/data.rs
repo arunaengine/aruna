@@ -309,6 +309,7 @@ impl DataCall {
 #[derive(Debug, PartialEq)]
 enum ReadStep {
     Access(Target),
+    Encryption(Target, Box<BucketInfo>),
     Head(Target, Box<BucketInfo>),
     Folder,
     List(Target, Box<BucketInfo>),
@@ -546,12 +547,34 @@ impl Operation for ReadDataOperation {
     fn next(&mut self, result: IoResult) -> ReadNext {
         match self.step.take().ok_or(IoError::Unfinished)? {
             ReadStep::Access(target) => match bucket_answer(result) {
+                Ok(info) if !self.run.protected && !target.owned => {
+                    let key = aruna_core::types::Key::from(target.bucket.as_bytes().to_vec());
+                    self.step = Some(ReadStep::Encryption(target, Box::new(info)));
+                    Ok(Next::Call(IoCall::Read(vec![(
+                        aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+                        key,
+                    )])))
+                }
                 Ok(info) => self.accessed(target, info),
                 Err(CatalogError::NotFound) if matches!(self.call, DataCall::Stat { .. }) => {
                     Ok(Next::Done(HostRpcResult::StorageStat { entry: None }))
                 }
                 Err(error) => Self::failed(refusal(error, self.call.address())?),
             },
+            ReadStep::Encryption(target, info) => {
+                let row = result.value()?;
+                let settings =
+                    aruna_core::structs::storage::encryption::BucketEncryption::from_row(
+                        row.as_deref(),
+                    )
+                    .map_err(|error| CatalogError::Storage(error.to_string()))?;
+                if settings.is_encrypted() {
+                    return Self::failed(denied(
+                        "encrypted inputs require a protected workflow run",
+                    ));
+                }
+                self.accessed(target, *info)
+            }
             ReadStep::Head(target, info) => self.headed(target, *info, result),
             ReadStep::Folder => {
                 let listed = result.child::<ListBucketResult, ListBucketError>()?;

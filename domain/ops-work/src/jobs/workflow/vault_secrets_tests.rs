@@ -207,6 +207,8 @@ async fn releases_workflow_secrets() {
         protected: false,
         started_at_ms: Some(10),
         secrets: BTreeMap::new(),
+        path_restrictions: None,
+        captured_remote: Vec::new(),
     };
     ctx.storage_handle
         .send_storage_effect(StorageEffect::Write {

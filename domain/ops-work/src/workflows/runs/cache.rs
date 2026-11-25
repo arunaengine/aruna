@@ -37,9 +37,9 @@ pub fn deterministic(request: &StartTask) -> bool {
         && pinned_inputs
 }
 
-/// The scope a task uses: the run's own, narrowed to the run when the task is not deterministic.
+/// The scope a task uses: the run's own, narrowed to the run when non-deterministic or restricted.
 pub fn task_scope(run: &WorkflowRunRecord, request: &StartTask) -> CacheScope {
-    match deterministic(request) {
+    match deterministic(request) && run.path_restrictions.is_none() {
         true => run.cache_scope,
         false => CacheScope::Run,
     }

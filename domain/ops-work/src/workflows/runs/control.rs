@@ -6,6 +6,7 @@
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::errors::AuthorizationError;
 use aruna_core::id::NodeId;
+use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::workflow_run::{
     CacheScope, WorkflowRunRecord, WorkflowSecretScope,
@@ -38,6 +39,7 @@ pub enum Follow {
 #[derive(Debug, PartialEq)]
 pub struct FollowRunOperation {
     auth: AuthContext,
+    token: Option<AuthToken>,
     node: (NodeId, RealmId),
     source: Ulid,
     follow: Follow,
@@ -56,11 +58,18 @@ impl FollowRunOperation {
     pub fn new(auth: &AuthContext, node: (NodeId, RealmId), source: Ulid, follow: Follow) -> Self {
         Self {
             auth: auth.clone(),
+            token: None,
             node,
             source,
             follow,
             step: FollowStep::Access,
         }
+    }
+
+    /// Supplies the caller's bearer token for resolving remote pinned inputs on repeat or resume.
+    pub fn with_token(mut self, token: Option<AuthToken>) -> Self {
+        self.token = token;
+        self
     }
 
     fn admit(
@@ -148,7 +157,13 @@ impl FollowRunOperation {
                 protected: source.protected,
             },
         };
-        Ok(StartRunOperation::new(&self.auth, self.node, request).in_lineage(lineage))
+        let mut start = StartRunOperation::new(&self.auth, self.node, request)
+            .in_lineage(lineage)
+            .with_token(self.token.clone());
+        if source.created_by == self.auth.user_id && self.auth.path_restrictions.is_none() {
+            start = start.with_captured(source.captured_remote.clone());
+        }
+        Ok(start)
     }
 }
 

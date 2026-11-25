@@ -467,7 +467,12 @@ pub(crate) fn tasks_answer(result: IoResult) -> Result<Vec<WorkflowTaskRecord>, 
     result.child::<Vec<WorkflowTaskRecord>, CatalogError>()?
 }
 
-/// The caller the node acts as for a run: its creator, never the node itself.
+/// The caller the node acts as for a run: its creator with captured restrictions, never the node.
 pub fn creator_auth(record: &WorkflowRunRecord) -> AuthContext {
-    AuthContext::new(record.created_by, record.realm_id)
+    AuthContext {
+        user_id: record.created_by,
+        realm_id: record.realm_id,
+        path_restrictions: record.path_restrictions.clone(),
+        session: None,
+    }
 }

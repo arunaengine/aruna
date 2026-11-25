@@ -686,6 +686,8 @@ pub(super) fn sample_run() -> WorkflowRunRecord {
         protected: false,
         started_at_ms: None,
         secrets: BTreeMap::new(),
+        path_restrictions: None,
+        captured_remote: Vec::new(),
     }
 }
 
@@ -859,9 +861,11 @@ fn waits_for_quota() {
     let miss = Ok::<Option<super::cache::CacheHit>, CatalogError>(None);
     let queued = task.next(child(miss)).unwrap();
     assert!(matches!(queued, Next::Call(IoCall::Child(_))));
-    let submit = task
+    let check = task
         .next(child(Ok::<_, CatalogError>(run.clone())))
         .unwrap();
+    assert!(matches!(check, Next::Call(IoCall::Read(_))));
+    let submit = task.next(IoResult::Values(vec![None])).unwrap();
     assert!(matches!(submit, Next::Call(IoCall::Child(_))));
     let denied = QuotaDenied {
         scope: QuotaScope::Group,
@@ -873,7 +877,9 @@ fn waits_for_quota() {
     let refused: Result<AcceptedSubmission, SubmitJobError> = Err(denied.into());
     let wait = task.next(child(refused)).unwrap();
     assert!(matches!(wait, Next::Call(IoCall::Delay(_))));
-    let again = task.next(IoResult::Woke).unwrap();
+    let recheck = task.next(IoResult::Woke).unwrap();
+    assert!(matches!(recheck, Next::Call(IoCall::Read(_))));
+    let again = task.next(IoResult::Values(vec![None])).unwrap();
     assert!(matches!(again, Next::Call(IoCall::Child(_))));
     let existing = JobId::from_bytes([9; 16]);
     let conflict: Result<AcceptedSubmission, SubmitJobError> =

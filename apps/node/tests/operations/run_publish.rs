@@ -592,6 +592,8 @@ async fn publishes_local_workflow() -> TestResult<()> {
         protected: false,
         started_at_ms: Some(now_ms),
         secrets: Default::default(),
+        path_restrictions: None,
+        captured_remote: Vec::new(),
     };
     device
         .context

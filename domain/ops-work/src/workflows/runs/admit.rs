@@ -9,13 +9,16 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::compute::valid_vault_env;
 use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
-use aruna_core::job_request::{SubmitJobError, SubmitJobResult};
+use aruna_core::job_request::{self, SubmissionScope, SubmitJobError, SubmitJobResult};
 use aruna_core::keyspaces::{
     BUCKET_ENCRYPTION_KEYSPACE, RUN_IDEMPOTENCY_KEYSPACE, WORKFLOW_RUN_KEYSPACE,
 };
+use aruna_core::metadata::AuthToken;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::execution::job::identity::RETENTION_MS;
-use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::input::{
+    CapturedInput, InputMode, InputSelection, InputSource, JobPayload,
+};
 use aruna_core::structs::execution::job::local::{WorkspaceMode, user_dedup_key};
 use aruna_core::structs::execution::workflow_run::{
     CacheScope, RunKeyRecord, RunOutput, RunState, WorkflowRunRecord, WorkflowRunSpec,
@@ -33,6 +36,7 @@ use ulid::Ulid;
 
 use super::data::ObjectAccessOperation;
 use super::{RunChange, change_call, changed, events};
+use crate::jobs::lifecycle::remote_inputs::{RemoteInputsOperation, ResolveCaller};
 use crate::jobs::submit::SubmitJobSpec;
 use crate::jobs::submit::local::SubmitLocalOperation;
 use crate::workflows::versions::{GetVersionOperation, VersionView};
@@ -68,27 +72,86 @@ pub struct RunRequest {
 }
 
 impl RunRequest {
-    /// What a repeated key must ask for again: the workflow, its version, values, inputs,
-    /// output and secret bindings.
+    /// What a repeated key must ask for again: every field that affects execution or publication.
     pub fn digest(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"aruna-workflow-run-request-v1\0");
+        hasher.update(b"aruna-workflow-run-request-v2\0");
         hasher.update(&self.group_id.to_bytes());
         hasher.update(&self.workflow_id.to_bytes());
         hasher.update(&self.version.to_be_bytes());
+        hasher.update(&[u8::from(self.provenance_crate)]);
         let secrets = serde_json::to_string(&self.secrets).unwrap_or_default();
+        let output = self
+            .output
+            .as_ref()
+            .map(|output| {
+                format!(
+                    "{}\0{}\0{}\0{}",
+                    output.bucket,
+                    output.prefix,
+                    output.node_id.map(|n| n.to_string()).unwrap_or_default(),
+                    output.dataset_json.as_deref().unwrap_or_default(),
+                )
+            })
+            .unwrap_or_default();
+        let mut pins: Vec<String> = (self.inputs.iter())
+            .map(|pin| {
+                format!(
+                    "{}\0{}\0{}\0{}\0{}",
+                    pin.name,
+                    pin.bucket,
+                    pin.key,
+                    pin.version_id,
+                    pin.source_node_id
+                        .map(|n| n.to_string())
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        pins.sort();
         for text in [
             self.values.to_string(),
             self.inputs_json.clone().unwrap_or_default(),
-            (self.output.as_ref())
-                .map(|output| format!("{}\0{}", output.bucket, output.prefix))
-                .unwrap_or_default(),
+            pins.join("\n"),
+            output,
+            self.placement_site.clone().unwrap_or_default(),
             secrets,
         ] {
             hasher.update(&(text.len() as u64).to_be_bytes());
             hasher.update(text.as_bytes());
         }
         *hasher.finalize().as_bytes()
+    }
+}
+
+/// Extracts `aruna://bucket/key[?...]` addresses from workflow values so local encryption and
+/// access checks cover file-valued parameters too.
+fn value_refs(value: &Value, out: &mut Vec<(String, String, Option<NodeId>)>) {
+    match value {
+        Value::String(text) => {
+            if let Some(rest) = text.strip_prefix("aruna://") {
+                let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
+                let node = query
+                    .split('&')
+                    .find_map(|pair| pair.strip_prefix("node="))
+                    .and_then(|text| text.parse::<NodeId>().ok());
+                let (bucket, key) = path.split_once('/').unwrap_or((path, ""));
+                if !bucket.is_empty() {
+                    out.push((bucket.to_owned(), key.to_owned(), node));
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                value_refs(item, out);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values() {
+                value_refs(item, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -121,6 +184,7 @@ enum AdmitStep {
     Output(Box<VersionView>),
     Encryption(Box<VersionView>),
     Config(Box<VersionView>, bool),
+    Remote(Box<VersionView>, bool, bool),
     Record,
     Submit(Box<WorkflowRunRecord>),
     Job(Box<WorkflowRunRecord>),
@@ -131,10 +195,13 @@ enum AdmitStep {
 #[derive(Debug, PartialEq)]
 pub struct StartRunOperation {
     auth: AuthContext,
+    token: Option<AuthToken>,
     node: (NodeId, RealmId),
     request: RunRequest,
     lineage: Lineage,
     pending: Vec<PinnedInput>,
+    remote: BTreeMap<NodeId, Vec<InputSelection>>,
+    captured: Vec<CapturedInput>,
     ids: IdMint,
     now_ms: u64,
     step: AdmitStep,
@@ -144,16 +211,43 @@ type AdmitNext = Result<Next<AdmittedRun>, CatalogError>;
 
 impl StartRunOperation {
     pub fn new(auth: &AuthContext, node: (NodeId, RealmId), request: RunRequest) -> Self {
+        let mut pending = request.inputs.clone();
+        let mut refs = Vec::new();
+        value_refs(&request.values, &mut refs);
+        for (bucket, key, source_node_id) in refs {
+            pending.push(PinnedInput {
+                name: String::new(),
+                bucket,
+                key,
+                version_id: Ulid::nil(),
+                source_node_id,
+            });
+        }
         Self {
             auth: auth.clone(),
+            token: None,
             node,
-            pending: request.inputs.clone(),
+            pending,
             request,
             lineage: Lineage::default(),
+            remote: BTreeMap::new(),
+            captured: Vec::new(),
             ids: IdMint::default(),
             now_ms: 0,
             step: AdmitStep::Group,
         }
+    }
+
+    /// Supplies the caller's bearer token for resolving remote pinned inputs at admission.
+    pub fn with_token(mut self, token: Option<AuthToken>) -> Self {
+        self.token = token;
+        self
+    }
+
+    /// Reuses remote inputs already captured and granted for an earlier run in the lineage.
+    pub fn with_captured(mut self, captured: Vec<CapturedInput>) -> Self {
+        self.captured = captured;
+        self
     }
 
     /// Starts the run in an existing lineage, as a resume or a repeat does.
@@ -213,13 +307,19 @@ impl StartRunOperation {
         Ok(Next::Call(IoCall::child(access)))
     }
 
-    /// Reads whether the pinned inputs this node holds and the output bucket encrypt. Inputs of
-    /// other nodes are not readable here, so they never make a run protected.
+    /// Reads whether local input buckets (from pins and `values`) and the output bucket encrypt.
     fn encryption(&mut self, view: VersionView) -> AdmitNext {
         let local = self.node.0;
-        let mut buckets: Vec<&str> = (self.request.inputs.iter())
+        let mut refs = Vec::new();
+        value_refs(&self.request.values, &mut refs);
+        let mut buckets: Vec<String> = (self.request.inputs.iter())
             .filter(|input| input.source_node_id.is_none_or(|node| node == local))
-            .map(|input| input.bucket.as_str())
+            .map(|input| input.bucket.clone())
+            .chain(
+                refs.into_iter()
+                    .filter(|(_, _, node)| node.is_none_or(|n| n == local))
+                    .map(|(bucket, _, _)| bucket),
+            )
             .collect();
         buckets.sort_unstable();
         buckets.dedup();
@@ -227,10 +327,10 @@ impl StartRunOperation {
             .request
             .output
             .as_ref()
-            .map(|output| output.bucket.as_str());
+            .map(|output| output.bucket.clone());
         let rows = (buckets.into_iter().chain(output))
             .map(|bucket| {
-                let key = Key::from(bucket.as_bytes().to_vec());
+                let key = Key::from(bucket.into_bytes());
                 (BUCKET_ENCRYPTION_KEYSPACE.to_string(), key)
             })
             .collect();
@@ -292,7 +392,7 @@ impl StartRunOperation {
             steps: Vec::new(),
             resumes_run_id: self.lineage.resumes,
             repeats_run_id: self.lineage.repeats,
-            cache_scope: match protected {
+            cache_scope: match protected || self.auth.path_restrictions.is_some() {
                 true => CacheScope::Run,
                 false => self.lineage.cache_scope,
             },
@@ -300,6 +400,8 @@ impl StartRunOperation {
             protected,
             started_at_ms: None,
             secrets: request.secrets.clone(),
+            path_restrictions: self.auth.path_restrictions.clone(),
+            captured_remote: std::mem::take(&mut self.captured),
         };
         let key = request.idempotency_key.as_ref().map(|key| {
             let row = self.key_row(key);
@@ -308,6 +410,80 @@ impl StartRunOperation {
         self.step = AdmitStep::Record;
         let store = RecordRunOperation::new(record, key);
         Ok(Next::Call(IoCall::retry(store, &run_id.to_bytes())))
+    }
+
+    fn next_remote(&mut self, view: VersionView, protected: bool, local_only: bool) -> AdmitNext {
+        let Some((node, inputs)) = self.remote.pop_first() else {
+            return self.record(view, protected, local_only);
+        };
+        let scope = SubmissionScope::Unkeyed(Ulid::nil());
+        let caller = ResolveCaller {
+            created_by: self.auth.user_id,
+            submission_id: job_request::submission_of(self.auth.user_id, &scope),
+            expires_at: self.now_ms.saturating_add(RETENTION_MS) / 1000,
+        };
+        let resolve = RemoteInputsOperation::new(node, inputs, caller, self.token.clone());
+        self.step = AdmitStep::Remote(Box::new(view), protected, local_only);
+        Ok(Next::Call(IoCall::child(resolve)))
+    }
+
+    fn queue_remote(
+        &mut self,
+        cfg: &RealmConfigDocument,
+        local_only: bool,
+    ) -> Result<(), CatalogError> {
+        if local_only {
+            return Ok(());
+        }
+        let local = self.node.0;
+        for pin in &self.request.inputs {
+            let Some(node) = pin.source_node_id.filter(|n| *n != local) else {
+                continue;
+            };
+            if !cfg
+                .node_kind(&node)
+                .is_some_and(|kind| kind.is_sync_eligible())
+            {
+                return Err(CatalogError::Invalid(format!(
+                    "input node {node} is not an eligible realm server"
+                )));
+            }
+            let dest_key = format!("{}/{}", pin.bucket, pin.key);
+            let already = self.captured.iter().any(|c| {
+                c.source_node_id == node
+                    && c.version_id == pin.version_id
+                    && c.destination_key == dest_key
+            });
+            if already || self.token.is_none() {
+                continue;
+            }
+            let version_text = pin.version_id.to_string();
+            let selection = InputSelection {
+                source: InputSource::S3 {
+                    bucket: pin.bucket.clone(),
+                    key: pin.key.clone(),
+                    version_id: Some(version_text.clone()),
+                },
+                source_node_id: Some(node),
+                dest_key: dest_key.clone(),
+                mode: InputMode::Snapshot,
+                container_path: Some(format!("/{dest_key}")),
+                name: None,
+                description: None,
+            };
+            let entry = self.remote.entry(node).or_default();
+            let duplicate = entry.iter().any(|existing| {
+                existing.dest_key == dest_key
+                    && matches!(
+                        &existing.source,
+                        InputSource::S3 { version_id: Some(v), .. } if v == &version_text
+                    )
+            });
+            if !duplicate {
+                entry.push(selection);
+            }
+        }
+        Ok(())
     }
 
     fn submit(&mut self, record: WorkflowRunRecord) -> AdmitNext {
@@ -352,10 +528,15 @@ impl Operation for StartRunOperation {
         if !self.request.values.is_object() {
             return Err(CatalogError::Invalid("values must be a JSON object".into()));
         }
-        if self.request.output.is_none() {
+        let Some(output) = &self.request.output else {
             return Err(CatalogError::Invalid(
                 "a run needs an output bucket: its task files are kept below the output prefix"
                     .into(),
+            ));
+        };
+        if output.node_id.is_some_and(|node| node != self.node.0) {
+            return Err(CatalogError::Invalid(
+                "output node must be the local node".into(),
             ));
         }
         if !self.request.secrets.is_empty() {
@@ -483,7 +664,28 @@ impl Operation for StartRunOperation {
                         "user, group, and realm vault secrets require a realm server".into(),
                     ));
                 }
-                self.record(*view, protected, local_only)
+                self.queue_remote(&cfg, local_only)?;
+                self.next_remote(*view, protected, local_only)
+            }
+            AdmitStep::Remote(view, protected, local_only) => {
+                type Answers = Vec<(InputSelection, CapturedInput)>;
+                let answers = result.child::<Answers, SubmitJobError>()?;
+                match answers {
+                    Ok(answers) => {
+                        for (_, captured) in answers {
+                            self.captured.push(captured);
+                        }
+                    }
+                    Err(SubmitJobError::AuthorityDenied | SubmitJobError::InputDenied(_)) => {
+                        return Err(CatalogError::Forbidden);
+                    }
+                    Err(SubmitJobError::InvalidWorkspace(reason)) => {
+                        return Err(CatalogError::Invalid(reason));
+                    }
+                    Err(_) if self.lineage.resumes.is_some() => {}
+                    Err(other) => return Err(CatalogError::Storage(other.to_string())),
+                }
+                self.next_remote(*view, protected, local_only)
             }
             AdmitStep::Record => {
                 let admitted = result.child::<AdmittedRun, CatalogError>()??;

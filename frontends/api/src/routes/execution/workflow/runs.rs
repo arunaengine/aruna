@@ -262,13 +262,17 @@ fn idempotency_key(headers: &HeaderMap) -> Result<Option<String>, ServerError> {
 pub async fn start_run(
     State(state): State<Arc<ServerState>>,
     RealmAuth(auth): RealmAuth,
+    axum::extract::Extension(bearer): axum::extract::Extension<
+        Option<crate::auth::ValidatedBearer>,
+    >,
     headers: HeaderMap,
     Json(request): Json<WorkflowRunRequest>,
 ) -> ServerResult<(StatusCode, Json<WorkflowRunBody>)> {
+    let token = crate::jobs::forwarded_job_auth(bearer)?;
     let request = run_request(&state, request, idempotency_key(&headers)?)?;
     crate::features::require(&state, Feature::Workflows, Some(request.group_id)).await?;
     let node = (state.get_node_id(), state.get_realm_id());
-    let start = StartRunOperation::new(&auth, node, request);
+    let start = StartRunOperation::new(&auth, node, request).with_token(token);
     let admitted = drive(start, &state.get_ctx())
         .await
         .map_err(catalog_error)?;
@@ -613,9 +617,13 @@ pub(super) async fn cancel(
 pub async fn resume_run(
     State(state): State<Arc<ServerState>>,
     RealmAuth(auth): RealmAuth,
+    axum::extract::Extension(bearer): axum::extract::Extension<
+        Option<crate::auth::ValidatedBearer>,
+    >,
     Path(run): Path<String>,
 ) -> ServerResult<(StatusCode, Json<WorkflowRunBody>)> {
-    follow(&state, &auth, &run, Follow::Resume).await
+    let token = crate::jobs::forwarded_job_auth(bearer)?;
+    follow(&state, &auth, token, &run, Follow::Resume).await
 }
 
 #[utoipa::path(
@@ -656,14 +664,19 @@ pub async fn resume_run(
 pub async fn repeat_run(
     State(state): State<Arc<ServerState>>,
     RealmAuth(auth): RealmAuth,
+    axum::extract::Extension(bearer): axum::extract::Extension<
+        Option<crate::auth::ValidatedBearer>,
+    >,
     Path(run): Path<String>,
 ) -> ServerResult<(StatusCode, Json<WorkflowRunBody>)> {
-    follow(&state, &auth, &run, Follow::Repeat).await
+    let token = crate::jobs::forwarded_job_auth(bearer)?;
+    follow(&state, &auth, token, &run, Follow::Repeat).await
 }
 
 async fn follow(
     state: &ServerState,
     auth: &aruna_core::structs::identity::auth::AuthContext,
+    token: Option<aruna_core::metadata::AuthToken>,
     run: &str,
     how: Follow,
 ) -> ServerResult<(StatusCode, Json<WorkflowRunBody>)> {
@@ -673,7 +686,7 @@ async fn follow(
     let group = Some(snapshot.record.group_id);
     crate::features::require(state, Feature::Workflows, group).await?;
     let node = (state.get_node_id(), state.get_realm_id());
-    let follow = FollowRunOperation::new(auth, node, run, how);
+    let follow = FollowRunOperation::new(auth, node, run, how).with_token(token);
     let record = drive(follow, &state.get_ctx())
         .await
         .map_err(catalog_error)?;

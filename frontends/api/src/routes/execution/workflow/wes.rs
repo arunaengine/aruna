@@ -362,13 +362,17 @@ pub async fn list_runs(
 pub async fn start_run(
     State(state): State<Arc<ServerState>>,
     RealmAuth(auth): RealmAuth,
+    axum::extract::Extension(bearer): axum::extract::Extension<
+        Option<crate::auth::ValidatedBearer>,
+    >,
     request: Request,
 ) -> WesResult<WesRunId> {
+    let token = crate::jobs::forwarded_job_auth(bearer)?;
     let form = run_form(request, &state).await?;
     let request = run_request(&state, workflow_request(form)?, None)?;
     crate::features::require(&state, Feature::Workflows, Some(request.group_id)).await?;
     let node = (state.get_node_id(), state.get_realm_id());
-    let start = StartRunOperation::new(&auth, node, request);
+    let start = StartRunOperation::new(&auth, node, request).with_token(token);
     let admitted = drive(start, &state.get_ctx())
         .await
         .map_err(catalog_error)?;
