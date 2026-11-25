@@ -411,12 +411,19 @@ async fn chunks_large_replicas() {
         more: false,
     };
     let send = ReplicateLogOperation::new(remote.run_id, (gone, remote.realm_id), 0);
-    let log = pages(3);
+    let mut log = pages(3);
+    // Include one oversized log page (> limit) so page chunking and frame bounds are exercised.
+    log.push(RunLogPage {
+        entries: vec![RunLogEntry::Change {
+            seq: 99,
+            change_json: serde_json::json!({ "blob": "z".repeat(2600) }),
+        }],
+    });
     let limit = 2048;
     let frames = send
         .frames_bounded(0, &remote, &log, Some(bundle), limit)
         .unwrap();
-    assert!(frames.len() >= 4, "expected bounded multi-frame transfer");
+    assert!(frames.len() >= 6, "expected bounded multi-frame transfer");
     for frame in &frames {
         assert!(
             frame.len() <= limit,
@@ -425,8 +432,9 @@ async fn chunks_large_replicas() {
         );
     }
 
-    // Apply all `more: true` frames first and confirm the run is not visible/resumable yet.
+    // Apply all frames in order; `more: true` frames before the commit must keep the run hidden.
     let mut applied_more = 0;
+    let mut committed = false;
     for frame in &frames {
         let MetadataTransportMessage::StoreRunLog {
             run,
@@ -454,15 +462,22 @@ async fn chunks_large_replicas() {
         .unwrap();
         if is_more {
             applied_more += 1;
-            let hidden = drive(
-                super::super::reads::RunSnapshotOperation::new(&runs.fixture.alice, remote.run_id),
-                context,
-            )
-            .await;
-            assert_eq!(hidden, Err(CatalogError::NotFound));
+            if !committed {
+                let hidden = drive(
+                    super::super::reads::RunSnapshotOperation::new(
+                        &runs.fixture.alice,
+                        remote.run_id,
+                    ),
+                    context,
+                )
+                .await;
+                assert_eq!(hidden, Err(CatalogError::NotFound));
+            }
+        } else {
+            committed = true;
         }
     }
-    assert!(applied_more >= 2);
+    assert!(applied_more >= 3);
     let stored = drive(
         super::super::reads::RunSnapshotOperation::new(&runs.fixture.alice, remote.run_id),
         context,
@@ -488,6 +503,90 @@ async fn chunks_large_replicas() {
         .unwrap()
         .1;
     assert_eq!(updated.definition, tool_v2.definition);
+
+    // Reimporting identical bytes with a newer timestamp advances the timestamp so a delayed
+    // intermediate definition cannot regress it; equal timestamps converge deterministically.
+    let mut tool_reimport = tool_v2.clone();
+    tool_reimport.created_at_ms = 40;
+    let mut tool_mid = tool_v2.clone();
+    tool_mid.definition = serde_json::json!({"id": "bigtool", "rev": 25}).to_string();
+    tool_mid.created_at_ms = 30;
+    let v2_bytes = tool_v2.to_bytes().unwrap();
+    let v3_bytes = tool_reimport.to_bytes().unwrap();
+    let mid_bytes = tool_mid.to_bytes().unwrap();
+    assert!(
+        tool_update(Some(&v2_bytes), &v3_bytes, remote.group_id)
+            .unwrap()
+            .is_some(),
+        "newer reimport of identical definition must advance stored timestamp"
+    );
+    assert!(
+        tool_update(Some(&v3_bytes), &mid_bytes, remote.group_id)
+            .unwrap()
+            .is_none(),
+        "delayed intermediate timestamp must not overwrite newer reimport"
+    );
+
+    // Composed tool selection uses parsed graph references and exact/latest version rules.
+    let graph = crate::workflows::GraphView {
+        graph: aruna_workflow_contract::preflight::WorkflowGraph {
+            nodes: vec![
+                aruna_workflow_contract::preflight::GraphNode {
+                    id: "s1".into(),
+                    label: "s1".into(),
+                    kind: NodeKind::Step,
+                    tool: Some("bigtool".into()),
+                    version: Some("1.0".into()),
+                },
+                aruna_workflow_contract::preflight::GraphNode {
+                    id: "s2".into(),
+                    label: "s2".into(),
+                    kind: NodeKind::Step,
+                    tool: Some("unpinned".into()),
+                    version: None,
+                },
+            ],
+            edges: Vec::new(),
+        },
+        complete: true,
+    };
+    let graph_json = serde_json::to_string(&graph).unwrap();
+    let mut big_v2_ver = tool_v1.clone();
+    big_v2_ver.version = "2.0".into();
+    let mut unpinned_v1 = tool_v1.clone();
+    unpinned_v1.tool_id = "unpinned".into();
+    unpinned_v1.version = "1.0".into();
+    let mut unpinned_v2 = unpinned_v1.clone();
+    unpinned_v2.version = "2.0".into();
+    let mut unrelated = tool_v1.clone();
+    unrelated.tool_id = "other".into();
+    let picked = used_tools(
+        &[],
+        Some(&graph_json),
+        vec![
+            tool_v1.clone(),
+            big_v2_ver.clone(),
+            unpinned_v1,
+            unpinned_v2.clone(),
+            unrelated,
+        ],
+    );
+    let picked_ids: Vec<(String, String)> =
+        picked.into_iter().map(|t| (t.tool_id, t.version)).collect();
+    assert_eq!(
+        picked_ids,
+        vec![
+            ("bigtool".to_string(), "1.0".to_string()),
+            ("unpinned".to_string(), "2.0".to_string()),
+        ]
+    );
+    let override_picked = used_tools(
+        &[("bigtool".to_string(), "2.0".to_string())],
+        Some(&graph_json),
+        vec![tool_v1, big_v2_ver],
+    );
+    assert_eq!(override_picked.len(), 1);
+    assert_eq!(override_picked[0].version, "2.0");
 
     // Missing source row on a replacement holder triggers NotFound so sender backfills from 0.
     context

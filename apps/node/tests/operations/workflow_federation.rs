@@ -19,8 +19,10 @@ use aruna_core::secrets::{
 };
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::job::identity::{JobId, RETENTION_MS};
-use aruna_core::structs::execution::job::input::TaskSecretBinding;
-use aruna_core::structs::execution::job::local::WorkspaceMode;
+use aruna_core::structs::execution::job::input::{
+    InputContent, JobPayload, TaskSecretBinding, WORKFLOW_UNPROTECTED_TAG,
+};
+use aruna_core::structs::execution::job::local::{JobErrorKind, JobRecord, WorkspaceMode};
 use aruna_core::structs::execution::workflow::{StoredWorkflowLanguage, WorkflowVisibility};
 use aruna_core::structs::execution::workflow_run::{
     RunOutput, RunState, WorkflowRunSpec, WorkflowSecretBinding, WorkflowSecretScope,
@@ -35,13 +37,13 @@ use aruna_core::types::GroupId;
 use aruna_core::user::id::UserId;
 use aruna_core::workflow::{WorkflowAnswer, WorkflowEffect, WorkflowError, WorkflowHost};
 use aruna_ops_data::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
-use aruna_ops_data::staging::granted_read::GrantedReadOperation;
 use aruna_ops_identity::secrets::SecretChange;
 use aruna_ops_identity::secrets::node::{NodeChange, NodeSecretOperation};
 use aruna_ops_work::jobs::lifecycle::submit_external::{
     ExternalSubmission, IngressNode, SubmitExternalOperation,
 };
 use aruna_ops_work::jobs::workflow::credential::RunIdentity;
+use aruna_ops_work::jobs::workflow::inputs::LoadInputsOperation;
 use aruna_ops_work::jobs::workflow::vault_secrets::ReleaseVaultSecrets;
 use aruna_ops_work::workflows::CatalogError;
 use aruna_ops_work::workflows::import::{CreateWorkflowOperation, NewWorkflow, SourceInput};
@@ -434,18 +436,22 @@ async fn replicates_workflow_run() -> TestResult<()> {
     .await?;
     assert!(matches!(prepared, Prepared::Ready(_)));
     let messages = surviving_sent.lock().unwrap().clone();
+    let replay_pos = messages
+        .iter()
+        .position(|msg| matches!(msg, HostToCoordinator::RunReplayPages { pages } if *pages == coord_pages))
+        .expect("surviving coordinator must stream replicated replay pages");
+    let start_pos = messages
+        .iter()
+        .position(|msg| {
+            matches!(
+                msg,
+                HostToCoordinator::RunStart(payload) if payload.prior_log_pages.is_empty()
+            )
+        })
+        .expect("run start carries empty inline replay after streamed pages");
     assert!(
-        messages
-            .iter()
-            .any(|msg| matches!(msg, HostToCoordinator::RunReplayPages { pages } if *pages == coord_pages)),
-        "surviving coordinator must stream replicated replay pages: {messages:?}"
-    );
-    assert!(
-        messages.iter().any(|msg| matches!(
-            msg,
-            HostToCoordinator::RunStart(payload) if payload.prior_log_pages.is_empty()
-        )),
-        "run start carries empty inline replay after streamed pages: {messages:?}"
+        replay_pos < start_pos,
+        "RunReplayPages must precede RunStart: {messages:?}"
     );
     Ok(())
 }
@@ -456,7 +462,14 @@ async fn replicates_workflow_run() -> TestResult<()> {
 async fn plans_multi_node() -> TestResult<()> {
     let realm = Topology::spawn(3, 0, 2).await?;
     let group_id = realm.seed_group().await?;
-    let (planner, data_node, gpu_node) = (realm.node(0), realm.node(1), realm.node(2));
+    let all_nodes = [realm.node(0), realm.node(1), realm.node(2)];
+    let gpu_node = all_nodes
+        .iter()
+        .copied()
+        .find(|n| record_holders(&realm.config, group_id, n.node_id()).len() == 2)
+        .ok_or("expected 1 non-holder in 3-node rf=2 topology")?;
+    let holder_ids = record_holders(&realm.config, group_id, gpu_node.node_id());
+    let (planner, data_node) = (realm.find(holder_ids[0]), realm.find(holder_ids[1]));
     let owner = realm.auth_context();
 
     for node in [data_node, gpu_node] {
@@ -662,8 +675,12 @@ async fn plans_multi_node() -> TestResult<()> {
         secret_placeholders: Vec::new(),
     };
     let spec = task_spec(&admitted.record, &child_req, &task_key_of("align-seed"))?;
+    assert!(
+        spec.tags.contains_key(WORKFLOW_UNPROTECTED_TAG),
+        "unprotected run child job must carry unprotected staging tag"
+    );
     let submission = ExternalSubmission {
-        spec,
+        spec: spec.clone(),
         created_by: realm.user_id,
         scope: SubmissionScope::Keyed("workflow-task/test/align/1/1".into()),
         workspace_mode: WorkspaceMode::None,
@@ -679,36 +696,69 @@ async fn plans_multi_node() -> TestResult<()> {
     .await?;
     assert!(!accepted.job_id.to_string().is_empty());
 
-    // Stage the remote pin over real P2P using the precaptured signed grant without a bearer.
+    // Stage the child job's hashless remote reference on a remote executor (`gpu_node`) through
+    // production `LoadInputsOperation` -> `GrantedReadOperation` with no bearer token.
     let big_entry = admitted
         .record
         .captured_remote
         .iter()
         .find(|entry| entry.pin_key == "big.bin")
         .ok_or("missing precaptured entry for big.bin")?;
-    let grant = big_entry
-        .captured
-        .grant
-        .as_ref()
-        .ok_or("missing signed grant for big.bin")?;
-    let read = GrantedReadOperation::new(
-        Some((planner.node_id(), realm.realm_id)),
-        data_node.node_id(),
-        grant,
+    let big_input = spec
+        .inputs
+        .iter()
+        .find(|input| input.source_node_id == Some(data_node.node_id()))
+        .ok_or("missing remote input on child spec")?;
+    let mut ref_capture = big_entry.captured.clone();
+    ref_capture.destination_key = big_input.dest_key.clone();
+    ref_capture.content = InputContent::Reference {
+        etag: None,
+        range_bound: false,
+    };
+    let mut stage_record = JobRecord::new(
+        accepted.job_id,
+        JobPayload::Execution(spec.clone()),
+        realm.user_id,
+        gpu_node.node_id(),
+        now_ms,
+        now_ms,
         None,
-        false,
     );
-    let mut blob = drive(read, &ctx).await?.blob;
+    stage_record.captured_inputs = vec![ref_capture];
+    let stage_identity = RunIdentity {
+        job_id: accepted.job_id,
+        user_id: realm.user_id,
+        group_id,
+        realm_id: realm.realm_id,
+        node_id: gpu_node.node_id(),
+    };
+    let staged_inputs = drive(
+        LoadInputsOperation::new(
+            stage_identity,
+            &spec,
+            Arc::new(stage_record),
+            &Default::default(),
+        ),
+        gpu_node.context.as_ref(),
+    )
+    .await
+    .map_err(|error| format!("child granted staging failed: {error:?}"))?;
+    let staged_big = staged_inputs
+        .iter()
+        .find(|item| item.size() == BIG_BYTES as u64)
+        .ok_or("missing staged big.bin task input")?;
+    let mut stream = staged_big.take_stream().ok_or("missing staged stream")?;
     let mut staged = Vec::new();
-    while let Some(chunk) = blob.next().await {
+    while let Some(chunk) = stream.next().await {
         staged.extend_from_slice(&chunk?);
     }
     assert_eq!(staged.len(), BIG_BYTES);
     assert!(staged.iter().all(|b| *b == b'A'));
 
-    // A remote executor without a local workflow run row verifies the run record over P2P
+    // A remote executor without a local workflow run row verifies the run verdict over P2P
     // from the coordinator before releasing a bound vault secret.
     let secret_name = SecretName::try_from("remote-tok".to_string())?;
+    let other_secret = SecretName::try_from("other-tok".to_string())?;
     let mut secret_req =
         RequestWithSecret::make(group_id, created.workflow_id, created.version, &secret_name);
     secret_req.output = Some(RunOutput {
@@ -723,48 +773,64 @@ async fn plans_multi_node() -> TestResult<()> {
     )
     .await?
     .record;
+    // Confirm `gpu_node` holds no local workflow run row for `sec_run`.
+    let local_row = drive(
+        RunSnapshotOperation::new(&owner, sec_run.run_id),
+        gpu_node.context.as_ref(),
+    )
+    .await;
+    assert_eq!(
+        local_row,
+        Err(CatalogError::NotFound),
+        "gpu_node must not hold a local run row"
+    );
     gpu_node
         .context
         .storage_handle
         .open_vault(NodeVaultKey::random());
-    drive(
-        NodeSecretOperation::new(NodeChange {
-            realm_id: realm.realm_id,
-            node_id: gpu_node.node_id(),
-            actor: realm.user_id,
-            change: SecretChange::Create {
-                name: secret_name.clone(),
-                kind: SecretKind::parse("bearer").unwrap(),
-                description: String::new(),
-                settings: BTreeMap::new(),
-                uses: vec![UseRule {
-                    consumer: SecretConsumer::Workflow {
-                        workflow_id: created.workflow_id,
-                    },
-                    delivery: Delivery::Value,
-                    origins: Vec::new(),
-                    paths: Vec::new(),
-                    methods: Vec::new(),
-                    response: ResponseExposure::Status,
-                    groups: vec![group_id],
-                }],
-                fields: SecretFields::new(BTreeMap::from([(
-                    "token".to_string(),
-                    Secret::new("remote-verified-secret".to_string()),
-                )])),
-            },
-            now_ms,
-            write_id: Ulid::generate(),
-        }),
-        gpu_node.context.as_ref(),
-    )
-    .await?;
+    for (name, val) in [
+        (&secret_name, "remote-verified-secret"),
+        (&other_secret, "unbound-secret"),
+    ] {
+        drive(
+            NodeSecretOperation::new(NodeChange {
+                realm_id: realm.realm_id,
+                node_id: gpu_node.node_id(),
+                actor: realm.user_id,
+                change: SecretChange::Create {
+                    name: name.clone(),
+                    kind: SecretKind::parse("bearer").unwrap(),
+                    description: String::new(),
+                    settings: BTreeMap::new(),
+                    uses: vec![UseRule {
+                        consumer: SecretConsumer::Workflow {
+                            workflow_id: created.workflow_id,
+                        },
+                        delivery: Delivery::Value,
+                        origins: Vec::new(),
+                        paths: Vec::new(),
+                        methods: Vec::new(),
+                        response: ResponseExposure::Status,
+                        groups: vec![group_id],
+                    }],
+                    fields: SecretFields::new(BTreeMap::from([(
+                        "token".to_string(),
+                        Secret::new(val.to_string()),
+                    )])),
+                },
+                now_ms,
+                write_id: Ulid::generate(),
+            }),
+            gpu_node.context.as_ref(),
+        )
+        .await?;
+    }
     let remote_bindings = BTreeMap::from([(
         "REMOTE_TOK".to_string(),
         TaskSecretBinding {
             workflow_id: created.workflow_id,
             scope: WorkflowSecretScope::Node,
-            name: secret_name,
+            name: secret_name.clone(),
             field: None,
         },
     )]);
@@ -776,12 +842,39 @@ async fn plans_multi_node() -> TestResult<()> {
         node_id: gpu_node.node_id(),
     };
     let released = drive(
-        ReleaseVaultSecrets::new(remote_identity, sec_run.run_id, remote_bindings),
+        ReleaseVaultSecrets::new(remote_identity, sec_run.run_id, remote_bindings.clone()),
         gpu_node.context.as_ref(),
     )
     .await
     .map_err(|error| format!("remote secret release failed: {error:?}"))?;
     assert_eq!(released["REMOTE_TOK"].expose(), "remote-verified-secret");
+
+    // Requesting a valid secret with a valid UseRule that is NOT bound to `sec_run` fails permanently.
+    let unbound_bindings = BTreeMap::from([(
+        "OTHER_TOK".to_string(),
+        TaskSecretBinding {
+            workflow_id: created.workflow_id,
+            scope: WorkflowSecretScope::Node,
+            name: other_secret,
+            field: None,
+        },
+    )]);
+    let mismatch = drive(
+        ReleaseVaultSecrets::new(remote_identity, sec_run.run_id, unbound_bindings),
+        gpu_node.context.as_ref(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(mismatch.kind, JobErrorKind::Permanent, "{mismatch:?}");
+
+    // A nonexistent run ID also fails closed permanently even with a valid secret and UseRule.
+    let absent = drive(
+        ReleaseVaultSecrets::new(remote_identity, Ulid::generate(), remote_bindings),
+        gpu_node.context.as_ref(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(absent.kind, JobErrorKind::Permanent, "{absent:?}");
     Ok(())
 }
 
