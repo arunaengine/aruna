@@ -231,27 +231,9 @@ impl PublishRunOperation {
     }
 
     fn bucket_checked(&mut self, result: IoResult) -> PublishTurn {
-        if no_peer_transport(&result) {
-            return Err(unavailable("metadata handle"));
-        }
-        let target = &self.input.target;
-        match peer_answer(result)?.map_err(PublishRunError::Unreachable)? {
-            MetadataTransportMessage::ForwardedBucketChecked { result: Ok(()) } => {}
-            MetadataTransportMessage::ForwardedBucketChecked {
-                result: Err(refusal),
-            } => {
-                return Err(PublishRunError::Refused {
-                    key: target.bucket.clone(),
-                    refusal,
-                });
-            }
-            other => {
-                let kind = aruna_core::metadata::protocol::transport_message_kind(&other);
-                return Err(PublishRunError::Unreachable(kind.to_string()));
-            }
-        }
+        check_bucket(&self.input.target, result)?;
         let frozen = FrozenPublish {
-            target: target.clone(),
+            target: self.input.target.clone(),
             copies: None,
         };
         self.store_frozen(frozen, PublishStep::Freeze)
@@ -276,52 +258,16 @@ impl PublishRunOperation {
             frozen.copies = Some(self.copies.clone());
             return self.store_frozen(frozen, PublishStep::StoreCopies);
         };
-        let auth = self.auth()?;
-        let source = VersionedObjectArn::new(
-            auth.realm_id,
-            output.node_id,
-            output.bucket.clone(),
-            output.key.clone(),
-            output.version_id,
-        )
-        .map_err(unavailable)?;
-        let target = &self.input.target;
-        let pull = SyncPull {
-            source,
-            blake3: output.digest.as_deref().and_then(parse_hash),
-            size: output.size,
-            target_bucket: target.bucket.clone(),
-            target_key: key.clone(),
-            deleted: false,
-        };
-        let token = AuthToken::internal(auth.clone());
-        let forward = ForwardPullOperation::new(target.node_id, token, pull);
+        let call = pull_call(self.auth()?, &self.input.target, output, key)?;
         self.step = PublishStep::Pull;
-        Ok(Next::Call(IoCall::child(forward)))
+        Ok(Next::Call(call))
     }
 
     fn pulled(&mut self, answer: Result<SyncPullAck, SyncRefusal>) -> PublishTurn {
         let (output, key) = self.pending.pop_front().ok_or(IoError::Unfinished)?;
-        match answer {
-            Ok(ack) => {
-                let target = &self.input.target;
-                self.copies.push(OutputObject {
-                    node_id: target.node_id,
-                    bucket: target.bucket.clone(),
-                    key,
-                    version_id: ack.version_id,
-                    ..output
-                });
-                self.next_pull()
-            }
-            Err(SyncRefusal::Unavailable) => Err(PublishRunError::Unreachable(
-                "the realm node did not finish the copy".to_string(),
-            )),
-            Err(refusal) => Err(PublishRunError::Refused {
-                key: output.key,
-                refusal,
-            }),
-        }
+        let copy = copy_pulled(&self.input.target, output, key, answer)?;
+        self.copies.push(copy);
+        self.next_pull()
     }
 
     fn write_crate(&mut self) -> PublishTurn {
@@ -448,9 +394,88 @@ impl Operation for LocalRunOperation {
     }
 }
 
+/// Verifies that the realm node answered a bucket write check positively.
+pub(crate) fn check_bucket(
+    target: &RemoteBinding,
+    result: IoResult,
+) -> Result<(), PublishRunError> {
+    if no_peer_transport(&result) {
+        return Err(unavailable("metadata handle"));
+    }
+    match peer_answer(result)?.map_err(PublishRunError::Unreachable)? {
+        MetadataTransportMessage::ForwardedBucketChecked { result: Ok(()) } => Ok(()),
+        MetadataTransportMessage::ForwardedBucketChecked {
+            result: Err(refusal),
+        } => Err(PublishRunError::Refused {
+            key: target.bucket.clone(),
+            refusal,
+        }),
+        other => {
+            let kind = aruna_core::metadata::protocol::transport_message_kind(&other);
+            Err(PublishRunError::Unreachable(kind.to_string()))
+        }
+    }
+}
+
+/// Builds the realm pull child call for one versioned output object.
+pub(crate) fn pull_call(
+    auth: &AuthContext,
+    target: &RemoteBinding,
+    output: &OutputObject,
+    key: &str,
+) -> Result<IoCall, PublishRunError> {
+    let source = VersionedObjectArn::new(
+        auth.realm_id,
+        output.node_id,
+        output.bucket.clone(),
+        output.key.clone(),
+        output.version_id,
+    )
+    .map_err(unavailable)?;
+    let pull = SyncPull {
+        source,
+        blake3: output.digest.as_deref().and_then(parse_hash),
+        size: output.size,
+        target_bucket: target.bucket.clone(),
+        target_key: key.to_owned(),
+        deleted: false,
+    };
+    let token = AuthToken::internal(auth.clone());
+    Ok(IoCall::child(ForwardPullOperation::new(
+        target.node_id,
+        token,
+        pull,
+    )))
+}
+
+/// Maps one pull acknowledgement into the realm copy record or a refusal error.
+pub(crate) fn copy_pulled(
+    target: &RemoteBinding,
+    output: OutputObject,
+    key: String,
+    answer: Result<SyncPullAck, SyncRefusal>,
+) -> Result<OutputObject, PublishRunError> {
+    match answer {
+        Ok(ack) => Ok(OutputObject {
+            node_id: target.node_id,
+            bucket: target.bucket.clone(),
+            key,
+            version_id: ack.version_id,
+            ..output
+        }),
+        Err(SyncRefusal::Unavailable) => Err(PublishRunError::Unreachable(
+            "the realm node did not finish the copy".to_string(),
+        )),
+        Err(refusal) => Err(PublishRunError::Refused {
+            key: output.key,
+            refusal,
+        }),
+    }
+}
+
 /// The realm key of every output, `<prefix>/<source bucket>/<key>`, so outputs of different
 /// buckets never meet. Two outputs on one key are refused before anything is copied.
-fn target_keys(
+pub(crate) fn target_keys(
     target: &RemoteBinding,
     outputs: &[OutputObject],
 ) -> Result<Vec<String>, PublishRunError> {
