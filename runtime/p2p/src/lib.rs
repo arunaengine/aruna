@@ -924,16 +924,12 @@ impl NetHandle {
                     }
                 }
 
-                if node_id != self.inner.node_id {
-                    send_connectivity_event(
-                        &self.inner.peer_connectivity_tx,
-                        PeerEvent::ConnectionFailure {
-                            node_id,
-                            source: "stream_open".to_string(),
-                            error: err.to_string(),
-                        },
-                    );
-                }
+                report_open_failure(
+                    &self.inner.peer_connectivity_tx,
+                    self.inner.node_id,
+                    node_id,
+                    &err,
+                );
                 Err(err)
             }
         }
@@ -1257,9 +1253,65 @@ async fn run_blocking<T: Send + 'static>(
         .map_err(|error| NetError::Bootstrap(error.to_string()))?
 }
 
+fn report_open_failure(
+    tx: &mpsc::Sender<PeerEvent>,
+    local_node: NodeId,
+    node_id: NodeId,
+    err: &NetError,
+) {
+    if node_id != local_node && err.is_peer_fault() {
+        send_connectivity_event(
+            tx,
+            PeerEvent::ConnectionFailure {
+                node_id,
+                source: "stream_open".to_string(),
+                error: err.to_string(),
+            },
+        );
+    }
+}
+
 pub(crate) fn unique_peer_nodes(mut nodes: Vec<NodeId>, local_id: NodeId) -> Vec<NodeId> {
     nodes.retain(|node| *node != local_id);
     nodes.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
     nodes.dedup();
     nodes
+}
+
+#[cfg(test)]
+mod open_failure_tests {
+    use super::{NetError, PeerEvent, report_open_failure};
+    use tokio::sync::mpsc;
+
+    #[test]
+    fn local_skips_failure() {
+        let local = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let peer = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        let (tx, mut rx) = mpsc::channel(8);
+
+        // Local pool exhaustion on initial open or DHT retry must never penalize the peer.
+        report_open_failure(
+            &tx,
+            local,
+            peer,
+            &NetError::LocalUnavailable("too many pooled connections".to_string()),
+        );
+        assert!(rx.try_recv().is_err());
+
+        // Self-dials are never reported as peer connectivity failures.
+        report_open_failure(&tx, local, local, &NetError::Connection("down".to_string()));
+        assert!(rx.try_recv().is_err());
+
+        // Genuine remote dial failures still notify the connectivity manager.
+        report_open_failure(
+            &tx,
+            local,
+            peer,
+            &NetError::Connection("connection refused".to_string()),
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(PeerEvent::ConnectionFailure { node_id, .. }) if node_id == peer
+        ));
+    }
 }

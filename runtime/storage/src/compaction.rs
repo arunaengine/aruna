@@ -90,9 +90,6 @@ impl CompactorHandle {
         db: OptimisticTxDatabase,
         keyspace: OptimisticTxKeyspace,
     ) {
-        if require_deletes && !self.has_deletes(key_space) {
-            return;
-        }
         let sender = self
             .sender
             .lock()
@@ -101,13 +98,17 @@ impl CompactorHandle {
         let Some(sender) = sender else {
             return;
         };
-        if !self
-            .active
-            .lock()
-            .expect("storage compaction mutex poisoned")
-            .insert(key_space.to_string())
         {
-            return;
+            let mut active = self
+                .active
+                .lock()
+                .expect("storage compaction mutex poisoned");
+            if require_deletes && !self.has_deletes(key_space) {
+                return;
+            }
+            if !active.insert(key_space.to_string()) {
+                return;
+            }
         }
         let job = CompactionJob {
             key_space: key_space.to_string(),
@@ -415,14 +416,17 @@ pub(crate) fn run_job(
         require_deletes,
         run,
     } = job;
-    let had_deletes = deleted
-        .write()
-        .expect("storage compaction deleted lock poisoned")
-        .remove(&key_space);
-    active
-        .lock()
-        .expect("storage compaction mutex poisoned")
-        .remove(&key_space);
+    let had_deletes = {
+        // Hold `active` across clearing `deleted` and `active` so a concurrent delete-threshold
+        // writer either contributes its `deleted` marker to this run or queues a successor.
+        let mut active_guard = active.lock().expect("storage compaction mutex poisoned");
+        let had_deletes = deleted
+            .write()
+            .expect("storage compaction deleted lock poisoned")
+            .remove(&key_space);
+        active_guard.remove(&key_space);
+        had_deletes
+    };
     if require_deletes && !had_deletes {
         return false;
     }
@@ -728,5 +732,56 @@ mod tests {
         assert_eq!(due.len(), 1);
         assert!(!due[0].require_deletes);
         assert_eq!(due[0].deletes, 5_001);
+    }
+
+    // A stale scan clearing `deleted` and `active` under one lock cannot drop a concurrent
+    // delete-threshold submission: either the scan runs or the threshold submission queues.
+    #[test]
+    fn scan_keeps_threshold() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::{Arc, Barrier};
+
+        for _ in 0..64 {
+            let compactor = Compactor::idle();
+            compactor
+                .active
+                .lock()
+                .expect("compaction mutex")
+                .insert("queue".to_string());
+            let barrier = Arc::new(Barrier::new(2));
+            let ran = Arc::new(AtomicUsize::new(0));
+
+            let active = compactor.active.clone();
+            let deleted = compactor.deleted.clone();
+            let scan_barrier = barrier.clone();
+            let scan_ran = ran.clone();
+            let scan_thread = std::thread::spawn(move || {
+                let job = CompactionJob {
+                    key_space: "queue".to_string(),
+                    deletes: 1,
+                    require_deletes: true,
+                    run: Box::new(move || {
+                        scan_ran.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }),
+                };
+                scan_barrier.wait();
+                super::run_job(job, &active, &deleted)
+            });
+
+            barrier.wait();
+            compactor.note_deleted("queue");
+            let queued = compactor
+                .active
+                .lock()
+                .expect("compaction mutex")
+                .insert("queue".to_string());
+            let compacted = scan_thread.join().expect("scan thread joins");
+            assert!(
+                compacted || queued,
+                "concurrent delete-threshold submission must either compact or queue"
+            );
+            assert_eq!(ran.load(Ordering::SeqCst), usize::from(compacted));
+        }
     }
 }
