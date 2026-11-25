@@ -336,12 +336,13 @@ async fn chunks_large_replicas() {
     remote.lineage = remote.run_id;
     remote.workflow_id = wf_id;
     remote.version = 1;
+    remote.values_json = serde_json::json!({"big": "r".repeat(2600)}).to_string();
 
     let wf = WorkflowRecord {
         workflow_id: wf_id,
         group_id: remote.group_id,
         name: "chunked".into(),
-        description: None,
+        description: Some("w".repeat(2300)),
         language: StoredWorkflowLanguage::Uwe,
         visibility: aruna_core::structs::execution::workflow::WorkflowVisibility::Group,
         version_count: 1,
@@ -358,7 +359,7 @@ async fn chunks_large_replicas() {
         files: vec!["workflow.uwe.yaml".into()],
         digest: "blake3:chunk".into(),
         commit: None,
-        message: None,
+        message: Some("v".repeat(2300)),
         uwe_yaml: Some("steps:\n  a:\n    tool: bigtool\n".into()),
         images: Default::default(),
         inspection: Default::default(),
@@ -486,6 +487,17 @@ async fn chunks_large_replicas() {
     .await
     .unwrap();
     assert_eq!(stored.record.run_id, remote.run_id);
+    assert_eq!(stored.record.values_json, remote.values_json);
+    let stored_ver = drive(
+        crate::workflows::versions::GetVersionOperation::new(&runs.fixture.alice, wf_id, 1)
+            .with_files(),
+        context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(stored_ver.workflow.description, wf.description);
+    assert_eq!(stored_ver.version.message, ver.message);
+    assert_eq!(stored_ver.files, Some(source_files));
     assert_eq!(
         drive(LoadLogOperation::new(remote.run_id), context)
             .await
@@ -526,6 +538,24 @@ async fn chunks_large_replicas() {
             .unwrap()
             .is_none(),
         "delayed intermediate timestamp must not overwrite newer reimport"
+    );
+    let mut tool_tie_a = tool_reimport.clone();
+    tool_tie_a.definition = serde_json::json!({"id": "bigtool", "rev": "a"}).to_string();
+    let mut tool_tie_b = tool_reimport.clone();
+    tool_tie_b.definition = serde_json::json!({"id": "bigtool", "rev": "z"}).to_string();
+    let tie_a = tool_tie_a.to_bytes().unwrap();
+    let tie_b = tool_tie_b.to_bytes().unwrap();
+    assert!(
+        tool_update(Some(&tie_a), &tie_b, remote.group_id)
+            .unwrap()
+            .is_some(),
+        "equal timestamp converges to the lexicographically larger record"
+    );
+    assert!(
+        tool_update(Some(&tie_b), &tie_a, remote.group_id)
+            .unwrap()
+            .is_none(),
+        "equal timestamp does not oscillate back to the smaller record"
     );
 
     // Composed tool selection uses parsed graph references and exact/latest version rules.

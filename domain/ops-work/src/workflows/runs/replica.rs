@@ -101,6 +101,48 @@ fn chunk_target(kind: &ChunkKind) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
+fn stub_run(run: &WorkflowRunRecord) -> WorkflowRunRecord {
+    WorkflowRunRecord {
+        run_id: run.run_id,
+        realm_id: run.realm_id,
+        group_id: run.group_id,
+        workflow_id: run.workflow_id,
+        workflow_name: String::new(),
+        version: run.version,
+        lineage: run.lineage,
+        state: run.state,
+        node_id: run.node_id,
+        created_by: run.created_by,
+        created_at_ms: run.created_at_ms,
+        started_at_ms: run.started_at_ms,
+        finished_at_ms: run.finished_at_ms,
+        error: None,
+        values_json: String::new(),
+        inputs_json: None,
+        output: None,
+        outputs: Vec::new(),
+        provenance_crate: run.provenance_crate,
+        provenance_document_id: run.provenance_document_id,
+        provenance_status: None,
+        last_event_seq: run.last_event_seq,
+        local_only: run.local_only,
+        origin: None,
+        parent_job_id: run.parent_job_id,
+        claim_token_digest: None,
+        attempts: run.attempts,
+        steps: Vec::new(),
+        resumes_run_id: run.resumes_run_id,
+        repeats_run_id: run.repeats_run_id,
+        cache_scope: run.cache_scope,
+        placement_site: None,
+        protected: run.protected,
+        secrets: Default::default(),
+        path_restrictions: None,
+        captured_remote: Vec::new(),
+        used_tools: Vec::new(),
+    }
+}
+
 fn chunk_blob(
     data: &[u8],
     kind: ChunkKind,
@@ -125,6 +167,32 @@ fn chunk_blob(
             data: slice.to_vec(),
         })
         .collect())
+}
+
+fn push_chunks(
+    frames: &mut Vec<Vec<u8>>,
+    envelope: &WorkflowRunRecord,
+    start_page: u32,
+    kind: ChunkKind,
+    data: &[u8],
+    (chunk_size, limit, stub): (usize, usize, bool),
+) -> Result<(), CatalogError> {
+    for chunk in chunk_blob(data, kind, chunk_size)? {
+        let part = ReplicatedWorkflow {
+            chunks: vec![chunk],
+            more: true,
+            stub_run: stub,
+            ..ReplicatedWorkflow::default()
+        };
+        frames.push(pack_frame(
+            envelope,
+            start_page,
+            Vec::new(),
+            Some(part),
+            limit,
+        )?);
+    }
+    Ok(())
 }
 
 fn measure_frame(
@@ -317,37 +385,55 @@ impl ReplicateLogOperation {
     ) -> Result<Vec<Vec<u8>>, CatalogError> {
         let mut frames = Vec::new();
         let mut final_meta = None;
-        let empty_part = ReplicatedWorkflow {
+        let probe_more = ReplicatedWorkflow {
             more: true,
             ..ReplicatedWorkflow::default()
         };
-        let overhead = measure_frame(run, start_page, &[], Some(&empty_part))?;
+        let use_stub = measure_frame(run, start_page, &[], Some(&probe_more))? > limit / 2;
+        let stub = stub_run(run);
+        let envelope = if use_stub { &stub } else { run };
+        let empty_part = ReplicatedWorkflow {
+            more: true,
+            stub_run: use_stub,
+            ..ReplicatedWorkflow::default()
+        };
+        let overhead = measure_frame(envelope, start_page, &[], Some(&empty_part))?;
         let chunk_size = limit.saturating_sub(overhead + 256).min(limit / 2).max(1);
+        let bounds = (chunk_size, limit, use_stub);
         if let Some(bundle) = workflow {
             let mut small: Vec<Vec<u8>> = Vec::new();
             for tool_bytes in bundle.tools {
                 let solo = ReplicatedWorkflow {
                     tools: vec![tool_bytes.clone()],
                     more: true,
+                    stub_run: use_stub,
                     ..ReplicatedWorkflow::default()
                 };
-                if measure_frame(run, start_page, &[], Some(&solo))? <= limit {
+                if measure_frame(envelope, start_page, &[], Some(&solo))? <= limit {
                     let mut candidate = small.clone();
                     candidate.push(tool_bytes.clone());
                     let test = ReplicatedWorkflow {
                         tools: candidate,
                         more: true,
+                        stub_run: use_stub,
                         ..ReplicatedWorkflow::default()
                     };
                     if !small.is_empty()
-                        && measure_frame(run, start_page, &[], Some(&test))? > limit
+                        && measure_frame(envelope, start_page, &[], Some(&test))? > limit
                     {
                         let flush = ReplicatedWorkflow {
                             tools: std::mem::take(&mut small),
                             more: true,
+                            stub_run: use_stub,
                             ..ReplicatedWorkflow::default()
                         };
-                        frames.push(pack_frame(run, start_page, Vec::new(), Some(flush), limit)?);
+                        frames.push(pack_frame(
+                            envelope,
+                            start_page,
+                            Vec::new(),
+                            Some(flush),
+                            limit,
+                        )?);
                     }
                     small.push(tool_bytes);
                 } else {
@@ -355,107 +441,250 @@ impl ReplicateLogOperation {
                         let flush = ReplicatedWorkflow {
                             tools: std::mem::take(&mut small),
                             more: true,
+                            stub_run: use_stub,
                             ..ReplicatedWorkflow::default()
                         };
-                        frames.push(pack_frame(run, start_page, Vec::new(), Some(flush), limit)?);
+                        frames.push(pack_frame(
+                            envelope,
+                            start_page,
+                            Vec::new(),
+                            Some(flush),
+                            limit,
+                        )?);
                     }
                     let tool = ToolRecord::from_bytes(&tool_bytes)?;
                     let kind = ChunkKind::Tool(tool.tool_id, tool.version);
-                    for chunk in chunk_blob(&tool_bytes, kind, chunk_size)? {
-                        let part = ReplicatedWorkflow {
-                            chunks: vec![chunk],
-                            more: true,
-                            ..ReplicatedWorkflow::default()
-                        };
-                        frames.push(pack_frame(run, start_page, Vec::new(), Some(part), limit)?);
-                    }
+                    push_chunks(&mut frames, envelope, start_page, kind, &tool_bytes, bounds)?;
                 }
             }
-            let (source, final_chunks) = match bundle.source {
-                Some(bytes) => {
-                    let inline_probe = ReplicatedWorkflow {
-                        workflow: bundle.workflow.clone(),
-                        version: bundle.version.clone(),
-                        source: Some(bytes.clone()),
-                        ..ReplicatedWorkflow::default()
-                    };
-                    if bytes.len() > chunk_size
-                        || measure_frame(run, start_page, &[], Some(&inline_probe))? > limit
-                    {
-                        let mut parts = chunk_blob(&bytes, ChunkKind::Source, chunk_size)?;
-                        let last = parts.pop();
-                        for chunk in parts {
-                            let part = ReplicatedWorkflow {
-                                chunks: vec![chunk],
-                                more: true,
-                                ..ReplicatedWorkflow::default()
-                            };
-                            frames.push(pack_frame(
-                                run,
-                                start_page,
-                                Vec::new(),
-                                Some(part),
-                                limit,
-                            )?);
-                        }
-                        (None, last.into_iter().collect())
-                    } else {
-                        (Some(bytes), Vec::new())
-                    }
+            let mut commit_wf = if bundle.workflow.len() > chunk_size {
+                push_chunks(
+                    &mut frames,
+                    envelope,
+                    start_page,
+                    ChunkKind::Workflow,
+                    &bundle.workflow,
+                    bounds,
+                )?;
+                Vec::new()
+            } else {
+                bundle.workflow
+            };
+            let mut commit_ver = if bundle.version.len() > chunk_size {
+                push_chunks(
+                    &mut frames,
+                    envelope,
+                    start_page,
+                    ChunkKind::Version,
+                    &bundle.version,
+                    bounds,
+                )?;
+                Vec::new()
+            } else {
+                bundle.version
+            };
+            let mut commit_src = match bundle.source {
+                Some(bytes) if bytes.len() > chunk_size => {
+                    push_chunks(
+                        &mut frames,
+                        envelope,
+                        start_page,
+                        ChunkKind::Source,
+                        &bytes,
+                        bounds,
+                    )?;
+                    None
                 }
-                None => (None, Vec::new()),
+                other => other,
             };
             let mut commit = ReplicatedWorkflow {
-                workflow: bundle.workflow,
-                version: bundle.version,
-                source,
+                workflow: std::mem::take(&mut commit_wf),
+                version: std::mem::take(&mut commit_ver),
+                source: commit_src.take(),
                 tools: Vec::new(),
-                chunks: final_chunks,
+                chunks: Vec::new(),
                 more: false,
-                stub_run: false,
+                stub_run: use_stub,
             };
-            if !commit.chunks.is_empty()
-                && measure_frame(run, start_page, &[], Some(&commit))? > limit
+            if measure_frame(envelope, start_page, &[], Some(&commit))? > limit
+                && let Some(bytes) = commit.source.take()
             {
-                let part = ReplicatedWorkflow {
-                    chunks: std::mem::take(&mut commit.chunks),
-                    more: true,
-                    ..ReplicatedWorkflow::default()
-                };
-                frames.push(pack_frame(run, start_page, Vec::new(), Some(part), limit)?);
+                push_chunks(
+                    &mut frames,
+                    envelope,
+                    start_page,
+                    ChunkKind::Source,
+                    &bytes,
+                    bounds,
+                )?;
+            }
+            if measure_frame(envelope, start_page, &[], Some(&commit))? > limit
+                && !commit.version.is_empty()
+            {
+                let bytes = std::mem::take(&mut commit.version);
+                push_chunks(
+                    &mut frames,
+                    envelope,
+                    start_page,
+                    ChunkKind::Version,
+                    &bytes,
+                    bounds,
+                )?;
+            }
+            if measure_frame(envelope, start_page, &[], Some(&commit))? > limit
+                && !commit.workflow.is_empty()
+            {
+                let bytes = std::mem::take(&mut commit.workflow);
+                push_chunks(
+                    &mut frames,
+                    envelope,
+                    start_page,
+                    ChunkKind::Workflow,
+                    &bytes,
+                    bounds,
+                )?;
             }
             if !small.is_empty() {
                 let mut probe = commit.clone();
                 probe.tools = small.clone();
-                if measure_frame(run, start_page, &[], Some(&probe))? <= limit {
+                if measure_frame(envelope, start_page, &[], Some(&probe))? <= limit {
                     commit.tools = small;
                 } else {
                     let flush = ReplicatedWorkflow {
                         tools: small,
                         more: true,
+                        stub_run: use_stub,
                         ..ReplicatedWorkflow::default()
                     };
-                    frames.push(pack_frame(run, start_page, Vec::new(), Some(flush), limit)?);
+                    frames.push(pack_frame(
+                        envelope,
+                        start_page,
+                        Vec::new(),
+                        Some(flush),
+                        limit,
+                    )?);
                 }
             }
             final_meta = Some(commit);
+        }
+        if use_stub {
+            let run_bytes = run.to_bytes()?;
+            let mut run_parts = chunk_blob(&run_bytes, ChunkKind::Run, chunk_size)?;
+            let last_run = run_parts.pop();
+            for chunk in run_parts {
+                let part = ReplicatedWorkflow {
+                    chunks: vec![chunk],
+                    more: true,
+                    stub_run: true,
+                    ..ReplicatedWorkflow::default()
+                };
+                frames.push(pack_frame(
+                    envelope,
+                    start_page,
+                    Vec::new(),
+                    Some(part),
+                    limit,
+                )?);
+            }
+            if let Some(last) = last_run {
+                let mut commit = final_meta.take().unwrap_or_else(|| ReplicatedWorkflow {
+                    more: false,
+                    stub_run: true,
+                    ..ReplicatedWorkflow::default()
+                });
+                commit.chunks.push(last);
+                if measure_frame(envelope, start_page, &[], Some(&commit))? > limit {
+                    if !commit.tools.is_empty() {
+                        let flush = ReplicatedWorkflow {
+                            tools: std::mem::take(&mut commit.tools),
+                            more: true,
+                            stub_run: true,
+                            ..ReplicatedWorkflow::default()
+                        };
+                        frames.push(pack_frame(
+                            envelope,
+                            start_page,
+                            Vec::new(),
+                            Some(flush),
+                            limit,
+                        )?);
+                    }
+                    if measure_frame(envelope, start_page, &[], Some(&commit))? > limit
+                        && let Some(bytes) = commit.source.take()
+                    {
+                        push_chunks(
+                            &mut frames,
+                            envelope,
+                            start_page,
+                            ChunkKind::Source,
+                            &bytes,
+                            bounds,
+                        )?;
+                    }
+                    if measure_frame(envelope, start_page, &[], Some(&commit))? > limit
+                        && !commit.version.is_empty()
+                    {
+                        let bytes = std::mem::take(&mut commit.version);
+                        push_chunks(
+                            &mut frames,
+                            envelope,
+                            start_page,
+                            ChunkKind::Version,
+                            &bytes,
+                            bounds,
+                        )?;
+                    }
+                    if measure_frame(envelope, start_page, &[], Some(&commit))? > limit
+                        && !commit.workflow.is_empty()
+                    {
+                        let bytes = std::mem::take(&mut commit.workflow);
+                        push_chunks(
+                            &mut frames,
+                            envelope,
+                            start_page,
+                            ChunkKind::Workflow,
+                            &bytes,
+                            bounds,
+                        )?;
+                    }
+                }
+                final_meta = Some(commit);
+            }
         }
         let encoded: Vec<Vec<u8>> = pages
             .iter()
             .skip(start_page as usize)
             .map(encode_page)
             .collect::<Result<_, _>>()?;
+        let page_meta = |meta: &Option<ReplicatedWorkflow>| {
+            meta.clone().or_else(|| {
+                use_stub.then(|| ReplicatedWorkflow {
+                    more: false,
+                    stub_run: true,
+                    ..ReplicatedWorkflow::default()
+                })
+            })
+        };
         let mut first = start_page;
         let mut batch: Vec<Vec<u8>> = Vec::new();
         for (offset, page) in encoded.into_iter().enumerate() {
             let number = start_page + offset as u32;
-            if measure_frame(run, number, std::slice::from_ref(&page), None)? > limit {
+            let solo_meta = page_meta(&None);
+            if measure_frame(
+                envelope,
+                number,
+                std::slice::from_ref(&page),
+                solo_meta.as_ref(),
+            )? > limit
+            {
                 if !batch.is_empty() || final_meta.is_some() {
+                    let meta = page_meta(&final_meta);
+                    final_meta = None;
                     frames.push(pack_frame(
-                        run,
+                        envelope,
                         first,
                         std::mem::take(&mut batch),
-                        final_meta.take(),
+                        meta,
                         limit,
                     )?);
                 }
@@ -465,31 +694,36 @@ impl ReplicateLogOperation {
                     let part = ReplicatedWorkflow {
                         chunks: vec![chunk],
                         more: true,
+                        stub_run: use_stub,
                         ..ReplicatedWorkflow::default()
                     };
-                    frames.push(pack_frame(run, number, Vec::new(), Some(part), limit)?);
+                    frames.push(pack_frame(envelope, number, Vec::new(), Some(part), limit)?);
                 }
                 if let Some(chunk) = last {
                     let done = ReplicatedWorkflow {
                         chunks: vec![chunk],
                         more: false,
+                        stub_run: use_stub,
                         ..ReplicatedWorkflow::default()
                     };
-                    frames.push(pack_frame(run, number, Vec::new(), Some(done), limit)?);
+                    frames.push(pack_frame(envelope, number, Vec::new(), Some(done), limit)?);
                 }
                 first = number + 1;
                 continue;
             }
             batch.push(page);
-            if measure_frame(run, first, &batch, final_meta.as_ref())? > limit {
+            let cur_meta = page_meta(&final_meta);
+            if measure_frame(envelope, first, &batch, cur_meta.as_ref())? > limit {
                 let overflow = batch.pop();
                 if !batch.is_empty() || final_meta.is_some() {
                     let count = batch.len() as u32;
+                    let meta = page_meta(&final_meta);
+                    final_meta = None;
                     frames.push(pack_frame(
-                        run,
+                        envelope,
                         first,
                         std::mem::take(&mut batch),
-                        final_meta.take(),
+                        meta,
                         limit,
                     )?);
                     first += count;
@@ -500,7 +734,8 @@ impl ReplicateLogOperation {
             }
         }
         if !batch.is_empty() || final_meta.is_some() || frames.is_empty() {
-            frames.push(pack_frame(run, first, batch, final_meta, limit)?);
+            let meta = page_meta(&final_meta);
+            frames.push(pack_frame(envelope, first, batch, meta, limit)?);
         }
         Ok(frames)
     }
