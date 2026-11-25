@@ -409,6 +409,7 @@ async fn chunks_large_replicas() {
         tools: vec![tool_v2.to_bytes().unwrap()],
         chunks: Vec::new(),
         more: false,
+        stub_run: false,
     };
     let send = ReplicateLogOperation::new(remote.run_id, (gone, remote.realm_id), 0);
     let mut log = pages(3);

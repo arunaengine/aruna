@@ -42,14 +42,21 @@ pub struct WorkflowRunAuth {
     pub bindings_match: bool,
 }
 
-/// One bounded piece of a large replicated workflow source, tool record, or log page.
+/// Which replicated payload a bounded chunk belongs to.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChunkKind {
+    Source,
+    Tool(String, String),
+    Page(u32),
+    Run,
+    Workflow,
+    Version,
+}
+
+/// One bounded piece of a large replicated workflow catalog, run, tool, or log page record.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplicatedChunk {
-    /// `None` for the workflow version's source blob or a log page, or `Some((tool_id, version))`.
-    pub tool: Option<(String, String)>,
-    /// Log page number when chunking a large log page (`tool` is `None`).
-    #[serde(default)]
-    pub page: Option<u32>,
+    pub kind: ChunkKind,
     pub index: u32,
     pub total: u32,
     pub data: Vec<u8>,
@@ -64,12 +71,15 @@ pub struct ReplicatedWorkflow {
     /// Group tool definitions required to lower a composed `.uwe.yaml` workflow after failover.
     #[serde(default)]
     pub tools: Vec<Vec<u8>>,
-    /// Bounded chunks of a large source or tool record; assembled when `index + 1 == total`.
+    /// Bounded chunks of a large payload; assembled when `index + 1 == total`.
     #[serde(default)]
     pub chunks: Vec<ReplicatedChunk>,
     /// True while earlier metadata frames are still arriving; the run commits on the final frame.
     #[serde(default)]
     pub more: bool,
+    /// True when the outer `StoreRunLog.run` is an identity stub and the full run is chunked.
+    #[serde(default)]
+    pub stub_run: bool,
 }
 
 /// Which secret store a workflow secret binding reads from.
