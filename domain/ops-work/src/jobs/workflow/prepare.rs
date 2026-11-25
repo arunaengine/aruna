@@ -18,7 +18,10 @@ use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::operation::Operation;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::structs::execution::job::family::JobFamilyId;
-use aruna_core::structs::execution::job::input::{ExecutionSpec, PLUGIN_REPORT_TAG, tagged};
+use aruna_core::structs::execution::job::input::{
+    ExecutionSpec, PLUGIN_REPORT_TAG, WORKFLOW_RUN_TAG, WORKFLOW_SECRETS_TAG,
+    parse_workflow_secrets, tagged,
+};
 use aruna_core::structs::execution::job::local::{JobError, JobRecord, WorkspaceMode};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 
@@ -29,6 +32,7 @@ use super::credential::{
 };
 use super::input_view::{CachedKeysOperation, ViewEntry, ViewError, view_bucket, view_entries};
 use super::inputs::LoadInputsOperation;
+use super::vault_secrets::ReleaseVaultSecrets;
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::alias::AliasFamilyOperation;
 use crate::jobs::lifecycle::held::HeldReservations;
@@ -47,6 +51,7 @@ pub struct PreparedTask {
     pub inputs: Vec<TaskInput>,
     pub mounts: Vec<S3Mount>,
     pub secrets: BTreeMap<String, Secret>,
+    pub vault_env: BTreeMap<String, Secret>,
     pub staging: StagingMode,
     /// Set for a session or a batch run inside its bucket: the bucket and endpoint its
     /// credential reaches.
@@ -81,6 +86,7 @@ enum PrepareStep {
     Cached,
     InputCredential,
     SessionCredential { view: bool },
+    VaultSecrets,
 }
 
 type PrepareNext = Result<Next<PreparedTask>, JobError>;
@@ -228,6 +234,7 @@ impl PrepareAttemptOperation {
             inputs,
             mounts: Vec::new(),
             secrets: BTreeMap::new(),
+            vault_env: BTreeMap::new(),
             staging: match empty {
                 true => StagingMode::Files,
                 false => StagingMode::S3Mount,
@@ -326,6 +333,24 @@ impl PrepareAttemptOperation {
     }
 
     fn finish(&mut self) -> PrepareNext {
+        if self.spec.tags.contains_key(WORKFLOW_SECRETS_TAG)
+            && self
+                .prepared
+                .as_ref()
+                .is_some_and(|prepared| prepared.vault_env.is_empty())
+        {
+            let bindings = parse_workflow_secrets(&self.spec.tags)
+                .map_err(|_| JobError::permanent("workflow secret bindings are malformed"))?;
+            if !bindings.is_empty() {
+                let run_id = self
+                    .spec
+                    .tags
+                    .get(WORKFLOW_RUN_TAG)
+                    .and_then(|id| ulid::Ulid::from_string(id).ok());
+                let release = ReleaseVaultSecrets::new(self.run, run_id, bindings);
+                return self.call(PrepareStep::VaultSecrets, IoCall::child(release));
+            }
+        }
         self.prepared
             .take()
             .map(Next::Done)
@@ -426,6 +451,14 @@ impl Operation for PrepareAttemptOperation {
                 let credential = result.child::<WorkspaceCredential, JobError>()??;
                 self.session_minted(credential, view)
             }
+            PrepareStep::VaultSecrets => {
+                let released = result.child::<BTreeMap<String, Secret>, JobError>()??;
+                let mut prepared = self.prepared.take().ok_or_else(|| {
+                    JobError::retryable("the attempt preparation lost its inputs")
+                })?;
+                prepared.vault_env = released;
+                Ok(Next::Done(prepared))
+            }
         }
     }
 }
@@ -441,6 +474,7 @@ pub fn build_task_spec(
         inputs,
         mounts,
         secrets,
+        vault_env,
         staging,
         workspace,
     } = prepared;
@@ -472,7 +506,7 @@ pub fn build_task_spec(
         workdir: spec.workdir.clone(),
         env,
         secret_env: secrets,
-        vault_env: BTreeMap::new(),
+        vault_env,
         resources,
         workspace,
         security: SecurityContext {

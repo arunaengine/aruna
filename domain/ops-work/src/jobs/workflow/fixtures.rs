@@ -109,6 +109,7 @@ pub(super) fn prepared() -> PreparedTask {
         inputs: Vec::new(),
         mounts: Vec::new(),
         secrets: BTreeMap::new(),
+        vault_env: BTreeMap::new(),
         staging: StagingMode::Files,
         workspace: None,
     }
