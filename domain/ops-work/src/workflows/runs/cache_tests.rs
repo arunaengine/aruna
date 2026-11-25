@@ -360,7 +360,16 @@ async fn follows_lineage() {
 
     assert!(matches!(runs.prepare(&resumed).await, Prepared::Ready(_)));
     assert!(matches!(runs.prepare(&repeated).await, Prepared::Ready(_)));
-    let starts: Vec<_> = (runs.host.sent().into_iter())
+    let sent = runs.host.sent();
+    let replayed: Vec<_> = sent
+        .iter()
+        .filter_map(|message| match message {
+            HostToCoordinator::RunReplayPages { pages } => Some(pages.len()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(replayed, vec![1]);
+    let starts: Vec<_> = (sent.into_iter())
         .filter_map(|message| match message {
             HostToCoordinator::RunStart(start) => Some(start),
             _ => None,
@@ -368,7 +377,7 @@ async fn follows_lineage() {
         .collect();
     assert_eq!(starts.len(), 2);
     assert_eq!(starts[0].resume_lineage, Some(first.run_id.to_string()));
-    assert_eq!(starts[0].prior_log_pages.len(), 1);
+    assert!(starts[0].prior_log_pages.is_empty());
     assert_eq!(
         starts[0].cache_namespace,
         Some(format!("group:{}", first.group_id))

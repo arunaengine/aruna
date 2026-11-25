@@ -14,6 +14,7 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::input::{CapturedInput, ExecutionSpec};
 use aruna_core::structs::execution::job::local::WorkspaceMode;
 use aruna_core::structs::execution::job::pages::PageManifest;
+use aruna_core::structs::identity::auth::PathRestriction;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::LabelMatch;
 use aruna_core::user::id::UserId;
@@ -52,6 +53,7 @@ impl IngressNode {
             created_by,
             realm_id: self.realm_id,
             local: self.local,
+            path_restrictions: None,
         }
     }
 
@@ -72,6 +74,7 @@ impl IngressNode {
             token,
             allowed_remote: None,
             precaptured: Vec::new(),
+            disallow_encrypted: false,
         }
     }
 
@@ -125,6 +128,8 @@ pub struct SubmitExternalOperation {
     node: Option<IngressNode>,
     labels: Vec<LabelMatch>,
     precaptured: Vec<CapturedInput>,
+    path_restrictions: Option<Vec<PathRestriction>>,
+    disallow_encrypted: bool,
     ids: IdMint,
     step: SubmitStep,
 }
@@ -143,6 +148,8 @@ impl SubmitExternalOperation {
             node,
             labels: Vec::new(),
             precaptured: Vec::new(),
+            path_restrictions: None,
+            disallow_encrypted: false,
             ids: IdMint::default(),
             step: SubmitStep::Config,
         }
@@ -151,6 +158,18 @@ impl SubmitExternalOperation {
     /// Reuses remote inputs already captured and granted during workflow admission.
     pub fn with_precaptured(mut self, precaptured: Vec<CapturedInput>) -> Self {
         self.precaptured = precaptured;
+        self
+    }
+
+    /// Constrains local input walk, link following, and grants to the caller's path restrictions.
+    pub fn with_path_restrictions(mut self, restrictions: Option<Vec<PathRestriction>>) -> Self {
+        self.path_restrictions = restrictions;
+        self
+    }
+
+    /// Refuses locally resolved inputs whose final bucket is encrypted (unprotected workflow runs).
+    pub fn disallow_encrypted(mut self, disallow: bool) -> Self {
+        self.disallow_encrypted = disallow;
         self
     }
 
@@ -241,7 +260,9 @@ impl SubmitExternalOperation {
                 submission.auth_token.clone(),
             )
             .with_config(&config)
-            .with_precaptured(std::mem::take(&mut self.precaptured));
+            .with_precaptured(std::mem::take(&mut self.precaptured))
+            .with_path_restrictions(self.path_restrictions.clone())
+            .disallow_encrypted(self.disallow_encrypted);
         let resolve = ResolveInputsOperation::new(&submission.spec, scope);
         self.step = SubmitStep::Resolve(Box::new(config));
         Ok(Next::Call(IoCall::child(resolve)))

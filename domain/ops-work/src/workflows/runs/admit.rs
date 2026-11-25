@@ -124,12 +124,15 @@ impl RunRequest {
     }
 }
 
-/// Extracts `aruna://bucket/key[?...]` addresses from workflow values so local encryption and
-/// access checks cover file-valued parameters too.
+/// Extracts `aruna://` and `s3://` addresses from workflow values so local encryption and access
+/// checks cover file-valued parameters under every scheme the coordinator serves.
 fn value_refs(value: &Value, out: &mut Vec<(String, String, Option<NodeId>)>) {
     match value {
         Value::String(text) => {
-            if let Some(rest) = text.strip_prefix("aruna://") {
+            let rest = text
+                .strip_prefix("aruna://")
+                .or_else(|| text.strip_prefix("s3://"));
+            if let Some(rest) = rest {
                 let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
                 let node = query
                     .split('&')

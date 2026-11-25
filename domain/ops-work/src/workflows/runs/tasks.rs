@@ -308,20 +308,30 @@ pub fn task_spec(
                         key: format!("{folder}control"),
                     },
                 )],
-                false => ["exit", "start", "end", "manifest"]
-                    .into_iter()
-                    .map(|name| OutputSelection {
-                        container_path: format!("{control}/{name}"),
-                        path_prefix: None,
-                        destination_node_id: None,
-                        destination: OutputDestination::S3 {
-                            bucket: bucket.clone(),
-                            key: format!("{folder}control/{name}"),
+                false => {
+                    let mut files: Vec<OutputSelection> = ["exit", "start", "end", "manifest"]
+                        .into_iter()
+                        .map(|name| OutputSelection {
+                            container_path: format!("{control}/{name}"),
+                            path_prefix: None,
+                            destination_node_id: None,
+                            destination: OutputDestination::S3 {
+                                bucket: bucket.clone(),
+                                key: format!("{folder}control/{name}"),
+                            },
+                            name: None,
+                            description: None,
+                        })
+                        .collect();
+                    files.push(folder_output(
+                        &format!("{control}/root"),
+                        OutputDestination::S3 {
+                            bucket,
+                            key: format!("{folder}control/root"),
                         },
-                        name: None,
-                        description: None,
-                    })
-                    .collect(),
+                    ));
+                    files
+                }
             };
             outputs.push(folder_output(&folders.work, work));
             outputs
@@ -862,7 +872,9 @@ impl RunTaskOperation {
         let mut node = self.node.clone();
         node.now_ms = self.now_ms.max(node.now_ms);
         let submit = SubmitExternalOperation::new(submission, Some(node))
-            .with_precaptured(self.run.captured_remote.clone());
+            .with_precaptured(self.run.captured_remote.clone())
+            .with_path_restrictions(self.run.path_restrictions.clone())
+            .disallow_encrypted(!self.run.protected);
         self.step = TaskStep::Submit;
         Ok(Next::Call(IoCall::child(submit)))
     }
@@ -1378,6 +1390,14 @@ enum StopStep {
     LocalCancel(String, Vec<WorkflowTaskRecord>),
 }
 
+/// Outcome of stopping child tasks: the coordinator RPC answer plus any local in-process job IDs
+/// the caller must signal via `JobsRuntime::request_cancel`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoppedTasks {
+    pub result: HostRpcResult,
+    pub running: Vec<JobId>,
+}
+
 /// Cancels child jobs of a run that have not ended: one named attempt for `CancelTask`, or all
 /// of them for `StopOrphans`. Local device runs cancel owned jobs; realm runs cancel families.
 #[derive(Debug, PartialEq)]
@@ -1386,10 +1406,13 @@ pub struct StopTasksOperation {
     serving: (NodeId, aruna_core::structs::identity::realm::RealmId),
     name: Option<String>,
     stopped: Vec<String>,
+    running: Vec<JobId>,
     failed: bool,
     now_ms: u64,
     step: StopStep,
 }
+
+type StopNext = Result<Next<StoppedTasks>, CatalogError>;
 
 impl StopTasksOperation {
     /// Stops the attempt `name`, or every running child when `name` is `None`.
@@ -1403,22 +1426,25 @@ impl StopTasksOperation {
             serving,
             name,
             stopped: Vec::new(),
+            running: Vec::new(),
             failed: false,
             now_ms: 0,
             step: StopStep::Tasks,
         }
     }
 
-    fn cancel_next(&mut self, mut tasks: Vec<WorkflowTaskRecord>) -> TaskNext {
+    fn cancel_next(&mut self, mut tasks: Vec<WorkflowTaskRecord>) -> StopNext {
         let Some(task) = tasks.pop() else {
             let stopped = std::mem::take(&mut self.stopped);
-            return Ok(Next::Done(match self.name.take() {
+            let running = std::mem::take(&mut self.running);
+            let result = match self.name.take() {
                 Some(_) if self.failed => HostRpcResult::Failed(ContractError::internal(
                     "the child task could not be cancelled",
                 )),
                 Some(name) => HostRpcResult::TaskCancelled { name },
                 None => HostRpcResult::StopOrphans { stopped },
-            }));
+            };
+            return Ok(Next::Done(StoppedTasks { result, running }));
         };
         let Some(job_id) = task.child_job_id else {
             return self.cancel_next(tasks);
@@ -1441,20 +1467,20 @@ impl StopTasksOperation {
 }
 
 impl Operation for StopTasksOperation {
-    type Output = HostRpcResult;
+    type Output = StoppedTasks;
     type Error = CatalogError;
 
     fn stamp(&mut self, now_ms: u64) {
         self.now_ms = now_ms;
     }
 
-    fn first(&mut self) -> TaskNext {
+    fn first(&mut self) -> StopNext {
         Ok(Next::Call(IoCall::child(RunTasksOperation::new(
             self.run.run_id,
         ))))
     }
 
-    fn next(&mut self, result: IoResult) -> TaskNext {
+    fn next(&mut self, result: IoResult) -> StopNext {
         match std::mem::replace(&mut self.step, StopStep::Tasks) {
             StopStep::Tasks => {
                 let name = self.name.clone();
@@ -1480,15 +1506,19 @@ impl Operation for StopTasksOperation {
             }
             StopStep::LocalCancel(name, tasks) => {
                 match result.child::<CancelReport<CancelJobOutcome>, JobReadError>()? {
-                    Ok(report) => match report.outcome {
-                        CancelJobOutcome::Requested(_) | CancelJobOutcome::AlreadyTerminal(_) => {
-                            self.stopped.push(name);
+                    Ok(report) => {
+                        self.running.extend(report.running);
+                        match report.outcome {
+                            CancelJobOutcome::Requested(_)
+                            | CancelJobOutcome::AlreadyTerminal(_) => {
+                                self.stopped.push(name);
+                            }
+                            CancelJobOutcome::NotFound => {
+                                self.failed = true;
+                                warn!(run = %self.run.run_id, task = %name, "local child job not found");
+                            }
                         }
-                        CancelJobOutcome::NotFound => {
-                            self.failed = true;
-                            warn!(run = %self.run.run_id, task = %name, "local child job not found");
-                        }
-                    },
+                    }
                     Err(error) => {
                         self.failed = true;
                         warn!(%error, run = %self.run.run_id, task = %name, "local child job was not cancelled");

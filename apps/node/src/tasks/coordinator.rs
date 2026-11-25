@@ -25,9 +25,10 @@ use aruna_ops_work::workflows::runs::run::{
 };
 use aruna_runner::driver::{DriverContext, drive, node_routing};
 use aruna_runner::jobs::context::JobContext;
+use aruna_runner::jobs::runtime::JobsRuntime;
 use aruna_workflow_contract::host::HostRpcResult;
 use aruna_workflow_contract::message::{CoordinatorToHost, HostToCoordinator, RunFinishedPayload};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinSet;
 use tracing::warn;
 use ulid::Ulid;
@@ -41,7 +42,11 @@ const REPLICATE_EVERY: Duration = Duration::from_secs(60);
 
 /// Runs one attempt of `spec`'s run on this node until the run ends, the job is cancelled or
 /// the node shuts down.
-pub(crate) async fn run_workflow(ctx: &JobContext, spec: &WorkflowRunSpec) -> JobRunOutcome {
+pub(crate) async fn run_workflow(
+    ctx: &JobContext,
+    spec: &WorkflowRunSpec,
+    runtime: Option<Arc<JobsRuntime>>,
+) -> JobRunOutcome {
     let claim = claim_digest(ctx.claim_token);
     let prepare = PrepareRunOperation::new(spec, ctx.owner_node_id, claim);
     let prepared = tokio::select! {
@@ -50,14 +55,20 @@ pub(crate) async fn run_workflow(ctx: &JobContext, spec: &WorkflowRunSpec) -> Jo
         prepared = drive(prepare, &ctx.driver) => prepared,
     };
     wake(&ctx.driver, spec.run_id);
+    let gate = Arc::new(Mutex::new(()));
     let outcome = match prepared {
-        Ok(Prepared::Ready(record)) => Session::new(ctx, spec, *record).run().await,
+        Ok(Prepared::Ready(record)) => {
+            Session::new(ctx, spec, *record, runtime, gate.clone())
+                .run()
+                .await
+        }
         Ok(Prepared::Ended(state)) => ended(spec.run_id, state, None),
         // The run waits for the next attempt, or fails on the last one, never stays planning.
         Err(error) => Session::interrupt(ctx, spec.run_id, error.to_string()).await,
     };
     if !matches!(outcome, JobRunOutcome::Interrupted) {
         write_crate(ctx, spec).await;
+        let _guard = gate.lock().await;
         let local = (ctx.owner_node_id, spec.realm_id);
         replicate(ctx.driver.clone(), spec.run_id, local, Arc::default()).await;
     }
@@ -137,10 +148,19 @@ struct Session<'a> {
     calls: JoinSet<()>,
     /// The log pages the holders of the run group's records got so far.
     sent: Arc<AtomicU32>,
+    runtime: Option<Arc<JobsRuntime>>,
+    /// Serializes periodic and terminal log replication passes so older snapshots cannot overtake.
+    replicate_gate: Arc<Mutex<()>>,
 }
 
 impl<'a> Session<'a> {
-    fn new(ctx: &'a JobContext, spec: &WorkflowRunSpec, run: WorkflowRunRecord) -> Self {
+    fn new(
+        ctx: &'a JobContext,
+        spec: &WorkflowRunSpec,
+        run: WorkflowRunRecord,
+        runtime: Option<Arc<JobsRuntime>>,
+        replicate_gate: Arc<Mutex<()>>,
+    ) -> Self {
         Self {
             ctx,
             realm_id: spec.realm_id,
@@ -148,6 +168,8 @@ impl<'a> Session<'a> {
             uploads: Uploads::default(),
             calls: JoinSet::new(),
             sent: Arc::default(),
+            runtime,
+            replicate_gate,
         }
     }
 
@@ -189,10 +211,16 @@ impl<'a> Session<'a> {
                 },
                 Some(_) = self.calls.join_next() => {}
                 _ = copies.tick() => {
-                    let driver = self.ctx.driver.clone();
-                    let local = (self.ctx.owner_node_id, self.realm_id);
-                    let copy = replicate(driver, self.run.run_id, local, self.sent.clone());
-                    self.calls.spawn(copy);
+                    if let Ok(guard) = self.replicate_gate.clone().try_lock_owned() {
+                        let driver = self.ctx.driver.clone();
+                        let local = (self.ctx.owner_node_id, self.realm_id);
+                        let run_id = self.run.run_id;
+                        let sent = self.sent.clone();
+                        self.calls.spawn(async move {
+                            let _guard = guard;
+                            replicate(driver, run_id, local, sent).await;
+                        });
+                    }
                 }
             }
         };
@@ -226,10 +254,18 @@ impl<'a> Session<'a> {
     /// Answers a call beside the others; each sends its own answer when it is done.
     fn spawn(&mut self, answer: AnswerCallOperation) {
         let driver = self.ctx.driver.clone();
+        let runtime = self.runtime.clone();
         let run_id = self.run.run_id;
         self.calls.spawn(async move {
-            if let Err(error) = drive(answer, &driver).await {
-                warn!(%error, run = %run_id, "a coordinator call was not answered");
+            match drive(answer, &driver).await {
+                Ok(outcome) => {
+                    if let Some(runtime) = &runtime {
+                        for job_id in outcome.running {
+                            runtime.request_cancel(job_id);
+                        }
+                    }
+                }
+                Err(error) => warn!(%error, run = %run_id, "a coordinator call was not answered"),
             }
             wake(&driver, run_id);
         });

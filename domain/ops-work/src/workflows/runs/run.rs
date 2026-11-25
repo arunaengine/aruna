@@ -36,7 +36,7 @@ use super::data::{
     upload_target,
 };
 use super::log::{AppendLogOperation, LineageLogOperation, LoadLogOperation, pages_answer};
-use super::tasks::{RunTaskOperation, StopTasksOperation};
+use super::tasks::{RunTaskOperation, StopTasksOperation, StoppedTasks};
 use super::{RunChange, change_call, changed, creator_auth};
 use crate::jobs::lifecycle::submit_external::IngressNode;
 use crate::workflows::import::{COMPOSED_ENTRY, WIR_ENTRY, catalog_tools};
@@ -421,7 +421,7 @@ impl Operation for PrepareRunOperation {
                 }
                 let (start, pages, resume) = *parts;
                 let chunks = replay_chunks(&pages);
-                if chunks.len() > 1 {
+                if !chunks.is_empty() {
                     let mut queue: std::collections::VecDeque<_> = chunks.into();
                     let first = queue.pop_front().unwrap_or_default();
                     self.step = PrepareStep::Replay(Box::new((start, queue, resume)));
@@ -430,7 +430,7 @@ impl Operation for PrepareRunOperation {
                         message: HostToCoordinator::RunReplayPages { pages: first },
                     })));
                 }
-                let payload = self.payload(start, pages, resume)?;
+                let payload = self.payload(start, Vec::new(), resume)?;
                 self.step = PrepareStep::Send;
                 Ok(Next::Call(workflow_call(WorkflowEffect::Send {
                     session: session_name(self.spec.run_id),
@@ -552,9 +552,17 @@ pub struct CallNode {
     pub ingress: IngressNode,
 }
 
+/// Outcome of answering one coordinator RPC call, plus any local job IDs to cancel in-process.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CallOutcome {
+    pub result: HostRpcResult,
+    pub running: Vec<aruna_core::structs::execution::job::identity::JobId>,
+}
+
 #[derive(Debug, PartialEq)]
 enum CallStep {
     Child,
+    Stop,
     Uploaded(u64),
     Logged(u64),
     Select(String),
@@ -571,10 +579,11 @@ pub struct AnswerCallOperation {
     call_id: u64,
     request: Option<HostRpcRequest>,
     upload: Option<(Target, Vec<u8>, u64)>,
+    running: Vec<aruna_core::structs::execution::job::identity::JobId>,
     step: CallStep,
 }
 
-type CallNext = Result<Next<HostRpcResult>, CatalogError>;
+type CallNext = Result<Next<CallOutcome>, CatalogError>;
 
 impl AnswerCallOperation {
     pub fn new(
@@ -589,6 +598,7 @@ impl AnswerCallOperation {
             call_id,
             request: Some(request),
             upload: None,
+            running: Vec::new(),
             step: CallStep::Child,
         }
     }
@@ -606,6 +616,7 @@ impl AnswerCallOperation {
             call_id,
             request: None,
             upload: Some((target, bytes, seq)),
+            running: Vec::new(),
             step: CallStep::Child,
         }
     }
@@ -650,10 +661,14 @@ impl AnswerCallOperation {
                 self.child(task.routing(routing))
             }
             HostRpcRequest::CancelTask { name } => {
-                self.child(StopTasksOperation::new(run, serving, Some(name)))
+                self.step = CallStep::Stop;
+                let stop = StopTasksOperation::new(run, serving, Some(name));
+                Ok(Next::Call(IoCall::child(stop)))
             }
             HostRpcRequest::StopOrphans { .. } => {
-                self.child(StopTasksOperation::new(run, serving, None))
+                self.step = CallStep::Stop;
+                let stop = StopTasksOperation::new(run, serving, None);
+                Ok(Next::Call(IoCall::child(stop)))
             }
             HostRpcRequest::StorageStat { address } => self.read(DataCall::Stat { address }),
             HostRpcRequest::StorageList { address } => self.read(DataCall::List { address }),
@@ -733,7 +748,7 @@ fn compute_answer(result: IoResult) -> Result<ComputeAnswer, CatalogError> {
 }
 
 impl Operation for AnswerCallOperation {
-    type Output = HostRpcResult;
+    type Output = CallOutcome;
     type Error = CatalogError;
 
     fn first(&mut self) -> CallNext {
@@ -759,6 +774,13 @@ impl Operation for AnswerCallOperation {
                     answer.unwrap_or_else(|error| HostRpcResult::Failed(call_failure(error))),
                 )
             }
+            CallStep::Stop => match result.child::<StoppedTasks, CatalogError>()? {
+                Ok(stopped) => {
+                    self.running = stopped.running;
+                    self.answer(stopped.result)
+                }
+                Err(error) => self.answer(HostRpcResult::Failed(call_failure(error))),
+            },
             CallStep::Uploaded(seq) => {
                 let answer = match result.child::<HostRpcResult, CatalogError>()? {
                     Ok(HostRpcResult::UploadAck { receipt, .. }) => {
@@ -797,7 +819,10 @@ impl Operation for AnswerCallOperation {
                 self.answer(HostRpcResult::PinImage { pinned })
             }
             CallStep::Send(answer) => match workflow_answer(result)? {
-                WorkflowAnswer::Sent(Ok(())) => Ok(Next::Done(*answer)),
+                WorkflowAnswer::Sent(Ok(())) => Ok(Next::Done(CallOutcome {
+                    result: *answer,
+                    running: std::mem::take(&mut self.running),
+                })),
                 WorkflowAnswer::Sent(Err(error)) => Err(CatalogError::Coordinator(error)),
                 _ => Err(crate::workflows::unexpected("WorkflowAnswer::Sent")),
             },

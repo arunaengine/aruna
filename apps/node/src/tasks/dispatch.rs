@@ -21,11 +21,16 @@ use aruna_ops_work::notifications::settings::{DeliveryOutcome, delivery_outcome}
 use aruna_ops_work::notifications::webhook::job::WebhookJobOperation;
 use aruna_runner::driver::drive;
 use aruna_runner::jobs::context::JobContext;
+use aruna_runner::jobs::runtime::JobsRuntime;
 
 /// Payload dispatch, mirroring how the task handler matches `TaskKey`. Execution
 /// payloads never reach here: the runtime routes them to the fenced external path
 /// before this seam.
-pub(crate) async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> JobRunOutcome {
+pub(crate) async fn dispatch_payload(
+    ctx: &JobContext,
+    payload: &JobPayload,
+    runtime: Option<std::sync::Arc<JobsRuntime>>,
+) -> JobRunOutcome {
     // Each payload is boxed, so this future and every future that holds it stay small.
     match payload {
         JobPayload::Probe {
@@ -114,7 +119,7 @@ pub(crate) async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> 
             Box::pin(run_delivery(ctx, drive(job, &ctx.driver))).await
         }
         JobPayload::PluginWork(spec) => Box::pin(run_plugin_work(ctx, spec)).await,
-        JobPayload::WorkflowRun(spec) => Box::pin(run_workflow(ctx, spec)).await,
+        JobPayload::WorkflowRun(spec) => Box::pin(run_workflow(ctx, spec, runtime)).await,
         // Guard: an execution job must run through the external attempt path.
         JobPayload::Execution(_) => JobRunOutcome::Failed(JobError::permanent(
             "execution payload dispatched through the in-process seam",

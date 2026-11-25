@@ -97,7 +97,7 @@ impl ServeInputsOperation {
             return Ok(Next::Done(std::mem::take(&mut self.answers)));
         };
         self.step = ServeStep::Follow;
-        let follow = FollowLinkOperation::new(self.caller, input.clone());
+        let follow = FollowLinkOperation::new(self.caller.clone(), input.clone());
         Ok(Next::Call(IoCall::child(follow)))
     }
 
@@ -110,10 +110,11 @@ impl ServeInputsOperation {
         }
         input.source_node_id = Some(local);
         let caller = CaptureCaller {
-            input: self.caller,
+            input: self.caller.clone(),
             submission_id: self.request.submission_id,
             expires_at: self.expires_at(),
             bearer: Some(self.bearer.clone()),
+            disallow_encrypted: false,
         };
         let capture = CaptureInputsOperation::new(caller, vec![input.clone()]);
         self.step = ServeStep::Capture(Box::new(input), link);

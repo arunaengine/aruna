@@ -652,6 +652,7 @@ pub fn delivery_target(record: &WorkflowRunRecord, path: &str) -> Result<Target,
 enum WriteStep {
     Target,
     Source(Box<BucketInfo>),
+    SourceEncryption(Box<BucketInfo>),
     Config(Box<BucketInfo>),
     Routing(Box<BucketInfo>, Option<u64>),
     Gate(Box<(BucketInfo, Option<u64>, RoutingSnapshot)>),
@@ -877,8 +878,30 @@ impl Operation for WriteObjectOperation {
                 };
                 let address = address_of(&source.bucket, &source.key, source.version);
                 match bucket_answer(result) {
-                    Ok(source) => self.source = Some(source),
+                    Ok(source_info) => self.source = Some(source_info),
                     Err(error) => return Self::failed(refusal(error, &address)?),
+                }
+                if !self.run.protected && !source.owned {
+                    let key = aruna_core::types::Key::from(source.bucket.as_bytes().to_vec());
+                    self.step = WriteStep::SourceEncryption(info);
+                    return Ok(Next::Call(IoCall::Read(vec![(
+                        aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+                        key,
+                    )])));
+                }
+                self.config(*info)
+            }
+            WriteStep::SourceEncryption(info) => {
+                let row = result.value()?;
+                let settings =
+                    aruna_core::structs::storage::encryption::BucketEncryption::from_row(
+                        row.as_deref(),
+                    )
+                    .map_err(|error| CatalogError::Storage(error.to_string()))?;
+                if settings.is_encrypted() {
+                    return Self::failed(denied(
+                        "an unprotected run cannot copy from an encrypted bucket",
+                    ));
                 }
                 self.config(*info)
             }

@@ -13,6 +13,7 @@ use aruna_core::structs::execution::job::family::SubmissionId;
 use aruna_core::structs::execution::job::input::{
     CapturedInput, ExecutionSpec, InputSelection, InputSource,
 };
+use aruna_core::structs::identity::auth::PathRestriction;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
@@ -38,6 +39,8 @@ pub(super) struct ResolveScope {
     pub(super) allowed_remote: Option<BTreeSet<NodeId>>,
     /// Remote inputs already captured and granted at workflow admission.
     pub(super) precaptured: Vec<CapturedInput>,
+    /// Refuse locally resolved inputs whose final bucket is encrypted (unprotected workflow runs).
+    pub(super) disallow_encrypted: bool,
 }
 
 impl ResolveScope {
@@ -56,6 +59,19 @@ impl ResolveScope {
         self
     }
 
+    pub(super) fn with_path_restrictions(
+        mut self,
+        restrictions: Option<Vec<PathRestriction>>,
+    ) -> Self {
+        self.caller.path_restrictions = restrictions;
+        self
+    }
+
+    pub(super) fn disallow_encrypted(mut self, disallow: bool) -> Self {
+        self.disallow_encrypted = disallow;
+        self
+    }
+
     /// The caller for captures here; the bearer lets coordinators answer release membership.
     pub(super) fn capture_caller(&self) -> CaptureCaller {
         let bearer = match &self.token {
@@ -63,10 +79,11 @@ impl ResolveScope {
             _ => None,
         };
         CaptureCaller {
-            input: self.caller,
+            input: self.caller.clone(),
             submission_id: self.submission_id,
             expires_at: self.expires_at,
             bearer,
+            disallow_encrypted: self.disallow_encrypted,
         }
     }
 }
@@ -143,7 +160,7 @@ impl ResolveInputsOperation {
         while let Some(input) = self.pending.pop_front() {
             if is_directory(&input) {
                 self.step = ResolveStep::Expand;
-                let expand = ExpandDirectoryOperation::new(self.scope.caller, input);
+                let expand = ExpandDirectoryOperation::new(self.scope.caller.clone(), input);
                 return Ok(Next::Call(IoCall::child(expand)));
             }
             self.files.push(input);
@@ -158,7 +175,7 @@ impl ResolveInputsOperation {
             return self.capture();
         };
         self.step = ResolveStep::Follow;
-        let follow = FollowLinkOperation::new(self.scope.caller, input);
+        let follow = FollowLinkOperation::new(self.scope.caller.clone(), input);
         Ok(Next::Call(IoCall::child(follow)))
     }
 
@@ -346,12 +363,14 @@ mod tests {
                 created_by: user(),
                 realm_id: REALM,
                 local: node(1),
+                path_restrictions: None,
             },
             submission_id: SubmissionId([4; 32]),
             expires_at: 10,
             token: None,
             allowed_remote: None,
             precaptured: Vec::new(),
+            disallow_encrypted: false,
         };
         ResolveInputsOperation::new(&spec, scope)
     }

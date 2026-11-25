@@ -559,8 +559,13 @@ async fn recovers_from_log() {
     let Some(HostToCoordinator::RunStart(start)) = sent.last() else {
         panic!("the next attempt starts the run again: {sent:?}");
     };
-    assert_eq!(start.prior_log_pages.len(), 1);
-    assert_eq!(start.prior_log_pages[0].entries.len(), 2);
+    let Some(HostToCoordinator::RunReplayPages { pages }) = sent.get(sent.len().saturating_sub(2))
+    else {
+        panic!("replay pages precede RunStart: {sent:?}");
+    };
+    assert_eq!(pages.len(), 1);
+    assert_eq!(pages[0].entries.len(), 2);
+    assert!(start.prior_log_pages.is_empty());
     assert_eq!(start.resume_lineage, Some(record.run_id.to_string()));
 
     let last = InterruptRunOperation::new(record.run_id, true, "channel closed");
