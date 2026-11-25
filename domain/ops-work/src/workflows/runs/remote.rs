@@ -13,15 +13,48 @@ use aruna_core::jobs::{JobEffect, JobEvent};
 use aruna_core::operation::Operation;
 use aruna_core::replication_protocol::{BaoReadRequest, BaoReadTarget};
 use aruna_core::structs::checksum::HASH_SHA256;
+use aruna_core::structs::execution::job::input::InputSource;
 use aruna_core::structs::execution::workflow_run::WorkflowRunRecord;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_ops_data::replication::bao_read::{BaoReadError, BaoReadOutput};
 use aruna_ops_data::replication::managed_read::ManagedReadOperation;
 use aruna_workflow_contract::{ContractError, DATA_CHUNK_BYTES, HostRpcResult, host::StorageEntry};
+use ulid::Ulid;
 
 use super::creator_auth;
 use super::data::{DataCall, Target};
 use crate::workflows::CatalogError;
+
+/// Rewrites a remote link pin to the target object captured at admission so exact-version
+/// coordinator reads work on precaptured remote links without bypassing authorization.
+pub fn resolve_precaptured(run: &WorkflowRunRecord, mut target: Target, node: NodeId) -> Target {
+    let Some(version) = target.version else {
+        return target;
+    };
+    let Some(entry) = run.captured_remote.iter().find(|entry| {
+        entry.pin_node_id == node
+            && entry.pin_bucket == target.bucket
+            && entry.pin_key == target.key
+            && entry.pin_version_id == version
+    }) else {
+        return target;
+    };
+    if let InputSource::S3 {
+        bucket,
+        key,
+        version_id,
+    } = &entry.resolved.source
+        && let Some(resolved_ver) = version_id
+            .as_deref()
+            .and_then(|v| Ulid::from_string(v).ok())
+    {
+        target.bucket = bucket.clone();
+        target.key = key.clone();
+        target.version = Some(resolved_ver);
+        target.node = entry.resolved.source_node_id.or(Some(node));
+    }
+    target
+}
 
 /// The read of an exact version `node` holds, as the run's creator; `None` without a version.
 pub fn read_call(
@@ -30,14 +63,16 @@ pub fn read_call(
     node: NodeId,
     (metadata_only, range): (bool, Option<Range<u64>>),
 ) -> Option<IoCall> {
+    let target = resolve_precaptured(run, target.clone(), node);
+    let holder = target.node.unwrap_or(node);
     let request = BaoReadRequest {
         auth_context: creator_auth(run),
         realm_id: run.realm_id,
         target: BaoReadTarget::ExactVersion(VersionedObjectArn {
             realm_id: run.realm_id,
-            node_id: node,
-            bucket: target.bucket.clone(),
-            key: target.key.clone(),
+            node_id: holder,
+            bucket: target.bucket,
+            key: target.key,
             version: target.version?,
         }),
         expected_blake3: None,
@@ -47,7 +82,7 @@ pub fn read_call(
         range,
         disallow_encrypted: !run.protected,
     };
-    Some(IoCall::child(ManagedReadOperation::new(node, request)))
+    Some(IoCall::child(ManagedReadOperation::new(holder, request)))
 }
 
 /// The answer of a [`read_call`], or the refusal the coordinator reads.
@@ -83,6 +118,8 @@ type RemoteNext = Result<Next<HostRpcResult>, CatalogError>;
 
 impl RemoteReadOperation {
     pub fn new(run: WorkflowRunRecord, target: Target, node: NodeId, call: DataCall) -> Self {
+        let target = resolve_precaptured(&run, target, node);
+        let node = target.node.unwrap_or(node);
         Self {
             run,
             target,
@@ -203,5 +240,101 @@ impl Operation for RemoteReadOperation {
                 }))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::records::{REALM, captured_input, node, user};
+    use aruna_core::structs::execution::job::input::{InputMode, InputSelection};
+    use aruna_core::structs::execution::workflow_run::{
+        CacheScope, PrecapturedInput, RunState, WorkflowRunRecord,
+    };
+
+    // Coordinator remote reads resolve precaptured link pins to their target object version.
+    #[test]
+    fn resolves_precaptured_link() {
+        let link_ver = Ulid::from_parts(2, 1);
+        let target_ver = Ulid::from_parts(3, 1);
+        let resolved_sel = InputSelection {
+            source: InputSource::S3 {
+                bucket: "data".into(),
+                key: "real.dat".into(),
+                version_id: Some(target_ver.to_string()),
+            },
+            source_node_id: Some(node(2)),
+            dest_key: "data/alias.link".into(),
+            mode: InputMode::Snapshot,
+            container_path: None,
+            name: None,
+            description: None,
+        };
+        let mut cap = captured_input(&resolved_sel, node(2));
+        cap.version_id = target_ver;
+        let run = WorkflowRunRecord {
+            run_id: Ulid::from_parts(1, 1),
+            lineage: Ulid::from_parts(1, 1),
+            group_id: aruna_core::types::GroupId::from_bytes([1; 16]),
+            workflow_id: Ulid::from_parts(1, 2),
+            workflow_name: "demo".into(),
+            version: 1,
+            realm_id: REALM,
+            node_id: node(1),
+            local_only: false,
+            last_event_seq: 0,
+            state: RunState::Running,
+            created_by: user(),
+            created_at_ms: 1,
+            started_at_ms: None,
+            finished_at_ms: None,
+            error: None,
+            values_json: "{}".into(),
+            inputs_json: None,
+            output: None,
+            provenance_crate: false,
+            provenance_status: None,
+            provenance_document_id: None,
+            outputs: Vec::new(),
+            origin: None,
+            parent_job_id: None,
+            claim_token_digest: None,
+            attempts: 1,
+            steps: Vec::new(),
+            resumes_run_id: None,
+            repeats_run_id: None,
+            cache_scope: CacheScope::Group,
+            placement_site: None,
+            protected: false,
+            secrets: Default::default(),
+            path_restrictions: None,
+            captured_remote: vec![PrecapturedInput {
+                pin_node_id: node(2),
+                pin_bucket: "data".into(),
+                pin_key: "alias.link".into(),
+                pin_version_id: link_ver,
+                resolved: resolved_sel,
+                captured: cap,
+            }],
+            used_tools: Vec::new(),
+        };
+        let link_target = Target {
+            bucket: "data".into(),
+            key: "alias.link".into(),
+            version: Some(link_ver),
+            owned: false,
+            node: Some(node(2)),
+        };
+        let op = RemoteReadOperation::new(
+            run,
+            link_target,
+            node(2),
+            DataCall::Stat {
+                address: "aruna://data/alias.link".into(),
+            },
+        );
+        assert_eq!(op.target.key, "real.dat");
+        assert_eq!(op.target.version, Some(target_ver));
+        assert_eq!(op.node, node(2));
     }
 }
