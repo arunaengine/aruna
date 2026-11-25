@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -16,6 +16,7 @@ use fjall::{
 use tracing::{debug, warn};
 
 pub(crate) const DELETE_THRESHOLD: u64 = 5_000;
+pub(crate) const MIN_SCAN_BYTES: u64 = 1024 * 1024;
 pub(crate) const MAX_KEYSPACE_BYTES: u64 = 256 * 1024 * 1024;
 /// Least time between two compactions of one keyspace. Each flushes its memtable while every
 /// commit waits, so a queue that deletes thousands of rows a second must not compact each time.
@@ -35,9 +36,70 @@ pub(crate) struct CompactionJob {
 
 pub(crate) struct Compactor {
     pub(crate) sender: Option<std::sync::mpsc::Sender<CompactionJob>>,
+    shared_sender: Arc<Mutex<Option<std::sync::mpsc::Sender<CompactionJob>>>>,
     thread: Option<thread::JoinHandle<()>>,
     pub(crate) active: Arc<Mutex<HashSet<String>>>,
+    /// Keyspaces that saw at least one committed delete since their last compaction started.
+    pub(crate) deleted: Arc<RwLock<HashSet<String>>>,
     pub(crate) stopping: Arc<AtomicBool>,
+}
+
+/// Cloneable handle read pool threads use to queue tombstone compactions.
+#[derive(Clone)]
+pub(crate) struct CompactorHandle {
+    sender: Arc<Mutex<Option<std::sync::mpsc::Sender<CompactionJob>>>>,
+    active: Arc<Mutex<HashSet<String>>>,
+    deleted: Arc<RwLock<HashSet<String>>>,
+}
+
+impl CompactorHandle {
+    pub(crate) fn has_deletes(&self, key_space: &str) -> bool {
+        self.deleted
+            .read()
+            .expect("storage compaction deleted lock poisoned")
+            .contains(key_space)
+    }
+
+    pub(crate) fn submit(
+        &self,
+        key_space: &str,
+        deletes: u64,
+        db: OptimisticTxDatabase,
+        keyspace: OptimisticTxKeyspace,
+    ) {
+        let sender = self
+            .sender
+            .lock()
+            .expect("storage compaction sender mutex poisoned")
+            .clone();
+        let Some(sender) = sender else {
+            return;
+        };
+        if !self
+            .active
+            .lock()
+            .expect("storage compaction mutex poisoned")
+            .insert(key_space.to_string())
+        {
+            return;
+        }
+        let job = CompactionJob {
+            key_space: key_space.to_string(),
+            deletes,
+            run: Box::new(move || {
+                let inner: &fjall::Keyspace = keyspace.as_ref();
+                inner.rotate_memtable_and_wait()?;
+                inner.major_compact()?;
+                checkpoint(&db, &keyspace)
+            }),
+        };
+        if sender.send(job).is_err() {
+            self.active
+                .lock()
+                .expect("storage compaction mutex poisoned")
+                .remove(key_space);
+        }
+    }
 }
 
 /// Keeps the compactions of one keyspace an interval apart, from the end of one to the start of
@@ -113,8 +175,10 @@ impl Compactor {
     pub(crate) fn spaced(interval: Duration) -> Self {
         let (sender, receiver) = std::sync::mpsc::channel::<CompactionJob>();
         let active = Arc::new(Mutex::new(HashSet::new()));
+        let deleted = Arc::new(RwLock::new(HashSet::new()));
         let stopping = Arc::new(AtomicBool::new(false));
         let running = active.clone();
+        let tracked = deleted.clone();
         let stop = stopping.clone();
         let thread = thread::spawn(move || {
             let mut spacing = Spacing::new(interval);
@@ -138,15 +202,18 @@ impl Compactor {
                         return;
                     }
                     let key_space = job.key_space.clone();
-                    run_job(job, &running);
+                    run_job(job, &running, &tracked);
                     spacing.finished(&key_space, Instant::now());
                 }
             }
         });
+        let shared_sender = Arc::new(Mutex::new(Some(sender.clone())));
         Self {
             sender: Some(sender),
+            shared_sender,
             thread: Some(thread),
             active,
+            deleted,
             stopping,
         }
     }
@@ -155,19 +222,47 @@ impl Compactor {
     pub(crate) fn idle() -> Self {
         Self {
             sender: None,
+            shared_sender: Arc::new(Mutex::new(None)),
             thread: None,
             active: Arc::new(Mutex::new(HashSet::new())),
+            deleted: Arc::new(RwLock::new(HashSet::new())),
             stopping: Arc::new(AtomicBool::new(false)),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn stub(sender: std::sync::mpsc::Sender<CompactionJob>) -> Self {
+        let shared_sender = Arc::new(Mutex::new(Some(sender.clone())));
         Self {
             sender: Some(sender),
+            shared_sender,
             thread: None,
             active: Arc::new(Mutex::new(HashSet::new())),
+            deleted: Arc::new(RwLock::new(HashSet::new())),
             stopping: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub(crate) fn note_deleted(&self, key_space: &str) {
+        if self
+            .deleted
+            .read()
+            .expect("storage compaction deleted lock poisoned")
+            .contains(key_space)
+        {
+            return;
+        }
+        self.deleted
+            .write()
+            .expect("storage compaction deleted lock poisoned")
+            .insert(key_space.to_string());
+    }
+
+    pub(crate) fn handle(&self) -> CompactorHandle {
+        CompactorHandle {
+            sender: self.shared_sender.clone(),
+            active: self.active.clone(),
+            deleted: self.deleted.clone(),
         }
     }
 
@@ -180,30 +275,7 @@ impl Compactor {
         db: OptimisticTxDatabase,
         keyspace: OptimisticTxKeyspace,
     ) {
-        let Some(sender) = self.sender.as_ref() else {
-            return;
-        };
-        if !self
-            .active
-            .lock()
-            .expect("storage compaction mutex poisoned")
-            .insert(key_space.to_string())
-        {
-            return;
-        }
-        let job = CompactionJob {
-            key_space: key_space.to_string(),
-            deletes,
-            run: Box::new(move || {
-                let inner: &fjall::Keyspace = keyspace.as_ref();
-                inner.rotate_memtable_and_wait()?;
-                inner.major_compact()?;
-                checkpoint(&db, &keyspace)
-            }),
-        };
-        if sender.send(job).is_err() {
-            self.release(key_space);
-        }
+        self.handle().submit(key_space, deletes, db, keyspace);
     }
 
     /// Checkpoints every keyspace without unflushed rows, since any of them may hold old journals.
@@ -250,6 +322,10 @@ impl Compactor {
     pub(crate) fn shutdown(&mut self) {
         self.stopping.store(true, Ordering::Release);
         self.sender = None;
+        self.shared_sender
+            .lock()
+            .expect("storage compaction sender mutex poisoned")
+            .take();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -292,7 +368,17 @@ pub(crate) fn compactable(disk_space: u64) -> bool {
     disk_space <= MAX_KEYSPACE_BYTES
 }
 
-pub(crate) fn run_job(job: CompactionJob, active: &Arc<Mutex<HashSet<String>>>) {
+/// Whether a slow tombstone scan on a keyspace warrants major compaction: at least one flushed
+/// table and `MIN_SCAN_BYTES` on disk, bounded by `MAX_KEYSPACE_BYTES`.
+pub(crate) fn scan_compactable(disk_space: u64, tables: usize) -> bool {
+    tables > 0 && disk_space >= MIN_SCAN_BYTES && compactable(disk_space)
+}
+
+pub(crate) fn run_job(
+    job: CompactionJob,
+    active: &Arc<Mutex<HashSet<String>>>,
+    deleted: &Arc<RwLock<HashSet<String>>>,
+) {
     let CompactionJob {
         key_space,
         deletes,
@@ -301,6 +387,10 @@ pub(crate) fn run_job(job: CompactionJob, active: &Arc<Mutex<HashSet<String>>>) 
     active
         .lock()
         .expect("storage compaction mutex poisoned")
+        .remove(&key_space);
+    let had_deletes = deleted
+        .write()
+        .expect("storage compaction deleted lock poisoned")
         .remove(&key_space);
     let started = Instant::now();
     match run() {
@@ -311,13 +401,21 @@ pub(crate) fn run_job(job: CompactionJob, active: &Arc<Mutex<HashSet<String>>>) 
             elapsed_ms = duration_ms(started.elapsed()),
             "Compacted a delete-heavy keyspace"
         ),
-        Err(error) => warn!(
-            event = "storage.keyspace.compact_failed",
-            key_space = %key_space,
-            deletes,
-            error = %error,
-            "Keyspace compaction failed"
-        ),
+        Err(error) => {
+            if had_deletes {
+                deleted
+                    .write()
+                    .expect("storage compaction deleted lock poisoned")
+                    .insert(key_space.clone());
+            }
+            warn!(
+                event = "storage.keyspace.compact_failed",
+                key_space = %key_space,
+                deletes,
+                error = %error,
+                "Keyspace compaction failed"
+            );
+        }
     }
 }
 
@@ -413,6 +511,11 @@ mod tests {
         assert!(compactable(0));
         assert!(compactable(MAX_KEYSPACE_BYTES));
         assert!(!compactable(MAX_KEYSPACE_BYTES + 1));
+        assert!(!super::scan_compactable(0, 0));
+        assert!(!super::scan_compactable(super::MIN_SCAN_BYTES, 0));
+        assert!(!super::scan_compactable(super::MIN_SCAN_BYTES - 1, 2));
+        assert!(super::scan_compactable(super::MIN_SCAN_BYTES, 1));
+        assert!(!super::scan_compactable(MAX_KEYSPACE_BYTES + 1, 2));
     }
 
     #[test]

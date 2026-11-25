@@ -100,11 +100,14 @@ impl FjallStorage {
             pool_threads,
             ..
         } = self;
-        compactor.shutdown();
+        compactor
+            .stopping
+            .store(true, std::sync::atomic::Ordering::Release);
         drop((read_pool, bulk_read_pool));
         for reader in pool_threads {
             let _ = reader.join();
         }
+        compactor.shutdown();
     }
 
     pub(super) fn new(
@@ -114,10 +117,19 @@ impl FjallStorage {
         read_threads: usize,
         bulk_threads: usize,
     ) -> Self {
-        let (read_pool, mut pool_threads) =
-            spawn_read_pool(store.clone(), read_threads, QUEUE_CAPACITY);
-        let (bulk_read_pool, bulk_threads) =
-            spawn_read_pool(store.clone(), bulk_threads, EFFECT_QUEUE_CAPACITY);
+        let compactor = Compactor::spawn();
+        let (read_pool, mut pool_threads) = spawn_read_pool(
+            store.clone(),
+            compactor.handle(),
+            read_threads,
+            QUEUE_CAPACITY,
+        );
+        let (bulk_read_pool, bulk_threads) = spawn_read_pool(
+            store.clone(),
+            compactor.handle(),
+            bulk_threads,
+            EFFECT_QUEUE_CAPACITY,
+        );
         pool_threads.extend(bulk_threads);
         let usage_shadow = running_rebuild(&store);
         flush_empty(&store);
@@ -130,7 +142,7 @@ impl FjallStorage {
             read_pool,
             bulk_read_pool,
             pool_threads,
-            compactor: Compactor::spawn(),
+            compactor,
             deletes: HashMap::new(),
             swept: 0,
             commits: 0,

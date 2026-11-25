@@ -32,7 +32,7 @@ use super::persistence::FjallPersistPolicy;
 use super::records::run_read;
 use super::telemetry::{storage_effect_kind, storage_event_kind};
 use super::transactions::PendingChanges;
-use crate::compaction::Compactor;
+use crate::compaction::{Compactor, CompactorHandle};
 
 /// An open transaction; a read pool thread holds a clone while it reads in it.
 #[derive(Clone)]
@@ -97,6 +97,7 @@ pub(super) fn effect_keyspace(effect: &StorageEffect) -> Option<&str> {
     }
 }
 const STORAGE_EFFECT_THRESHOLD: Duration = Duration::from_millis(50);
+const SLOW_SCAN_THRESHOLD: Duration = Duration::from_millis(200);
 const QUEUE_LOG_INTERVAL: Duration = Duration::from_secs(1);
 pub(super) const MAX_GROUP_COMMIT: usize = 256;
 pub(super) const READ_POOL_THREADS: usize = 4;
@@ -536,6 +537,7 @@ impl FjallStorage {
         let (effect, mut response_tx, span, enqueued_at, in_flight) = item;
         let _guard = span.enter();
         let operation = storage_effect_kind(&effect);
+        let is_scan = is_scan_effect(&effect);
         let key_space = effect_keyspace(&effect).map(str::to_string);
         let cleanup = cleanup_effect(&effect);
         let queue_wait = enqueued_at.elapsed();
@@ -575,6 +577,14 @@ impl FjallStorage {
             queue_wait,
             service_elapsed,
             result,
+        );
+        compact_slow_scan(
+            &self.store,
+            &self.compactor.handle(),
+            is_scan,
+            key_space.as_deref(),
+            service_elapsed,
+            &event,
         );
         drop(in_flight);
         Self::deliver_response(response_tx, event, operation, result);
@@ -1206,28 +1216,68 @@ fn reject_bulk_read(item: EffectHandle) {
     });
 }
 
+pub(super) fn is_scan_effect(effect: &StorageEffect) -> bool {
+    matches!(
+        effect,
+        StorageEffect::Iter { .. } | StorageEffect::IterRange { .. }
+    )
+}
+
+pub(super) fn compact_slow_scan(
+    store: &Store,
+    compactor: &CompactorHandle,
+    is_scan: bool,
+    key_space: Option<&str>,
+    elapsed: Duration,
+    event: &StorageEvent,
+) {
+    if !is_scan || elapsed < SLOW_SCAN_THRESHOLD {
+        return;
+    }
+    let StorageEvent::IterResult { values, .. } = event else {
+        return;
+    };
+    if values.len() > 1 {
+        return;
+    }
+    let Some(name) = key_space else {
+        return;
+    };
+    if !compactor.has_deletes(name) {
+        return;
+    }
+    if let Ok(Some(keyspace)) = store.existing_keyspace(name) {
+        let inner = keyspace.inner();
+        if crate::compaction::scan_compactable(inner.disk_space(), inner.table_count()) {
+            compactor.submit(name, 1, store.db.clone(), keyspace);
+        }
+    }
+}
+
 pub(super) fn spawn_read_pool(
     store: Store,
+    compactor: CompactorHandle,
     threads: usize,
     capacity: usize,
 ) -> (PoolSender, Vec<thread::JoinHandle<()>>) {
     let (sender, receiver) = mpmc::bounded_blocking(capacity);
     let handles = (0..threads)
         .map(|_| {
-            let (store, receiver) = (store.clone(), receiver.clone());
-            thread::spawn(move || read_pool_loop(store, receiver))
+            let (store, compactor, receiver) = (store.clone(), compactor.clone(), receiver.clone());
+            thread::spawn(move || read_pool_loop(store, compactor, receiver))
         })
         .collect();
     (sender, handles)
 }
 
-fn read_pool_loop(store: Store, receiver: PoolReceiver) {
+fn read_pool_loop(store: Store, compactor: CompactorHandle, receiver: PoolReceiver) {
     while let Ok(((effect, response_tx, span, enqueued_at, in_flight), txn)) = receiver.recv() {
         let _guard = span.enter();
         if response_tx.is_closed() {
             continue;
         }
         let operation = storage_effect_kind(&effect);
+        let is_scan = is_scan_effect(&effect);
         let key_space = effect_keyspace(&effect).map(str::to_string);
         let queue_wait = enqueued_at.elapsed();
         let service_started = Instant::now();
@@ -1249,6 +1299,14 @@ fn read_pool_loop(store: Store, receiver: PoolReceiver) {
                 "Slow storage read"
             );
         }
+        compact_slow_scan(
+            &store,
+            &compactor,
+            is_scan,
+            key_space.as_deref(),
+            service_elapsed,
+            &event,
+        );
         drop(in_flight);
         let _ = response_tx.send(event);
     }
