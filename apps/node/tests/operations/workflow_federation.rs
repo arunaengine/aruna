@@ -1,4 +1,4 @@
-//! Tests multi-node workflow log replication and failover resume across a real P2P topology.
+//! Tests multi-node workflow log replication, failover resume and data-aware placement planning.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -6,26 +6,40 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use aruna_compute::registry::ExecutorRegistry;
+use aruna_core::compute::quota::{ComputeDemandSnapshot, ComputeReservationSnapshot};
+use aruna_core::compute::{ExecutorAvailability, ExecutorCapability, ResourceEnvelope};
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::heartbeat::{HeldHeartbeat, NodeHeartbeat};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    WORKFLOW_KEYSPACE, WORKFLOW_SOURCE_KEYSPACE, WORKFLOW_VERSION_KEYSPACE,
+    NODE_INFO_KEYSPACE, WORKFLOW_KEYSPACE, WORKFLOW_SOURCE_KEYSPACE, WORKFLOW_VERSION_KEYSPACE,
 };
+use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::workflow::{
     StoredWorkflowLanguage, WorkflowVisibility, version_key, workflow_key,
 };
 use aruna_core::structs::execution::workflow_run::{RunOutput, RunState};
+use aruna_core::structs::placement::policy::PlacementSubject;
+use aruna_core::structs::storage::node_info::{
+    AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization, node_info_key,
+};
+use aruna_core::structs::storage::routing::RoutingSnapshot;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_core::user::id::UserId;
 use aruna_core::workflow::{WorkflowAnswer, WorkflowEffect, WorkflowError, WorkflowHost};
+use aruna_ops_data::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+use aruna_ops_work::jobs::lifecycle::submit_external::IngressNode;
 use aruna_ops_work::workflows::CatalogError;
 use aruna_ops_work::workflows::import::{CreateWorkflowOperation, NewWorkflow, SourceInput};
-use aruna_ops_work::workflows::runs::admit::{RunRequest, StartRunOperation};
+use aruna_ops_work::workflows::runs::admit::{PinnedInput, RunRequest, StartRunOperation};
 use aruna_ops_work::workflows::runs::control::{Follow, FollowRunOperation};
 use aruna_ops_work::workflows::runs::log::{
     AppendLogOperation, LineageLogOperation, LoadLogOperation,
 };
-use aruna_ops_work::workflows::runs::reads::RunSnapshotOperation;
+use aruna_ops_work::workflows::runs::plan::{COMPUTE_TO_DATA, DATA_TO_COMPUTE, PlanRunOperation};
+use aruna_ops_work::workflows::runs::reads::{ListRunsOperation, RunFilter, RunSnapshotOperation};
 use aruna_ops_work::workflows::runs::replica::{
     ReplicateLogOperation, UNREACHABLE, record_holders, replica_note,
 };
@@ -40,6 +54,8 @@ use ulid::Ulid;
 use crate::topology::{TestNode, TestResult, Topology};
 
 const CWL: &str = "cwlVersion: v1.2\nclass: CommandLineTool\nbaseCommand: echo\n";
+const BIG_BYTES: usize = 1 << 20;
+const SMALL_BYTES: usize = 1024;
 
 struct PlanHost {
     graph: Value,
@@ -97,6 +113,39 @@ fn attach_host(node: &TestNode, graph: Value) -> DriverContext {
     ctx
 }
 
+async fn seed_blob(
+    realm: &Topology,
+    node: &TestNode,
+    group_id: GroupId,
+    bucket: &str,
+    key: &str,
+    size: usize,
+) -> TestResult<Ulid> {
+    let body = BackendStream::new(tokio_util::io::ReaderStream::new(std::io::Cursor::new(
+        vec![b'A'; size],
+    ))) as BackendStream<Result<bytes::Bytes, StreamError>>;
+    let put = PutObjectOperation::new(PutObjectConfig {
+        user_id: realm.user_id,
+        group_id,
+        realm_id: realm.realm_id,
+        node_id: node.node_id(),
+        request: PutObjectInput {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            content_length: Some(size as u64),
+            body: Some(body),
+        },
+        expected_checksums: Vec::new(),
+        checksum_type: None,
+        exists: false,
+        version_source: None,
+        preassigned_version_id: None,
+        quota_ceiling: None,
+        routing: RoutingSnapshot::single(group_id),
+    });
+    Ok(drive(put, node.context.as_ref()).await?.version_id)
+}
+
 fn upload_workflow(group_id: GroupId) -> NewWorkflow {
     NewWorkflow {
         group_id,
@@ -113,6 +162,103 @@ fn upload_workflow(group_id: GroupId) -> NewWorkflow {
             }],
         },
     }
+}
+
+async fn advertise_executor(
+    realm: &Topology,
+    reader: &TestNode,
+    target: NodeId,
+    gpus: u32,
+    now_ms: u64,
+) -> TestResult<HeldHeartbeat> {
+    let subject = PlacementSubject {
+        node_id: target,
+        generation: 1,
+        location: "eu".to_owned(),
+        labels: BTreeMap::new(),
+        executor_kind: None,
+        local_to_controller: true,
+    };
+    let mut cap = ExecutorCapability::new("docker".into(), "docker".into(), subject)?;
+    cap.file_staging = true;
+    cap.declared.gpus = gpus;
+    cap.limits = ResourceEnvelope {
+        max_cpu_cores: Some(8),
+        max_ram_bytes: Some(16 << 30),
+        max_disk_bytes: Some(100 << 30),
+        max_concurrent: Some(4),
+    };
+    let availability = ExecutorAvailability {
+        free_cpu_cores: Some(8),
+        free_ram_bytes: Some(16 << 30),
+        free_disk_bytes: Some(100 << 30),
+        active_executions: 0,
+        observed_at_ms: now_ms,
+    };
+    cap.availability = Some(availability);
+    let epoch = AdvertisementEpoch {
+        membership_generation: 1,
+        publisher_generation: 1,
+        observed_at_ms: now_ms,
+    };
+    let utilization = NodeUtilization {
+        storage_bytes_used: 0,
+        documents_held: None,
+        load_permille: Some(0),
+        heartbeat_at_ms: now_ms,
+        download_slots: None,
+        storage_capacity_bytes: None,
+    };
+    let demand = ComputeDemandSnapshot {
+        epoch,
+        groups: Vec::new(),
+        truncated: false,
+    };
+    let reservation = ComputeReservationSnapshot {
+        epoch,
+        reserved: Default::default(),
+    };
+    let doc = NodeInfoDocument {
+        node_id: target,
+        executors: vec![cap],
+        labels: BTreeMap::new(),
+        urls: NodeUrls {
+            api: None,
+            s3: None,
+        },
+        utilization: utilization.clone(),
+        updated_at_ms: now_ms,
+        epoch,
+        compute_draining: false,
+        leaving: false,
+        demand: demand.clone(),
+        reservation: reservation.clone(),
+    };
+    reader
+        .context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: NODE_INFO_KEYSPACE.to_owned(),
+            key: node_info_key(target).into(),
+            value: postcard::to_allocvec(&doc)?.into(),
+            txn_id: None,
+        })
+        .await;
+    Ok(HeldHeartbeat {
+        node_id: target,
+        heartbeat: NodeHeartbeat {
+            realm_id: realm.realm_id,
+            epoch,
+            sequence: 1,
+            utilization,
+            availability: vec![("docker".into(), availability)],
+            reservation,
+            demand,
+            jobs: None,
+        },
+        age_ms: 0,
+        received_at_ms: now_ms,
+    })
 }
 
 async fn copy_workflow(from: &TestNode, to: &TestNode, workflow_id: Ulid) {
@@ -280,5 +426,131 @@ async fn replicates_workflow_run() -> TestResult<()> {
     assert_eq!(resumed.node_id, surviving.node_id());
     let replayed = drive(LineageLogOperation::new(resumed.run_id), &surviving_ctx).await?;
     assert_eq!(replayed, coord_pages);
+    Ok(())
+}
+
+/// Plans a multi-step workflow across a 3-node topology over real P2P input resolution:
+/// compute-to-data for bulk CPU, data-to-compute for GPU, and fan-in minimizing staged bytes.
+#[tokio::test]
+async fn plans_multi_node() -> TestResult<()> {
+    let realm = Topology::spawn(3, 0, 2).await?;
+    let group_id = realm.seed_group().await?;
+    let (planner, data_node, gpu_node) = (realm.node(0), realm.node(1), realm.node(2));
+    let owner = realm.auth_context();
+
+    for node in [data_node, gpu_node] {
+        seed_bucket(
+            node.context.as_ref(),
+            "data",
+            group_id,
+            realm.user_id,
+            Vec::new(),
+        )
+        .await;
+    }
+    let big_ver = seed_blob(&realm, data_node, group_id, "data", "big.bin", BIG_BYTES).await?;
+    let small_ver = seed_blob(&realm, gpu_node, group_id, "data", "small.bin", SMALL_BYTES).await?;
+
+    let pin = |name: &str, key: &str, ver: Ulid, node: &TestNode| PinnedInput {
+        name: name.to_owned(),
+        bucket: "data".to_owned(),
+        key: key.to_owned(),
+        version_id: ver,
+        source_node_id: Some(node.node_id()),
+    };
+    let big_pin = pin("big", "big.bin", big_ver, data_node);
+    let small_pin = pin("small", "small.bin", small_ver, gpu_node);
+
+    let task = |id: u64, step: &str, gpus: Option<u32>, reads: &[&PinnedInput]| {
+        let inputs: Vec<Value> = reads
+            .iter()
+            .map(|p| {
+                let src = format!("aruna://{}/{}?version={}", p.bucket, p.key, p.version_id);
+                json!({"path": p.key, "source": src, "directory": false})
+            })
+            .collect();
+        json!({"task": {"id": id, "step": step, "image": "tool:1", "inputs": inputs,
+            "resources": {"cpus": 2.0, "gpus": gpus}, "after": []}, "markers": []})
+    };
+    let graph = json!({
+        "nodes": [
+            task(1, "align", None, &[&big_pin]),
+            task(2, "train", Some(1), &[&big_pin]),
+            task(3, "merge", None, &[&big_pin, &small_pin]),
+        ],
+        "edges": [],
+    });
+
+    let ctx = attach_host(planner, graph);
+    let created = drive(
+        CreateWorkflowOperation::new(&owner, planner.node_id(), upload_workflow(group_id)),
+        &ctx,
+    )
+    .await?;
+
+    let now_ms = unix_timestamp_millis();
+    let fresh = BTreeMap::from([
+        (
+            data_node.node_id(),
+            advertise_executor(&realm, planner, data_node.node_id(), 0, now_ms).await?,
+        ),
+        (
+            gpu_node.node_id(),
+            advertise_executor(&realm, planner, gpu_node.node_id(), 1, now_ms).await?,
+        ),
+    ]);
+    let ingress = IngressNode {
+        local: planner.node_id(),
+        realm_id: realm.realm_id,
+        now_ms,
+        fresh,
+    };
+    let request = RunRequest {
+        group_id,
+        workflow_id: created.workflow_id,
+        version: created.version,
+        values: json!({}),
+        inputs: vec![big_pin, small_pin],
+        inputs_json: None,
+        output: None,
+        provenance_crate: false,
+        idempotency_key: None,
+        placement_site: None,
+        secrets: BTreeMap::new(),
+    };
+    let plan = drive(
+        PlanRunOperation::new(&owner, ingress, request).with_token(Some(realm.bearer_token())),
+        &ctx,
+    )
+    .await?;
+    assert!(plan.complete, "plan should be complete: {plan:?}");
+    assert_eq!(plan.tasks.len(), 3, "{plan:?}");
+
+    let by_step = |name: &str| {
+        plan.tasks
+            .iter()
+            .find(|t| t.step == name)
+            .unwrap_or_else(|| panic!("missing step {name} in {plan:?}"))
+    };
+    let align = by_step("align");
+    assert_eq!(align.node_id, Some(data_node.node_id()));
+    assert_eq!(align.mode, COMPUTE_TO_DATA);
+    assert_eq!(align.bytes, Some(0));
+
+    let train = by_step("train");
+    assert_eq!(train.node_id, Some(gpu_node.node_id()));
+    assert_eq!(train.mode, DATA_TO_COMPUTE);
+    assert_eq!(train.bytes, Some(BIG_BYTES as u64));
+
+    let merge = by_step("merge");
+    assert_eq!(merge.node_id, Some(data_node.node_id()));
+    assert_eq!(merge.bytes, Some(SMALL_BYTES as u64));
+
+    let listed = drive(
+        ListRunsOperation::new(&owner, RunFilter::default(), None, 16),
+        &ctx,
+    )
+    .await?;
+    assert_eq!(listed.total, 0, "planning must not admit any runs");
     Ok(())
 }
