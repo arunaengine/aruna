@@ -110,6 +110,8 @@ async fn restore_graph_prune(
 const QUEUE_REARM_AFTER: Duration = Duration::from_secs(5);
 /// Rearm ticks between dead-letter sweeps, i.e. one sweep a minute.
 const DEAD_LETTER_TICKS: usize = 12;
+/// Rearm ticks between node usage dirty-marker sweeps, i.e. once every two minutes.
+const USAGE_REARM_TICKS: usize = 24;
 
 /// Dispatches scheduled tasks and background drains to their operations.
 pub(crate) struct OperationsTaskHandler {

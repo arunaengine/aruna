@@ -81,7 +81,11 @@ async fn durable_rearm_loop(
         restore_outbox_timer(&context).await;
         restore_publish_timer(&context, &task_handle).await;
         restore_sync_timers(&context, &task_handle).await;
-        restore_usage_timer(&context.storage_handle, &task_handle).await;
+        // Usage dirty markers are armed at startup and on every mutation; keep a slow backstop
+        // instead of scanning `NODE_STATS_KEYSPACE` every 5 seconds.
+        if ticks.is_multiple_of(USAGE_REARM_TICKS) {
+            restore_usage_timer(&context.storage_handle, &task_handle).await;
+        }
         restore_watch_interest(&context, &task_handle).await;
         restore_info_timer(&task_handle, aruna_core::heartbeat::INFO_PUBLISH_INTERVAL).await;
         restore_notification_outbox(&context, &task_handle, None).await;
