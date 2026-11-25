@@ -52,3 +52,5 @@ mod transition_turnover;
 mod usage_replication;
 #[path = "operations/watch_delivery.rs"]
 mod watch_delivery;
+#[path = "operations/workflow_federation.rs"]
+mod workflow_federation;
