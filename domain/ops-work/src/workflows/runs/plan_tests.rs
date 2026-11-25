@@ -104,8 +104,9 @@ fn previewed(plan: ExecutionPlan) -> IoResult {
 }
 
 fn task(id: u64, step: &str, reads: &[&PinnedInput]) -> Value {
+    let local = node(1);
     let inputs: Vec<Value> = (reads.iter())
-        .map(|pin| json!({"path": pin.key, "source": pin_address(pin), "directory": false}))
+        .map(|pin| json!({"path": pin.key, "source": pin_address(local, pin), "directory": false}))
         .collect();
     json!({"task": {"id": id, "step": step, "image": "tool:1", "inputs": inputs,
         "resources": {"cpus": 2.0, "gpus": null}, "after": []}, "markers": []})

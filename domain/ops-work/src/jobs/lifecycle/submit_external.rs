@@ -11,7 +11,7 @@ use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::input::ExecutionSpec;
+use aruna_core::structs::execution::job::input::{CapturedInput, ExecutionSpec};
 use aruna_core::structs::execution::job::local::WorkspaceMode;
 use aruna_core::structs::execution::job::pages::PageManifest;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -70,6 +70,8 @@ impl IngressNode {
             submission_id,
             expires_at,
             token,
+            allowed_remote: None,
+            precaptured: Vec::new(),
         }
     }
 
@@ -122,6 +124,7 @@ pub struct SubmitExternalOperation {
     submission: ExternalSubmission,
     node: Option<IngressNode>,
     labels: Vec<LabelMatch>,
+    precaptured: Vec<CapturedInput>,
     ids: IdMint,
     step: SubmitStep,
 }
@@ -139,9 +142,16 @@ impl SubmitExternalOperation {
             submission,
             node,
             labels: Vec::new(),
+            precaptured: Vec::new(),
             ids: IdMint::default(),
             step: SubmitStep::Config,
         }
+    }
+
+    /// Reuses remote inputs already captured and granted during workflow admission.
+    pub fn with_precaptured(mut self, precaptured: Vec<CapturedInput>) -> Self {
+        self.precaptured = precaptured;
+        self
     }
 
     fn node(&self) -> Result<&IngressNode, SubmitJobError> {
@@ -223,12 +233,15 @@ impl SubmitExternalOperation {
         let node = self.node()?.clone();
         pin_outputs(&mut self.submission.spec, node.local);
         let submission = &self.submission;
-        let scope = node.resolve_scope(
-            submission.created_by,
-            &submission.scope,
-            submission.retention_ms,
-            submission.auth_token.clone(),
-        );
+        let scope = node
+            .resolve_scope(
+                submission.created_by,
+                &submission.scope,
+                submission.retention_ms,
+                submission.auth_token.clone(),
+            )
+            .with_config(&config)
+            .with_precaptured(std::mem::take(&mut self.precaptured));
         let resolve = ResolveInputsOperation::new(&submission.spec, scope);
         self.step = SubmitStep::Resolve(Box::new(config));
         Ok(Next::Call(IoCall::child(resolve)))

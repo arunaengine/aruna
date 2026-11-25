@@ -3,14 +3,17 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::family::SubmissionId;
-use aruna_core::structs::execution::job::input::{CapturedInput, ExecutionSpec, InputSelection};
+use aruna_core::structs::execution::job::input::{
+    CapturedInput, ExecutionSpec, InputSelection, InputSource,
+};
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 
@@ -31,9 +34,28 @@ pub(super) struct ResolveScope {
     pub(super) submission_id: SubmissionId,
     pub(super) expires_at: u64,
     pub(super) token: Option<AuthToken>,
+    /// Sync-eligible realm servers allowed to receive credential-bearing input resolve requests.
+    pub(super) allowed_remote: Option<BTreeSet<NodeId>>,
+    /// Remote inputs already captured and granted at workflow admission.
+    pub(super) precaptured: Vec<CapturedInput>,
 }
 
 impl ResolveScope {
+    pub(super) fn with_config(mut self, config: &RealmConfigDocument) -> Self {
+        let allowed = config
+            .sync_eligible_nodes()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        self.allowed_remote = Some(allowed);
+        self
+    }
+
+    pub(super) fn with_precaptured(mut self, precaptured: Vec<CapturedInput>) -> Self {
+        self.precaptured = precaptured;
+        self
+    }
+
     /// The caller for captures here; the bearer lets coordinators answer release membership.
     pub(super) fn capture_caller(&self) -> CaptureCaller {
         let bearer = match &self.token {
@@ -153,6 +175,13 @@ impl ResolveInputsOperation {
             let policies = OutputPoliciesOperation::new(&self.spec, self.local());
             return Ok(Next::Call(IoCall::child(policies)));
         };
+        if let Some(allowed) = &self.scope.allowed_remote
+            && !allowed.contains(&node)
+        {
+            return Err(SubmitJobError::PlacementUnavailable(format!(
+                "input node {node} is not an eligible realm server"
+            )));
+        }
         self.step = ResolveStep::Remote;
         let caller = ResolveCaller {
             created_by: self.scope.caller.created_by,
@@ -162,6 +191,31 @@ impl ResolveInputsOperation {
         let token = self.scope.token.clone();
         let ask = RemoteInputsOperation::new(node, inputs, caller, token);
         Ok(Next::Call(IoCall::child(ask)))
+    }
+
+    fn take_precaptured(&self, node: NodeId, input: &InputSelection) -> Option<CapturedInput> {
+        let InputSource::S3 {
+            bucket,
+            key,
+            version_id: Some(version),
+        } = &input.source
+        else {
+            return None;
+        };
+        let target_key = format!("{bucket}/{key}");
+        self.scope
+            .precaptured
+            .iter()
+            .find(|captured| {
+                captured.source_node_id == node
+                    && captured.version_id.to_string() == *version
+                    && captured.destination_key == target_key
+            })
+            .cloned()
+            .map(|mut captured| {
+                captured.destination_key = input.dest_key.clone();
+                captured
+            })
     }
 
     /// The captures in input order, each with the first link its walk met, here or remotely.
@@ -203,7 +257,12 @@ impl Operation for ResolveInputsOperation {
             match input.source_node_id.filter(|node| *node != self.local()) {
                 Some(node) => {
                     exact_version(&input)?;
-                    self.remote.entry(node).or_default().push(input);
+                    if let Some(captured) = self.take_precaptured(node, &input) {
+                        self.answered.push(input);
+                        self.captured.push(captured);
+                    } else {
+                        self.remote.entry(node).or_default().push(input);
+                    }
                 }
                 None => self.pending.push_back(input),
             }
@@ -235,7 +294,7 @@ impl Operation for ResolveInputsOperation {
             }
             ResolveStep::Capture => {
                 let captured = result.child::<Vec<CapturedInput>, SubmitJobError>()?;
-                self.captured = captured.map_err(placement_failure)?;
+                self.captured.extend(captured.map_err(placement_failure)?);
                 self.remote_next()
             }
             ResolveStep::Remote => {
@@ -291,6 +350,8 @@ mod tests {
             submission_id: SubmissionId([4; 32]),
             expires_at: 10,
             token: None,
+            allowed_remote: None,
+            precaptured: Vec::new(),
         };
         ResolveInputsOperation::new(&spec, scope)
     }

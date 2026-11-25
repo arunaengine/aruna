@@ -32,6 +32,7 @@ use super::run::run_inputs;
 use super::tasks::{site_tags, task_key_of};
 use crate::jobs::lifecycle::preview::{PreviewError, PreviewPlanOperation};
 use crate::jobs::lifecycle::submit_external::IngressNode;
+use crate::jobs::workflow::prepare::NETWORK_TAG_KEY;
 use crate::workflows::import::{COMPOSED_ENTRY, WIR_ENTRY, catalog_tools};
 use crate::workflows::inspect::values_report;
 use crate::workflows::versions::{GetVersionOperation, VersionView};
@@ -97,18 +98,17 @@ enum Placement {
     Runtime(Option<NodeId>),
 }
 
-/// Distinguishes preview rounds by inputs, compute ceilings, and placement tags.
+/// Distinguishes preview rounds by inputs, compute ceilings, network mode, and placement tags.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct PreviewKey {
-    inputs: Vec<(String, Option<NodeId>)>,
-    resources: (
-        Option<u32>,
-        Option<u64>,
-        Option<u64>,
-        Option<u64>,
-        bool,
-        Option<u32>,
-    ),
+    inputs: Vec<(String, String, Option<NodeId>)>,
+    cpu_cores: Option<u32>,
+    ram_bytes: Option<u64>,
+    disk_bytes: Option<u64>,
+    max_walltime_ms: Option<u64>,
+    preemptible: bool,
+    gpus: Option<u32>,
+    network_open: bool,
     tags: Vec<(String, String)>,
 }
 
@@ -214,6 +214,8 @@ impl PlanRunOperation {
             protected: false,
             started_at_ms: None,
             secrets: request.secrets.clone(),
+            path_restrictions: self.auth.path_restrictions.clone(),
+            captured_remote: Vec::new(),
         }
     }
 
@@ -279,8 +281,9 @@ impl PlanRunOperation {
         self.plan
             .diagnostics
             .extend(diagnostics.iter().map(diagnostic_json));
+        let local = self.node.local;
         let pins: Vec<(String, PinnedInput)> = (self.request.inputs.iter())
-            .map(|pin| (pin_address(pin), pin.clone()))
+            .map(|pin| (pin_address(local, pin), pin.clone()))
             .collect();
         let mut upstream: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
         for edge in graph["edges"].as_array().into_iter().flatten() {
@@ -339,23 +342,24 @@ impl PlanRunOperation {
     }
 
     fn preview_key(&self, task: &SimTask) -> PreviewKey {
+        let local = self.node.local;
         let settings = self.settings.get(&task.step);
         let tags = site_tags(None, settings, self.request.placement_site.clone());
+        let network_open = settings.is_some_and(|s| s.execution.network == Some(true));
         let r = &task.resources;
         PreviewKey {
             inputs: task
                 .inputs
                 .iter()
-                .map(|(_, pin)| (pin_address(pin), pin.source_node_id))
+                .map(|(path, pin)| (path.clone(), pin_address(local, pin), pin.source_node_id))
                 .collect(),
-            resources: (
-                r.cpu_cores,
-                r.ram_bytes,
-                r.disk_bytes,
-                r.max_walltime_ms,
-                r.preemptible,
-                r.gpus,
-            ),
+            cpu_cores: r.cpu_cores,
+            ram_bytes: r.ram_bytes,
+            disk_bytes: r.disk_bytes,
+            max_walltime_ms: r.max_walltime_ms,
+            preemptible: r.preemptible,
+            gpus: r.gpus,
+            network_open,
             tags,
         }
     }
@@ -378,12 +382,18 @@ impl PlanRunOperation {
             })
             .collect();
         let settings = self.settings.get(&task.step);
-        let tags = site_tags(None, settings, self.request.placement_site.clone());
+        let mut tags: BTreeMap<String, String> =
+            site_tags(None, settings, self.request.placement_site.clone())
+                .into_iter()
+                .collect();
+        if settings.is_some_and(|s| s.execution.network == Some(true)) {
+            tags.insert(NETWORK_TAG_KEY.to_owned(), "open".to_owned());
+        }
         ExecutionSpec {
             group_id: self.request.group_id,
             name: Some(task.step.clone()),
             description: None,
-            tags: tags.into_iter().collect(),
+            tags,
             image: task.image.clone().unwrap_or_default(),
             entrypoint: None,
             command: Vec::new(),
@@ -737,12 +747,18 @@ fn downstream_of(tasks: &[SimTask], markers: &BTreeSet<u64>) -> BTreeSet<u64> {
     unknown
 }
 
-/// The address a pinned input has in the run's values.
-fn pin_address(pin: &PinnedInput) -> String {
-    format!(
-        "aruna://{}/{}?version={}",
-        pin.bucket, pin.key, pin.version_id
-    )
+/// The address a pinned input has in the run's values, matching `run_inputs`.
+fn pin_address(local: NodeId, pin: &PinnedInput) -> String {
+    match pin.source_node_id.filter(|node| *node != local) {
+        Some(node) => format!(
+            "aruna://{}/{}?version={}&node={node}",
+            pin.bucket, pin.key, pin.version_id
+        ),
+        None => format!(
+            "aruna://{}/{}?version={}",
+            pin.bucket, pin.key, pin.version_id
+        ),
+    }
 }
 
 /// The pinned objects a simulated task reads, by the path it sees each at.

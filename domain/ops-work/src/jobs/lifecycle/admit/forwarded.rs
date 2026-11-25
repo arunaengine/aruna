@@ -261,12 +261,14 @@ impl AdmitForwardedOperation {
         let node = self.node()?.clone();
         let request = &mut self.request;
         pin_outputs(&mut request.spec, node.local);
-        let scope = node.resolve_scope(
-            request.created_by,
-            &request.scope,
-            request.retention_ms,
-            Some(self.token.clone()),
-        );
+        let scope = node
+            .resolve_scope(
+                request.created_by,
+                &request.scope,
+                request.retention_ms,
+                Some(self.token.clone()),
+            )
+            .with_config(&config);
         let resolve = ResolveInputsOperation::new(&request.spec, scope);
         self.step = ForwardedStep::Device(Box::new(config));
         Ok(Next::Call(IoCall::child(resolve)))

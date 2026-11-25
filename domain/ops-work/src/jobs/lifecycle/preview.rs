@@ -145,12 +145,9 @@ impl Operation for PreviewPlanOperation {
                 let config = result.child::<RealmConfigDocument, GetConfigError>()?;
                 let config = config.map_err(|error| PreviewError::Config(error.to_string()))?;
                 let scope = SubmissionScope::Unkeyed(Ulid::nil());
-                let resolve_scope = (self.node).resolve_scope(
-                    self.created_by,
-                    &scope,
-                    RETENTION_MS,
-                    self.token.clone(),
-                );
+                let resolve_scope = (self.node)
+                    .resolve_scope(self.created_by, &scope, RETENTION_MS, self.token.clone())
+                    .with_config(&config);
                 let resolve = ResolveInputsOperation::new(&self.spec, resolve_scope);
                 self.step = PreviewStep::Resolve(Box::new(config));
                 Ok(Next::Call(IoCall::child(resolve)))

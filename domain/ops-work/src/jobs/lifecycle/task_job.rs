@@ -123,8 +123,9 @@ impl PrepareTaskJob {
 
     fn resolve(&mut self, config: RealmConfigDocument) -> PrepareNext {
         pin_outputs(&mut self.spec, self.node.local);
-        let scope =
-            (self.node).resolve_scope(self.created_by, &self.scope, self.retention_ms, None);
+        let scope = (self.node)
+            .resolve_scope(self.created_by, &self.scope, self.retention_ms, None)
+            .with_config(&config);
         let resolve = ResolveInputsOperation::new(&self.spec, scope);
         self.step = PrepareStep::Resolve(Box::new(config));
         Ok(Next::Call(IoCall::child(resolve)))
