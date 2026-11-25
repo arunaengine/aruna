@@ -191,6 +191,18 @@ fn role_paths_bounded() {
     );
     assert!(paths[1].0.ends_with("/uploads/bakta/**"), "{:?}", paths[1]);
     assert_eq!(paths[1].1, Permission::WRITE);
+    applet.grants.start = Some(StartGrant::Workflow {
+        workflow_id: Ulid::from_bytes([9; 16]),
+        version: 1,
+    });
+    let with_start = applet.role_paths(realm, node());
+    assert_eq!(
+        with_start[2],
+        (
+            crate::structs::execution::workflow::workflow_permission_path(realm, applet.group_id),
+            Permission::WRITE
+        )
+    );
     let encoded = applet.to_bytes().unwrap();
     assert_eq!(Applet::from_bytes(&encoded).unwrap(), applet);
 }

@@ -20,9 +20,28 @@ pub const PREVIEW: &str = "__Host-aruna-preview";
 pub const STATE: &str = "__Host-aruna-state";
 /// Set on top-level page loads; browsers never send it from a cross-site frame.
 pub const TOP: &str = "__Host-aruna-top";
+/// Random host-bound identity for an anonymous guest, separate from IP rate limits.
+pub const GUEST: &str = "__Host-aruna-guest";
+/// How long an anonymous guest session cookie stays valid (7 days).
+pub const GUEST_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 /// Every pod derives the same sealing key from the shared edge key.
 const KEY_CONTEXT: &str = "aruna applet gateway 2026-11 session cookie";
 const NONCE_BYTES: usize = 24;
+
+/// A random host-bound identity for an anonymous guest on one applet.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuestSession {
+    pub applet_id: String,
+    pub id: String,
+    /// Unix seconds.
+    pub expires: u64,
+}
+
+/// Mints a random 128-bit URL-safe guest session id.
+pub fn new_guest_id() -> String {
+    let bytes: [u8; 16] = rand::random();
+    URL_SAFE_NO_PAD.encode(bytes)
+}
 
 /// The version or build a preview session looks at instead of the decision's version.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +109,30 @@ impl Sealer {
         let plain = self.cipher().decrypt(&XNonce::from(nonce), payload).ok()?;
         let session: Session = serde_json::from_slice(&plain).ok()?;
         (session.expires > now).then_some(session)
+    }
+
+    pub fn seal_guest(&self, host: &str, guest: &GuestSession) -> Option<String> {
+        let plain = serde_json::to_vec(guest).ok()?;
+        let nonce: [u8; NONCE_BYTES] = rand::random();
+        let payload = Payload {
+            msg: &plain,
+            aad: host.as_bytes(),
+        };
+        let sealed = self.cipher().encrypt(&XNonce::from(nonce), payload).ok()?;
+        Some(URL_SAFE_NO_PAD.encode([nonce.as_slice(), &sealed].concat()))
+    }
+
+    pub fn open_guest(&self, host: &str, text: &str, now: u64) -> Option<GuestSession> {
+        let bytes = URL_SAFE_NO_PAD.decode(text).ok()?;
+        let (nonce, sealed) = bytes.split_at_checked(NONCE_BYTES)?;
+        let nonce: [u8; NONCE_BYTES] = nonce.try_into().ok()?;
+        let payload = Payload {
+            msg: sealed,
+            aad: host.as_bytes(),
+        };
+        let plain = self.cipher().decrypt(&XNonce::from(nonce), payload).ok()?;
+        let guest: GuestSession = serde_json::from_slice(&plain).ok()?;
+        (guest.expires > now).then_some(guest)
     }
 
     fn cipher(&self) -> XChaCha20Poly1305 {

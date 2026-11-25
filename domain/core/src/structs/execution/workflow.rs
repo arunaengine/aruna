@@ -10,8 +10,14 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::errors::ConversionError;
+use crate::structs::identity::realm::RealmId;
 use crate::types::{GroupId, Key};
 use crate::user::id::UserId;
+
+/// Permission path for a group's workflows and tools, below its metadata.
+pub fn workflow_permission_path(realm_id: RealmId, group_id: GroupId) -> String {
+    format!("/{realm_id}/g/{group_id}/meta/workflows")
+}
 
 /// Who may read a workflow: the members of its group, or every user of the realm.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

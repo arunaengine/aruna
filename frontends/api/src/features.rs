@@ -136,7 +136,10 @@ pub(crate) async fn gate_middleware(
     }
     let path = request.uri().path();
     let path = path.strip_prefix(API_PREFIX).unwrap_or(path);
-    let (group, profile) = path_group(&state, template, path).await;
+    let (group, profile) = match path_group(&state, template, path).await {
+        Ok(resolved) => resolved,
+        Err(error) => return error.into_response(),
+    };
     if profile {
         features.push(Feature::Profiles);
     }
@@ -161,45 +164,65 @@ pub(crate) fn gates(method: &Method, template: &str) -> Vec<Feature> {
         .collect()
 }
 
-/// The group a path names, and whether it names a document under `profiles/`. Unknown buckets
-/// and documents name none, so the gate resolves at realm level and the handler answers 404.
-async fn path_group(state: &ServerState, template: &str, path: &str) -> (Option<GroupId>, bool) {
+/// Resolves the decoded group path parameter and whether it names a `profiles/` document,
+/// rejecting malformed ids or lookup failures rather than falling back to realm defaults.
+async fn path_group(
+    state: &ServerState,
+    template: &str,
+    path: &str,
+) -> ServerResult<(Option<GroupId>, bool)> {
     let pairs = template.split('/').zip(path.split('/'));
     let mut previous = "";
-    for (name, value) in pairs {
+    for (name, raw) in pairs {
         match (previous, name) {
             (_, "{group_id}") | ("groups", "{id}") => {
-                return (Ulid::from_string(value).ok(), false);
+                let value = decode_segment(raw)?;
+                let id = Ulid::from_string(&value)
+                    .map_err(|_| ServerError::BadRequestReason("group_id is not a ULID".into()))?;
+                return Ok((Some(id), false));
             }
             (_, "{bucket}") => {
-                let group = crate::routes::access::groups::get_bucket_group(state, value).await;
-                return (group.ok().flatten(), false);
+                let value = decode_segment(raw)?;
+                let group = crate::routes::access::groups::get_bucket_group(state, &value).await?;
+                return Ok((group, false));
             }
             (_, "{document_id}") => {
-                let Ok(id) = Ulid::from_string(value) else {
-                    return (None, false);
-                };
+                let value = decode_segment(raw)?;
+                let id = Ulid::from_string(&value).map_err(|_| {
+                    ServerError::BadRequestReason("document_id is not a ULID".into())
+                })?;
                 return document_group(state, id).await;
             }
             _ => previous = name,
         }
     }
-    (None, false)
+    Ok((None, false))
 }
 
-async fn document_group(state: &ServerState, document_id: Ulid) -> (Option<GroupId>, bool) {
+fn decode_segment(raw: &str) -> ServerResult<String> {
+    percent_encoding::percent_decode_str(raw)
+        .decode_utf8()
+        .map(std::borrow::Cow::into_owned)
+        .map_err(|_| ServerError::BadRequestReason("malformed path parameter".into()))
+}
+
+async fn document_group(
+    state: &ServerState,
+    document_id: Ulid,
+) -> ServerResult<(Option<GroupId>, bool)> {
     match crate::metadata::load_document_record(state, document_id).await {
         Ok(record) => {
             let profile = record.document_path.starts_with(PROFILE_DOCUMENT_PREFIX);
-            (Some(record.group_id), profile)
+            Ok((Some(record.group_id), profile))
         }
-        Err(_) => (None, false),
+        Err(ServerError::NotFound) => Ok((None, false)),
+        Err(error) => Err(error),
     }
 }
 
 /// Refuses a write to a document under `profiles/` while `profiles` is off for its group.
 pub(crate) async fn profile_write(state: &ServerState, document_id: Ulid) -> ServerResult<()> {
-    match document_group(state, document_id).await {
+    match document_group(state, document_id).await? {
         (group, true) => require(state, Feature::Profiles, group).await,
         (_, false) => Ok(()),
     }

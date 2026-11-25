@@ -73,13 +73,41 @@ pub fn run_request(
             source_node_id: Some(applet.host_node),
         });
     }
+    let inputs_json = if pinned.is_empty() {
+        None
+    } else {
+        let mut by_name: std::collections::BTreeMap<String, Vec<Value>> =
+            std::collections::BTreeMap::new();
+        for pin in &pinned {
+            by_name
+                .entry(pin.name.clone())
+                .or_default()
+                .push(serde_json::json!({
+                    "bucket": pin.bucket,
+                    "key": pin.key,
+                    "version_id": pin.version_id.to_string(),
+                    "source_node_id": pin.source_node_id.map(|n| n.to_string()),
+                }));
+        }
+        let map: serde_json::Map<String, Value> = by_name
+            .into_iter()
+            .map(|(name, mut items)| {
+                let value = match items.len() {
+                    1 => items.pop().unwrap_or(Value::Null),
+                    _ => Value::Array(items),
+                };
+                (name, value)
+            })
+            .collect();
+        serde_json::to_string(&Value::Object(map)).ok()
+    };
     Ok(RunRequest {
         group_id: applet.group_id,
         workflow_id,
         version,
         values,
         inputs: pinned,
-        inputs_json: None,
+        inputs_json,
         output: Some(RunOutput {
             bucket,
             prefix: format!("{folder}runs"),

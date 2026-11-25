@@ -137,6 +137,18 @@ pub async fn create_version(
     Json(request): Json<CreateVersionRequest>,
 ) -> ServerResult<(StatusCode, Json<WorkflowCreated>)> {
     let workflow_id = ulid(&workflow_id, "workflow_id")?;
+    let current = drive(
+        aruna_ops_work::workflows::reads::GetWorkflowOperation::new(&auth, workflow_id),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(catalog_error)?;
+    crate::features::require(
+        &state,
+        aruna_core::structs::identity::features::Feature::Workflows,
+        Some(current.record.group_id),
+    )
+    .await?;
     let source = source_input(request.source)?;
     let add = AddVersionOperation::new(
         (&auth, state.get_node_id()),

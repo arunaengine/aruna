@@ -51,12 +51,11 @@ struct Caller {
     previewer: bool,
 }
 
-/// The guest id the edge sent: its own guest id, else the client address it forwards. It is
-/// only ever stored as a salted hash.
+/// The guest session id the edge sealed in its host-bound cookie, stored only as a salted hash.
 fn guest_id(headers: &HeaderMap) -> Option<String> {
-    let header = |name| headers.get(name).and_then(|value| value.to_str().ok());
-    (header("x-aruna-guest").map(str::trim))
-        .or_else(|| header("x-forwarded-for").and_then(|list| list.split(',').next()))
+    headers
+        .get("x-aruna-guest")
+        .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|id| !id.is_empty())
         .map(str::to_string)
@@ -156,8 +155,8 @@ pub struct SessionBody {
     description = r#"Answers who visits an applet page and what the page may do for them.
 
 **Authentication**: the configured edge key in `X-Aruna-Edge-Key`, plus the visitor's sealed
-token in `X-Aruna-Visitor`, or a guest id in `X-Aruna-Guest` (else the first `X-Forwarded-For`
-address) where guests are allowed.
+token in `X-Aruna-Visitor`, or the edge's sealed guest session id in `X-Aruna-Guest` where guests
+are allowed.
 
 **Behavior**
 - The pseudonym is a keyed hash of the account or guest id; the raw guest id is never stored.
@@ -400,6 +399,12 @@ pub async fn start_run(
     Json(body): Json<RunRequestBody>,
 ) -> ServerResult<(StatusCode, Json<RunBody>)> {
     let caller = caller(&state, &headers, &id).await?;
+    crate::features::require(
+        &state,
+        aruna_core::structs::identity::features::Feature::Workflows,
+        Some(caller.applet.group_id),
+    )
+    .await?;
     if caller.visit.guest || caller.applet.access == Access::Public {
         let backends = drive(SandboxOperation, &state.get_ctx())
             .await

@@ -104,7 +104,7 @@ pub struct GraphView {
 
 /// The permission path of the workflows and tools of a group, below its metadata.
 pub fn workflow_path(realm_id: RealmId, group_id: GroupId) -> String {
-    format!("/{realm_id}/g/{group_id}/meta/workflows")
+    aruna_core::structs::execution::workflow::workflow_permission_path(realm_id, group_id)
 }
 
 pub(crate) fn diagnostic(severity: Severity, message: impl Into<String>) -> Diagnostic {

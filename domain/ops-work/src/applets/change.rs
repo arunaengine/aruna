@@ -379,6 +379,8 @@ impl Operation for ChangeAppletOperation {
                     now_ms: 0,
                     record: None,
                     deletes: Vec::new(),
+                    writes: Vec::new(),
+                    checking: false,
                 };
                 let seed = self.applet_id.to_bytes();
                 Ok(Next::Call(IoCall::retry(write, &seed)))
@@ -412,6 +414,8 @@ pub struct WriteChangeOperation {
     now_ms: u64,
     record: Option<Applet>,
     deletes: Vec<String>,
+    writes: Vec<(KeySpace, Key, Value)>,
+    checking: bool,
 }
 
 impl WriteChangeOperation {
@@ -425,6 +429,8 @@ impl WriteChangeOperation {
             now_ms: 0,
             record: None,
             deletes: Vec::new(),
+            writes: Vec::new(),
+            checking: false,
         }
     }
 }
@@ -446,12 +452,26 @@ impl Operation for WriteChangeOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Applet>, AppletError> {
+        if self.checking {
+            self.checking = false;
+            let values = result.values()?;
+            let candidates = std::mem::take(&mut self.deletes);
+            for (host, row) in candidates.into_iter().zip(values) {
+                let owned =
+                    super::host_answer(row)?.is_some_and(|row| row.applet_id == self.applet_id);
+                if owned {
+                    self.deletes.push(host);
+                }
+            }
+            let writes = std::mem::take(&mut self.writes);
+            return Ok(Next::Call(IoCall::Write(writes)));
+        }
         if let Some(record) = self.record.take() {
             result.done()?;
             if self.deletes.is_empty() {
                 return Ok(Next::Done(record));
             }
-            // The removed hosts go in the same transaction as the record write.
+            // Only host rows owned by this applet are deleted, in the same transaction.
             let deletes = (std::mem::take(&mut self.deletes).iter())
                 .map(|host| (APPLET_HOSTS_KEYSPACE.to_string(), host_key(host)))
                 .collect();
@@ -482,6 +502,16 @@ impl Operation for WriteChangeOperation {
         }
         self.record = Some(applet);
         self.deletes = moves.remove;
+        if !self.deletes.is_empty() {
+            let reads = self
+                .deletes
+                .iter()
+                .map(|host| (APPLET_HOSTS_KEYSPACE.to_string(), host_key(host)))
+                .collect();
+            self.writes = writes;
+            self.checking = true;
+            return Ok(Next::Call(IoCall::Read(reads)));
+        }
         Ok(Next::Call(IoCall::Write(writes)))
     }
 

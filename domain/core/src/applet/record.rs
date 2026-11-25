@@ -474,9 +474,11 @@ impl Applet {
             paths.push((format!("{path}/**"), Permission::WRITE));
         }
         if grants.start.is_some() {
-            let group =
-                crate::structs::storage::blob::group_permission_path(realm_id, self.group_id, node);
-            paths.push((group, Permission::WRITE));
+            let path = crate::structs::execution::workflow::workflow_permission_path(
+                realm_id,
+                self.group_id,
+            );
+            paths.push((path, Permission::WRITE));
         }
         paths
     }

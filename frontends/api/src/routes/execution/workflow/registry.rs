@@ -250,6 +250,13 @@ pub async fn patch_workflow(
     Json(patch): Json<WorkflowPatchBody>,
 ) -> ServerResult<Json<WorkflowSummary>> {
     let workflow_id = ulid(&workflow_id, "workflow_id")?;
+    let current = drive(
+        GetWorkflowOperation::new(&auth, workflow_id),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(catalog_error)?;
+    crate::features::require(&state, Feature::Workflows, Some(current.record.group_id)).await?;
     let patch = WorkflowPatch {
         name: patch.name,
         description: patch.description,

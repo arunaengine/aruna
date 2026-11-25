@@ -7,14 +7,17 @@ use std::net::{IpAddr, SocketAddr};
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request};
 use axum::http::header::{
-    ACCEPT, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG, HeaderMap, HeaderValue,
+    ACCEPT, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG, HeaderMap, HeaderValue, SET_COOKIE,
 };
 use axum::http::{Method, StatusCode};
 use axum::response::Response;
 use tracing::warn;
 
 use crate::pages::{bare, unavailable};
-use crate::session::{TOP, cookies};
+use crate::session::{
+    GUEST, GUEST_TTL_SECS, GuestSession, Site, TOP, cookies, framed, new_guest_id, now_seconds,
+    set_cookie,
+};
 use crate::upstream::Serving;
 use crate::visit::{Visit, plain_id};
 use crate::{Gateway, policy, preview, signin};
@@ -83,8 +86,33 @@ async fn proxy(gateway: &Gateway, visit: &Visit, rest: &str, request: Request) -
     let mut sent = (gateway.upstream.request(visit.answer.node, method, &path))
         .header("x-aruna-host", &visit.host)
         .header("x-aruna-top", if top { "1" } else { "0" });
+    let mut guest_cookie: Option<HeaderValue> = None;
     if let Some(token) = token {
         sent = sent.header("x-aruna-visitor", token);
+    } else {
+        let now = now_seconds();
+        let applet_id = decision.applet_id.as_str();
+        let guest_id = cookies(headers, GUEST)
+            .find_map(|text| gateway.sealer.open_guest(&visit.host, text, now))
+            .filter(|guest| guest.applet_id == applet_id)
+            .map(|guest| guest.id)
+            .unwrap_or_else(|| {
+                let id = new_guest_id();
+                let guest = GuestSession {
+                    applet_id: applet_id.to_owned(),
+                    id: id.clone(),
+                    expires: now.saturating_add(GUEST_TTL_SECS),
+                };
+                if let Some(sealed) = gateway.sealer.seal_guest(&visit.host, &guest) {
+                    let site = match framed(headers) || !top {
+                        true => Site::Framed,
+                        false => Site::Lax,
+                    };
+                    guest_cookie = set_cookie(GUEST, &sealed, GUEST_TTL_SECS, site);
+                }
+                id
+            });
+        sent = sent.header("x-aruna-guest", guest_id);
     }
     if let Some(client) = client_ip(gateway, &request) {
         sent = sent.header("x-forwarded-for", client.to_string());
@@ -112,6 +140,9 @@ async fn proxy(gateway: &Gateway, visit: &Visit, rest: &str, request: Request) -
     }
     if !out.contains_key(CACHE_CONTROL) {
         out.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    if let Some(cookie) = guest_cookie {
+        out.append(SET_COOKIE, cookie);
     }
     policy::secure(out, frame);
     *response.body_mut() = Body::from_stream(upstream.bytes_stream());

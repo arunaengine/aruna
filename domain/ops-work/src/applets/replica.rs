@@ -158,7 +158,8 @@ impl Operation for StoreAppletOperation {
             local: self.local.0,
             applet,
             stale: Vec::new(),
-            reading: true,
+            writes: Vec::new(),
+            step: CopyStep::Read,
         };
         Ok(Next::Call(IoCall::retry(write, &seed)))
     }
@@ -168,6 +169,14 @@ impl Operation for StoreAppletOperation {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CopyStep {
+    Read,
+    CheckStale,
+    Write,
+    Delete,
+}
+
 /// Writes an applet copy with the host rows it serves in one transaction, unless the stored
 /// copy is as new. A host row naming another applet is left alone.
 #[derive(Clone, Debug, PartialEq)]
@@ -175,7 +184,12 @@ pub struct WriteCopyOperation {
     local: NodeId,
     applet: Box<Applet>,
     stale: Vec<String>,
-    reading: bool,
+    writes: Vec<(
+        aruna_core::types::KeySpace,
+        aruna_core::types::Key,
+        aruna_core::types::Value,
+    )>,
+    step: CopyStep,
 }
 
 impl Operation for WriteCopyOperation {
@@ -201,45 +215,80 @@ impl Operation for WriteCopyOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<u64>, AppletError> {
         let revision = self.applet.revision;
-        if !std::mem::replace(&mut self.reading, false) {
-            result.done()?;
-            let stale = std::mem::take(&mut self.stale);
-            if stale.is_empty() {
-                return Ok(Next::Done(revision));
+        match self.step {
+            CopyStep::Delete => {
+                result.done()?;
+                Ok(Next::Done(revision))
             }
-            let deletes = (stale.iter())
-                .map(|host| (APPLET_HOSTS_KEYSPACE.to_string(), host_key(host)))
-                .collect();
-            return Ok(Next::Call(IoCall::Delete(deletes)));
+            CopyStep::Write => {
+                result.done()?;
+                let stale = std::mem::take(&mut self.stale);
+                if stale.is_empty() {
+                    return Ok(Next::Done(revision));
+                }
+                let deletes = (stale.iter())
+                    .map(|host| (APPLET_HOSTS_KEYSPACE.to_string(), host_key(host)))
+                    .collect();
+                self.step = CopyStep::Delete;
+                Ok(Next::Call(IoCall::Delete(deletes)))
+            }
+            CopyStep::CheckStale => {
+                let values = result.values()?;
+                let candidates = std::mem::take(&mut self.stale);
+                for (host, row) in candidates.into_iter().zip(values) {
+                    let owned =
+                        host_answer(row)?.is_some_and(|row| row.applet_id == self.applet.applet_id);
+                    if owned {
+                        self.stale.push(host);
+                    }
+                }
+                let writes = std::mem::take(&mut self.writes);
+                self.step = CopyStep::Write;
+                Ok(Next::Call(IoCall::Write(writes)))
+            }
+            CopyStep::Read => {
+                let mut values = result.values()?.into_iter();
+                let stored = applet_answer(IoResult::Values(vec![values.next().flatten()]))?;
+                if let Some(stored) = &stored {
+                    if stored.host_node == self.local {
+                        return Err(AppletError::Forbidden);
+                    }
+                    if stored.revision >= revision {
+                        return Ok(Next::Done(stored.revision));
+                    }
+                }
+                let mut writes = record_rows(&self.applet)?;
+                let hosts = served_hosts(&self.applet);
+                for ((host, kind), row) in hosts.iter().zip(values) {
+                    let taken =
+                        host_answer(row)?.is_some_and(|row| row.applet_id != self.applet.applet_id);
+                    if !taken {
+                        let row = HostRow {
+                            applet_id: self.applet.applet_id,
+                            kind: *kind,
+                        };
+                        writes.push(host_row(host, row)?);
+                    }
+                }
+                // Hosts the older copy served that this one no longer serves.
+                self.stale = (stored.iter().flat_map(served_hosts))
+                    .map(|(host, _)| host)
+                    .filter(|host| !hosts.iter().any(|(kept, _)| kept == host))
+                    .collect();
+                if !self.stale.is_empty() {
+                    let reads = self
+                        .stale
+                        .iter()
+                        .map(|host| (APPLET_HOSTS_KEYSPACE.to_string(), host_key(host)))
+                        .collect();
+                    self.writes = writes;
+                    self.step = CopyStep::CheckStale;
+                    return Ok(Next::Call(IoCall::Read(reads)));
+                }
+                self.step = CopyStep::Write;
+                Ok(Next::Call(IoCall::Write(writes)))
+            }
         }
-        let mut values = result.values()?.into_iter();
-        let stored = applet_answer(IoResult::Values(vec![values.next().flatten()]))?;
-        if let Some(stored) = &stored {
-            if stored.host_node == self.local {
-                return Err(AppletError::Forbidden);
-            }
-            if stored.revision >= revision {
-                return Ok(Next::Done(stored.revision));
-            }
-        }
-        let mut writes = record_rows(&self.applet)?;
-        let hosts = served_hosts(&self.applet);
-        for ((host, kind), row) in hosts.iter().zip(values) {
-            let taken = host_answer(row)?.is_some_and(|row| row.applet_id != self.applet.applet_id);
-            if !taken {
-                let row = HostRow {
-                    applet_id: self.applet.applet_id,
-                    kind: *kind,
-                };
-                writes.push(host_row(host, row)?);
-            }
-        }
-        // Hosts the older copy served that this one no longer serves.
-        self.stale = (stored.iter().flat_map(served_hosts))
-            .map(|(host, _)| host)
-            .filter(|host| !hosts.iter().any(|(kept, _)| kept == host))
-            .collect();
-        Ok(Next::Call(IoCall::Write(writes)))
     }
 
     fn expected_error(error: &AppletError) -> bool {
@@ -259,12 +308,13 @@ mod tests {
             local,
             applet: Box::new(applet.clone()),
             stale: Vec::new(),
-            reading: true,
+            writes: Vec::new(),
+            step: CopyStep::Read,
         }
     }
 
-    // A newer copy replaces an older one and drops the hosts it no longer serves; an older copy
-    // and the host's own record are never overwritten.
+    // A newer copy replaces an older one and drops only hosts still owned by it; an older copy,
+    // the host's own record, and hosts now owned by another applet are left untouched.
     #[test]
     fn copies_only_newer() {
         let holder = iroh::SecretKey::from_bytes(&[9; 32]).public();
@@ -280,10 +330,23 @@ mod tests {
         new.domains.clear();
         new.revision += 1;
         let stored = Some(ByteView::from(old.to_bytes().unwrap()));
+        let owned_host = host_row(
+            "bakta.lab.org",
+            HostRow {
+                applet_id: old.applet_id,
+                kind: HostKind::Custom,
+            },
+        )
+        .unwrap()
+        .2;
         let mut write = copy(&new, holder);
         write.first().unwrap();
-        let answer = write
+        let check = write
             .next(IoResult::Values(vec![stored.clone(), None]))
+            .unwrap();
+        assert!(matches!(check, Next::Call(IoCall::Read(_))));
+        let answer = write
+            .next(IoResult::Values(vec![Some(owned_host)]))
             .unwrap();
         assert!(matches!(answer, Next::Call(IoCall::Write(_))));
         assert_eq!(write.stale, vec!["bakta.lab.org".to_string()]);
@@ -291,6 +354,30 @@ mod tests {
             write.next(IoResult::Done),
             Ok(Next::Call(IoCall::Delete(_)))
         ));
+
+        // If another applet now owns the stale host row, it is NOT deleted.
+        let other_host = host_row(
+            "bakta.lab.org",
+            HostRow {
+                applet_id: ulid::Ulid::from_bytes([77; 16]),
+                kind: HostKind::Custom,
+            },
+        )
+        .unwrap()
+        .2;
+        let mut keep_other = copy(&new, holder);
+        keep_other.first().unwrap();
+        keep_other
+            .next(IoResult::Values(vec![stored.clone(), None]))
+            .unwrap();
+        keep_other
+            .next(IoResult::Values(vec![Some(other_host)]))
+            .unwrap();
+        assert!(keep_other.stale.is_empty());
+        assert_eq!(
+            keep_other.next(IoResult::Done).unwrap(),
+            Next::Done(new.revision)
+        );
 
         let mut stale = copy(&old, holder);
         stale.first().unwrap();
