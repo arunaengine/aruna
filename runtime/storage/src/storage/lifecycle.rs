@@ -17,7 +17,7 @@ use super::metrics::WorkerLifecycleGuard;
 use super::persistence::FjallPersistPolicy;
 use super::preimage::flush_empty;
 use super::rebuild::running_rebuild;
-use super::worker::{BULK_POOL_THREADS, FjallStorage, READ_POOL_THREADS, Store, spawn_read_pool};
+use super::worker::{BULK_POOL_THREADS, FjallStorage, Store, read_pool_threads, spawn_read_pool};
 
 pub use aruna_core::persistence::CACHE_BYTES;
 
@@ -54,7 +54,7 @@ impl FjallStorage {
             path,
             policy,
             cache_bytes,
-            (READ_POOL_THREADS, BULK_POOL_THREADS),
+            (read_pool_threads(), BULK_POOL_THREADS),
         )
     }
 

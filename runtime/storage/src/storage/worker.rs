@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound::{self, Excluded, Included, Unbounded};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -100,24 +100,32 @@ const STORAGE_EFFECT_THRESHOLD: Duration = Duration::from_millis(50);
 const QUEUE_LOG_INTERVAL: Duration = Duration::from_secs(1);
 pub(super) const MAX_GROUP_COMMIT: usize = 256;
 pub(super) const READ_POOL_THREADS: usize = 4;
+pub(super) const READ_POOL_MAX: usize = 16;
 pub(super) const BULK_POOL_THREADS: usize = 2;
-/// Point reads on a network disk wait on its latency, so a batch of more than `READ_CHUNK`
-/// keys is read by up to `READ_THREADS` threads at once.
+/// Batches larger than this read on the bulk pool so small foreground reads never wait behind them.
 const READ_CHUNK: usize = 256;
-const READ_THREADS: usize = 8;
 // Count foreground effects so large batches cannot starve the bulk lane under load.
 pub(super) const FOREGROUND_PER_BULK: usize = 8;
+
+pub(super) fn scale_read_pool(cpus: usize) -> usize {
+    cpus.clamp(READ_POOL_THREADS, READ_POOL_MAX)
+}
+
+pub(super) fn read_pool_threads() -> usize {
+    scale_read_pool(thread::available_parallelism().map_or(READ_POOL_THREADS, usize::from))
+}
+
 #[derive(Clone)]
 pub(super) struct Store {
     pub(super) db: OptimisticTxDatabase,
-    pub(super) keyspaces: Arc<Mutex<HashMap<String, OptimisticTxKeyspace>>>,
+    pub(super) keyspaces: Arc<RwLock<HashMap<String, OptimisticTxKeyspace>>>,
 }
 
 impl Store {
     pub(super) fn new(db: OptimisticTxDatabase) -> Self {
         Self {
             db,
-            keyspaces: Arc::new(Mutex::new(HashMap::new())),
+            keyspaces: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -127,8 +135,8 @@ impl Store {
     ) -> Result<OptimisticTxKeyspace, StorageError> {
         if let Some(ks) = self
             .keyspaces
-            .lock()
-            .expect("storage keyspace cache mutex poisoned")
+            .read()
+            .expect("storage keyspace cache lock poisoned")
             .get(name)
         {
             return Ok(ks.clone());
@@ -138,8 +146,8 @@ impl Store {
             Ok(ks) => {
                 let mut keyspaces = self
                     .keyspaces
-                    .lock()
-                    .expect("storage keyspace cache mutex poisoned");
+                    .write()
+                    .expect("storage keyspace cache lock poisoned");
                 Ok(keyspaces
                     .entry(name.to_string())
                     .or_insert_with(|| ks.clone())
@@ -154,12 +162,15 @@ impl Store {
         &self,
         name: &str,
     ) -> Result<Option<OptimisticTxKeyspace>, StorageError> {
-        let cached = self
+        if let Some(ks) = self
             .keyspaces
-            .lock()
-            .expect("storage keyspace cache mutex poisoned")
-            .contains_key(name);
-        match cached || self.db.keyspace_exists(name) {
+            .read()
+            .expect("storage keyspace cache lock poisoned")
+            .get(name)
+        {
+            return Ok(Some(ks.clone()));
+        }
+        match self.db.keyspace_exists(name) {
             true => self.resolve_keyspace(name).map(Some),
             false => Ok(None),
         }
@@ -794,30 +805,13 @@ pub(super) fn store_read(
     }
 }
 
-pub(super) fn batch_read_with<R: Readable + Sync>(
+pub(super) fn batch_read_with<R: Readable>(
     store: &Store,
     reader: &R,
     reads: Vec<(String, ByteView)>,
     create: bool,
 ) -> StorageEvent {
-    let chunk = reads.len().div_ceil(READ_THREADS).max(READ_CHUNK);
-    let values = match reads.len() > chunk {
-        false => read_keys(store, reader, &reads, create),
-        true => thread::scope(|scope| {
-            let parts: Vec<_> = (reads.chunks(chunk))
-                .map(|part| scope.spawn(move || read_keys(store, reader, part, create)))
-                .collect();
-            let mut values = Vec::with_capacity(reads.len());
-            for part in parts {
-                let part = part
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-                values.extend(part?);
-            }
-            Ok(values)
-        }),
-    };
-    match values {
+    match read_keys(store, reader, &reads, create) {
         Ok(values) => StorageEvent::BatchReadResult { values },
         Err(error) => StorageEvent::Error { error },
     }
@@ -829,17 +823,36 @@ fn read_keys<R: Readable>(
     reads: &[(String, ByteView)],
     create: bool,
 ) -> Result<Vec<(ByteView, Option<ByteView>)>, StorageError> {
+    let mut resolved: HashMap<&str, Option<OptimisticTxKeyspace>> = HashMap::new();
+    for (key_space, _) in reads {
+        if let std::collections::hash_map::Entry::Vacant(slot) = resolved.entry(key_space.as_str())
+        {
+            let keyspace = match create {
+                true => store.resolve_keyspace(key_space).map(Some),
+                false => store.existing_keyspace(key_space),
+            }?;
+            slot.insert(keyspace);
+        }
+    }
     let mut values = Vec::with_capacity(reads.len());
+    if resolved.len() == 1 {
+        let keyspace = resolved.values().next().and_then(Option::as_ref);
+        for (_, key) in reads {
+            let value = match keyspace {
+                Some(keyspace) => reader.get(keyspace, key),
+                None => Ok(None),
+            }
+            .map_err(|error| StorageError::ReadError(error.to_string()))?;
+            values.push((key.clone(), value.map(Into::into)));
+        }
+        return Ok(values);
+    }
     for (key_space, key) in reads {
-        let keyspace = match create {
-            true => store.resolve_keyspace(key_space).map(Some),
-            false => store.existing_keyspace(key_space),
-        }?;
-        let value = match keyspace {
-            Some(keyspace) => reader.get(&keyspace, key),
+        let value = match resolved.get(key_space.as_str()).and_then(Option::as_ref) {
+            Some(keyspace) => reader.get(keyspace, key),
             None => Ok(None),
-        };
-        let value = value.map_err(|error| StorageError::ReadError(error.to_string()))?;
+        }
+        .map_err(|error| StorageError::ReadError(error.to_string()))?;
         values.push((key.clone(), value.map(Into::into)));
     }
     Ok(values)

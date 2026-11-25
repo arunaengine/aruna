@@ -2754,3 +2754,83 @@ async fn sweep_drops_journals() {
     (jobs.try_recv().expect("sweep is queued").run)().unwrap();
     first_dropped(dir.path()).await;
 }
+
+#[test]
+fn read_pool_clamped() {
+    assert_eq!(super::worker::scale_read_pool(1), 4);
+    assert_eq!(super::worker::scale_read_pool(4), 4);
+    assert_eq!(super::worker::scale_read_pool(8), 8);
+    assert_eq!(super::worker::scale_read_pool(16), 16);
+    assert_eq!(super::worker::scale_read_pool(64), 16);
+}
+
+#[tokio::test]
+async fn batch_read_mixed() {
+    let dir = tempdir().unwrap();
+    let handle = FjallStorage::open_test(dir.path().to_str().unwrap()).unwrap();
+    let mut writes = Vec::new();
+    for index in 0..320usize {
+        let key = ByteView::from(format!("k-{index:04}"));
+        let value = ByteView::from(format!("v-{index:04}"));
+        let space = if index % 2 == 0 { "alpha" } else { "beta" };
+        writes.push((space.to_string(), key, value));
+    }
+    let event = handle
+        .send_storage_effect(StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        })
+        .await;
+    assert!(matches!(
+        event,
+        Event::Storage(StorageEvent::BatchWriteResult { .. })
+    ));
+
+    let single: Vec<_> = (0..320usize)
+        .step_by(2)
+        .map(|index| ("alpha".to_string(), ByteView::from(format!("k-{index:04}"))))
+        .collect();
+    let Event::Storage(StorageEvent::BatchReadResult { values }) = handle
+        .send_storage_effect(StorageEffect::BatchRead {
+            reads: single,
+            txn_id: None,
+        })
+        .await
+    else {
+        panic!("expected single-keyspace batch read");
+    };
+    assert_eq!(values.len(), 160);
+    assert_eq!(values[0].1, Some(ByteView::from("v-0000")));
+    assert_eq!(values[159].1, Some(ByteView::from("v-0318")));
+
+    let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = handle
+        .send_storage_effect(StorageEffect::StartTransaction { read: true })
+        .await
+    else {
+        panic!("expected read transaction");
+    };
+    let mixed = vec![
+        ("alpha".to_string(), ByteView::from("k-0000")),
+        ("missing".to_string(), ByteView::from("k-0000")),
+        ("beta".to_string(), ByteView::from("k-0001")),
+        ("alpha".to_string(), ByteView::from("k-9999")),
+    ];
+    let Event::Storage(StorageEvent::BatchReadResult { values }) = handle
+        .send_storage_effect(StorageEffect::BatchRead {
+            reads: mixed,
+            txn_id: Some(txn_id),
+        })
+        .await
+    else {
+        panic!("expected mixed-keyspace batch read");
+    };
+    assert_eq!(
+        values,
+        vec![
+            (ByteView::from("k-0000"), Some(ByteView::from("v-0000"))),
+            (ByteView::from("k-0000"), None),
+            (ByteView::from("k-0001"), Some(ByteView::from("v-0001"))),
+            (ByteView::from("k-9999"), None),
+        ]
+    );
+}
