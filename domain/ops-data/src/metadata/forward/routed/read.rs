@@ -14,7 +14,9 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 
-use super::super::holder_reads::{READ_FANOUT_LIMIT, READ_PEER_TIMEOUT};
+use super::super::holder_reads::{
+    READ_FANOUT_LIMIT, READ_PEER_TIMEOUT, avoid_holders_call, peer_transport_fault,
+};
 use super::super::read::METADATA_READ_DEADLINE;
 use super::export::owner_reads;
 use crate::device::replica::{ReplicaRecord, read_answer as replica_answer, replica_read};
@@ -34,28 +36,32 @@ use aruna_ops_identity::forward::fetch::read_answer;
 use aruna_ops_identity::realm::peer_trust::is_sync_eligible;
 
 type ReadTurn = Result<Next<MetadataRegistryRecord>, MetadataApiError>;
+type ReadOutcome = Result<MetadataRegistryRecord, MetadataApiError>;
 
 #[derive(Debug, PartialEq)]
 enum ReadStage {
     Local,
     Config,
     Replica,
+    SoleLocal,
     Holders,
+    Avoid(Box<ReadOutcome>),
     /// The replica's record waits for the caller's own READ check.
     Readable(MetadataRegistryRecord),
     /// The record read online is kept as an unselected replica on this device.
     Kept(MetadataRegistryRecord),
 }
 
-/// Reads one registry record on its holders, this node's copy among them, at once under one
-/// deadline. A device answers from its pinned replica; an unselected replica answers only while
-/// the realm is out of reach, and the owner's online read is kept for offline use.
+/// Reads one registry record directly when this node is the sole holder, or on all holders under
+/// one deadline so denials and deletions hold. A device answers from its pinned replica, or an
+/// unselected replica while offline, and keeps the owner's online read.
 #[derive(Debug, PartialEq)]
 pub struct RoutedReadOperation {
     local_node: Option<NodeId>,
     realm_id: RealmId,
     request: GetVisibleRequest,
     forward_token: Option<AuthToken>,
+    now_ms: u64,
     stage: ReadStage,
     config: Option<RealmConfigDocument>,
     replica: Option<ReplicaRecord>,
@@ -76,6 +82,7 @@ impl RoutedReadOperation {
             realm_id,
             request,
             forward_token,
+            now_ms: 0,
             stage: ReadStage::Config,
             config: None,
             replica: None,
@@ -116,14 +123,20 @@ impl RoutedReadOperation {
         self.route()
     }
 
-    /// Asks every holder at once; this node reads its own copy.
+    /// Reads locally without frame encoding when this node is the sole holder; otherwise asks
+    /// every holder at once under one overall deadline.
     fn route(&mut self) -> ReadTurn {
         let config = self.config()?;
-        let config_digest = (config.digest()).map_err(|_| MetadataApiError::ServiceUnavailable)?;
         let placement = resolve_metadata_id(config, self.realm_id, None, self.request.document_id)
             .map_err(|_| MetadataApiError::ServiceUnavailable)?;
         let holders =
             read_holder_sets(config, &placement).map_err(MetadataApiError::PlacementUnavailable)?;
+        if holders.len() == 1 && Some(holders[0]) == self.local_node {
+            self.placement = Some(placement);
+            self.stage = ReadStage::SoleLocal;
+            return Ok(Next::Call(IoCall::child(self.visible())));
+        }
+        let config_digest = (config.digest()).map_err(|_| MetadataApiError::ServiceUnavailable)?;
         let message = MetadataTransportMessage::ForwardReadDocument {
             auth_token: self.forward_token.clone(),
             config_digest,
@@ -154,6 +167,28 @@ impl RoutedReadOperation {
         })))
     }
 
+    fn record_valid(&self, record: &MetadataRegistryRecord) -> bool {
+        let Ok(config) = self.config() else {
+            return false;
+        };
+        let Some(placement) = self.placement.as_ref() else {
+            return false;
+        };
+        routed_record_matches(config, self.realm_id, record.document_id, placement, record)
+    }
+
+    fn sole_local_answered(&mut self, result: IoResult) -> ReadTurn {
+        match result.child::<MetadataRegistryRecord, MetadataApiError>()? {
+            Ok(record) if self.record_valid(&record) => self.found(record),
+            Err(
+                error @ (MetadataApiError::Unauthorized
+                | MetadataApiError::Forbidden
+                | MetadataApiError::NotFound),
+            ) => Err(error),
+            Ok(_) | Err(_) => self.fall_back(MetadataApiError::ServiceUnavailable),
+        }
+    }
+
     /// One holder's record, when it matches the placement it was read for.
     fn holder_record(
         &self,
@@ -174,15 +209,7 @@ impl RoutedReadOperation {
                 _ => return Err(MetadataReadError::Unavailable),
             },
         };
-        let config = self.config().map_err(|_| MetadataReadError::Unavailable)?;
-        let placement = (self.placement.as_ref()).ok_or(MetadataReadError::Unavailable)?;
-        match routed_record_matches(
-            config,
-            self.realm_id,
-            record.document_id,
-            placement,
-            &record,
-        ) {
+        match self.record_valid(&record) {
             true => Ok(record),
             false => Err(MetadataReadError::Unavailable),
         }
@@ -194,9 +221,13 @@ impl RoutedReadOperation {
         let mut success = None;
         let mut auth_error = None;
         let mut unavailable = false;
+        let mut faulted = Vec::new();
         let mut results = results.into_iter();
         for holder in std::mem::take(&mut self.holders) {
             let member = results.next().unwrap_or(GroupResult::Unfinished);
+            if Some(holder) != self.local_node && peer_transport_fault(&member) {
+                faulted.push(holder);
+            }
             unavailable |= matches!(member, GroupResult::Unfinished);
             match self.holder_record(holder, member) {
                 Ok(record) => {
@@ -214,16 +245,27 @@ impl RoutedReadOperation {
                 }
             }
         }
-        let routed = match (auth_error, success) {
-            (Some(error), _) => error,
-            (None, Some(_)) if not_found > 0 => MetadataApiError::ServiceUnavailable,
-            (None, Some(record)) => return self.found(record),
+        let outcome = match (auth_error, success) {
+            (Some(error), _) => Err(error),
+            (None, Some(_)) if not_found > 0 => Err(MetadataApiError::ServiceUnavailable),
+            (None, Some(record)) => Ok(record),
             (None, None) if !unavailable && holder_count > 0 && not_found == holder_count => {
-                MetadataApiError::NotFound
+                Err(MetadataApiError::NotFound)
             }
-            (None, None) => MetadataApiError::ServiceUnavailable,
+            (None, None) => Err(MetadataApiError::ServiceUnavailable),
         };
-        self.fall_back(routed)
+        if !faulted.is_empty() {
+            self.stage = ReadStage::Avoid(Box::new(outcome));
+            return Ok(Next::Call(avoid_holders_call(faulted, self.now_ms)));
+        }
+        self.finish_routed(outcome)
+    }
+
+    fn finish_routed(&mut self, outcome: ReadOutcome) -> ReadTurn {
+        match outcome {
+            Ok(record) => self.found(record),
+            Err(error) => self.fall_back(error),
+        }
     }
 
     /// The owner's own online read is kept on this device before it answers.
@@ -261,6 +303,10 @@ impl Operation for RoutedReadOperation {
     type Output = MetadataRegistryRecord;
     type Error = MetadataApiError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
     fn first(&mut self) -> ReadTurn {
         if self.local_node.is_none() {
             self.stage = ReadStage::Local;
@@ -277,12 +323,14 @@ impl Operation for RoutedReadOperation {
             )),
             ReadStage::Config => self.configured(result),
             ReadStage::Replica => self.replica_read(result),
+            ReadStage::SoleLocal => self.sole_local_answered(result),
             ReadStage::Holders => {
                 let IoResult::Group(GroupEvent::Finished { results }) = result else {
                     return Err(MetadataApiError::ServiceUnavailable);
                 };
                 self.collect(results)
             }
+            ReadStage::Avoid(outcome) => self.finish_routed(*outcome),
             ReadStage::Readable(record) => {
                 result.child::<(), MetadataApiError>()??;
                 Ok(Next::Done(record))
