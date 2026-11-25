@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,9 +40,6 @@ const PRESENCE_FRESH: Duration = Duration::from_secs(10);
 /// Beyond this age the snapshot is not served at all and the caller waits for a
 /// bounded cold lookup.
 const PRESENCE_MAX_STALE: Duration = Duration::from_secs(60);
-/// A stale reader gives up this long before its own deadline, so a refresh that
-/// cannot finish still yields the snapshot instead of an expired read.
-const PRESENCE_ANSWER_MARGIN: Duration = Duration::from_millis(250);
 /// Puts carry no driver deadline so an accepted store still finishes. This
 /// bounds only the caller's wait, well above the driver's own RPC budget.
 const PUT_ANSWER_DEADLINE: Duration = Duration::from_secs(180);
@@ -90,10 +87,9 @@ struct PresenceSnapshot {
 #[derive(Clone, Default)]
 pub struct RealmPresenceCache {
     snapshots: Arc<Mutex<HashMap<RealmId, PresenceSnapshot>>>,
-    /// Token per in-flight refresh, cancelled when it settles so every stale
-    /// reader can join the one refresh instead of starting its own. Locked
-    /// before `snapshots` whenever both are needed.
-    refreshing: Arc<Mutex<HashMap<RealmId, CancellationToken>>>,
+    /// Realms with an in-flight background refresh, so stale readers start at most one.
+    /// Locked before `snapshots` whenever both are needed.
+    refreshing: Arc<Mutex<HashSet<RealmId>>>,
 }
 
 impl std::fmt::Debug for RealmPresenceCache {
@@ -111,8 +107,6 @@ enum PresenceServe {
         values: Vec<DhtEntry>,
         /// True for the reader that has to start the refresh.
         refresh: bool,
-        /// Cancelled once that refresh settled.
-        settled: CancellationToken,
     },
     Cold,
 }
@@ -145,26 +139,10 @@ impl RealmPresenceCache {
         if let Some(fresh) = self.fresh(realm_id, now) {
             return PresenceServe::Fresh(fresh);
         }
-        match refreshing.get(&realm_id) {
-            Some(settled) => PresenceServe::Stale {
-                values,
-                refresh: false,
-                settled: settled.clone(),
-            },
-            None => {
-                let settled = CancellationToken::new();
-                refreshing.insert(realm_id, settled.clone());
-                PresenceServe::Stale {
-                    values,
-                    refresh: true,
-                    settled,
-                }
-            }
-        }
+        let refresh = refreshing.insert(realm_id);
+        PresenceServe::Stale { values, refresh }
     }
 
-    /// Side-effect free freshness check: a reader that waited for a refresh
-    /// must not claim the next single-flight slot while re-reading.
     fn fresh(&self, realm_id: RealmId, now: Instant) -> Option<Vec<DhtEntry>> {
         let snapshots = self.snapshots.lock();
         let snapshot = snapshots.get(&realm_id)?;
@@ -189,9 +167,7 @@ impl RealmPresenceCache {
     }
 
     fn release(&self, realm_id: RealmId) {
-        if let Some(settled) = self.refreshing.lock().remove(&realm_id) {
-            settled.cancel();
-        }
+        self.refreshing.lock().remove(&realm_id);
     }
 }
 
@@ -526,9 +502,9 @@ async fn run_get(
     }
 }
 
-/// Serves realm presence from a young snapshot. A stale one starts a single
-/// refresh that every stale reader awaits inside its own deadline, so a peer
-/// is reported unseen only when that refresh cannot answer in time.
+/// Serves realm presence from a young snapshot. A stale one returns immediately
+/// (stale-while-revalidate) while a single background refresh updates the cache,
+/// so callers never block waiting on dead or slow peers.
 async fn serve_presence(
     ctx: &NetEffectContext,
     realm_id: RealmId,
@@ -542,25 +518,9 @@ async fn serve_presence(
             values,
             stale: false,
         }),
-        PresenceServe::Stale {
-            values,
-            refresh,
-            settled,
-        } => {
+        PresenceServe::Stale { values, refresh } => {
             if refresh {
                 spawn_refresh(ctx, realm_id, key, realm_filter, options);
-            }
-            let wait = options.deadline.saturating_sub(PRESENCE_ANSWER_MARGIN);
-            if tokio::time::timeout(wait, settled.cancelled())
-                .await
-                .is_ok()
-                && let Some(values) = ctx.presence.fresh(realm_id, Instant::now())
-            {
-                return NetEvent::Dht(DhtEvent::GetResult {
-                    key,
-                    values,
-                    stale: false,
-                });
             }
             NetEvent::Dht(DhtEvent::GetResult {
                 key,
@@ -1157,19 +1117,27 @@ mod tests {
             vec![stale_entry(realm_id, 12)],
             Instant::now() - Duration::from_secs(20),
         );
-        // The stale reader waits for the refresh instead of flapping the peer
-        // to unseen for a whole freshness window.
+        // Stale readers return the cached snapshot immediately while the background refresh runs.
         let event = handle_net_effect(&context, presence_effect(realm_id)).await;
         assert!(matches!(
             event,
+            NetEvent::Dht(DhtEvent::GetResult {
+                stale: true,
+                values,
+                ..
+            }) if values[0].node_id == make_repeated_node(12)
+        ));
+
+        finish_tasks(&context).await;
+        let fresh = handle_net_effect(&context, presence_effect(realm_id)).await;
+        assert!(matches!(
+            fresh,
             NetEvent::Dht(DhtEvent::GetResult {
                 stale: false,
                 values,
                 ..
             }) if values.iter().any(|entry| entry.node_id == handle.node_id())
         ));
-
-        finish_tasks(&context).await;
         handle.shutdown().await;
     }
 
@@ -1251,7 +1219,7 @@ mod tests {
 
     #[tokio::test]
     async fn single_flight_handler() {
-        // Concurrent stale readers join one refresh and both answer fresh.
+        // Concurrent stale readers return immediately while starting only one refresh.
         let (handle, mut context, _directory, realm_id) = handler_context(16).await;
         let probe = Arc::new(RefreshProbe::new());
         context.refresh_probe = Some(probe.clone());
@@ -1272,31 +1240,33 @@ mod tests {
             Instant::now() - Duration::from_secs(20),
         );
 
-        let releaser = {
-            let probe = probe.clone();
-            tokio::spawn(async move {
-                probe.started.notified().await;
-                probe.release.notify_one();
-            })
-        };
         let (first, second) = tokio::join!(
             handle_net_effect(&context, presence_effect(realm_id)),
             handle_net_effect(&context, presence_effect(realm_id)),
         );
-        releaser.await.expect("releaser joins");
-
         for event in [first, second] {
             assert!(matches!(
                 event,
                 NetEvent::Dht(DhtEvent::GetResult {
-                    stale: false,
+                    stale: true,
                     values,
                     ..
-                }) if values.iter().any(|entry| entry.node_id == handle.node_id())
+                }) if values[0].node_id == make_repeated_node(16)
             ));
         }
+        probe.started.notified().await;
         assert_eq!(probe.starts.load(Ordering::SeqCst), 1);
+        probe.release.notify_one();
         finish_tasks(&context).await;
+        let fresh = handle_net_effect(&context, presence_effect(realm_id)).await;
+        assert!(matches!(
+            fresh,
+            NetEvent::Dht(DhtEvent::GetResult {
+                stale: false,
+                values,
+                ..
+            }) if values.iter().any(|entry| entry.node_id == handle.node_id())
+        ));
         handle.shutdown().await;
     }
 
