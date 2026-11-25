@@ -18,7 +18,7 @@ use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::execution::job::input::parse_workflow_secrets;
 use aruna_core::structs::execution::workflow::{StoredWorkflowLanguage, WorkflowVisibility};
 use aruna_core::structs::execution::workflow_run::{
-    RunFile, RunOutput, RunState, WorkflowSecretBinding, WorkflowSecretScope,
+    RunOutput, RunState, WorkflowSecretBinding, WorkflowSecretScope,
 };
 use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode};
 use aruna_core::structs::storage::routing::{NodeRouting, RoutingSnapshot};
@@ -29,32 +29,32 @@ use aruna_ops_data::metadata::record_reads::DocumentRecordOperation;
 use aruna_ops_data::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_ops_identity::secrets::SecretChange;
 use aruna_ops_identity::secrets::node::{NodeChange, NodeSecretOperation};
+use aruna_ops_work::jobs::lifecycle::submit_external::IngressNode;
 use aruna_ops_work::jobs::workflow::credential::RunIdentity;
 use aruna_ops_work::jobs::workflow::vault_secrets::ReleaseVaultSecrets;
 use aruna_ops_work::workflows::CatalogError;
 use aruna_ops_work::workflows::import::{CreateWorkflowOperation, NewWorkflow, SourceInput};
 use aruna_ops_work::workflows::runs::admit::{PinnedInput, RunRequest, StartRunOperation};
 use aruna_ops_work::workflows::runs::control::{Follow, FollowRunOperation};
-use aruna_ops_work::workflows::runs::data::{
-    Target, WriteBody, WriteObjectOperation, delivery_target,
-};
 use aruna_ops_work::workflows::runs::events::ReadEventsOperation;
 use aruna_ops_work::workflows::runs::provenance::{
     RunCrateOperation, WriteProvenanceOperation, status,
 };
+use aruna_ops_work::workflows::runs::reads::RunSnapshotOperation;
 use aruna_ops_work::workflows::runs::run::{
-    ApplyEventOperation, FinishRunOperation, PrepareRunOperation, Prepared,
+    AnswerCallOperation, ApplyEventOperation, CallNode, FinishRunOperation, PrepareRunOperation,
+    Prepared,
 };
 use aruna_ops_work::workflows::runs::tasks::{task_key_of, task_spec};
-use aruna_ops_work::workflows::runs::{ChangeRunOperation, RunChange};
 use aruna_ops_work::workflows::versions::GetVersionOperation;
 use aruna_runner::driver::{DriverContext, drive};
 use aruna_runner::testing::seed_bucket;
-use aruna_workflow_contract::HostRpcResult;
 use aruna_workflow_contract::host::{SecretPlaceholder, StartTask, TaskFolders, TaskResources};
 use aruna_workflow_contract::message::{LiveWorkflowEvent, TaskChange, TaskState};
 use aruna_workflow_contract::preflight::{GraphNode, NodeKind, SourceFile, WorkflowGraph};
-use aruna_workflow_contract::{ContractError, PreflightKind, PreflightResult};
+use aruna_workflow_contract::{
+    ContractError, HostRpcRequest, HostRpcResult, PreflightKind, PreflightResult,
+};
 use serde_json::json;
 use ulid::Ulid;
 
@@ -338,36 +338,49 @@ async fn drives_workflow_lifecycle() -> TestResult<()> {
     .map_err(|error| format!("secret release failed: {error:?}"))?;
     assert_eq!(released["NODE_TOKEN"].expose(), "synthetic-workflow-secret");
 
-    // Deliver the task output through the workflow object writer to the run's output prefix.
-    let target = delivery_target(&admitted.record, "said.txt")?;
-    let source = Target {
-        bucket: "results".into(),
-        key: "in.txt".into(),
-        version: Some(input_ver),
-        owned: false,
-        node: Some(node.node_id()),
+    // Deliver the task output through the coordinator's DeliverOutput RPC and inspect stored output.
+    let call_node = CallNode {
+        node_id: node.node_id(),
+        realm_id: realm.realm_id,
+        routing: NodeRouting::default(),
+        ingress: IngressNode {
+            local: node.node_id(),
+            realm_id: realm.realm_id,
+            now_ms: 100,
+            fresh: BTreeMap::new(),
+        },
     };
-    let ack = drive(
-        WriteObjectOperation::new(
-            (admitted.record.clone(), node.node_id()),
-            NodeRouting::default(),
-            target,
-            WriteBody::Copy(source),
+    let delivery = drive(
+        AnswerCallOperation::new(
+            admitted.record.clone(),
+            call_node,
+            1,
+            HostRpcRequest::DeliverOutput {
+                source_ref: format!("aruna://results/in.txt?version={input_ver}"),
+                target_path: "said.txt".into(),
+            },
         ),
         &ctx,
     )
     .await?;
-    let HostRpcResult::UploadAck {
-        receipt: Some(receipt),
-        ..
-    } = ack
-    else {
-        return Err(format!("expected delivery receipt, got {ack:?}").into());
+    let HostRpcResult::Delivered { location } = delivery.result else {
+        return Err(format!("expected delivery result, got {:?}", delivery.result).into());
     };
-    let out_ver = receipt
-        .version
-        .ok_or("delivered output must carry a version id")?;
-    assert_eq!(receipt.size, SAMPLE.len() as u64);
+    let out_ver = location
+        .split_once("?version=")
+        .map(|(_, v)| v.to_owned())
+        .ok_or("delivered output location must carry a version id")?;
+    let after_deliver = drive(RunSnapshotOperation::new(&owner, run_id), &ctx).await?;
+    assert_eq!(after_deliver.record.outputs.len(), 1);
+    assert_eq!(after_deliver.record.outputs[0].name, "said.txt");
+    assert_eq!(
+        after_deliver.record.outputs[0].size,
+        Some(SAMPLE.len() as u64)
+    );
+    assert_eq!(
+        after_deliver.record.outputs[0].version_id.as_deref(),
+        Some(out_ver.as_str())
+    );
 
     let task_done = LiveWorkflowEvent::TaskChanged(TaskChange {
         task_id: 1,
@@ -383,19 +396,6 @@ async fn drives_workflow_lifecycle() -> TestResult<()> {
         error: None,
     });
     drive(ApplyEventOperation::new(run_id, &task_done), &ctx).await?;
-    let delivered = RunChange::Delivered {
-        file: RunFile {
-            name: "said.txt".into(),
-            bucket: Some("results".into()),
-            key: Some("out/said.txt".into()),
-            version_id: Some(out_ver),
-            node_id: Some(node.node_id()),
-            size: Some(receipt.size),
-            digest: Some(blake3::hash(SAMPLE).to_hex().to_string()),
-        },
-        origin: None,
-    };
-    drive(ChangeRunOperation::new(run_id, vec![delivered]), &ctx).await?;
     let ended = drive(
         FinishRunOperation::new(run_id, RunState::Succeeded, None),
         &ctx,

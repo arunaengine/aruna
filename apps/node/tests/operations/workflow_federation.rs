@@ -3,21 +3,28 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use aruna_compute::registry::ExecutorRegistry;
 use aruna_core::compute::quota::{ComputeDemandSnapshot, ComputeReservationSnapshot};
-use aruna_core::compute::{ExecutorAvailability, ExecutorCapability, ResourceEnvelope};
+use aruna_core::compute::{ExecutorAvailability, ExecutorCapability, ResourceEnvelope, Secret};
 use aruna_core::effects::StorageEffect;
 use aruna_core::heartbeat::{HeldHeartbeat, NodeHeartbeat};
 use aruna_core::id::NodeId;
 use aruna_core::job_request::SubmissionScope;
 use aruna_core::keyspaces::NODE_INFO_KEYSPACE;
+use aruna_core::node::vault::NodeVaultKey;
+use aruna_core::secrets::{
+    Delivery, ResponseExposure, SecretConsumer, SecretFields, SecretKind, SecretName, UseRule,
+};
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::execution::job::identity::RETENTION_MS;
+use aruna_core::structs::execution::job::identity::{JobId, RETENTION_MS};
+use aruna_core::structs::execution::job::input::TaskSecretBinding;
 use aruna_core::structs::execution::job::local::WorkspaceMode;
 use aruna_core::structs::execution::workflow::{StoredWorkflowLanguage, WorkflowVisibility};
-use aruna_core::structs::execution::workflow_run::{RunOutput, RunState, WorkflowRunSpec};
+use aruna_core::structs::execution::workflow_run::{
+    RunOutput, RunState, WorkflowRunSpec, WorkflowSecretBinding, WorkflowSecretScope,
+};
 use aruna_core::structs::placement::policy::PlacementSubject;
 use aruna_core::structs::storage::node_info::{
     AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization, node_info_key,
@@ -28,9 +35,14 @@ use aruna_core::types::GroupId;
 use aruna_core::user::id::UserId;
 use aruna_core::workflow::{WorkflowAnswer, WorkflowEffect, WorkflowError, WorkflowHost};
 use aruna_ops_data::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+use aruna_ops_data::staging::granted_read::GrantedReadOperation;
+use aruna_ops_identity::secrets::SecretChange;
+use aruna_ops_identity::secrets::node::{NodeChange, NodeSecretOperation};
 use aruna_ops_work::jobs::lifecycle::submit_external::{
     ExternalSubmission, IngressNode, SubmitExternalOperation,
 };
+use aruna_ops_work::jobs::workflow::credential::RunIdentity;
+use aruna_ops_work::jobs::workflow::vault_secrets::ReleaseVaultSecrets;
 use aruna_ops_work::workflows::CatalogError;
 use aruna_ops_work::workflows::import::{CreateWorkflowOperation, NewWorkflow, SourceInput};
 use aruna_ops_work::workflows::runs::admit::{PinnedInput, RunRequest, StartRunOperation};
@@ -49,8 +61,10 @@ use aruna_ops_work::workflows::runs::{ChangeRunOperation, RunChange};
 use aruna_runner::driver::{DriverContext, drive};
 use aruna_runner::testing::seed_bucket;
 use aruna_workflow_contract::host::{DirectInput, StartTask, TaskFolders, TaskResources};
+use aruna_workflow_contract::message::HostToCoordinator;
 use aruna_workflow_contract::preflight::{RunLogEntry, SourceFile, WorkflowGraph};
 use aruna_workflow_contract::{ContractError, PreflightKind, PreflightResult};
+use futures_util::StreamExt;
 use serde_json::{Value, json};
 use ulid::Ulid;
 
@@ -62,6 +76,7 @@ const SMALL_BYTES: usize = 1024;
 
 struct PlanHost {
     graph: Value,
+    sent: Arc<Mutex<Vec<HostToCoordinator>>>,
 }
 
 #[async_trait::async_trait]
@@ -101,19 +116,29 @@ impl WorkflowHost for PlanHost {
                 ContractError::unsupported("test"),
             ))),
             WorkflowEffect::Open { .. } => WorkflowAnswer::Opened(Ok(())),
-            WorkflowEffect::Send { .. } => WorkflowAnswer::Sent(Ok(())),
+            WorkflowEffect::Send { message, .. } => {
+                self.sent.lock().unwrap().push(message);
+                WorkflowAnswer::Sent(Ok(()))
+            }
             WorkflowEffect::Receive { .. } => WorkflowAnswer::Received(Ok(None)),
             WorkflowEffect::Close { .. } => WorkflowAnswer::Closed(Ok(())),
         }
     }
 }
 
-fn attach_host(node: &TestNode, graph: Value) -> DriverContext {
+fn attach_host(
+    node: &TestNode,
+    graph: Value,
+) -> (DriverContext, Arc<Mutex<Vec<HostToCoordinator>>>) {
+    let sent = Arc::new(Mutex::new(Vec::new()));
     let mut ctx = (*node.context).clone();
-    ctx.compute_handle = Some(Arc::new(
-        ExecutorRegistry::new().with_workflow(Arc::new(PlanHost { graph })),
-    ));
-    ctx
+    ctx.compute_handle = Some(Arc::new(ExecutorRegistry::new().with_workflow(Arc::new(
+        PlanHost {
+            graph,
+            sent: sent.clone(),
+        },
+    ))));
+    (ctx, sent)
 }
 
 async fn seed_blob(
@@ -229,13 +254,13 @@ async fn advertise_executor(
             api: None,
             s3: None,
         },
-        utilization: utilization.clone(),
+        utilization,
         updated_at_ms: now_ms,
         epoch,
         compute_draining: false,
         leaving: false,
         demand: demand.clone(),
-        reservation: reservation.clone(),
+        reservation,
     };
     reader
         .context
@@ -278,8 +303,8 @@ async fn replicates_workflow_run() -> TestResult<()> {
     assert!(!holders.is_empty(), "group has remote record holders");
     let surviving = realm.find(holders[0]);
 
-    let coord_ctx = attach_host(coord, Value::Null);
-    let surviving_ctx = attach_host(surviving, Value::Null);
+    let (coord_ctx, _) = attach_host(coord, Value::Null);
+    let (surviving_ctx, surviving_sent) = attach_host(surviving, Value::Null);
     let (owner, other) = (realm.auth_context(), realm.auth_for(other_user));
 
     seed_bucket(&coord_ctx, "results", group_id, realm.user_id, Vec::new()).await;
@@ -408,6 +433,20 @@ async fn replicates_workflow_run() -> TestResult<()> {
     )
     .await?;
     assert!(matches!(prepared, Prepared::Ready(_)));
+    let messages = surviving_sent.lock().unwrap().clone();
+    assert!(
+        messages
+            .iter()
+            .any(|msg| matches!(msg, HostToCoordinator::RunReplayPages { pages } if *pages == coord_pages)),
+        "surviving coordinator must stream replicated replay pages: {messages:?}"
+    );
+    assert!(
+        messages.iter().any(|msg| matches!(
+            msg,
+            HostToCoordinator::RunStart(payload) if payload.prior_log_pages.is_empty()
+        )),
+        "run start carries empty inline replay after streamed pages: {messages:?}"
+    );
     Ok(())
 }
 
@@ -469,7 +508,7 @@ async fn plans_multi_node() -> TestResult<()> {
         "edges": [],
     });
 
-    let ctx = attach_host(planner, graph);
+    let (ctx, _) = attach_host(planner, graph);
     let created = drive(
         CreateWorkflowOperation::new(&owner, planner.node_id(), upload_workflow(group_id)),
         &ctx,
@@ -579,7 +618,7 @@ async fn plans_multi_node() -> TestResult<()> {
             .record
             .captured_remote
             .iter()
-            .all(|capture| capture.grant.is_some()),
+            .all(|entry| entry.captured.grant.is_some()),
         "remote pins carry signed read grants"
     );
     let child_req = StartTask {
@@ -639,5 +678,136 @@ async fn plans_multi_node() -> TestResult<()> {
     )
     .await?;
     assert!(!accepted.job_id.to_string().is_empty());
+
+    // Stage the remote pin over real P2P using the precaptured signed grant without a bearer.
+    let big_entry = admitted
+        .record
+        .captured_remote
+        .iter()
+        .find(|entry| entry.pin_key == "big.bin")
+        .ok_or("missing precaptured entry for big.bin")?;
+    let grant = big_entry
+        .captured
+        .grant
+        .as_ref()
+        .ok_or("missing signed grant for big.bin")?;
+    let read = GrantedReadOperation::new(
+        Some((planner.node_id(), realm.realm_id)),
+        data_node.node_id(),
+        grant,
+        None,
+        false,
+    );
+    let mut blob = drive(read, &ctx).await?.blob;
+    let mut staged = Vec::new();
+    while let Some(chunk) = blob.next().await {
+        staged.extend_from_slice(&chunk?);
+    }
+    assert_eq!(staged.len(), BIG_BYTES);
+    assert!(staged.iter().all(|b| *b == b'A'));
+
+    // A remote executor without a local workflow run row verifies the run record over P2P
+    // from the coordinator before releasing a bound vault secret.
+    let secret_name = SecretName::try_from("remote-tok".to_string())?;
+    let mut secret_req =
+        RequestWithSecret::make(group_id, created.workflow_id, created.version, &secret_name);
+    secret_req.output = Some(RunOutput {
+        bucket: "results".to_owned(),
+        prefix: "sec/".to_owned(),
+        node_id: None,
+        dataset_json: None,
+    });
+    let sec_run = drive(
+        StartRunOperation::new(&owner, (planner.node_id(), realm.realm_id), secret_req),
+        &ctx,
+    )
+    .await?
+    .record;
+    gpu_node
+        .context
+        .storage_handle
+        .open_vault(NodeVaultKey::random());
+    drive(
+        NodeSecretOperation::new(NodeChange {
+            realm_id: realm.realm_id,
+            node_id: gpu_node.node_id(),
+            actor: realm.user_id,
+            change: SecretChange::Create {
+                name: secret_name.clone(),
+                kind: SecretKind::parse("bearer").unwrap(),
+                description: String::new(),
+                settings: BTreeMap::new(),
+                uses: vec![UseRule {
+                    consumer: SecretConsumer::Workflow {
+                        workflow_id: created.workflow_id,
+                    },
+                    delivery: Delivery::Value,
+                    origins: Vec::new(),
+                    paths: Vec::new(),
+                    methods: Vec::new(),
+                    response: ResponseExposure::Status,
+                    groups: vec![group_id],
+                }],
+                fields: SecretFields::new(BTreeMap::from([(
+                    "token".to_string(),
+                    Secret::new("remote-verified-secret".to_string()),
+                )])),
+            },
+            now_ms,
+            write_id: Ulid::generate(),
+        }),
+        gpu_node.context.as_ref(),
+    )
+    .await?;
+    let remote_bindings = BTreeMap::from([(
+        "REMOTE_TOK".to_string(),
+        TaskSecretBinding {
+            workflow_id: created.workflow_id,
+            scope: WorkflowSecretScope::Node,
+            name: secret_name,
+            field: None,
+        },
+    )]);
+    let remote_identity = RunIdentity {
+        job_id: JobId::from_bytes([8; 16]),
+        user_id: realm.user_id,
+        group_id,
+        realm_id: realm.realm_id,
+        node_id: gpu_node.node_id(),
+    };
+    let released = drive(
+        ReleaseVaultSecrets::new(remote_identity, sec_run.run_id, remote_bindings),
+        gpu_node.context.as_ref(),
+    )
+    .await
+    .map_err(|error| format!("remote secret release failed: {error:?}"))?;
+    assert_eq!(released["REMOTE_TOK"].expose(), "remote-verified-secret");
     Ok(())
+}
+
+struct RequestWithSecret;
+
+impl RequestWithSecret {
+    fn make(group_id: GroupId, workflow_id: Ulid, version: u32, name: &SecretName) -> RunRequest {
+        RunRequest {
+            group_id,
+            workflow_id,
+            version,
+            values: json!({}),
+            inputs: Vec::new(),
+            inputs_json: None,
+            output: None,
+            provenance_crate: false,
+            idempotency_key: None,
+            placement_site: None,
+            secrets: BTreeMap::from([(
+                "REMOTE_TOK".to_string(),
+                WorkflowSecretBinding {
+                    scope: WorkflowSecretScope::Node,
+                    name: name.clone(),
+                    field: None,
+                },
+            )]),
+        }
+    }
 }
