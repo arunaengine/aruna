@@ -123,9 +123,9 @@ fn served(turn: Turn) -> GetObjectResult {
     }
 }
 
-/// A restart reads the records again, each outside the first snapshot.
+/// A restart delegates to a fresh child read in its own snapshot.
 fn restarted(turn: &Turn, operation: &GetObjectOperation) -> bool {
-    matches!(turn, Ok(Next::Call(IoCall::Child(_)))) && operation.restarted
+    matches!(turn, Ok(Next::Call(IoCall::Child(_)))) && operation.state == GetObjectState::Restarted
 }
 
 fn test_node_id() -> aruna_core::id::NodeId {
@@ -394,7 +394,7 @@ fn range_drift_restarts() {
     );
 
     assert!(restarted(&turn, &operation));
-    assert_eq!(operation.state, GetObjectState::GetCurrentVersion);
+    assert_eq!(operation.state, GetObjectState::Restarted);
 }
 
 #[tokio::test]
@@ -1668,7 +1668,7 @@ fn read_drift_restarts() {
     let turn = step(&mut operation, source_read(read));
 
     assert!(restarted(&turn, &operation));
-    assert_eq!(operation.state, GetObjectState::GetCurrentVersion);
+    assert_eq!(operation.state, GetObjectState::Restarted);
     assert!(operation.advance_observation.is_none());
 }
 
@@ -2409,13 +2409,30 @@ mod sealed {
 
     #[test]
     fn disallows_encrypted_read() {
-        // Plain copy in an encrypting bucket is refused inside GetObjectOperation when disallowed.
+        // Bucket settings are checked at the start of the snapshot before version or blob lookups,
+        // so a missing local blob in an encrypting bucket fails closed instead of BlobNotLocal.
         let mut op = operation().with_disallow_encrypted(true);
+        assert!(matches!(op.first(), Ok(Next::Call(IoCall::Read(_)))));
+        assert_eq!(op.state, super::GetObjectState::CheckEncryption);
+        let row = encrypting().to_bytes().unwrap();
+        assert_eq!(
+            op.next(IoResult::Values(vec![Some(row.clone().into())]))
+                .err(),
+            Some(GetObjectError::EncryptedDisallowed)
+        );
+        // Plain bucket passes the initial check and advances to the version lookup.
+        let mut op = operation().with_disallow_encrypted(true);
+        assert!(matches!(op.first(), Ok(Next::Call(IoCall::Read(_)))));
+        assert!(matches!(
+            op.next(IoResult::Values(vec![None])),
+            Ok(Next::Call(IoCall::Read(_)))
+        ));
+        assert_eq!(op.state, super::GetObjectState::GetCurrentVersion);
+        // Plain copy in an encrypting bucket is refused inside GetObjectOperation when disallowed.
         let mut location = sealed_location();
         location.format = StoredFormat::default();
         op.location = Some(location);
         assert!(matches!(op.read_blob(), Ok(Next::Call(IoCall::Read(_)))));
-        let row = encrypting().to_bytes().unwrap();
         assert_eq!(
             op.next(IoResult::Values(vec![Some(row.clone().into())]))
                 .err(),
