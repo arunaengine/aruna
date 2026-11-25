@@ -919,6 +919,7 @@ pub fn metadata_read_error(error: MetadataError) -> MetadataReadError {
         | MetadataError::ProfileValidation(_)
         | MetadataError::Persist(_)
         | MetadataError::Storage(_)
+        | MetadataError::LocalUnavailable(_)
         | MetadataError::Backend(_)
         | MetadataError::MissingDependencies(_) => MetadataReadError::Unavailable,
     }

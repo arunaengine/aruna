@@ -783,14 +783,14 @@ impl NetHandle {
 
     pub async fn open_stream(&self, node_id: NodeId, alpn: Alpn) -> Result<streams::BiStream> {
         if matches!(alpn, Alpn::Dht) {
-            return Err(NetError::Stream(format!(
+            return Err(NetError::LocalUnavailable(format!(
                 "{alpn} is an internal network protocol"
             )));
         }
         // Outbound half of the accept matrix: a device must not even dial a
         // protocol its own node kind is refused on.
         if !self.inner.inbound_admission.local_dials(alpn) {
-            return Err(NetError::Stream(format!(
+            return Err(NetError::LocalUnavailable(format!(
                 "{alpn} is not permitted for this node kind"
             )));
         }
@@ -870,6 +870,9 @@ impl NetHandle {
                 Ok(stream)
             }
             Err(mut err) => {
+                if matches!(err, NetError::LocalUnavailable(_)) {
+                    return Err(err);
+                }
                 if node_id != self.inner.node_id {
                     let authorized_nodes = self.inner.signed_authorized_nodes.read().clone();
                     match resolve_signed_endpoint(

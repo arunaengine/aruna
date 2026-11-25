@@ -1868,6 +1868,10 @@ pub enum MetadataError {
     /// node from a payload the backend will never accept.
     #[error("metadata storage error: {0}")]
     Storage(#[from] StorageError),
+    /// Local transport capacity or policy prevented sending the request before any peer
+    /// contact; retryable and never attributable to the remote peer.
+    #[error("local metadata transport unavailable: {0}")]
+    LocalUnavailable(String),
     #[error("metadata backend error: {0}")]
     Backend(String),
     /// A batch depends on events this replica has not merged yet; it applies once they arrive.

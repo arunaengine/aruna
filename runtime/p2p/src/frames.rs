@@ -16,18 +16,37 @@ use tracing::{Span, field};
 use crate::NetHandle;
 use crate::streams::{BiStream, RecvStream};
 
-/// Why a frame request failed, and whether the request may have reached the peer.
+/// Why a frame request failed, whether it may have reached the peer, and whether the failure
+/// can be attributed to the remote peer rather than local capacity or frame limits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrameError {
     pub sent: bool,
+    pub peer_fault: bool,
     pub message: String,
 }
 
 impl FrameError {
+    fn local(message: impl Into<String>) -> Self {
+        Self {
+            sent: false,
+            peer_fault: false,
+            message: message.into(),
+        }
+    }
+
     fn unsent(message: impl Into<String>) -> Self {
         Self {
             sent: false,
+            peer_fault: true,
             message: message.into(),
+        }
+    }
+
+    fn from_open(error: crate::NetError) -> Self {
+        Self {
+            sent: false,
+            peer_fault: error.is_peer_fault(),
+            message: error.to_string(),
         }
     }
 
@@ -40,6 +59,7 @@ impl FrameError {
         };
         Self {
             sent: true,
+            peer_fault: true,
             message,
         }
     }
@@ -114,11 +134,11 @@ impl NetHandle {
     ) -> Result<Vec<u8>, FrameError> {
         let started = Instant::now();
         let length = u32::try_from(frame.len())
-            .map_err(|_| FrameError::unsent("request frame exceeds the frame size"))?;
+            .map_err(|_| FrameError::local("request frame exceeds the frame size"))?;
         let mut stream = timeout(shape.io_wait, self.open_stream(peer, alpn))
             .await
             .map_err(|_| FrameError::unsent("timed out opening the stream"))?
-            .map_err(|error| FrameError::unsent(error.to_string()))?;
+            .map_err(FrameError::from_open)?;
         record_elapsed_ms(span, "open_stream_ms", started);
         let write_started = Instant::now();
         let written = timeout(shape.io_wait, async {
@@ -169,5 +189,28 @@ impl NetHandle {
             return Err(FrameError::sent(&stream, "answer dropped by a test hook"));
         }
         Ok(answer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FrameError;
+    use crate::NetError;
+
+    #[test]
+    fn local_skips_fault() {
+        let local = FrameError::from_open(NetError::LocalUnavailable(
+            "too many pooled connections".to_string(),
+        ));
+        assert!(!local.sent);
+        assert!(!local.peer_fault);
+
+        let peer = FrameError::from_open(NetError::Connection("refused".to_string()));
+        assert!(!peer.sent);
+        assert!(peer.peer_fault);
+
+        let stream = FrameError::from_open(NetError::Stream("open_bi timed out".to_string()));
+        assert!(!stream.sent);
+        assert!(stream.peer_fault);
     }
 }

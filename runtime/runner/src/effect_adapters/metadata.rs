@@ -26,6 +26,22 @@ pub(super) async fn dispatch_metadata(effect: MetadataEffect, context: &DriverCo
     Event::Metadata(event)
 }
 
+fn map_frame_error(error: FrameError) -> PeerRequestError {
+    match error {
+        FrameError {
+            sent: false,
+            peer_fault: false,
+            message,
+        } => PeerRequestError::NotSent(MetadataError::LocalUnavailable(message)),
+        FrameError {
+            sent: false,
+            peer_fault: true,
+            message,
+        } => PeerRequestError::NotSent(MetadataError::Backend(message)),
+        FrameError { message, .. } => PeerRequestError::Failed(MetadataError::Backend(message)),
+    }
+}
+
 /// Sends one encoded request over the net handle and reports the answer with the time it took.
 pub(super) async fn dispatch_request(
     effect: MetadataRequestEffect,
@@ -41,13 +57,7 @@ pub(super) async fn dispatch_request(
             let request = net.frame_request(effect.peer, Alpn::Metadata, &effect.frame, &shape);
             match timeout(effect.timeout, request).await {
                 Ok(Ok(answer)) => Ok(answer),
-                Ok(Err(FrameError {
-                    sent: false,
-                    message,
-                })) => Err(PeerRequestError::NotSent(MetadataError::Backend(message))),
-                Ok(Err(FrameError { message, .. })) => {
-                    Err(PeerRequestError::Failed(MetadataError::Backend(message)))
-                }
+                Ok(Err(error)) => Err(map_frame_error(error)),
                 Err(_) => Err(PeerRequestError::TimedOut),
             }
         }
@@ -57,4 +67,47 @@ pub(super) async fn dispatch_request(
         elapsed: started.elapsed(),
         result,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::map_frame_error;
+    use aruna_core::events::PeerRequestError;
+    use aruna_core::metadata::MetadataError;
+    use aruna_p2p::frames::FrameError;
+
+    #[test]
+    fn maps_frame_faults() {
+        let local = FrameError {
+            sent: false,
+            peer_fault: false,
+            message: "too many pooled connections".to_string(),
+        };
+        assert_eq!(
+            map_frame_error(local),
+            PeerRequestError::NotSent(MetadataError::LocalUnavailable(
+                "too many pooled connections".to_string()
+            ))
+        );
+
+        let dial = FrameError {
+            sent: false,
+            peer_fault: true,
+            message: "connection failed".to_string(),
+        };
+        assert_eq!(
+            map_frame_error(dial),
+            PeerRequestError::NotSent(MetadataError::Backend("connection failed".to_string()))
+        );
+
+        let sent = FrameError {
+            sent: true,
+            peer_fault: true,
+            message: "stream reset".to_string(),
+        };
+        assert_eq!(
+            map_frame_error(sent),
+            PeerRequestError::Failed(MetadataError::Backend("stream reset".to_string()))
+        );
+    }
 }

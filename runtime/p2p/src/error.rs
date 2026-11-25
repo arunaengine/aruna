@@ -15,6 +15,11 @@ pub enum NetError {
     #[error("Connection failed: {0}")]
     Connection(String),
 
+    /// Local transport capacity or policy prevented opening an outbound stream before any peer
+    /// contact; never attributable to the remote peer.
+    #[error("Local transport unavailable: {0}")]
+    LocalUnavailable(String),
+
     #[error("DHT error: {0}")]
     Dht(String),
 
@@ -69,6 +74,11 @@ impl NetError {
     /// partial local state can exist to reconcile.
     pub fn is_admission_rejection(&self) -> bool {
         matches!(self, NetError::AdmissionRejected(_))
+    }
+
+    /// Whether a failed outbound dial or stream open can be attributed to the remote peer.
+    pub fn is_peer_fault(&self) -> bool {
+        !matches!(self, NetError::LocalUnavailable(_))
     }
 }
 
