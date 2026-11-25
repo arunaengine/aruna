@@ -233,13 +233,17 @@ impl StoreCacheOperation {
             true => scope,
             false => CacheScope::Run,
         };
+        let (stdout_tail, stderr_tail) = match entry.has_secrets {
+            true => (Vec::new(), Vec::new()),
+            false => (entry.stdout_tail, entry.stderr_tail),
+        };
         let record = WorkflowCacheRecord {
             task_key: entry.task_key,
             scope_namespace: String::new(),
             exit_code: 0,
             outputs: Vec::new(),
-            stdout_tail: entry.stdout_tail,
-            stderr_tail: entry.stderr_tail,
+            stdout_tail,
+            stderr_tail,
             created_at_ms: 0,
             producer_group_id: run.group_id,
             producer_run_id: run.run_id,

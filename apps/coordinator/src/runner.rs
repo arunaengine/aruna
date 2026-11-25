@@ -85,10 +85,7 @@ async fn prepare_and_run(
     store.replay_log_pages(&payload.prior_log_pages, &relocation)?;
     let steps = composed::step_matches(&workspace.entry, &step_settings)
         .map_err(ContractError::workflow)?;
-    let allowed_steps: Vec<String> = (steps.iter())
-        .filter(|step| step.settings.execution.network == Some(true))
-        .flat_map(|step| step.names.iter().cloned())
-        .collect();
+    let allowed_steps = composed::allowed_network_steps(&steps).map_err(ContractError::workflow)?;
     let backend = CoordinatorBackend::new(
         rpc.clone(),
         run_id.clone(),

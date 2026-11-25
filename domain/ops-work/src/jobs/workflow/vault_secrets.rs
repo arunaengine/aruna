@@ -10,7 +10,7 @@ use aruna_core::compute::{Secret, SecretBytes};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id_mint::IdMint;
-use aruna_core::keyspaces::NODE_SECRETS_KEYSPACE;
+use aruna_core::keyspaces::{NODE_SECRETS_KEYSPACE, WORKFLOW_RUN_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::realm_vault::{RealmSealed, RealmSecretRef, RealmVaultError, RealmVaultRecord};
 use aruna_core::request_policy::PolicyRequest;
@@ -21,7 +21,9 @@ use aruna_core::secrets::{
 };
 use aruna_core::structs::execution::job::input::TaskSecretBinding;
 use aruna_core::structs::execution::job::local::JobError;
-use aruna_core::structs::execution::workflow_run::WorkflowSecretScope;
+use aruna_core::structs::execution::workflow_run::{
+    WorkflowRunRecord, WorkflowSecretScope, run_key,
+};
 use aruna_core::structs::identity::admin_audit::{
     AdminAuditAction, AdminAuditRecord, SecretAudit, SecretUse,
 };
@@ -55,6 +57,7 @@ struct Candidate {
 #[derive(Debug, PartialEq)]
 enum Step {
     Idle,
+    VerifyRun,
     OwnerEntry {
         env_name: String,
         binding: TaskSecretBinding,
@@ -80,7 +83,7 @@ enum Step {
 #[derive(Debug, PartialEq)]
 pub struct ReleaseVaultSecrets {
     run: RunIdentity,
-    run_id: Option<Ulid>,
+    run_id: Ulid,
     pending: Vec<(String, TaskSecretBinding)>,
     released: BTreeMap<String, Secret>,
     ids: IdMint,
@@ -93,7 +96,7 @@ type SecretNext = Result<Next<BTreeMap<String, Secret>>, JobError>;
 impl ReleaseVaultSecrets {
     pub fn new(
         run: RunIdentity,
-        run_id: Option<Ulid>,
+        run_id: Ulid,
         bindings: BTreeMap<String, TaskSecretBinding>,
     ) -> Self {
         let mut pending: Vec<_> = bindings.into_iter().collect();
@@ -174,7 +177,7 @@ impl ReleaseVaultSecrets {
         let mut record = AdminAuditRecord::for_secret(audit_id, action, self.run.user_id, secret);
         record.secret_use = Some(SecretUse {
             delivery: Delivery::Value,
-            run_id: self.run_id,
+            run_id: Some(self.run_id),
             refused: refused.map(str::to_owned),
         });
         let rows = record
@@ -302,12 +305,42 @@ impl Operation for ReleaseVaultSecrets {
     }
 
     fn first(&mut self) -> SecretNext {
-        self.next_secret()
+        self.step = Step::VerifyRun;
+        Ok(Next::Call(IoCall::Read(vec![(
+            WORKFLOW_RUN_KEYSPACE.to_string(),
+            run_key(self.run_id),
+        )])))
     }
 
     fn next(&mut self, result: IoResult) -> SecretNext {
         match std::mem::replace(&mut self.step, Step::Idle) {
             Step::Idle => Err(JobError::retryable(IoError::Unfinished.to_string())),
+            Step::VerifyRun => {
+                if let Some(bytes) = result
+                    .value()
+                    .map_err(|error| JobError::retryable(error.to_string()))?
+                {
+                    let record = WorkflowRunRecord::from_bytes(&bytes).map_err(|error| {
+                        JobError::permanent(format!("workflow run record is corrupt: {error}"))
+                    })?;
+                    let valid = record.group_id == self.run.group_id
+                        && record.created_by == self.run.user_id
+                        && self.pending.iter().all(|(_, binding)| {
+                            binding.workflow_id == record.workflow_id
+                                && record.secrets.values().any(|bound| {
+                                    bound.scope == binding.scope
+                                        && bound.name == binding.name
+                                        && bound.field == binding.field
+                                })
+                        });
+                    if !valid {
+                        return Err(JobError::permanent(
+                            "workflow secret binding does not match the run record",
+                        ));
+                    }
+                }
+                self.next_secret()
+            }
             Step::OwnerEntry {
                 env_name,
                 binding,

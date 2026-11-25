@@ -190,6 +190,17 @@ impl AdmitForwardedOperation {
         if !peer_acts_for(&config, self.peer, auth.user_id) || auth.path_restrictions.is_some() {
             return Err(SubmissionRefusal::Unauthorized);
         }
+        // Only realm servers submit workflow child tasks; devices may never forge workflow tags.
+        let workflow_tagged = self.request.spec.tags.keys().any(|key| {
+            key.starts_with(aruna_core::structs::execution::job::input::WORKFLOW_TAG_PREFIX)
+        });
+        if workflow_tagged
+            && !config
+                .node_kind(&self.peer)
+                .is_some_and(|kind| kind.is_sync_eligible())
+        {
+            return Err(SubmissionRefusal::Unauthorized);
+        }
         // A plugin task passes the replicated task check, sent by its install's receiver only.
         if tagged(&self.request.spec).is_some() {
             let request = &self.request;

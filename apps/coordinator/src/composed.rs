@@ -227,35 +227,81 @@ pub struct StepMatch {
     pub settings: ArunaStepSettings,
 }
 
-/// The settings by step, with the tool names of the steps of a composed entry file, whose
-/// tool files lie beside it.
+/// The settings by step with tool names for every composed step, so sibling steps using the same
+/// tool with default settings are flagged as ambiguous rather than inheriting an override.
 pub fn step_matches(
     entry: &Path,
     settings: &BTreeMap<String, ArunaStepSettings>,
 ) -> Result<Vec<StepMatch>, String> {
-    let mut tools = BTreeMap::new();
     if uwe::tools::composed::is_composed(entry) && !settings.is_empty() {
         let mut library = ToolLibrary::new();
         let workflow = uwe::tools::composed::load(entry, &mut library)?;
+        let mut matches = Vec::with_capacity(workflow.graph.nodes.len());
+        let mut seen = std::collections::BTreeSet::new();
         for node in &workflow.graph.nodes {
+            let mut names = vec![node.id.clone()];
             if let Some(found) = library.get(&node.tool, Some(&node.version)) {
                 let definition = &found.definition;
-                tools.insert(
-                    node.id.clone(),
-                    [definition.id.clone(), definition.title.clone()],
-                );
+                names.push(definition.id.clone());
+                names.push(definition.title.clone());
+            }
+            seen.insert(node.id.clone());
+            matches.push(StepMatch {
+                step: node.id.clone(),
+                names,
+                settings: settings.get(&node.id).cloned().unwrap_or_default(),
+            });
+        }
+        for (step, entry) in settings {
+            if !seen.contains(step) {
+                matches.push(StepMatch {
+                    step: step.clone(),
+                    names: vec![step.clone()],
+                    settings: entry.clone(),
+                });
             }
         }
+        return Ok(matches);
     }
     Ok((settings.iter())
         .map(|(step, settings)| StepMatch {
             step: step.clone(),
-            names: std::iter::once(step.clone())
-                .chain(tools.get(step).into_iter().flatten().cloned())
-                .collect(),
+            names: vec![step.clone()],
             settings: settings.clone(),
         })
         .collect())
+}
+
+/// The step names allowed open network access, refusing any override whose tool aliases also
+/// match a sibling step that keeps network isolation.
+pub fn allowed_network_steps(matches: &[StepMatch]) -> Result<Vec<String>, String> {
+    let mut allowed = Vec::new();
+    for entry in matches
+        .iter()
+        .filter(|entry| entry.settings.execution.network == Some(true))
+    {
+        for other in matches.iter().filter(|other| {
+            other.step != entry.step && other.settings.execution.network != Some(true)
+        }) {
+            if let Some(shared) = entry
+                .names
+                .iter()
+                .find(|name| other.names.iter().any(|candidate| candidate == *name))
+            {
+                return Err(format!(
+                    "step {} enables network access while step {} shares tool name {shared} with \
+                     network isolated; give them distinct tools",
+                    entry.step, other.step
+                ));
+            }
+        }
+        for name in &entry.names {
+            if !allowed.contains(name) {
+                allowed.push(name.clone());
+            }
+        }
+    }
+    Ok(allowed)
 }
 
 /// The settings of the tasks of `step`, as uwe names it. Two steps that share a name but not
@@ -478,6 +524,28 @@ mod tests {
             entry("second", &["second", "reverse"], 1.0),
         ];
         assert_eq!(settings_for(&same, "reverse"), Ok(Some(settings(1.0))));
+    }
+
+    #[test]
+    fn rejects_shared_network() {
+        let open =
+            ArunaStepSettings::from_value(serde_json::json!({"execution": {"network": true}}))
+                .expect("reads");
+        let isolated = ArunaStepSettings::default();
+        let matches = [
+            StepMatch {
+                step: "fetch".into(),
+                names: vec!["fetch".into(), "curl".into(), "Curl".into()],
+                settings: open,
+            },
+            StepMatch {
+                step: "check".into(),
+                names: vec!["check".into(), "curl".into(), "Curl".into()],
+                settings: isolated,
+            },
+        ];
+        let err = allowed_network_steps(&matches).unwrap_err();
+        assert!(err.contains("shares tool name curl"), "{err}");
     }
 
     #[test]

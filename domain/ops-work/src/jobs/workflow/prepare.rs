@@ -346,7 +346,10 @@ impl PrepareAttemptOperation {
                     .spec
                     .tags
                     .get(WORKFLOW_RUN_TAG)
-                    .and_then(|id| ulid::Ulid::from_string(id).ok());
+                    .and_then(|id| ulid::Ulid::from_string(id).ok())
+                    .ok_or_else(|| {
+                        JobError::permanent("workflow secret bindings require a valid workflow run")
+                    })?;
                 let release = ReleaseVaultSecrets::new(self.run, run_id, bindings);
                 return self.call(PrepareStep::VaultSecrets, IoCall::child(release));
             }

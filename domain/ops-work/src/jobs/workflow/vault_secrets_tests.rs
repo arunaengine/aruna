@@ -150,7 +150,8 @@ async fn releases_workflow_secrets() {
             },
         ),
     ]);
-    let released = drive(ReleaseVaultSecrets::new(run, None, bindings), ctx)
+    let run_id = Ulid::from_bytes([9; 16]);
+    let released = drive(ReleaseVaultSecrets::new(run, run_id, bindings), ctx)
         .await
         .unwrap();
     assert_eq!(released["USER_TOKEN"].expose(), "user-secret-val");
@@ -165,8 +166,67 @@ async fn releases_workflow_secrets() {
             field: None,
         },
     )]);
-    let err = drive(ReleaseVaultSecrets::new(run, None, denied), ctx)
+    let err = drive(ReleaseVaultSecrets::new(run, run_id, denied), ctx)
         .await
         .unwrap_err();
     assert!(err.message.contains("refused"), "{err:?}");
+
+    // A stored run record must match the claimed workflow and secret bindings.
+    let run_record = WorkflowRunRecord {
+        run_id,
+        realm_id,
+        group_id,
+        workflow_id: Ulid::from_bytes([1; 16]),
+        workflow_name: "other".to_string(),
+        version: 1,
+        lineage: run_id,
+        state: aruna_core::structs::execution::workflow_run::RunState::Running,
+        node_id,
+        created_by: user_id,
+        created_at_ms: 10,
+        finished_at_ms: None,
+        error: None,
+        values_json: "{}".to_string(),
+        inputs_json: None,
+        output: None,
+        outputs: Vec::new(),
+        provenance_crate: false,
+        provenance_document_id: None,
+        provenance_status: None,
+        last_event_seq: 0,
+        local_only: false,
+        origin: None,
+        parent_job_id: None,
+        claim_token_digest: None,
+        attempts: 1,
+        steps: Vec::new(),
+        resumes_run_id: None,
+        repeats_run_id: None,
+        cache_scope: aruna_core::structs::execution::workflow_run::CacheScope::Run,
+        placement_site: None,
+        protected: false,
+        started_at_ms: Some(10),
+        secrets: BTreeMap::new(),
+    };
+    ctx.storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: WORKFLOW_RUN_KEYSPACE.to_string(),
+            key: run_key(run_id),
+            value: run_record.to_bytes().unwrap().into(),
+            txn_id: None,
+        })
+        .await;
+    let forged = BTreeMap::from([(
+        "NODE_TOKEN".to_string(),
+        TaskSecretBinding {
+            workflow_id,
+            scope: WorkflowSecretScope::Node,
+            name: secret_name("node-token"),
+            field: None,
+        },
+    )]);
+    let err = drive(ReleaseVaultSecrets::new(run, run_id, forged), ctx)
+        .await
+        .unwrap_err();
+    assert!(err.message.contains("does not match"), "{err:?}");
 }

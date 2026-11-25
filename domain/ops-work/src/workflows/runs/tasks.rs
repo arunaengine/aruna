@@ -48,6 +48,8 @@ use super::cache::{
 };
 use super::data::{Target, WriteBody, WriteObjectOperation, area_of, file_address, resolve};
 use super::{RunChange, RunTasksOperation, change_call, changed, creator_auth, tasks_answer};
+use crate::jobs::job::cancel::{CancelJobOutcome, CancelOwnedOperation, CancelReport};
+use crate::jobs::job::reads::JobReadError;
 use crate::jobs::lifecycle::admit::here::AcceptedSubmission;
 use crate::jobs::lifecycle::cancel::CancelFamilyOperation;
 use crate::jobs::lifecycle::family_reads::{FamilyProjectionOperation, FamilyView};
@@ -289,17 +291,35 @@ pub fn task_spec(
         backend: None,
         inputs,
         // The control files go to the run's node, which reads them; the work folder of an open
-        // run stays in the run area of the node that runs the task.
-        file_outputs: vec![
-            folder_output(
-                control,
-                OutputDestination::S3 {
-                    bucket,
-                    key: format!("{folder}control"),
-                },
-            ),
-            folder_output(&folders.work, work),
-        ],
+        // run stays in the run area of the node that runs the task. Secret-bearing attempts omit
+        // stdout/stderr control files so leaked credentials never reach durable object storage.
+        file_outputs: {
+            let mut outputs = match request.secret_placeholders.is_empty() {
+                true => vec![folder_output(
+                    control,
+                    OutputDestination::S3 {
+                        bucket,
+                        key: format!("{folder}control"),
+                    },
+                )],
+                false => ["exit", "start", "end", "manifest"]
+                    .into_iter()
+                    .map(|name| OutputSelection {
+                        container_path: format!("{control}/{name}"),
+                        path_prefix: None,
+                        destination_node_id: None,
+                        destination: OutputDestination::S3 {
+                            bucket: bucket.clone(),
+                            key: format!("{folder}control/{name}"),
+                        },
+                        name: None,
+                        description: None,
+                    })
+                    .collect(),
+            };
+            outputs.push(folder_output(&folders.work, work));
+            outputs
+        },
         workspace_outputs: Vec::new(),
         output_prefixes: Vec::new(),
         collision_policy: Default::default(),
@@ -1002,14 +1022,21 @@ impl RunTaskOperation {
             })
             .collect();
         let seconds = |name: &str| text(name).and_then(|value| value.parse::<f64>().ok());
+        let has_secrets = !self.request.secret_placeholders.is_empty();
         let finished = TaskFinished {
             exit_code,
             error: None,
             retryable: false,
             cancelled: false,
             outputs,
-            stdout_tail: tail("stdout", summary.stdout.as_ref()),
-            stderr_tail: tail("stderr", summary.stderr.as_ref()),
+            stdout_tail: match has_secrets {
+                true => Vec::new(),
+                false => tail("stdout", summary.stdout.as_ref()),
+            },
+            stderr_tail: match has_secrets {
+                true => Vec::new(),
+                false => tail("stderr", summary.stderr.as_ref()),
+            },
             started: seconds("start"),
             ended: seconds("end"),
             usage: None,
@@ -1232,17 +1259,19 @@ impl Operation for ControlFilesOperation {
 #[derive(Debug, PartialEq)]
 enum StopStep {
     Tasks,
-    Cancel(Vec<WorkflowTaskRecord>),
+    Cancel(String, Vec<WorkflowTaskRecord>),
+    LocalCancel(String, Vec<WorkflowTaskRecord>),
 }
 
 /// Cancels child jobs of a run that have not ended: one named attempt for `CancelTask`, or all
-/// of them for `StopOrphans`. Each is cancelled through its family as the run's creator.
+/// of them for `StopOrphans`. Local device runs cancel owned jobs; realm runs cancel families.
 #[derive(Debug, PartialEq)]
 pub struct StopTasksOperation {
     run: WorkflowRunRecord,
     serving: (NodeId, aruna_core::structs::identity::realm::RealmId),
     name: Option<String>,
     stopped: Vec<String>,
+    failed: bool,
     now_ms: u64,
     step: StopStep,
 }
@@ -1259,6 +1288,7 @@ impl StopTasksOperation {
             serving,
             name,
             stopped: Vec::new(),
+            failed: false,
             now_ms: 0,
             step: StopStep::Tasks,
         }
@@ -1268,6 +1298,9 @@ impl StopTasksOperation {
         let Some(task) = tasks.pop() else {
             let stopped = std::mem::take(&mut self.stopped);
             return Ok(Next::Done(match self.name.take() {
+                Some(_) if self.failed => HostRpcResult::Failed(ContractError::internal(
+                    "the child task could not be cancelled",
+                )),
                 Some(name) => HostRpcResult::TaskCancelled { name },
                 None => HostRpcResult::StopOrphans { stopped },
             }));
@@ -1275,7 +1308,11 @@ impl StopTasksOperation {
         let Some(job_id) = task.child_job_id else {
             return self.cancel_next(tasks);
         };
-        self.stopped.push(task.name.clone());
+        if self.run.local_only {
+            let cancel = CancelOwnedOperation::new(self.run.created_by, job_id, self.now_ms);
+            self.step = StopStep::LocalCancel(task.name, tasks);
+            return Ok(Next::Call(IoCall::child(cancel)));
+        }
         let cancel = CancelFamilyOperation::new(
             &creator_auth(&self.run),
             job_id,
@@ -1283,7 +1320,7 @@ impl StopTasksOperation {
             Some(self.serving),
             self.now_ms,
         );
-        self.step = StopStep::Cancel(tasks);
+        self.step = StopStep::Cancel(task.name, tasks);
         Ok(Next::Call(IoCall::child(cancel)))
     }
 }
@@ -1312,9 +1349,35 @@ impl Operation for StopTasksOperation {
                     .collect();
                 self.cancel_next(tasks)
             }
-            StopStep::Cancel(tasks) => {
-                if let Err(error) = result.child::<Option<()>, JobRouteError>()? {
-                    warn!(%error, run = %self.run.run_id, "a child job was not cancelled");
+            StopStep::Cancel(name, tasks) => {
+                match result.child::<Option<()>, JobRouteError>()? {
+                    Ok(Some(())) => self.stopped.push(name),
+                    Ok(None) => {
+                        self.failed = true;
+                        warn!(run = %self.run.run_id, task = %name, "child job family not found");
+                    }
+                    Err(error) => {
+                        self.failed = true;
+                        warn!(%error, run = %self.run.run_id, task = %name, "a child job was not cancelled");
+                    }
+                }
+                self.cancel_next(tasks)
+            }
+            StopStep::LocalCancel(name, tasks) => {
+                match result.child::<CancelReport<CancelJobOutcome>, JobReadError>()? {
+                    Ok(report) => match report.outcome {
+                        CancelJobOutcome::Requested(_) | CancelJobOutcome::AlreadyTerminal(_) => {
+                            self.stopped.push(name);
+                        }
+                        CancelJobOutcome::NotFound => {
+                            self.failed = true;
+                            warn!(run = %self.run.run_id, task = %name, "local child job not found");
+                        }
+                    },
+                    Err(error) => {
+                        self.failed = true;
+                        warn!(%error, run = %self.run.run_id, task = %name, "local child job was not cancelled");
+                    }
                 }
                 self.cancel_next(tasks)
             }
