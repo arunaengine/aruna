@@ -101,6 +101,10 @@ fn chunk_target(kind: &ChunkKind) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
+fn staged_key(run_id: Ulid, kind: ChunkKind) -> Key {
+    chunk_key(run_id, chunk_target(&kind), u32::MAX)
+}
+
 fn stub_run(run: &WorkflowRunRecord) -> WorkflowRunRecord {
     WorkflowRunRecord {
         run_id: run.run_id,
@@ -1067,6 +1071,18 @@ impl Operation for WriteReplicaOperation {
             (WORKFLOW_KEYSPACE.to_string(), wf_key),
             (WORKFLOW_VERSION_KEYSPACE.to_string(), ver_key.clone()),
             (WORKFLOW_SOURCE_KEYSPACE.to_string(), ver_key),
+            (
+                RUN_LOG_KEYSPACE.to_string(),
+                staged_key(run_id, ChunkKind::Workflow),
+            ),
+            (
+                RUN_LOG_KEYSPACE.to_string(),
+                staged_key(run_id, ChunkKind::Version),
+            ),
+            (
+                RUN_LOG_KEYSPACE.to_string(),
+                staged_key(run_id, ChunkKind::Source),
+            ),
         ];
         for index in 0..self.pages.len() {
             let number = self.first_page + index as u32;
@@ -1147,6 +1163,9 @@ impl Operation for WriteReplicaOperation {
         let wf_row = values.next().flatten();
         let ver_row = values.next().flatten();
         let src_row = values.next().flatten();
+        let staged_wf = values.next().flatten();
+        let staged_ver = values.next().flatten();
+        let staged_src = values.next().flatten();
         let mut page_rows = Vec::with_capacity(self.pages.len());
         for _ in 0..self.pages.len() {
             page_rows.push(values.next().flatten());
@@ -1158,9 +1177,9 @@ impl Operation for WriteReplicaOperation {
         }
         let mut writes = Vec::new();
         let mut deletes = Vec::new();
-        let mut wrote_wf = false;
-        let mut wrote_ver = false;
-        let mut wrote_source = false;
+        let mut pending_wf: Option<Vec<u8>> = None;
+        let mut pending_ver: Option<Vec<u8>> = None;
+        let mut pending_src: Option<Vec<u8>> = None;
         let mut assembled_run: Option<WorkflowRunRecord> = None;
         let run_id = self.run.run_id;
         let space = RUN_LOG_KEYSPACE.to_string();
@@ -1227,18 +1246,33 @@ impl Operation for WriteReplicaOperation {
                 assembled.extend_from_slice(&chunk.data);
                 match chunk.kind {
                     ChunkKind::Source => {
-                        if src_row.is_none() {
+                        if more {
                             writes.push((
-                                WORKFLOW_SOURCE_KEYSPACE.to_string(),
-                                ver_key.clone(),
+                                space.clone(),
+                                staged_key(run_id, ChunkKind::Source),
                                 ByteView::from(assembled),
                             ));
+                        } else {
+                            pending_src = Some(assembled);
                         }
-                        wrote_source = true;
                     }
                     ChunkKind::Workflow => {
-                        store_workflow(&assembled, wf_row.as_deref(), &self.run, &mut writes)?;
-                        wrote_wf = true;
+                        let wf = WorkflowRecord::from_bytes(&assembled)
+                            .map_err(|_| CatalogError::Forbidden)?;
+                        if wf.workflow_id != self.run.workflow_id
+                            || wf.group_id != self.run.group_id
+                        {
+                            return Err(CatalogError::Forbidden);
+                        }
+                        if more {
+                            writes.push((
+                                space.clone(),
+                                staged_key(run_id, ChunkKind::Workflow),
+                                ByteView::from(assembled),
+                            ));
+                        } else {
+                            pending_wf = Some(assembled);
+                        }
                     }
                     ChunkKind::Version => {
                         let ver = WorkflowVersionRecord::from_bytes(&assembled)
@@ -1248,14 +1282,15 @@ impl Operation for WriteReplicaOperation {
                         {
                             return Err(CatalogError::Forbidden);
                         }
-                        if ver_row.is_none() {
+                        if more {
                             writes.push((
-                                WORKFLOW_VERSION_KEYSPACE.to_string(),
-                                ver_key.clone(),
+                                space.clone(),
+                                staged_key(run_id, ChunkKind::Version),
                                 ByteView::from(assembled),
                             ));
+                        } else {
+                            pending_ver = Some(assembled);
                         }
-                        wrote_ver = true;
                     }
                     ChunkKind::Run => {
                         if more {
@@ -1326,49 +1361,68 @@ impl Operation for WriteReplicaOperation {
                 }
             }
             if !more {
-                if !replicated.workflow.is_empty() {
-                    store_workflow(
-                        &replicated.workflow,
-                        wf_row.as_deref(),
-                        &self.run,
-                        &mut writes,
-                    )?;
-                    wrote_wf = true;
+                if pending_wf.is_none() && !replicated.workflow.is_empty() {
+                    pending_wf = Some(replicated.workflow);
                 }
-                if !replicated.version.is_empty() {
-                    let ver = WorkflowVersionRecord::from_bytes(&replicated.version)
-                        .map_err(|_| CatalogError::Forbidden)?;
-                    if ver.workflow_id != self.run.workflow_id || ver.version != self.run.version {
-                        return Err(CatalogError::Forbidden);
-                    }
-                    if ver_row.is_none() {
-                        writes.push((
-                            WORKFLOW_VERSION_KEYSPACE.to_string(),
-                            ver_key.clone(),
-                            ByteView::from(replicated.version),
-                        ));
-                    }
-                    wrote_ver = true;
+                if pending_ver.is_none() && !replicated.version.is_empty() {
+                    pending_ver = Some(replicated.version);
                 }
-                if !wrote_source && let Some(source) = replicated.source {
-                    if src_row.is_none() {
-                        writes.push((
-                            WORKFLOW_SOURCE_KEYSPACE.to_string(),
-                            ver_key,
-                            ByteView::from(source),
-                        ));
-                    }
-                    wrote_source = true;
+                if pending_src.is_none() {
+                    pending_src = replicated.source;
                 }
             }
         }
         if !more {
-            // Publish the replica only when every required catalog row is present or assembled.
-            if (wf_row.is_none() && !wrote_wf)
-                || (ver_row.is_none() && !wrote_ver)
-                || (src_row.is_none() && !wrote_source)
+            if let Some(bytes) = staged_wf {
+                deletes.push((space.clone(), staged_key(run_id, ChunkKind::Workflow)));
+                if pending_wf.is_none() {
+                    pending_wf = Some(bytes.to_vec());
+                }
+            }
+            if let Some(bytes) = staged_ver {
+                deletes.push((space.clone(), staged_key(run_id, ChunkKind::Version)));
+                if pending_ver.is_none() {
+                    pending_ver = Some(bytes.to_vec());
+                }
+            }
+            if let Some(bytes) = staged_src {
+                deletes.push((space.clone(), staged_key(run_id, ChunkKind::Source)));
+                if pending_src.is_none() {
+                    pending_src = Some(bytes.to_vec());
+                }
+            }
+            // Publish catalog rows and the run together only when every required row is available.
+            if (wf_row.is_none() && pending_wf.is_none())
+                || (ver_row.is_none() && pending_ver.is_none())
+                || (src_row.is_none() && pending_src.is_none())
             {
                 return Err(CatalogError::NotFound);
+            }
+            if let Some(bytes) = pending_wf {
+                store_workflow(&bytes, wf_row.as_deref(), &self.run, &mut writes)?;
+            }
+            if let Some(bytes) = pending_ver {
+                let ver = WorkflowVersionRecord::from_bytes(&bytes)
+                    .map_err(|_| CatalogError::Forbidden)?;
+                if ver.workflow_id != self.run.workflow_id || ver.version != self.run.version {
+                    return Err(CatalogError::Forbidden);
+                }
+                if ver_row.is_none() {
+                    writes.push((
+                        WORKFLOW_VERSION_KEYSPACE.to_string(),
+                        ver_key.clone(),
+                        ByteView::from(bytes),
+                    ));
+                }
+            }
+            if let Some(bytes) = pending_src
+                && src_row.is_none()
+            {
+                writes.push((
+                    WORKFLOW_SOURCE_KEYSPACE.to_string(),
+                    ver_key,
+                    ByteView::from(bytes),
+                ));
             }
             if let Some(full) = assembled_run {
                 if stored.as_ref().is_none_or(|old| !keep_stored(old, &full)) {

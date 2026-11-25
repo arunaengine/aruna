@@ -474,6 +474,17 @@ async fn chunks_large_replicas() {
                 )
                 .await;
                 assert_eq!(hidden, Err(CatalogError::NotFound));
+                let hidden_ver = drive(
+                    crate::workflows::versions::GetVersionOperation::new(
+                        &runs.fixture.alice,
+                        wf_id,
+                        1,
+                    )
+                    .with_files(),
+                    context,
+                )
+                .await;
+                assert_eq!(hidden_ver, Err(CatalogError::NotFound));
             }
         } else {
             committed = true;
