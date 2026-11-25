@@ -129,24 +129,8 @@ impl RunRequest {
 fn value_refs(value: &Value, out: &mut Vec<(String, String, Option<Ulid>, Option<NodeId>)>) {
     match value {
         Value::String(text) => {
-            let rest = text
-                .strip_prefix("aruna://")
-                .or_else(|| text.strip_prefix("s3://"));
-            if let Some(rest) = rest {
-                let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
-                let mut version = None;
-                let mut node = None;
-                for pair in query.split('&') {
-                    if let Some(val) = pair.strip_prefix("version=") {
-                        version = Ulid::from_string(val).ok();
-                    } else if let Some(val) = pair.strip_prefix("node=") {
-                        node = val.parse::<NodeId>().ok();
-                    }
-                }
-                let (bucket, key) = path.split_once('/').unwrap_or((path, ""));
-                if !bucket.is_empty() {
-                    out.push((bucket.to_owned(), key.to_owned(), version, node));
-                }
+            if let Ok(parsed) = super::data::parse_address(text) {
+                out.push(parsed);
             }
         }
         Value::Array(items) => {

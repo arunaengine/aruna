@@ -1263,3 +1263,45 @@ async fn refreshes_remote_grants() {
     assert_eq!(keep.captured.len(), 1);
     assert!(keep.remote.is_empty());
 }
+
+// Workflow addresses encode `?`, `%`, and `#` in object keys so pinned inputs and data calls
+// round-trip special prefixes losslessly while still refusing encoded `..` traversal.
+#[tokio::test]
+async fn round_trips_addresses() {
+    let runs = runs().await;
+    let mut record = runs.started().await;
+    let peer = aruna_ops_identity::testing::node(9);
+    let ver = Ulid::from_bytes([33; 16]);
+    let key = "team\\west?/a?b%25#1/file.txt";
+    record.inputs_json = Some(
+        json!({
+            "local": {
+                "bucket": "results",
+                "key": key,
+                "version_id": ver.to_string(),
+            },
+            "remote": {
+                "bucket": "results",
+                "key": key,
+                "version_id": ver.to_string(),
+                "source_node_id": peer.to_string(),
+            }
+        })
+        .to_string(),
+    );
+    let values = super::run::run_inputs(&record).unwrap();
+    let local_addr = values["local"].as_str().unwrap();
+    let remote_addr = values["remote"].as_str().unwrap();
+    let local_target = resolve(&record, local_addr).unwrap();
+    assert_eq!(local_target.bucket, "results");
+    assert_eq!(local_target.key, key);
+    assert_eq!(local_target.version, Some(ver));
+    assert_eq!(local_target.node, None);
+    let remote_target = resolve(&record, remote_addr).unwrap();
+    assert_eq!(remote_target.bucket, "results");
+    assert_eq!(remote_target.key, key);
+    assert_eq!(remote_target.version, Some(ver));
+    assert_eq!(remote_target.node, Some(peer));
+    assert!(resolve(&record, "aruna://results/%2E%2E/secret.txt").is_err());
+    assert!(resolve(&record, "aruna://results/bad%2").is_err());
+}

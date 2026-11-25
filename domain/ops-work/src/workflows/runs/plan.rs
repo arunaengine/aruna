@@ -807,14 +807,8 @@ fn downstream_of(tasks: &[SimTask], markers: &BTreeSet<u64>) -> BTreeSet<u64> {
 /// The address a pinned input has in the run's values, matching `run_inputs`.
 fn pin_address(local: NodeId, pin: &PinnedInput) -> String {
     match pin.source_node_id.filter(|node| *node != local) {
-        Some(node) => format!(
-            "aruna://{}/{}?version={}&node={node}",
-            pin.bucket, pin.key, pin.version_id
-        ),
-        None => format!(
-            "aruna://{}/{}?version={}",
-            pin.bucket, pin.key, pin.version_id
-        ),
+        Some(node) => super::data::address_on(&pin.bucket, &pin.key, Some(pin.version_id), node),
+        None => super::data::address_of(&pin.bucket, &pin.key, Some(pin.version_id)),
     }
 }
 

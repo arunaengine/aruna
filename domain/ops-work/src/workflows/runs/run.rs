@@ -314,13 +314,13 @@ pub(crate) fn run_inputs(record: &WorkflowRunRecord) -> Result<Value, CatalogErr
     let address = |pin: &Value| -> Option<Value> {
         let bucket = pin.get("bucket")?.as_str()?;
         let key = pin.get("key")?.as_str()?;
-        let version = pin.get("version_id")?.as_str()?;
+        let version = Ulid::from_string(pin.get("version_id")?.as_str()?).ok()?;
         let node = (pin.get("source_node_id").and_then(Value::as_str))
             .and_then(|node| node.parse::<NodeId>().ok())
             .filter(|node| *node != record.node_id);
         Some(Value::String(match node {
-            Some(node) => format!("aruna://{bucket}/{key}?version={version}&node={node}"),
-            None => format!("aruna://{bucket}/{key}?version={version}"),
+            Some(node) => super::data::address_on(bucket, key, Some(version), node),
+            None => super::data::address_of(bucket, key, Some(version)),
         }))
     };
     for (name, pin) in inputs {
