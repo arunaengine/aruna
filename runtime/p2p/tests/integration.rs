@@ -621,7 +621,8 @@ async fn rejects_internal_alpn() -> Result<(), Box<dyn std::error::Error>> {
         .open_stream(handle_b.node_id(), Alpn::Dht)
         .await
         .expect_err("DHT streams are internal to the DHT service");
-    assert!(matches!(error, NetError::Stream(_)));
+    assert!(matches!(error, NetError::LocalUnavailable(_)));
+    assert!(!error.is_peer_fault());
 
     handle_a.shutdown().await;
     handle_b.shutdown().await;
