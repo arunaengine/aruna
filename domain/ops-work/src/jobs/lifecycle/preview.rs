@@ -5,6 +5,7 @@
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::job_request::{self, SubmissionScope, SubmitJobError};
+use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::scheduling::ExecutionPlan;
 use aruna_core::structs::execution::job::family::{
@@ -57,6 +58,7 @@ pub struct PreviewPlanOperation {
     node: IngressNode,
     spec: ExecutionSpec,
     created_by: UserId,
+    token: Option<AuthToken>,
     step: PreviewStep,
 }
 
@@ -68,8 +70,14 @@ impl PreviewPlanOperation {
             node,
             spec,
             created_by,
+            token: None,
             step: PreviewStep::Config,
         }
+    }
+
+    pub fn with_token(mut self, token: Option<AuthToken>) -> Self {
+        self.token = token;
+        self
     }
 
     /// The stored spec a launch of these inputs would plan from; its ids name no stored job.
@@ -137,8 +145,12 @@ impl Operation for PreviewPlanOperation {
                 let config = result.child::<RealmConfigDocument, GetConfigError>()?;
                 let config = config.map_err(|error| PreviewError::Config(error.to_string()))?;
                 let scope = SubmissionScope::Unkeyed(Ulid::nil());
-                let resolve_scope =
-                    (self.node).resolve_scope(self.created_by, &scope, RETENTION_MS, None);
+                let resolve_scope = (self.node).resolve_scope(
+                    self.created_by,
+                    &scope,
+                    RETENTION_MS,
+                    self.token.clone(),
+                );
                 let resolve = ResolveInputsOperation::new(&self.spec, resolve_scope);
                 self.step = PreviewStep::Resolve(Box::new(config));
                 Ok(Next::Call(IoCall::child(resolve)))

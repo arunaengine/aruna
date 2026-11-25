@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
+use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::scheduling::ExecutionPlan;
 use aruna_core::structs::execution::job::input::{
@@ -96,6 +97,21 @@ enum Placement {
     Runtime(Option<NodeId>),
 }
 
+/// Distinguishes preview rounds by inputs, compute ceilings, and placement tags.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct PreviewKey {
+    inputs: Vec<(String, Option<NodeId>)>,
+    resources: (
+        Option<u32>,
+        Option<u64>,
+        Option<u64>,
+        Option<u64>,
+        bool,
+        Option<u32>,
+    ),
+    tags: Vec<(String, String)>,
+}
+
 #[derive(Debug, PartialEq)]
 enum PlanStep {
     Group,
@@ -105,7 +121,7 @@ enum PlanStep {
     Inputs,
     Validate,
     Simulate,
-    Preview(Vec<String>),
+    Preview(PreviewKey),
     Cache(u64),
 }
 
@@ -113,6 +129,7 @@ enum PlanStep {
 #[derive(Debug, PartialEq)]
 pub struct PlanRunOperation {
     auth: AuthContext,
+    token: Option<AuthToken>,
     node: IngressNode,
     request: RunRequest,
     source: Option<(WorkflowSource, String, Option<WorkflowLanguage>)>,
@@ -121,8 +138,8 @@ pub struct PlanRunOperation {
     plan: RunPlan,
     tasks: Vec<SimTask>,
     markers: BTreeSet<u64>,
-    previews: VecDeque<(Vec<String>, ExecutionSpec)>,
-    planned: BTreeMap<Vec<String>, Option<ExecutionPlan>>,
+    previews: VecDeque<(PreviewKey, ExecutionSpec)>,
+    planned: BTreeMap<PreviewKey, Option<ExecutionPlan>>,
     seeds: VecDeque<(u64, String)>,
     cached: BTreeSet<u64>,
     step: PlanStep,
@@ -136,6 +153,7 @@ impl PlanRunOperation {
         pending_inputs.reverse();
         Self {
             auth: auth.clone(),
+            token: None,
             node,
             request,
             source: None,
@@ -150,6 +168,11 @@ impl PlanRunOperation {
             cached: BTreeSet::new(),
             step: PlanStep::Group,
         }
+    }
+
+    pub fn with_token(mut self, token: Option<AuthToken>) -> Self {
+        self.token = token;
+        self
     }
 
     /// The run as it would be admitted, which the value check, the simulation and the cache
@@ -300,11 +323,7 @@ impl PlanRunOperation {
             if !task.upstream.is_empty() {
                 continue;
             }
-            let key: Vec<String> = task
-                .inputs
-                .iter()
-                .map(|(_, pin)| pin_address(pin))
-                .collect();
+            let key = self.preview_key(task);
             if self.planned.contains_key(&key)
                 || self.previews.iter().any(|(known, _)| *known == key)
             {
@@ -317,6 +336,28 @@ impl PlanRunOperation {
             .filter_map(|task| Some((task.id, task.seed.clone()?)))
             .collect();
         self.next_preview()
+    }
+
+    fn preview_key(&self, task: &SimTask) -> PreviewKey {
+        let settings = self.settings.get(&task.step);
+        let tags = site_tags(None, settings, self.request.placement_site.clone());
+        let r = &task.resources;
+        PreviewKey {
+            inputs: task
+                .inputs
+                .iter()
+                .map(|(_, pin)| (pin_address(pin), pin.source_node_id))
+                .collect(),
+            resources: (
+                r.cpu_cores,
+                r.ram_bytes,
+                r.disk_bytes,
+                r.max_walltime_ms,
+                r.preemptible,
+                r.gpus,
+            ),
+            tags,
+        }
     }
 
     /// The execution spec a launch of `task` would plan from.
@@ -363,12 +404,13 @@ impl PlanRunOperation {
         let Some((key, spec)) = self.previews.pop_front() else {
             return self.next_seed();
         };
-        let preview = PreviewPlanOperation::new(self.node.clone(), spec, self.auth.user_id);
+        let preview = PreviewPlanOperation::new(self.node.clone(), spec, self.auth.user_id)
+            .with_token(self.token.clone());
         self.step = PlanStep::Preview(key);
         Ok(Next::Call(IoCall::child(preview)))
     }
 
-    fn previewed(&mut self, key: Vec<String>, result: IoResult) -> PlanNext {
+    fn previewed(&mut self, key: PreviewKey, result: IoResult) -> PlanNext {
         let plan = match result.child::<ExecutionPlan, PreviewError>()? {
             Ok(plan) => Some(plan),
             Err(error) => {
@@ -408,11 +450,7 @@ impl PlanRunOperation {
         for task in &self.tasks {
             let placement = match task.upstream.is_empty() {
                 true => {
-                    let key: Vec<String> = task
-                        .inputs
-                        .iter()
-                        .map(|(_, pin)| pin_address(pin))
-                        .collect();
+                    let key = self.preview_key(task);
                     planned(self.planned.get(&key).and_then(Option::as_ref))
                 }
                 false => {

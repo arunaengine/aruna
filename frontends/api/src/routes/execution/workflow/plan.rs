@@ -11,7 +11,7 @@ use aruna_ops_work::jobs::node_inputs::ingress_node;
 use aruna_ops_work::workflows::runs::plan::{PlanRunOperation, PlannedStep, RunPlan};
 use aruna_runner::driver::drive;
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use utoipa::ToSchema;
@@ -21,7 +21,7 @@ use utoipa_axum::routes;
 use super::catalog_error;
 use super::run_wire::WorkflowRunRequest;
 use super::runs::run_request;
-use crate::auth::RealmAuth;
+use crate::auth::{RealmAuth, ValidatedBearer};
 use crate::error::{ErrorResponse, ServerResult};
 use crate::server::state::ServerState;
 
@@ -148,8 +148,10 @@ impl From<RunPlan> for RunPlanBody {
 pub async fn plan_run(
     State(state): State<Arc<ServerState>>,
     RealmAuth(auth): RealmAuth,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
     Json(request): Json<WorkflowRunRequest>,
 ) -> ServerResult<Json<RunPlanBody>> {
+    let token = crate::jobs::forwarded_job_auth(bearer)?;
     let request = run_request(&state, request, None)?;
     let context = state.get_ctx();
     let now_ms = unix_timestamp_millis();
@@ -160,7 +162,7 @@ pub async fn plan_run(
             now_ms,
             fresh: Default::default(),
         });
-    let plan = PlanRunOperation::new(&auth, node, request);
+    let plan = PlanRunOperation::new(&auth, node, request).with_token(token);
     let plan = drive(plan, &context).await.map_err(catalog_error)?;
     Ok(Json(plan.into()))
 }

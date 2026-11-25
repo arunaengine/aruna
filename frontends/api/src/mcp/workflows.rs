@@ -168,7 +168,16 @@ impl McpServer {
             .checked(&parts, "plan_workflow_run", &input, Permission::READ)
             .await?;
         let body = body_of(input.body)?;
-        payload(plan::plan_run(self.handler_state(), RealmAuth(auth), axum::Json(body)).await)
+        let bearer = axum::extract::Extension(super::compute::request_bearer(&parts));
+        payload(
+            plan::plan_run(
+                self.handler_state(),
+                RealmAuth(auth),
+                bearer,
+                axum::Json(body),
+            )
+            .await,
+        )
     }
 
     #[tool(

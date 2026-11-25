@@ -296,3 +296,41 @@ fn reports_unplaceable_tasks() {
         [json!({"message": "no such step", "severity": "error"})]
     );
 }
+
+// Two tasks reading the same pinned input with different resource requirements get separate
+// preview rounds so each receives its own placement instead of inheriting the first task's node.
+#[test]
+fn separates_distinct_resources() {
+    let (data_node, gpu_node) = (node(2), node(3));
+    let reads = pin("reads", 1, data_node);
+    let mut planning = operation(vec![reads.clone()]);
+    let mut train = task(2, "train", &[&reads]);
+    train["task"]["resources"]["gpus"] = json!(1);
+    let graph = json!({
+        "nodes": [task(1, "align", &[&reads]), train],
+        "edges": [],
+    });
+
+    planning.simulated(&graph, &[]).unwrap();
+    assert_eq!(planning.previews.len(), 1, "gpu task queues a second round");
+    assert_eq!(planning.previews[0].1.resources.gpus, Some(1));
+
+    let next = planning
+        .next(previewed(chosen(data_node, &[(MIB, None, 0)])))
+        .unwrap();
+    assert!(matches!(next, Next::Call(IoCall::Child(_))), "{next:?}");
+
+    let Next::Done(plan) = planning
+        .next(previewed(chosen(gpu_node, &[(MIB, Some(data_node), 20)])))
+        .unwrap()
+    else {
+        panic!("plan completes after second preview");
+    };
+    assert!(plan.complete);
+    assert_eq!(plan.tasks[0].step, "align");
+    assert_eq!(plan.tasks[0].node_id, Some(data_node));
+    assert_eq!(plan.tasks[0].mode, COMPUTE_TO_DATA);
+    assert_eq!(plan.tasks[1].step, "train");
+    assert_eq!(plan.tasks[1].node_id, Some(gpu_node));
+    assert_eq!(plan.tasks[1].mode, DATA_TO_COMPUTE);
+}
