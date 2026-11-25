@@ -763,6 +763,8 @@ pub enum MetadataTransportMessage {
         run: Box<crate::structs::execution::workflow_run::WorkflowRunRecord>,
         first_page: u32,
         pages: Vec<Vec<u8>>,
+        #[serde(default)]
+        workflow: Option<crate::structs::execution::workflow_run::ReplicatedWorkflow>,
     },
     /// The pages the holder now keeps of the run.
     RunLogStored {

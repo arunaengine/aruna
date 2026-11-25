@@ -197,8 +197,10 @@ impl MetadataPeerOperation {
                 run,
                 first_page,
                 pages,
+                workflow,
             } => {
-                let store = StoreReplicaOperation::new(peer, self.local, run, first_page, pages);
+                let store =
+                    StoreReplicaOperation::new(peer, self.local, run, first_page, pages, workflow);
                 self.ask(Asked::RunLog, store)
             }
             Message::StoreApplet { applet } => {

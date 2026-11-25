@@ -115,10 +115,54 @@ pub fn crate_json(
             push_ref(root, "hasPart", &id);
         }
     }
+    normalize_urls(&mut graph);
     json!({
         "@context": [CRATE_CONTEXT, WORKFLOW_RUN_CONTEXT],
         "@graph": graph,
     })
+}
+
+/// Converts JSON-LD `@id` objects on `SoftwareApplication`/`ContainerImage` `url` into string
+/// literals and drops relative paths that violate the embedded SHACL URI-scheme pattern.
+fn normalize_urls(graph: &mut [Value]) {
+    for entity in graph.iter_mut() {
+        if !has_type(entity, "SoftwareApplication") && !has_type(entity, "ContainerImage") {
+            continue;
+        }
+        let Some(current) = entity.get("url") else {
+            continue;
+        };
+        let extracted = match current {
+            Value::String(s) => Some(s.clone()),
+            Value::Object(obj) => obj.get("@id").and_then(Value::as_str).map(str::to_owned),
+            Value::Array(items) => items.iter().find_map(|item| match item {
+                Value::String(s) => Some(s.clone()),
+                Value::Object(obj) => obj.get("@id").and_then(Value::as_str).map(str::to_owned),
+                _ => None,
+            }),
+            _ => None,
+        };
+        match extracted.filter(|url| has_uri_scheme(url)) {
+            Some(url) => entity["url"] = Value::String(url),
+            None => {
+                if let Some(map) = entity.as_object_mut() {
+                    map.remove("url");
+                }
+            }
+        }
+    }
+}
+
+fn has_uri_scheme(text: &str) -> bool {
+    let Some((scheme, _)) = text.split_once(':') else {
+        return false;
+    };
+    let mut bytes = scheme.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    first.is_ascii_alphabetic()
+        && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'.' | b'-'))
 }
 
 /// The id of uwe's action of the whole run: `#run/<run id>`, or the action of the root's main
@@ -817,12 +861,7 @@ impl WriteProvenanceOperation {
     }
 
     fn internal(&self, record: &WorkflowRunRecord) -> AuthContext {
-        AuthContext {
-            user_id: record.created_by,
-            realm_id: self.node.1,
-            path_restrictions: None,
-            session: None,
-        }
+        creator_auth(record)
     }
 
     fn record(&mut self, status: &str, document_id: Option<Ulid>) -> WriteNext {

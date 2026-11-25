@@ -6,7 +6,10 @@
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::id::NodeId;
-use aruna_core::keyspaces::{RUN_LOG_KEYSPACE, WORKFLOW_RUN_KEYSPACE};
+use aruna_core::keyspaces::{
+    RUN_LOG_KEYSPACE, WORKFLOW_KEYSPACE, WORKFLOW_RUN_KEYSPACE, WORKFLOW_SOURCE_KEYSPACE,
+    WORKFLOW_VERSION_KEYSPACE,
+};
 use aruna_core::metadata::protocol::{
     METADATA_IO_TIMEOUT, MetadataReadError, MetadataTransportMessage, encode_message, peer_call,
     peer_reply,
@@ -14,8 +17,12 @@ use aruna_core::metadata::protocol::{
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::placement::plan_target_placement;
 use aruna_core::placement::resolver::PlacementResolutionContext;
+use aruna_core::structs::execution::workflow::{
+    WorkflowRecord, WorkflowVersionRecord, version_key, workflow_key,
+};
 use aruna_core::structs::execution::workflow_run::{
-    LogHead, WorkflowRunRecord, decode_page, encode_page, head_key, page_key, run_key,
+    LogHead, ReplicatedWorkflow, WorkflowRunRecord, decode_page, encode_page, head_key, page_key,
+    run_key,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::GroupId;
@@ -63,7 +70,12 @@ pub fn replica_note(record: &WorkflowRunRecord, local: NodeId) -> Option<&'stati
 enum SendStep {
     Run,
     Config(Box<WorkflowRunRecord>),
-    Log(Box<WorkflowRunRecord>, Vec<NodeId>),
+    Workflow(Box<WorkflowRunRecord>, Vec<NodeId>),
+    Log(
+        Box<WorkflowRunRecord>,
+        Vec<NodeId>,
+        Option<ReplicatedWorkflow>,
+    ),
     Send(NodeId),
 }
 
@@ -102,6 +114,7 @@ impl ReplicateLogOperation {
         &self,
         run: &WorkflowRunRecord,
         pages: &[RunLogPage],
+        mut workflow: Option<ReplicatedWorkflow>,
     ) -> Result<Vec<Vec<u8>>, CatalogError> {
         let mut batches: Vec<Vec<Vec<u8>>> = vec![Vec::new()];
         let mut bytes = 0;
@@ -125,6 +138,7 @@ impl ReplicateLogOperation {
                 run: Box::new(run.clone()),
                 first_page: first,
                 pages: batch,
+                workflow: workflow.take(),
             };
             let frame = encode_message(&message);
             frames.push(frame.map_err(|error| CatalogError::Storage(error.to_string()))?);
@@ -135,9 +149,10 @@ impl ReplicateLogOperation {
 
     fn send_next(&mut self) -> SendNext {
         let Some((node, frame)) = self.sends.pop() else {
+            // Keep the cursor on the last transmitted page because that page remains mutable.
             let next = match self.missed {
                 true => self.from_page,
-                false => self.pages,
+                false => self.pages.saturating_sub(1),
             };
             return Ok(Next::Done(next));
         };
@@ -174,16 +189,41 @@ impl Operation for ReplicateLogOperation {
                 if holders.is_empty() {
                     return Ok(Next::Done(self.from_page));
                 }
-                self.step = SendStep::Log(run, holders);
+                if self.from_page == 0 {
+                    let wf_key = workflow_key(run.workflow_id);
+                    let ver_key = version_key(run.workflow_id, run.version);
+                    self.step = SendStep::Workflow(run, holders);
+                    return Ok(Next::Call(IoCall::Read(vec![
+                        (WORKFLOW_KEYSPACE.to_string(), wf_key),
+                        (WORKFLOW_VERSION_KEYSPACE.to_string(), ver_key.clone()),
+                        (WORKFLOW_SOURCE_KEYSPACE.to_string(), ver_key),
+                    ])));
+                }
+                self.step = SendStep::Log(run, holders, None);
                 Ok(Next::Call(IoCall::child(LoadLogOperation::new(
                     self.run_id,
                 ))))
             }
-            SendStep::Log(run, holders) => {
+            SendStep::Workflow(run, holders) => {
+                let mut values = result.values()?.into_iter();
+                let workflow = match (values.next().flatten(), values.next().flatten()) {
+                    (Some(wf), Some(ver)) => Some(ReplicatedWorkflow {
+                        workflow: wf.to_vec(),
+                        version: ver.to_vec(),
+                        source: values.next().flatten().map(|s| s.to_vec()),
+                    }),
+                    _ => None,
+                };
+                self.step = SendStep::Log(run, holders, workflow);
+                Ok(Next::Call(IoCall::child(LoadLogOperation::new(
+                    self.run_id,
+                ))))
+            }
+            SendStep::Log(run, holders, workflow) => {
                 let pages = pages_answer(result)?;
                 self.pages = pages.len() as u32;
                 self.from_page = self.from_page.min(self.pages.saturating_sub(1));
-                let frames = self.frames(&run, &pages)?;
+                let frames = self.frames(&run, &pages, workflow)?;
                 for node in holders.into_iter().rev() {
                     for frame in frames.iter().rev() {
                         self.sends.push((node, frame.clone()));
@@ -223,6 +263,7 @@ pub struct StoreReplicaOperation {
     run: Box<WorkflowRunRecord>,
     first_page: u32,
     pages: Vec<Vec<u8>>,
+    workflow: Option<ReplicatedWorkflow>,
     step: StoreStep,
 }
 
@@ -233,6 +274,7 @@ impl StoreReplicaOperation {
         run: Box<WorkflowRunRecord>,
         first_page: u32,
         pages: Vec<Vec<u8>>,
+        workflow: Option<ReplicatedWorkflow>,
     ) -> Self {
         Self {
             peer,
@@ -240,6 +282,7 @@ impl StoreReplicaOperation {
             run,
             first_page,
             pages,
+            workflow,
             step: StoreStep::Config,
         }
     }
@@ -276,6 +319,7 @@ impl Operation for StoreReplicaOperation {
                     run: self.run.clone(),
                     first_page: self.first_page,
                     pages: std::mem::take(&mut self.pages),
+                    workflow: self.workflow.take(),
                     reading: true,
                     kept: 0,
                 };
@@ -309,6 +353,7 @@ pub struct WriteReplicaOperation {
     run: Box<WorkflowRunRecord>,
     first_page: u32,
     pages: Vec<Vec<u8>>,
+    workflow: Option<ReplicatedWorkflow>,
     reading: bool,
     kept: u32,
 }
@@ -322,10 +367,18 @@ impl Operation for WriteReplicaOperation {
     }
 
     fn first(&mut self) -> Result<Next<u32>, CatalogError> {
-        Ok(Next::Call(IoCall::Read(vec![
+        let mut reads = vec![
             (WORKFLOW_RUN_KEYSPACE.to_string(), run_key(self.run.run_id)),
             (RUN_LOG_KEYSPACE.to_string(), head_key(self.run.run_id)),
-        ])))
+        ];
+        if self.workflow.is_some() {
+            let wf_key = workflow_key(self.run.workflow_id);
+            let ver_key = version_key(self.run.workflow_id, self.run.version);
+            reads.push((WORKFLOW_KEYSPACE.to_string(), wf_key));
+            reads.push((WORKFLOW_VERSION_KEYSPACE.to_string(), ver_key.clone()));
+            reads.push((WORKFLOW_SOURCE_KEYSPACE.to_string(), ver_key));
+        }
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<u32>, CatalogError> {
@@ -345,6 +398,45 @@ impl Operation for WriteReplicaOperation {
             .transpose()?
             .unwrap_or_default();
         let mut writes = vec![run_row(&self.run)?];
+        if let Some(replicated) = self.workflow.take() {
+            let wf = WorkflowRecord::from_bytes(&replicated.workflow)
+                .map_err(|_| CatalogError::Forbidden)?;
+            let ver = WorkflowVersionRecord::from_bytes(&replicated.version)
+                .map_err(|_| CatalogError::Forbidden)?;
+            if wf.workflow_id != self.run.workflow_id
+                || wf.group_id != self.run.group_id
+                || ver.workflow_id != self.run.workflow_id
+                || ver.version != self.run.version
+            {
+                return Err(CatalogError::Forbidden);
+            }
+            let wf_exists = values.next().flatten().is_some();
+            let ver_exists = values.next().flatten().is_some();
+            let src_exists = values.next().flatten().is_some();
+            let wf_key = workflow_key(self.run.workflow_id);
+            let ver_key = version_key(self.run.workflow_id, self.run.version);
+            if !wf_exists {
+                writes.push((
+                    WORKFLOW_KEYSPACE.to_string(),
+                    wf_key,
+                    ByteView::from(replicated.workflow),
+                ));
+            }
+            if !ver_exists {
+                writes.push((
+                    WORKFLOW_VERSION_KEYSPACE.to_string(),
+                    ver_key.clone(),
+                    ByteView::from(replicated.version),
+                ));
+            }
+            if !src_exists && let Some(source) = replicated.source {
+                writes.push((
+                    WORKFLOW_SOURCE_KEYSPACE.to_string(),
+                    ver_key,
+                    ByteView::from(source),
+                ));
+            }
+        }
         let space = RUN_LOG_KEYSPACE.to_string();
         let run_id = self.run.run_id;
         for (index, bytes) in self.pages.iter().enumerate() {

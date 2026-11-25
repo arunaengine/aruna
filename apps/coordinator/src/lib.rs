@@ -106,6 +106,7 @@ async fn session(
     let cancel = rpc.cancel_token();
     let mut requests: JoinSet<()> = JoinSet::new();
     let mut run: Option<JoinHandle<RunFinishedPayload>> = None;
+    let mut replay_pages = Vec::new();
     let mut started = false;
     let mut draining = false;
     let mut open = true;
@@ -143,8 +144,23 @@ async fn session(
                             respond(&rpc, request_id, result);
                         });
                     }
-                    HostToCoordinator::RunStart(payload) if mode == CoordinatorMode::Run && !started => {
+                    HostToCoordinator::RunReplayPages { pages }
+                        if mode == CoordinatorMode::Run && !started =>
+                    {
+                        replay_pages.extend(pages);
+                    }
+                    HostToCoordinator::RunReplayPages { .. } => {
+                        tracing::warn!(?mode, started, "replay pages this session does not take");
+                    }
+                    HostToCoordinator::RunStart(mut payload)
+                        if mode == CoordinatorMode::Run && !started =>
+                    {
                         started = true;
+                        if !replay_pages.is_empty() {
+                            let mut combined = std::mem::take(&mut replay_pages);
+                            combined.extend(payload.prior_log_pages);
+                            payload.prior_log_pages = combined;
+                        }
                         let (rpc, run_id) = (rpc.clone(), run_id.clone());
                         let secrets = options.secrets_file.clone();
                         run = Some(tokio::spawn(async move {

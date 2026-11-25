@@ -42,6 +42,10 @@ pub enum HostToCoordinator {
         request_id: u64,
         kind: PreflightKind,
     },
+    /// Streams bounded chunks of prior run-log pages before `RunStart` for long lineages.
+    RunReplayPages {
+        pages: Vec<RunLogPage>,
+    },
     RunStart(RunStartPayload),
     RpcResponse {
         call_id: u64,

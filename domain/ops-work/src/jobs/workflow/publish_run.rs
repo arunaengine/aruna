@@ -263,7 +263,7 @@ impl PublishRunOperation {
         Ok(Next::Call(call))
     }
 
-    fn pulled(&mut self, answer: Result<SyncPullAck, SyncRefusal>) -> PublishTurn {
+    fn pulled(&mut self, answer: Result<(NodeId, SyncPullAck), SyncRefusal>) -> PublishTurn {
         let (output, key) = self.pending.pop_front().ok_or(IoError::Unfinished)?;
         let copy = copy_pulled(&self.input.target, output, key, answer)?;
         self.copies.push(copy);
@@ -341,7 +341,7 @@ impl Operation for PublishRunOperation {
                 result.done()?;
                 self.next_pull()
             }
-            PublishStep::Pull => self.pulled(result.child::<SyncPullAck, SyncRefusal>()?),
+            PublishStep::Pull => self.pulled(result.child::<(NodeId, SyncPullAck), SyncRefusal>()?),
             PublishStep::StoreCopies => {
                 result.done()?;
                 self.write_crate()
@@ -453,11 +453,11 @@ pub(crate) fn copy_pulled(
     target: &RemoteBinding,
     output: OutputObject,
     key: String,
-    answer: Result<SyncPullAck, SyncRefusal>,
+    answer: Result<(NodeId, SyncPullAck), SyncRefusal>,
 ) -> Result<OutputObject, PublishRunError> {
     match answer {
-        Ok(ack) => Ok(OutputObject {
-            node_id: target.node_id,
+        Ok((holder, ack)) => Ok(OutputObject {
+            node_id: holder,
             bucket: target.bucket.clone(),
             key,
             version_id: ack.version_id,
@@ -630,7 +630,7 @@ mod tests {
             .pending
             .push_back((copy, "runs/one/a/report.txt".to_string()));
         publish.step = PublishStep::Pull;
-        let refused = child(Err::<SyncPullAck, _>(SyncRefusal::Forbidden));
+        let refused = child(Err::<(NodeId, SyncPullAck), _>(SyncRefusal::Forbidden));
         let expected = PublishRunError::Refused {
             key: "report.txt".to_string(),
             refusal: SyncRefusal::Forbidden,

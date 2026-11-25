@@ -489,3 +489,83 @@ async fn builds_missing_crate() {
     let action = by_id(&built, &action_id(run.run_id));
     assert_eq!(action["identifier"], run.run_id.to_string());
 }
+
+// A real UWE crate with relative @id tool URLs and URI @id URLs passes the embedded SHACL shapes.
+#[test]
+fn validates_uwe_crate() {
+    use aruna_core::profile_shapes::ProfileShapes;
+    use aruna_ops_data::metadata::builtin::{BUILTIN_REVISION, builtin_shapes};
+    use aruna_rdf_graph::shacl::ProfileShaclEngine;
+
+    let mut record = super::tests::sample_run();
+    record.state = RunState::Succeeded;
+    record.finished_at_ms = Some(record.created_at_ms + 5000);
+    let run = record.run_id;
+    let uwe = json!({
+        "@context": "https://w3id.org/ro/crate/1.1/context",
+        "@graph": [
+            {"@id": "ro-crate-metadata.json", "@type": "CreativeWork", "about": {"@id": "./"},
+                "conformsTo": [{"@id": "https://w3id.org/ro/crate/1.1"}]},
+            {"@id": "./", "@type": "Dataset", "mainEntity": {"@id": "Snakefile"},
+                "mentions": [{"@id": format!("#run/{run}")}, {"@id": "#task/1"}],
+                "conformsTo": [{"@id": PROCESS_PROFILE}, {"@id": WORKFLOW_PROFILE},
+                    {"@id": PROVENANCE_PROFILE}]},
+            {"@id": "Snakefile", "@type": ["File", "SoftwareSourceCode", "ComputationalWorkflow"],
+                "name": "Snakefile", "url": "file://Snakefile"},
+            {"@id": "#tool/echo", "@type": "SoftwareApplication",
+                "name": "echo", "url": {"@id": "Snakefile"}},
+            {"@id": "#tool/ext", "@type": "SoftwareApplication",
+                "name": "ext", "url": {"@id": "https://example.org/tool"}},
+            {"@id": "#image/0", "@type": "ContainerImage",
+                "additionalType": {"@id": "https://w3id.org/ro/terms/workflow-run#DockerImage"},
+                "registry": "docker.io", "name": "library/debian", "tag": "stable-slim",
+                "url": {"@id": "https://hub.docker.com/_/debian"}},
+            {"@id": format!("#run/{run}"), "@type": "CreateAction",
+                "name": "Run", "description": "uwe run Snakefile",
+                "instrument": {"@id": "Snakefile"},
+                "actionStatus": "http://schema.org/CompletedActionStatus",
+                "startTime": "2026-11-24T08:00:00+00:00",
+                "endTime": "2026-11-24T08:00:05+00:00"},
+            {"@id": "#task/1", "@type": "CreateAction",
+                "name": "echo-1", "description": "echo hi",
+                "instrument": {"@id": "#tool/echo"},
+                "containerImage": {"@id": "#image/0"},
+                "actionStatus": "http://schema.org/CompletedActionStatus",
+                "startTime": "2026-11-24T08:00:01+00:00",
+                "endTime": "2026-11-24T08:00:04+00:00"}
+        ]
+    });
+    let merged = crate_json(&record, &[], Some(uwe));
+    assert!(by_id(&merged, "#tool/echo").get("url").is_none());
+    assert_eq!(
+        by_id(&merged, "#tool/ext")["url"],
+        "https://example.org/tool"
+    );
+    assert_eq!(
+        by_id(&merged, "#image/0")["url"],
+        "https://hub.docker.com/_/debian"
+    );
+
+    let directory = tempfile::tempdir().unwrap();
+    let engine = ProfileShaclEngine::open(directory.path()).unwrap();
+    let report = engine
+        .evaluate(
+            &ProfileShapes {
+                graph_iri: format!("{PROCESS_PROFILE}#shapes/{BUILTIN_REVISION}"),
+                sources: builtin_shapes(PROCESS_PROFILE)
+                    .unwrap()
+                    .iter()
+                    .map(|shapes| shapes.to_string())
+                    .collect(),
+            },
+            &merged.to_string(),
+        )
+        .unwrap();
+    let blocking: Vec<_> = report
+        .results
+        .iter()
+        .filter(|result| !result.severity.0.contains("Warning"))
+        .collect();
+    assert!(blocking.is_empty(), "{blocking:#?}");
+    assert!(report.structural.is_empty(), "{:#?}", report.structural);
+}

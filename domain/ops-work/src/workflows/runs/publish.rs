@@ -277,7 +277,7 @@ impl PublishDeviceOperation {
         self.store_frozen(frozen, PublishStep::StoreCopies)
     }
 
-    fn pulled(&mut self, answer: Result<SyncPullAck, SyncRefusal>) -> PublishTurn {
+    fn pulled(&mut self, answer: Result<(NodeId, SyncPullAck), SyncRefusal>) -> PublishTurn {
         let (output, key) = self.pending.pop_front().ok_or(IoError::Unfinished)?;
         let copy = copy_pulled(&self.input.target, output, key, answer)?;
         self.copies.push(copy);
@@ -377,7 +377,7 @@ impl Operation for PublishDeviceOperation {
                 result.done()?;
                 self.next_pull()
             }
-            PublishStep::Pull => self.pulled(result.child::<SyncPullAck, SyncRefusal>()?),
+            PublishStep::Pull => self.pulled(result.child::<(NodeId, SyncPullAck), SyncRefusal>()?),
             PublishStep::StoreCopies => {
                 result.done()?;
                 self.write_crate()

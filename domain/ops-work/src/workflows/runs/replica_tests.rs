@@ -58,12 +58,13 @@ fn frames_log_pages() {
     let local = (record.node_id, record.realm_id);
     let pages = pages(5);
     let send = ReplicateLogOperation::new(record.run_id, local, 1);
-    let frames = send.frames(&record, &pages).unwrap();
+    let frames = send.frames(&record, &pages, None).unwrap();
     assert_eq!(frames.len(), 1);
     let MetadataTransportMessage::StoreRunLog {
         run,
         first_page,
         pages: sent,
+        workflow: None,
     } = decode_message(&frames[0]).unwrap()
     else {
         panic!("a store request");
@@ -86,12 +87,18 @@ fn frames_log_pages() {
     send_local.first().unwrap();
     let stored = IoResult::Values(vec![Some(local_run.to_bytes().unwrap().into())]);
     assert_eq!(send_local.next(stored).unwrap(), Next::Done(0));
-    let mut store_local =
-        StoreReplicaOperation::new(local_run.node_id, local, Box::new(local_run), 0, Vec::new());
+    let mut store_local = StoreReplicaOperation::new(
+        local_run.node_id,
+        local,
+        Box::new(local_run),
+        0,
+        Vec::new(),
+        None,
+    );
     assert_eq!(store_local.first(), Err(MetadataReadError::Forbidden));
     // A sender that is not the run's node is refused before anything is read.
     let peer = aruna_ops_identity::testing::node(9);
-    let mut store = StoreReplicaOperation::new(peer, local, Box::new(record), 0, Vec::new());
+    let mut store = StoreReplicaOperation::new(peer, local, Box::new(record), 0, Vec::new(), None);
     assert_eq!(store.first(), Err(MetadataReadError::Forbidden));
 }
 
@@ -112,6 +119,7 @@ async fn resumes_copied_run() {
             run: Box::new(run.clone()),
             first_page,
             pages,
+            workflow: None,
             reading: true,
             kept: 0,
         };

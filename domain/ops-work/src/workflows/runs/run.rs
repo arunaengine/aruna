@@ -89,6 +89,9 @@ struct Start {
     images: BTreeMap<String, String>,
 }
 
+/// Largest encoded replay-page batch sent in one `RunReplayPages` frame, well inside 8 MiB.
+const REPLAY_CHUNK_BYTES: usize = 2 * 1024 * 1024;
+
 #[derive(Debug, PartialEq)]
 enum PrepareStep {
     Run,
@@ -99,6 +102,13 @@ enum PrepareStep {
     Lineage(Box<Start>),
     Log(Box<(Start, Vec<RunLogPage>)>),
     Open(Box<(Start, Vec<RunLogPage>, Option<String>)>),
+    Replay(
+        Box<(
+            Start,
+            std::collections::VecDeque<Vec<RunLogPage>>,
+            Option<String>,
+        )>,
+    ),
     Send,
     Running,
     Failed(String),
@@ -242,6 +252,26 @@ impl PrepareRunOperation {
             step_settings: start.step_settings,
         })
     }
+}
+
+/// Splits prior log pages into bounded batches so long lineages never exceed one frame.
+fn replay_chunks(pages: &[RunLogPage]) -> Vec<Vec<RunLogPage>> {
+    let mut chunks: Vec<Vec<RunLogPage>> = Vec::new();
+    let mut current: Vec<RunLogPage> = Vec::new();
+    let mut bytes = 0usize;
+    for page in pages {
+        let size = serde_json::to_vec(page).map_or(0, |v| v.len());
+        if !current.is_empty() && bytes + size > REPLAY_CHUNK_BYTES {
+            chunks.push(std::mem::take(&mut current));
+            bytes = 0;
+        }
+        bytes += size;
+        current.push(page.clone());
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 /// The values of a run with its pinned inputs as addresses the coordinator reads through the
@@ -390,7 +420,40 @@ impl Operation for PrepareRunOperation {
                     _ => return Err(crate::workflows::unexpected("WorkflowAnswer::Opened")),
                 }
                 let (start, pages, resume) = *parts;
+                let chunks = replay_chunks(&pages);
+                if chunks.len() > 1 {
+                    let mut queue: std::collections::VecDeque<_> = chunks.into();
+                    let first = queue.pop_front().unwrap_or_default();
+                    self.step = PrepareStep::Replay(Box::new((start, queue, resume)));
+                    return Ok(Next::Call(workflow_call(WorkflowEffect::Send {
+                        session: session_name(self.spec.run_id),
+                        message: HostToCoordinator::RunReplayPages { pages: first },
+                    })));
+                }
                 let payload = self.payload(start, pages, resume)?;
+                self.step = PrepareStep::Send;
+                Ok(Next::Call(workflow_call(WorkflowEffect::Send {
+                    session: session_name(self.spec.run_id),
+                    message: HostToCoordinator::RunStart(payload),
+                })))
+            }
+            PrepareStep::Replay(parts) => {
+                match workflow_answer(result)? {
+                    WorkflowAnswer::Sent(Ok(())) => {}
+                    WorkflowAnswer::Sent(Err(error)) => {
+                        return Err(CatalogError::Coordinator(error));
+                    }
+                    _ => return Err(crate::workflows::unexpected("WorkflowAnswer::Sent")),
+                }
+                let (start, mut queue, resume) = *parts;
+                if let Some(next_chunk) = queue.pop_front() {
+                    self.step = PrepareStep::Replay(Box::new((start, queue, resume)));
+                    return Ok(Next::Call(workflow_call(WorkflowEffect::Send {
+                        session: session_name(self.spec.run_id),
+                        message: HostToCoordinator::RunReplayPages { pages: next_chunk },
+                    })));
+                }
+                let payload = self.payload(start, Vec::new(), resume)?;
                 self.step = PrepareStep::Send;
                 Ok(Next::Call(workflow_call(WorkflowEffect::Send {
                     session: session_name(self.spec.run_id),
