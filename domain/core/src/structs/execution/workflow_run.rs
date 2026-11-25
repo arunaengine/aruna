@@ -25,6 +25,9 @@ pub struct ReplicatedWorkflow {
     pub workflow: Vec<u8>,
     pub version: Vec<u8>,
     pub source: Option<Vec<u8>>,
+    /// Group tool definitions required to lower a composed `.uwe.yaml` workflow after failover.
+    #[serde(default)]
+    pub tools: Vec<Vec<u8>>,
 }
 
 /// Which secret store a workflow secret binding reads from.

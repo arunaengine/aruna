@@ -128,6 +128,15 @@ impl FollowRunOperation {
         if has_user_secrets && source.created_by != self.auth.user_id {
             return Err(CatalogError::Forbidden);
         }
+        let mut output = source.output.clone();
+        // A cross-node failover resume rebinds an output targeting the original coordinator to this
+        // surviving holder; admission still checks the bucket exists and is writable here.
+        if source.node_id != self.node.0
+            && let Some(out) = &mut output
+            && out.node_id == Some(source.node_id)
+        {
+            out.node_id = Some(self.node.0);
+        }
         let request = RunRequest {
             group_id: source.group_id,
             workflow_id: source.workflow_id,
@@ -135,7 +144,7 @@ impl FollowRunOperation {
             values,
             inputs,
             inputs_json,
-            output: source.output.clone(),
+            output,
             provenance_crate: source.provenance_crate,
             idempotency_key: None,
             placement_site: source.placement_site.clone(),

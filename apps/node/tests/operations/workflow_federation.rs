@@ -17,7 +17,7 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::job::identity::RETENTION_MS;
 use aruna_core::structs::execution::job::local::WorkspaceMode;
 use aruna_core::structs::execution::workflow::{StoredWorkflowLanguage, WorkflowVisibility};
-use aruna_core::structs::execution::workflow_run::{RunOutput, RunState};
+use aruna_core::structs::execution::workflow_run::{RunOutput, RunState, WorkflowRunSpec};
 use aruna_core::structs::placement::policy::PlacementSubject;
 use aruna_core::structs::storage::node_info::{
     AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization, node_info_key,
@@ -43,6 +43,7 @@ use aruna_ops_work::workflows::runs::reads::{ListRunsOperation, RunFilter, RunSn
 use aruna_ops_work::workflows::runs::replica::{
     ReplicateLogOperation, UNREACHABLE, record_holders, replica_note,
 };
+use aruna_ops_work::workflows::runs::run::{PrepareRunOperation, Prepared};
 use aruna_ops_work::workflows::runs::tasks::{task_key_of, task_spec};
 use aruna_ops_work::workflows::runs::{ChangeRunOperation, RunChange};
 use aruna_runner::driver::{DriverContext, drive};
@@ -395,6 +396,18 @@ async fn replicates_workflow_run() -> TestResult<()> {
     assert_eq!(resumed.node_id, surviving.node_id());
     let replayed = drive(LineageLogOperation::new(resumed.run_id), &surviving_ctx).await?;
     assert_eq!(replayed, coord_pages);
+    let resumed_spec = WorkflowRunSpec {
+        run_id: resumed.run_id,
+        group_id,
+        created_by: realm.user_id,
+        realm_id: realm.realm_id,
+    };
+    let prepared = drive(
+        PrepareRunOperation::new(&resumed_spec, surviving.node_id(), "blake3:resume".into()),
+        &surviving_ctx,
+    )
+    .await?;
+    assert!(matches!(prepared, Prepared::Ready(_)));
     Ok(())
 }
 

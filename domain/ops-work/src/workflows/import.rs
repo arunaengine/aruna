@@ -765,6 +765,7 @@ pub struct StoreVersionOperation {
     created_by: aruna_core::user::id::UserId,
     message: Option<String>,
     now_ms: u64,
+    checking: Option<WorkflowRecord>,
     stored: Option<Created>,
 }
 
@@ -839,6 +840,14 @@ impl Operation for StoreVersionOperation {
             result.done()?;
             return Ok(Next::Done(created));
         }
+        if let Some(record) = self.checking.take() {
+            if result.value()?.is_some() {
+                return Err(CatalogError::Conflict(
+                    "the workflow version already exists".into(),
+                ));
+            }
+            return self.write(record);
+        }
         let stored = result.value()?;
         let record = match (stored, self.created.take()) {
             (None, Some(record)) => record,
@@ -859,7 +868,13 @@ impl Operation for StoreVersionOperation {
                 record.language.as_str()
             )));
         }
-        self.write(record)
+        let next = record.version_count + 1;
+        let key = version_key(self.workflow_id, next);
+        self.checking = Some(record);
+        Ok(Next::Call(aruna_core::rows::read_row(
+            WORKFLOW_VERSION_KEYSPACE,
+            key,
+        )))
     }
 
     fn transaction(&self) -> TransactionMode {
@@ -962,6 +977,7 @@ impl Operation for CreateWorkflowOperation {
                     created_by: self.auth.user_id,
                     message: None,
                     now_ms: self.now_ms,
+                    checking: None,
                     stored: None,
                 })))
             }
@@ -1049,6 +1065,7 @@ impl Operation for AddVersionOperation {
                     created_by: self.auth.user_id,
                     message: self.message.take(),
                     now_ms: self.now_ms,
+                    checking: None,
                     stored: None,
                 })))
             }

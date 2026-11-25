@@ -212,3 +212,49 @@ fn admin_resumes_copy() {
         Err(CatalogError::Conflict(_))
     ));
 }
+
+// A replica refuses a page gap and never lets an older shorter tail overwrite a newer tail page.
+#[tokio::test]
+async fn guards_replica_gaps() {
+    let runs = runs().await;
+    let context = &runs.fixture.context;
+    let here = runs.fixture.node;
+    let gone = aruna_ops_identity::testing::node(9);
+    let own = runs.started().await;
+    let copy = copy_of(&own, gone);
+    let write =
+        |run: &WorkflowRunRecord, first_page: u32, pages: Vec<Vec<u8>>| WriteReplicaOperation {
+            local: here,
+            run: Box::new(run.clone()),
+            first_page,
+            pages,
+            workflow: None,
+            reading: true,
+            kept: 0,
+        };
+    let page = |entries: Vec<RunLogEntry>| vec![encode_page(&RunLogPage { entries }).unwrap()];
+    // Page 1 before page 0 is a gap and must return NotFound so the sender backfills from 0.
+    let gap = drive(write(&copy, 1, page(vec![])), context).await;
+    assert_eq!(gap, Err(CatalogError::NotFound));
+
+    // Write a 2-entry tail page, then try to overwrite it with an older 1-entry snapshot.
+    let newer = vec![
+        RunLogEntry::Begin {
+            run_start_json: serde_json::json!({"run": 1}),
+        },
+        RunLogEntry::Change {
+            seq: 1,
+            change_json: serde_json::json!({"task": 1}),
+        },
+    ];
+    let older = vec![newer[0].clone()];
+    drive(write(&copy, 0, page(newer.clone())), context)
+        .await
+        .unwrap();
+    drive(write(&copy, 0, page(older)), context).await.unwrap();
+    let loaded = drive(LoadLogOperation::new(copy.run_id), context)
+        .await
+        .unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].entries, newer);
+}
