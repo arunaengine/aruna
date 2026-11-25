@@ -39,7 +39,15 @@ use aruna_ops_identity::realm::mutate_placement::node_kind;
 use aruna_ops_identity::realm::peer_trust::is_sync_eligible;
 
 type ExportTurn = Result<Next<ExportMetadataResult>, MetadataApiError>;
-type ExportOutcome = Result<ExportMetadataResult, MetadataApiError>;
+
+#[derive(Debug, PartialEq)]
+enum ExportOutcome {
+    Found(ExportMetadataResult),
+    /// At least one holder answered NotFound without full agreement; fail closed without
+    /// falling back to an unselected device replica.
+    Conflict,
+    Error(MetadataApiError),
+}
 
 /// Refuses an export larger than `metadata_bytes`.
 pub fn ensure_export_limit(
@@ -452,16 +460,21 @@ impl RoutedExportOperation {
             unavailable,
             AuthFailure::Fatal,
         ) {
-            ReadDecision::Success(export) => Ok(export),
-            ReadDecision::NotFound => Err(MetadataApiError::NotFound),
+            ReadDecision::Success(export) => ExportOutcome::Found(export),
+            ReadDecision::NotFound => ExportOutcome::Error(MetadataApiError::NotFound),
             ReadDecision::Auth(MetadataReadError::Unauthorized) => {
-                Err(MetadataApiError::Unauthorized)
+                ExportOutcome::Error(MetadataApiError::Unauthorized)
             }
-            ReadDecision::Auth(MetadataReadError::Forbidden) => Err(MetadataApiError::Forbidden),
+            ReadDecision::Auth(MetadataReadError::Forbidden) => {
+                ExportOutcome::Error(MetadataApiError::Forbidden)
+            }
+            ReadDecision::Unavailable if conflict || not_found > 0 => ExportOutcome::Conflict,
             // A holder that found the page too large answered for every holder of the graph.
-            ReadDecision::Unavailable if too_large => Err(MetadataApiError::TooLarge),
+            ReadDecision::Unavailable if too_large => {
+                ExportOutcome::Error(MetadataApiError::TooLarge)
+            }
             ReadDecision::Auth(_) | ReadDecision::Unavailable => {
-                Err(MetadataApiError::ServiceUnavailable)
+                ExportOutcome::Error(MetadataApiError::ServiceUnavailable)
             }
         };
         if !faulted.is_empty() {
@@ -473,8 +486,9 @@ impl RoutedExportOperation {
 
     fn finish_routed(&mut self, outcome: ExportOutcome) -> ExportTurn {
         match outcome {
-            Ok(export) => self.found(export),
-            Err(error) => self.fall_back(error),
+            ExportOutcome::Found(export) => self.found(export),
+            ExportOutcome::Conflict => Err(MetadataApiError::ServiceUnavailable),
+            ExportOutcome::Error(error) => self.fall_back(error),
         }
     }
 

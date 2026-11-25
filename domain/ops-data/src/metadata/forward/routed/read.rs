@@ -36,7 +36,15 @@ use aruna_ops_identity::forward::fetch::read_answer;
 use aruna_ops_identity::realm::peer_trust::is_sync_eligible;
 
 type ReadTurn = Result<Next<MetadataRegistryRecord>, MetadataApiError>;
-type ReadOutcome = Result<MetadataRegistryRecord, MetadataApiError>;
+
+#[derive(Debug, PartialEq)]
+enum ReadOutcome {
+    Found(MetadataRegistryRecord),
+    /// At least one holder answered NotFound without full agreement; fail closed without
+    /// falling back to an unselected device replica.
+    Conflict,
+    Error(MetadataApiError),
+}
 
 #[derive(Debug, PartialEq)]
 enum ReadStage {
@@ -246,13 +254,14 @@ impl RoutedReadOperation {
             }
         }
         let outcome = match (auth_error, success) {
-            (Some(error), _) => Err(error),
-            (None, Some(_)) if not_found > 0 => Err(MetadataApiError::ServiceUnavailable),
-            (None, Some(record)) => Ok(record),
+            (Some(error), _) => ReadOutcome::Error(error),
+            (None, Some(_)) if not_found > 0 => ReadOutcome::Conflict,
+            (None, Some(record)) => ReadOutcome::Found(record),
             (None, None) if !unavailable && holder_count > 0 && not_found == holder_count => {
-                Err(MetadataApiError::NotFound)
+                ReadOutcome::Error(MetadataApiError::NotFound)
             }
-            (None, None) => Err(MetadataApiError::ServiceUnavailable),
+            (None, None) if not_found > 0 => ReadOutcome::Conflict,
+            (None, None) => ReadOutcome::Error(MetadataApiError::ServiceUnavailable),
         };
         if !faulted.is_empty() {
             self.stage = ReadStage::Avoid(Box::new(outcome));
@@ -263,8 +272,9 @@ impl RoutedReadOperation {
 
     fn finish_routed(&mut self, outcome: ReadOutcome) -> ReadTurn {
         match outcome {
-            Ok(record) => self.found(record),
-            Err(error) => self.fall_back(error),
+            ReadOutcome::Found(record) => self.found(record),
+            ReadOutcome::Conflict => Err(MetadataApiError::ServiceUnavailable),
+            ReadOutcome::Error(error) => self.fall_back(error),
         }
     }
 

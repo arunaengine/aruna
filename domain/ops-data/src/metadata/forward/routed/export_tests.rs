@@ -15,6 +15,7 @@ use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
 use super::*;
+use crate::device::replica::ReplicaOrigin;
 use crate::metadata::forward::holder_reads::peer_error_result;
 
 fn realm() -> RealmId {
@@ -240,7 +241,7 @@ fn multi_holder_conflicts() {
         Err(MetadataApiError::Forbidden)
     );
 
-    // Only peer-attributable transport errors trigger AvoidHolder.
+    // Only peer-attributable transport errors trigger AvoidHolder; local capacity errors do not.
     let mut faulted = RoutedExportOperation::new(
         Some(node(9)),
         realm(),
@@ -250,13 +251,19 @@ fn multi_holder_conflicts() {
     );
     faulted.stamp(7_000);
     faulted.config = Some(config);
-    faulted.holders = vec![node(2), node(3)];
+    faulted.holders = vec![node(2), node(3), node(4)];
     let Next::Call(IoCall::Group(avoid)) = faulted
         .collect(vec![
             peer_error_result(node(2), PeerRequestError::TimedOut),
             peer_error_result(
                 node(3),
                 PeerRequestError::NotSent(MetadataError::InvalidInput("bad".to_string())),
+            ),
+            peer_error_result(
+                node(4),
+                PeerRequestError::NotSent(MetadataError::LocalUnavailable(
+                    "too many pooled connections".to_string(),
+                )),
             ),
         ])
         .unwrap()
@@ -270,4 +277,104 @@ fn multi_holder_conflicts() {
             now_ms: 7_000,
         })]
     );
+}
+
+#[test]
+fn conflict_skips_replica() {
+    let sample = export();
+    let ExportMetadataResult::Full { record, .. } = &sample else {
+        unreachable!();
+    };
+    let document_id = record.document_id;
+    let mut replica = ReplicaRecord::new(
+        document_id,
+        record.group_id,
+        record.document_path.clone(),
+        ReplicaOrigin::Realm,
+    );
+    replica.selected = false;
+    replica.record = Some(Box::new(record.clone()));
+    replica.displayed_jsonld = "{}".to_string();
+
+    let mut config = RealmConfigDocument::default_for_realm(realm(), Vec::new());
+    config.seed_default_placement();
+    for seed in [1u8, 2, 3, 4] {
+        config.ensure_node(node(seed), RealmNodeKind::Server);
+    }
+
+    let mut conflict = RoutedExportOperation::new(
+        Some(node(9)),
+        realm(),
+        export_request(document_id),
+        None,
+        1_000,
+    );
+    conflict.config = Some(config.clone());
+    conflict.replica = Some(replica.clone());
+    conflict.holders = vec![node(2), node(3)];
+    assert_eq!(
+        conflict.collect(vec![
+            forwarded_export(node(2), Ok(Box::new(sample.clone()))),
+            forwarded_export(node(3), Err(MetadataReadError::NotFound)),
+        ]),
+        Err(MetadataApiError::ServiceUnavailable)
+    );
+
+    let mut avoided = RoutedExportOperation::new(
+        Some(node(9)),
+        realm(),
+        export_request(document_id),
+        None,
+        1_000,
+    );
+    avoided.config = Some(config.clone());
+    avoided.replica = Some(replica.clone());
+    avoided.holders = vec![node(2), node(3), node(4)];
+    assert!(matches!(
+        avoided.collect(vec![
+            forwarded_export(node(2), Ok(Box::new(sample))),
+            forwarded_export(node(3), Err(MetadataReadError::NotFound)),
+            peer_error_result(node(4), PeerRequestError::TimedOut),
+        ]),
+        Ok(Next::Call(IoCall::Group(_)))
+    ));
+    let done = IoResult::Group(GroupEvent::Finished {
+        results: vec![GroupResult::Done(Box::new(Event::Net(
+            NetEvent::HolderAvoided,
+        )))],
+    });
+    assert_eq!(
+        avoided.next(done),
+        Err(MetadataApiError::ServiceUnavailable)
+    );
+
+    // Genuine unavailability without any NotFound still falls back to the device replica.
+    let mut offline = RoutedExportOperation::new(
+        Some(node(9)),
+        realm(),
+        export_request(document_id),
+        None,
+        1_000,
+    );
+    offline.config = Some(config);
+    offline.replica = Some(replica);
+    offline.holders = vec![node(2), node(3)];
+    assert!(matches!(
+        offline.collect(vec![
+            peer_error_result(
+                node(2),
+                PeerRequestError::NotSent(MetadataError::LocalUnavailable(
+                    "too many pooled connections".to_string()
+                ))
+            ),
+            peer_error_result(
+                node(3),
+                PeerRequestError::NotSent(MetadataError::LocalUnavailable(
+                    "too many pooled connections".to_string()
+                ))
+            ),
+        ]),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    assert_eq!(offline.stage, RoutedStage::Device);
 }

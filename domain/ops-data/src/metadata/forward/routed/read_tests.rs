@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::device::replica::ReplicaOrigin;
 use crate::metadata::forward::holder_reads::peer_error_result;
 use aruna_core::calls::ChildOutcome;
 use aruna_core::events::{MetadataAnswer, NetEvent, PeerRequestError};
@@ -234,10 +235,95 @@ fn late_holder_unavailable() {
     );
 }
 
+fn unselected_replica(record: MetadataRegistryRecord) -> ReplicaRecord {
+    let mut replica = ReplicaRecord::new(
+        record.document_id,
+        record.group_id,
+        record.document_path.clone(),
+        ReplicaOrigin::Realm,
+    );
+    replica.selected = false;
+    replica.record = Some(Box::new(record));
+    replica.displayed_jsonld = "{}".to_string();
+    replica
+}
+
+#[test]
+fn conflict_skips_replica() {
+    // A device with an unselected cached replica must not fall back to it when holders disagree
+    // or when any reachable holder reports NotFound, even after avoiding another faulted peer.
+    let config = config_with_nodes(&[1, 2, 3, 4]);
+    let req = request();
+    let placement = resolve_metadata_id(&config, realm(), None, req.document_id).unwrap();
+    let record = record_for(&config, req.document_id, placement);
+
+    let mut conflict = RoutedReadOperation::new(Some(node(9)), realm(), req.clone(), None);
+    conflict.config = Some(config.clone());
+    conflict.placement = Some(placement);
+    conflict.replica = Some(unselected_replica(record.clone()));
+    conflict.holders = vec![node(2), node(3)];
+    assert_eq!(
+        conflict.collect(vec![
+            forwarded(node(2), Ok(Box::new(record.clone()))),
+            forwarded(node(3), Err(MetadataReadError::NotFound)),
+        ]),
+        Err(MetadataApiError::ServiceUnavailable)
+    );
+
+    let mut avoided = RoutedReadOperation::new(Some(node(9)), realm(), req.clone(), None);
+    avoided.config = Some(config.clone());
+    avoided.placement = Some(placement);
+    avoided.replica = Some(unselected_replica(record.clone()));
+    avoided.holders = vec![node(2), node(3), node(4)];
+    assert!(matches!(
+        avoided.collect(vec![
+            forwarded(node(2), Ok(Box::new(record.clone()))),
+            forwarded(node(3), Err(MetadataReadError::NotFound)),
+            peer_error_result(node(4), PeerRequestError::TimedOut),
+        ]),
+        Ok(Next::Call(IoCall::Group(_)))
+    ));
+    let done = IoResult::Group(GroupEvent::Finished {
+        results: vec![GroupResult::Done(Box::new(Event::Net(
+            NetEvent::HolderAvoided,
+        )))],
+    });
+    assert_eq!(
+        avoided.next(done),
+        Err(MetadataApiError::ServiceUnavailable)
+    );
+
+    // Genuine unavailability with no holder reporting NotFound still falls back to the replica.
+    let mut offline = RoutedReadOperation::new(Some(node(9)), realm(), req, None);
+    offline.config = Some(config);
+    offline.placement = Some(placement);
+    offline.replica = Some(unselected_replica(record));
+    offline.holders = vec![node(2), node(3)];
+    assert!(matches!(
+        offline.collect(vec![
+            peer_error_result(
+                node(2),
+                PeerRequestError::NotSent(MetadataError::LocalUnavailable(
+                    "too many pooled connections".to_string()
+                ))
+            ),
+            peer_error_result(
+                node(3),
+                PeerRequestError::NotSent(MetadataError::LocalUnavailable(
+                    "too many pooled connections".to_string()
+                ))
+            ),
+        ]),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    assert!(matches!(offline.stage, ReadStage::Readable(_)));
+}
+
 #[test]
 fn avoids_peer_faults() {
-    // Peer-attributable timeouts emit AvoidHolder; local handle/frame errors never penalize peers.
-    let mut read = routed(vec![node(2), node(3), node(4)]);
+    // Peer-attributable timeouts and dial failures emit AvoidHolder; local pool exhaustion,
+    // handle and frame errors never penalize healthy peers.
+    let mut read = routed(vec![node(2), node(3), node(4), node(5), node(6)]);
     read.stamp(5_000);
     let results = vec![
         peer_error_result(node(2), PeerRequestError::TimedOut),
@@ -249,21 +335,38 @@ fn avoids_peer_faults() {
             node(4),
             PeerRequestError::Failed(MetadataError::HandleMissing),
         ),
+        peer_error_result(
+            node(5),
+            PeerRequestError::NotSent(MetadataError::LocalUnavailable(
+                "too many pooled connections".to_string(),
+            )),
+        ),
+        peer_error_result(
+            node(6),
+            PeerRequestError::NotSent(MetadataError::Backend("connection failed".to_string())),
+        ),
     ];
     let Next::Call(IoCall::Group(avoid)) = read.collect(results).unwrap() else {
-        panic!("expected AvoidHolder group for timed-out peer");
+        panic!("expected AvoidHolder group for peer faults");
     };
     assert_eq!(
         avoid.members,
-        vec![Effect::Net(NetEffect::AvoidHolder {
-            node_id: node(2),
-            now_ms: 5_000,
-        })]
+        vec![
+            Effect::Net(NetEffect::AvoidHolder {
+                node_id: node(2),
+                now_ms: 5_000,
+            }),
+            Effect::Net(NetEffect::AvoidHolder {
+                node_id: node(6),
+                now_ms: 5_000,
+            }),
+        ]
     );
     let finished = IoResult::Group(GroupEvent::Finished {
-        results: vec![GroupResult::Done(Box::new(Event::Net(
-            NetEvent::HolderAvoided,
-        )))],
+        results: vec![
+            GroupResult::Done(Box::new(Event::Net(NetEvent::HolderAvoided))),
+            GroupResult::Done(Box::new(Event::Net(NetEvent::HolderAvoided))),
+        ],
     });
     assert_eq!(
         read.next(finished),
