@@ -279,7 +279,17 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
 
 /// Migrates the node database at `database_path` and its document sync store at `sync_path`.
 fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput, ExplorerError> {
-    let db = OptimisticTxDatabase::builder(Path::new(database_path)).open()?;
+    let db = OptimisticTxDatabase::builder(Path::new(database_path))
+        .cache_size(aruna_core::persistence::CACHE_BYTES)
+        .open()?;
+    let sync_storage = if sync_path.exists() {
+        let sync_db = OptimisticTxDatabase::builder(sync_path)
+            .cache_size(aruna_core::persistence::CACHE_BYTES)
+            .open()?;
+        Some(irokle::FjallStorage::from_database(sync_db)?)
+    } else {
+        None
+    };
     let record_rows = db.keyspace(FAMILY_RECORD_KEYSPACE, KeyspaceCreateOptions::default)?;
     let pending_rows = db.keyspace(FAMILY_PENDING_KEYSPACE, KeyspaceCreateOptions::default)?;
     let conflict_rows = db.keyspace(FAMILY_CONFLICT_KEYSPACE, KeyspaceCreateOptions::default)?;
@@ -342,7 +352,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     let onboarding_rows = db.keyspace(ONBOARDING_KEYSPACE, KeyspaceCreateOptions::default)?;
     let document_rows = db.keyspace(DOCUMENT_STATE_KEYSPACE, KeyspaceCreateOptions::default)?;
 
-    sync_ops::unread_ops(&db, sync_path, &applied_rows)?;
+    sync_ops::unread_ops(&db, sync_storage.as_ref(), &applied_rows)?;
     // Old families are read before any write, so an unreadable one stops the run unchanged.
     let mut evidence = families::Evidence::default();
     let specs = [
@@ -443,7 +453,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     })?;
     let info = info_topics::info_cleanup(
         &db,
-        sync_path,
+        sync_storage.as_ref(),
         info_topics::InfoRows {
             applied: &applied_rows,
             quarantine: &quarantine_rows,
@@ -451,6 +461,8 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
             outbox: &outbox_rows,
         },
     )?;
+    // Release the sync store handle before any topic purge reopens it with its larger cache.
+    drop(sync_storage);
     let logins = rewrites::<UserSession, user_sessions::LegacySession>(
         &db,
         &login_rows,

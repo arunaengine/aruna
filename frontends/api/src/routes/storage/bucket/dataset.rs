@@ -3,13 +3,16 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
+use aruna_core::id::NodeId;
 use aruna_core::metadata::api::CreateDocumentPayload;
 use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::identifier::{Identifier, IdentifierTarget};
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::bucket_metadata::{BucketMetadata, validate_identifiers};
 use aruna_core::structs::storage::data::link::DataLink;
@@ -40,6 +43,26 @@ use crate::lookup::actor;
 use crate::lookup::bucket_info;
 use crate::metadata::{forwarded_auth_token, local_write_record, run_create_metadata};
 use crate::server::state::ServerState;
+
+type BucketLockKey = (RealmId, NodeId, String);
+type BucketLockMap = HashMap<BucketLockKey, Weak<tokio::sync::Mutex<()>>>;
+
+/// Serializes concurrent dataset creation on one bucket so only the first request mints a dataset.
+fn bucket_lock(realm_id: RealmId, node_id: NodeId, bucket: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<std::sync::Mutex<BucketLockMap>> = OnceLock::new();
+    let mut map = LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .expect("bucket dataset lock poisoned");
+    map.retain(|_, weak| weak.strong_count() > 0);
+    let key = (realm_id, node_id, bucket.to_string());
+    if let Some(lock) = map.get(&key).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    map.insert(key, Arc::downgrade(&lock));
+    lock
+}
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new().routes(routes!(describe_bucket))
@@ -129,6 +152,8 @@ pub async fn describe_bucket(
     let identifiers = checked_identifiers(&request)?;
     let info = bucket_info(&state, &bucket).await?;
     ensure_group_admin(&state, &auth, info.group_id).await?;
+    let lock = bucket_lock(state.get_realm_id(), state.get_node_id(), &bucket);
+    let _guard = lock.lock().await;
     let current = drive(
         BucketMetadataOperation::new(&bucket, &info),
         &state.get_ctx(),
@@ -249,6 +274,9 @@ fn refused(error: &ServerError) -> bool {
     )
 }
 
+/// Milliseconds between cleanup retries when deleting an unlinked dataset.
+const REMOVE_DELAYS: [u64; 3] = [50, 150, 300];
+
 /// Deletes a dataset this request created but could not link.
 async fn remove_dataset(
     state: &ServerState,
@@ -256,16 +284,40 @@ async fn remove_dataset(
     bearer: Option<ValidatedBearer>,
     dataset: Ulid,
 ) -> ServerResult<()> {
-    let extras = PolicyRequestExtras::rest();
-    let record = local_write_record(state, auth, dataset, extras).await?;
-    let actor = actor(state, auth);
-    let token = forwarded_auth_token(bearer)?;
-    let ctx = state.get_ctx();
-    let local_node = ctx.net_handle.as_ref().map(|net| net.node_id());
-    let delete = RouteDeleteOperation::new((actor, local_node), record, dataset, token);
-    drive(delete, ctx.as_ref())
-        .await
-        .map_err(|error| ServerError::ServiceUnavailableReason(error.to_string()))
+    let mut last_error = None;
+    for attempt in 0..=REMOVE_DELAYS.len() {
+        let extras = PolicyRequestExtras::rest();
+        let record = match local_write_record(state, auth, dataset, extras).await {
+            Ok(record) => record,
+            Err(error) => {
+                if matches!(error, ServerError::NotFound) {
+                    return Ok(());
+                }
+                last_error = Some(error);
+                if let Some(&delay) = REMOVE_DELAYS.get(attempt) {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                }
+                continue;
+            }
+        };
+        let actor = actor(state, auth);
+        let token = forwarded_auth_token(bearer.clone())?;
+        let ctx = state.get_ctx();
+        let local_node = ctx.net_handle.as_ref().map(|net| net.node_id());
+        let delete = RouteDeleteOperation::new((actor, local_node), record, dataset, token);
+        match drive(delete, ctx.as_ref()).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last_error = Some(ServerError::ServiceUnavailableReason(error.to_string()));
+                if let Some(&delay) = REMOVE_DELAYS.get(attempt) {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        ServerError::ServiceUnavailableReason("failed to delete unlinked dataset".to_string())
+    }))
 }
 
 fn checked_identifiers(request: &DescribeBucketRequest) -> ServerResult<Vec<Identifier>> {

@@ -85,18 +85,17 @@ pub(super) fn persisted_node_state(
 
 pub(super) fn info_cleanup(
     db: &OptimisticTxDatabase,
-    sync_path: &Path,
+    storage: Option<&FjallStorage>,
     rows: InfoRows<'_>,
 ) -> Result<InfoCleanup, ExplorerError> {
     let Some(realm_id) = node_realm(db)? else {
         return Ok(InfoCleanup::default());
     };
     let topics = info_topics(realm_id);
-    if !sync_path.exists()
-        || FjallStorage::open(sync_path)?
-            .topic_state(&topics[1])?
-            .is_none()
-    {
+    let Some(storage) = storage else {
+        return Ok(InfoCleanup::default());
+    };
+    if storage.topic_state(&topics[1])?.is_none() {
         return Ok(InfoCleanup::default());
     }
     topic_rows(db, &topics, rows, |record| {

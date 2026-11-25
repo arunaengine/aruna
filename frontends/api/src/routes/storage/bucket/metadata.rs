@@ -5,17 +5,24 @@
 
 use std::sync::Arc;
 
+use aruna_core::errors::StorageError;
 use aruna_core::metadata::AuthToken;
+use aruna_core::metadata::api::{ExportMetadataResult, RoCrateExportView};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::identifier::Identifier;
 use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
 use aruna_core::structs::storage::bucket_metadata::{BucketMetadata, validate_metadata};
-use aruna_core::structs::storage::dataset_description::{DatasetDescription, DescriptionError};
+use aruna_core::structs::storage::dataset_description::{
+    DatasetDescription, DescriptionError, describe,
+};
+use aruna_ops_data::metadata::api::MetadataApiError;
+use aruna_ops_data::metadata::api::export_types::ExportMetadataRequest;
 use aruna_ops_data::metadata::forward::read::DatasetSummaryOperation;
+use aruna_ops_data::metadata::forward::routed::export::RoutedExportOperation;
 use aruna_ops_data::s3::bucket::dataset::BucketMetadataOperation;
 use aruna_ops_data::s3::bucket::metadata::{PutMetadataError, PutMetadataOperation};
 use aruna_ops_data::transfer::change::change_metadata;
-use aruna_runner::driver::drive;
+use aruna_runner::driver::{drive, drive_retry};
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::{Extension, Json};
@@ -144,6 +151,7 @@ pub(crate) async fn describe_bucket(
 }
 
 /// Refuses a dataset link the caller cannot read or whose root is not a Dataset.
+/// Falls back to a routed raw export during the brief window before local materialization lands.
 async fn check_link(
     state: &ServerState,
     metadata: Option<&BucketMetadata>,
@@ -153,16 +161,48 @@ async fn check_link(
         return Ok(None);
     };
     let ctx = state.get_ctx();
-    let read = DatasetSummaryOperation::new(state.get_realm_id(), dataset, (Some(auth), token));
+    let read =
+        DatasetSummaryOperation::new(state.get_realm_id(), dataset, (Some(auth), token.clone()));
     match drive(read, &ctx).await {
         Ok(described) => Ok(Some(described.into())),
         Err(DescriptionError::Unreadable) => Err(ServerError::BadRequestReason(format!(
             "dataset {dataset} does not exist or you may not read it"
         ))),
         Err(DescriptionError::Invalid(reason)) => Err(ServerError::BadRequestReason(reason)),
-        Err(DescriptionError::Unavailable) => Err(ServerError::ServiceUnavailableReason(format!(
-            "dataset {dataset} could not be read now"
-        ))),
+        Err(DescriptionError::Unavailable) => {
+            let local = ctx.net_handle.as_ref().map(|net| net.node_id());
+            let request = ExportMetadataRequest {
+                document_id: dataset,
+                auth: Some(auth.clone()),
+                view: RoCrateExportView::Raw,
+                limit: None,
+                offset: None,
+                after: None,
+            };
+            let raw = RoutedExportOperation::new(
+                local,
+                state.get_realm_id(),
+                request,
+                token,
+                state.rocrate_limits().metadata_bytes,
+            );
+            match drive(raw, &ctx).await {
+                Ok(ExportMetadataResult::Raw { raw, .. }) => describe(&raw.revision.jsonld)
+                    .map(|described| Some(described.into()))
+                    .map_err(ServerError::BadRequestReason),
+                Err(
+                    MetadataApiError::NotFound
+                    | MetadataApiError::Forbidden
+                    | MetadataApiError::Unauthorized
+                    | MetadataApiError::BadRequest,
+                ) => Err(ServerError::BadRequestReason(format!(
+                    "dataset {dataset} does not exist or you may not read it"
+                ))),
+                Ok(_) | Err(_) => Err(ServerError::ServiceUnavailableReason(format!(
+                    "dataset {dataset} could not be read now"
+                ))),
+            }
+        }
     }
 }
 
@@ -191,28 +231,41 @@ pub(crate) async fn write_metadata(
             .map_err(ServerError::from)?;
         }
         None => {
-            let mut put = PutMetadataOperation::new(
-                (auth.clone(), state.get_realm_id()),
-                bucket.to_string(),
-                info.group_id,
-                metadata,
-            );
-            if let Some(expected) = expected {
-                put = put.expecting(expected);
-            }
-            drive(put, &state.get_ctx())
-                .await
-                .map_err(|error| match error {
-                    PutMetadataError::NoSuchBucket | PutMetadataError::GroupMismatch => {
-                        ServerError::NotFound
+            drive_retry(
+                || {
+                    let mut put = PutMetadataOperation::new(
+                        (auth.clone(), state.get_realm_id()),
+                        bucket.to_string(),
+                        info.group_id,
+                        metadata.clone(),
+                    );
+                    if let Some(expected) = expected.clone() {
+                        put = put.expecting(expected);
                     }
-                    PutMetadataError::Forbidden => ServerError::Forbidden,
-                    PutMetadataError::Changed => ServerError::Conflict(error.to_string()),
-                    error => ServerError::InternalError(error.into()),
-                })?;
+                    put
+                },
+                &state.get_ctx(),
+                bucket.as_bytes(),
+            )
+            .await
+            .map_err(put_metadata_error)?;
         }
     }
     Ok(())
+}
+
+/// Maps local bucket-metadata write errors; an exhausted transaction conflict never committed, so
+/// it surfaces as `Conflict` (a definite refusal) rather than an ambiguous `InternalError`.
+pub(crate) fn put_metadata_error(error: PutMetadataError) -> ServerError {
+    match error {
+        PutMetadataError::NoSuchBucket | PutMetadataError::GroupMismatch => ServerError::NotFound,
+        PutMetadataError::Forbidden => ServerError::Forbidden,
+        PutMetadataError::Changed
+        | PutMetadataError::Storage(StorageError::TransactionConflict) => {
+            ServerError::Conflict(error.to_string())
+        }
+        error => ServerError::InternalError(error.into()),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

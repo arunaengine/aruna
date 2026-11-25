@@ -11,7 +11,6 @@ use aruna_core::document_apply::cursor::AppliedCursor;
 use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use irokle::{ActorClock, Event, FjallStorage, Op, OpId, Storage, TopicId, TopicPayload};
 use std::collections::BTreeSet;
-use std::path::Path;
 
 /// Ops of the pending pool one page reads.
 const PENDING_PAGE: usize = 256;
@@ -40,13 +39,12 @@ impl Unread {
 /// pending pool. The node would drop it, so its change would never apply.
 pub(super) fn unread_ops(
     db: &OptimisticTxDatabase,
-    sync_path: &Path,
+    storage: Option<&FjallStorage>,
     applied: &OptimisticTxKeyspace,
 ) -> Result<(), ExplorerError> {
-    if !sync_path.exists() {
+    let Some(storage) = storage else {
         return Ok(());
-    }
-    let storage = FjallStorage::open(sync_path)?;
+    };
     let read = db.read_tx();
     let mut unread = Unread::default();
     let topics = storage.list_topics()?;
@@ -55,7 +53,7 @@ pub(super) fn unread_ops(
             continue;
         }
         let stored = read.get(applied, cursor_key(&topic.topic_id))?;
-        let cursor = applied_clock(&storage, &topic.topic_id, topic.genesis, stored.as_deref())?;
+        let cursor = applied_clock(storage, &topic.topic_id, topic.genesis, stored.as_deref())?;
         for (actor_id, tip) in storage.actor_clock(&topic.topic_id)?.iter() {
             for actor_seq in cursor.get(actor_id) + 1..=*tip {
                 let Some(op_id) = storage.actor_index(&topic.topic_id, actor_id, actor_seq)? else {
@@ -70,7 +68,7 @@ pub(super) fn unread_ops(
     let provisional = storage.provisional_topics()?.into_iter();
     let topic_ids =
         (topics.iter().map(|topic| topic.topic_id)).chain(provisional.map(|topic| topic.topic_id));
-    pending_ops(&storage, topic_ids.collect(), &mut unread)?;
+    pending_ops(storage, topic_ids.collect(), &mut unread)?;
     let Some(topic_id) = unread.first else {
         return Ok(());
     };
