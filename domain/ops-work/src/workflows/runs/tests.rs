@@ -693,6 +693,7 @@ pub(super) fn sample_run() -> WorkflowRunRecord {
         secrets: BTreeMap::new(),
         path_restrictions: None,
         captured_remote: Vec::new(),
+        used_tools: Vec::new(),
     }
 }
 

@@ -14,6 +14,7 @@ use aruna_core::metadata::protocol::{MetadataReadError, MetadataTransportMessage
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::input::{CapturedInput, InputSelection};
 use aruna_core::structs::execution::job::pages::InputPage;
+use aruna_core::structs::execution::workflow_run::WorkflowRunAuth;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::routing::NodeRouting;
 use ulid::Ulid;
@@ -209,8 +210,12 @@ impl MetadataPeerOperation {
                 let store = StoreAppletOperation::new(peer, self.local, applet);
                 self.ask(Asked::Applet, store)
             }
-            Message::ReadWorkflowRun { run_id, group_id } => {
-                let serve = ServeRunOperation::new(peer, self.local, run_id, group_id);
+            Message::ReadWorkflowRun {
+                run_id,
+                group_id,
+                bindings,
+            } => {
+                let serve = ServeRunOperation::new(peer, self.local, run_id, group_id, bindings);
                 self.ask(Asked::RunRead, serve)
             }
             message => {
@@ -290,10 +295,7 @@ impl Operation for MetadataPeerOperation {
                 result: result.child::<u32, MetadataReadError>()?,
             },
             Asked::RunRead => Message::WorkflowRunRead {
-                result:
-                    result.child::<Option<
-                        Box<aruna_core::structs::execution::workflow_run::WorkflowRunRecord>,
-                    >, MetadataReadError>()?,
+                result: result.child::<Option<WorkflowRunAuth>, MetadataReadError>()?,
             },
             Asked::Applet => Message::AppletStored {
                 result: result.child::<u64, MetadataReadError>()?,

@@ -122,6 +122,7 @@ pub struct PrepareRunOperation {
     node_id: NodeId,
     claim: String,
     record: Option<WorkflowRunRecord>,
+    used_tools: Vec<(String, String)>,
     step: PrepareStep,
 }
 
@@ -134,6 +135,7 @@ impl PrepareRunOperation {
             node_id,
             claim,
             record: None,
+            used_tools: Vec::new(),
             step: PrepareStep::Run,
         }
     }
@@ -183,6 +185,18 @@ impl PrepareRunOperation {
                 problems.join("; ")
             ));
         };
+        self.used_tools = lowering
+            .graph
+            .nodes
+            .iter()
+            .filter_map(|node| {
+                (node.kind == aruna_workflow_contract::preflight::NodeKind::Step)
+                    .then(|| Some((node.tool.clone()?, node.version.clone()?)))
+                    .flatten()
+            })
+            .collect();
+        self.used_tools.sort();
+        self.used_tools.dedup();
         let start = Start {
             source: WorkflowSource {
                 files: vec![SourceFile {
@@ -468,12 +482,16 @@ impl Operation for PrepareRunOperation {
                     }
                     _ => return Err(crate::workflows::unexpected("WorkflowAnswer::Sent")),
                 }
-                let change = RunChange::State {
+                let mut changes = Vec::new();
+                if !self.used_tools.is_empty() {
+                    changes.push(RunChange::Tools(std::mem::take(&mut self.used_tools)));
+                }
+                changes.push(RunChange::State {
                     state: RunState::Running,
                     error: None,
-                };
+                });
                 self.step = PrepareStep::Running;
-                Ok(Next::Call(change_call(self.spec.run_id, vec![change])))
+                Ok(Next::Call(change_call(self.spec.run_id, changes)))
             }
             PrepareStep::Running => {
                 let record = changed(result)?;

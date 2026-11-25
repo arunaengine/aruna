@@ -30,7 +30,7 @@ use aruna_core::secrets::{
 use aruna_core::structs::execution::job::input::TaskSecretBinding;
 use aruna_core::structs::execution::job::local::JobError;
 use aruna_core::structs::execution::workflow_run::{
-    WorkflowRunRecord, WorkflowSecretScope, run_key,
+    WorkflowRunAuth, WorkflowRunRecord, WorkflowSecretScope, run_key,
 };
 use aruna_core::structs::identity::admin_audit::{
     AdminAuditAction, AdminAuditRecord, SecretAudit, SecretUse,
@@ -156,6 +156,24 @@ impl ReleaseVaultSecrets {
         Ok(())
     }
 
+    fn verify_auth(&self, auth: &WorkflowRunAuth) -> Result<(), JobError> {
+        let valid = auth.realm_id == self.run.realm_id
+            && auth.group_id == self.run.group_id
+            && auth.created_by == self.run.user_id
+            && !auth.local_only
+            && auth.bindings_match
+            && self
+                .pending
+                .iter()
+                .all(|(_, binding)| binding.workflow_id == auth.workflow_id);
+        if !valid {
+            return Err(JobError::permanent(
+                "workflow secret binding does not match the run record",
+            ));
+        }
+        Ok(())
+    }
+
     fn next_peer(&mut self, mut peers: Vec<NodeId>, transient: bool) -> SecretNext {
         let Some(peer) = peers.pop() else {
             return Err(match transient {
@@ -166,6 +184,7 @@ impl ReleaseVaultSecrets {
         let message = MetadataTransportMessage::ReadWorkflowRun {
             run_id: self.run_id,
             group_id: self.run.group_id,
+            bindings: self.pending.iter().map(|(_, b)| b.clone()).collect(),
         };
         let frame = encode_message(&message)
             .map_err(|error| JobError::retryable(format!("run record request encode: {error}")))?;
@@ -423,9 +442,9 @@ impl Operation for ReleaseVaultSecrets {
                     .map_err(|error| JobError::retryable(error.to_string()))?;
                 match reply {
                     Ok(MetadataTransportMessage::WorkflowRunRead {
-                        result: Ok(Some(record)),
+                        result: Ok(Some(auth)),
                     }) => {
-                        self.verify_record(&record, true)?;
+                        self.verify_auth(&auth)?;
                         self.next_secret()
                     }
                     Ok(MetadataTransportMessage::WorkflowRunRead {

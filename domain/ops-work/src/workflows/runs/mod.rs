@@ -164,6 +164,8 @@ pub enum RunChange {
         status: String,
         document_id: Option<Ulid>,
     },
+    /// Resolved `(tool_id, version)` pairs a composed workflow lowered against.
+    Tools(Vec<(String, String)>),
 }
 
 /// Applies changes to a run, its tasks and its event rows in one write transaction, so the
@@ -323,6 +325,10 @@ fn change_run(
         } => {
             record.provenance_status = Some(status);
             record.provenance_document_id = document_id.or(record.provenance_document_id);
+            Ok(())
+        }
+        RunChange::Tools(tools) => {
+            record.used_tools = tools;
             Ok(())
         }
         RunChange::Task(_) => Ok(()),

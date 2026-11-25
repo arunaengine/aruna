@@ -412,6 +412,7 @@ impl StartRunOperation {
             secrets: request.secrets.clone(),
             path_restrictions: self.auth.path_restrictions.clone(),
             captured_remote: std::mem::take(&mut self.captured),
+            used_tools: Vec::new(),
         };
         let key = request.idempotency_key.as_ref().map(|key| {
             let row = self.key_row(key);

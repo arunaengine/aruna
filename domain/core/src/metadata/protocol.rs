@@ -778,15 +778,17 @@ pub enum MetadataTransportMessage {
     AppletStored {
         result: Result<u64, MetadataReadError>,
     },
-    /// An executor asks an authoritative realm server for a workflow run record to verify secrets.
+    /// An executor asks an authoritative realm server to verify a run's vault secret bindings.
     ReadWorkflowRun {
         run_id: Ulid,
         group_id: GroupId,
+        #[serde(default)]
+        bindings: Vec<crate::structs::execution::job::input::TaskSecretBinding>,
     },
-    /// The authoritative run record, or `None` when the server holds no matching run.
+    /// Constant-size authoritative run verdict, or `None` when the server holds no matching run.
     WorkflowRunRead {
         result: Result<
-            Option<Box<crate::structs::execution::workflow_run::WorkflowRunRecord>>,
+            Option<crate::structs::execution::workflow_run::WorkflowRunAuth>,
             MetadataReadError,
         >,
     },
@@ -962,6 +964,11 @@ pub fn metadata_read_error(error: MetadataError) -> MetadataReadError {
 pub enum WriteAuthError {
     Unauthorized,
     Forbidden,
+}
+
+/// Encoded byte length of `message` without applying frame limits or allocating a buffer.
+pub fn message_size(message: &MetadataTransportMessage) -> Result<usize, String> {
+    postcard::experimental::serialized_size(message).map_err(|err| err.to_string())
 }
 
 pub fn encode_message(message: &MetadataTransportMessage) -> Result<Vec<u8>, String> {

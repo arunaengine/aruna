@@ -31,11 +31,25 @@ pub struct PrecapturedInput {
     pub captured: CapturedInput,
 }
 
-/// One bounded piece of a large replicated workflow source or tool record.
+/// Constant-size authoritative run verdict for remote vault secret verification.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowRunAuth {
+    pub realm_id: RealmId,
+    pub group_id: GroupId,
+    pub workflow_id: Ulid,
+    pub created_by: UserId,
+    pub local_only: bool,
+    pub bindings_match: bool,
+}
+
+/// One bounded piece of a large replicated workflow source, tool record, or log page.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplicatedChunk {
-    /// `None` for the workflow version's source blob, or `Some((tool_id, version))`.
+    /// `None` for the workflow version's source blob or a log page, or `Some((tool_id, version))`.
     pub tool: Option<(String, String)>,
+    /// Log page number when chunking a large log page (`tool` is `None`).
+    #[serde(default)]
+    pub page: Option<u32>,
     pub index: u32,
     pub total: u32,
     pub data: Vec<u8>,
@@ -335,6 +349,9 @@ pub struct WorkflowRunRecord {
     /// Remote pinned inputs resolved and granted at admission for reuse by child tasks.
     #[serde(default)]
     pub captured_remote: Vec<PrecapturedInput>,
+    /// Resolved `(tool_id, version)` pairs a composed workflow lowered against for this run.
+    #[serde(default)]
+    pub used_tools: Vec<(String, String)>,
 }
 
 /// One task of a run, with the state of its newest attempt.
