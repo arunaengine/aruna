@@ -39,7 +39,7 @@ use super::log::{LoadLogOperation, pages_answer};
 use super::{read_run, run_answer, run_row};
 use crate::workflows::{CatalogError, ScanOperation, scan_answer};
 
-/// Encoded page bytes one store request carries at most, well inside one metadata frame.
+/// Encoded store request size target, well inside one 16 MiB metadata frame.
 const BATCH_BYTES: usize = 8 << 20;
 /// Maximum chunk count allowed for one replicated source or tool blob.
 const MAX_CHUNKS: u32 = 64;
@@ -87,6 +87,41 @@ fn chunk_target(tool: Option<&(String, String)>) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
+fn chunk_blob(
+    data: &[u8],
+    tool: Option<(String, String)>,
+    chunk_size: usize,
+) -> Vec<ReplicatedChunk> {
+    let step = chunk_size.max(1);
+    let parts: Vec<&[u8]> = data.chunks(step).collect();
+    let total = parts.len() as u32;
+    parts
+        .into_iter()
+        .enumerate()
+        .map(|(index, slice)| ReplicatedChunk {
+            tool: tool.clone(),
+            index: index as u32,
+            total,
+            data: slice.to_vec(),
+        })
+        .collect()
+}
+
+fn pack_frame(
+    run: &WorkflowRunRecord,
+    first_page: u32,
+    pages: Vec<Vec<u8>>,
+    workflow: Option<ReplicatedWorkflow>,
+) -> Result<Vec<u8>, CatalogError> {
+    let message = MetadataTransportMessage::StoreRunLog {
+        run: Box::new(run.clone()),
+        first_page,
+        pages,
+        workflow,
+    };
+    encode_message(&message).map_err(|error| CatalogError::Storage(error.to_string()))
+}
+
 fn keep_stored(stored: &WorkflowRunRecord, incoming: &WorkflowRunRecord) -> bool {
     if stored.state.is_terminal() != incoming.state.is_terminal() {
         return stored.state.is_terminal();
@@ -114,12 +149,22 @@ fn tool_update(
     Ok(Some((key, ByteView::from(incoming.to_vec()))))
 }
 
+fn used_tools(uwe_yaml: Option<&str>, tools: Vec<ToolRecord>) -> Vec<ToolRecord> {
+    let Some(yaml) = uwe_yaml else {
+        return Vec::new();
+    };
+    tools
+        .into_iter()
+        .filter(|tool| yaml.contains(&tool.tool_id))
+        .collect()
+}
+
 #[derive(Debug, PartialEq)]
 enum SendStep {
     Run,
     Config,
     Workflow(Vec<NodeId>, bool),
-    Tools(Vec<NodeId>, ReplicatedWorkflow, bool),
+    Tools(Vec<NodeId>, ReplicatedWorkflow, Option<String>, bool),
     Log(Vec<NodeId>),
     Send(NodeId),
 }
@@ -172,7 +217,7 @@ impl ReplicateLogOperation {
         pages: &[RunLogPage],
         workflow: Option<ReplicatedWorkflow>,
     ) -> Result<Vec<Vec<u8>>, CatalogError> {
-        self.frames_from(self.from_page, run, pages, workflow)
+        self.frames_bounded(self.from_page, run, pages, workflow, BATCH_BYTES)
     }
 
     fn frames_from(
@@ -180,35 +225,167 @@ impl ReplicateLogOperation {
         start_page: u32,
         run: &WorkflowRunRecord,
         pages: &[RunLogPage],
-        mut workflow: Option<ReplicatedWorkflow>,
+        workflow: Option<ReplicatedWorkflow>,
     ) -> Result<Vec<Vec<u8>>, CatalogError> {
-        let mut batches: Vec<Vec<Vec<u8>>> = vec![Vec::new()];
-        let mut bytes = 0;
-        for page in pages.iter().skip(start_page as usize) {
-            let encoded = encode_page(page)?;
-            let full = batches.last().is_some_and(|batch| !batch.is_empty());
-            if full && bytes + encoded.len() > BATCH_BYTES {
-                batches.push(Vec::new());
-                bytes = 0;
+        self.frames_bounded(start_page, run, pages, workflow, BATCH_BYTES)
+    }
+
+    fn frames_bounded(
+        &self,
+        start_page: u32,
+        run: &WorkflowRunRecord,
+        pages: &[RunLogPage],
+        workflow: Option<ReplicatedWorkflow>,
+        limit: usize,
+    ) -> Result<Vec<Vec<u8>>, CatalogError> {
+        let mut frames = Vec::new();
+        let mut final_meta = None;
+        if let Some(bundle) = workflow {
+            let empty_part = ReplicatedWorkflow {
+                more: true,
+                ..ReplicatedWorkflow::default()
+            };
+            let overhead = pack_frame(run, start_page, Vec::new(), Some(empty_part))?.len();
+            let chunk_size = limit.saturating_sub(overhead + 256).min(limit / 2).max(1);
+            let mut small: Vec<Vec<u8>> = Vec::new();
+            for tool_bytes in bundle.tools {
+                let solo = ReplicatedWorkflow {
+                    tools: vec![tool_bytes.clone()],
+                    more: true,
+                    ..ReplicatedWorkflow::default()
+                };
+                if pack_frame(run, start_page, Vec::new(), Some(solo))?.len() <= limit {
+                    let mut candidate = small.clone();
+                    candidate.push(tool_bytes.clone());
+                    let test = ReplicatedWorkflow {
+                        tools: candidate,
+                        more: true,
+                        ..ReplicatedWorkflow::default()
+                    };
+                    if !small.is_empty()
+                        && pack_frame(run, start_page, Vec::new(), Some(test))?.len() > limit
+                    {
+                        let flush = ReplicatedWorkflow {
+                            tools: std::mem::take(&mut small),
+                            more: true,
+                            ..ReplicatedWorkflow::default()
+                        };
+                        frames.push(pack_frame(run, start_page, Vec::new(), Some(flush))?);
+                    }
+                    small.push(tool_bytes);
+                } else {
+                    if !small.is_empty() {
+                        let flush = ReplicatedWorkflow {
+                            tools: std::mem::take(&mut small),
+                            more: true,
+                            ..ReplicatedWorkflow::default()
+                        };
+                        frames.push(pack_frame(run, start_page, Vec::new(), Some(flush))?);
+                    }
+                    let tool = ToolRecord::from_bytes(&tool_bytes)?;
+                    let id_ver = (tool.tool_id, tool.version);
+                    for chunk in chunk_blob(&tool_bytes, Some(id_ver), chunk_size) {
+                        let part = ReplicatedWorkflow {
+                            chunks: vec![chunk],
+                            more: true,
+                            ..ReplicatedWorkflow::default()
+                        };
+                        frames.push(pack_frame(run, start_page, Vec::new(), Some(part))?);
+                    }
+                }
             }
-            bytes += encoded.len();
-            if let Some(batch) = batches.last_mut() {
-                batch.push(encoded);
+            let (source, final_chunks) = match bundle.source {
+                Some(bytes) => {
+                    let inline_probe = ReplicatedWorkflow {
+                        workflow: bundle.workflow.clone(),
+                        version: bundle.version.clone(),
+                        source: Some(bytes.clone()),
+                        ..ReplicatedWorkflow::default()
+                    };
+                    if bytes.len() > chunk_size
+                        || pack_frame(run, start_page, Vec::new(), Some(inline_probe))?.len()
+                            > limit
+                    {
+                        let mut parts = chunk_blob(&bytes, None, chunk_size);
+                        let last = parts.pop();
+                        for chunk in parts {
+                            let part = ReplicatedWorkflow {
+                                chunks: vec![chunk],
+                                more: true,
+                                ..ReplicatedWorkflow::default()
+                            };
+                            frames.push(pack_frame(run, start_page, Vec::new(), Some(part))?);
+                        }
+                        (None, last.into_iter().collect())
+                    } else {
+                        (Some(bytes), Vec::new())
+                    }
+                }
+                None => (None, Vec::new()),
+            };
+            let mut commit = ReplicatedWorkflow {
+                workflow: bundle.workflow,
+                version: bundle.version,
+                source,
+                tools: Vec::new(),
+                chunks: final_chunks,
+                more: false,
+            };
+            if !commit.chunks.is_empty()
+                && pack_frame(run, start_page, Vec::new(), Some(commit.clone()))?.len() > limit
+            {
+                let part = ReplicatedWorkflow {
+                    chunks: std::mem::take(&mut commit.chunks),
+                    more: true,
+                    ..ReplicatedWorkflow::default()
+                };
+                frames.push(pack_frame(run, start_page, Vec::new(), Some(part))?);
+            }
+            if !small.is_empty() {
+                let mut probe = commit.clone();
+                probe.tools = small.clone();
+                if pack_frame(run, start_page, Vec::new(), Some(probe))?.len() <= limit {
+                    commit.tools = small;
+                } else {
+                    let flush = ReplicatedWorkflow {
+                        tools: small,
+                        more: true,
+                        ..ReplicatedWorkflow::default()
+                    };
+                    frames.push(pack_frame(run, start_page, Vec::new(), Some(flush))?);
+                }
+            }
+            final_meta = Some(commit);
+        }
+        let encoded: Vec<Vec<u8>> = pages
+            .iter()
+            .skip(start_page as usize)
+            .map(encode_page)
+            .collect::<Result<_, _>>()?;
+        let mut first = start_page;
+        let mut batch: Vec<Vec<u8>> = Vec::new();
+        for page in encoded {
+            batch.push(page);
+            let encoded_len = pack_frame(run, first, batch.clone(), final_meta.clone())?.len();
+            if encoded_len > limit {
+                let overflow = batch.pop();
+                if !batch.is_empty() || final_meta.is_some() {
+                    let count = batch.len() as u32;
+                    frames.push(pack_frame(
+                        run,
+                        first,
+                        std::mem::take(&mut batch),
+                        final_meta.take(),
+                    )?);
+                    first += count;
+                }
+                if let Some(item) = overflow {
+                    batch.push(item);
+                }
             }
         }
-        let mut first = start_page;
-        let mut frames = Vec::with_capacity(batches.len());
-        for batch in batches {
-            let count = batch.len() as u32;
-            let message = MetadataTransportMessage::StoreRunLog {
-                run: Box::new(run.clone()),
-                first_page: first,
-                pages: batch,
-                workflow: workflow.take(),
-            };
-            let frame = encode_message(&message);
-            frames.push(frame.map_err(|error| CatalogError::Storage(error.to_string()))?);
-            first += count;
+        if !batch.is_empty() || final_meta.is_some() || frames.is_empty() {
+            frames.push(pack_frame(run, first, batch, final_meta)?);
         }
         Ok(frames)
     }
@@ -323,16 +500,18 @@ impl Operation for ReplicateLogOperation {
                     }),
                     _ => None,
                 };
-                let needs_tools = workflow.as_ref().is_some_and(|bundle| {
+                let uwe_yaml = workflow.as_ref().and_then(|bundle| {
                     WorkflowVersionRecord::from_bytes(&bundle.version)
-                        .is_ok_and(|ver| ver.language == StoredWorkflowLanguage::Uwe)
+                        .ok()
+                        .filter(|ver| ver.language == StoredWorkflowLanguage::Uwe)
+                        .and_then(|ver| ver.uwe_yaml)
                 });
-                if needs_tools
+                if uwe_yaml.is_some()
                     && let Some(run) = &self.run
                     && let Some(bundle) = workflow
                 {
                     let groups = Some([run.group_id].into());
-                    self.step = SendStep::Tools(holders, bundle, load_log);
+                    self.step = SendStep::Tools(holders, bundle, uwe_yaml, load_log);
                     return Ok(Next::Call(IoCall::child(
                         ScanOperation::<ToolRecord>::of_groups(groups),
                     )));
@@ -346,12 +525,12 @@ impl Operation for ReplicateLogOperation {
                 }
                 self.enqueue(0, holders, true)
             }
-            SendStep::Tools(holders, mut bundle, load_log) => {
+            SendStep::Tools(holders, mut bundle, uwe_yaml, load_log) => {
                 let tools: Vec<ToolRecord> = scan_answer(result)?
                     .into_iter()
                     .map(|(_, tool)| tool)
                     .collect();
-                for tool in tools {
+                for tool in used_tools(uwe_yaml.as_deref(), tools) {
                     bundle.tools.push(tool.to_bytes()?);
                 }
                 self.workflow = Some(bundle);
