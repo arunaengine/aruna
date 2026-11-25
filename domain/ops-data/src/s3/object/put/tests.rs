@@ -1534,6 +1534,28 @@ fn existing_location_kept() {
 }
 
 #[test]
+fn dedup_still_announces() {
+    // Ordinary deduplicated PUTs still announce to the DHT so an expired or previously
+    // distributed-only blob stays discoverable; distributed buckets skip DHT registration.
+    let realm_id = RealmId::from_bytes([1u8; 32]);
+    let group_id = Ulid::generate();
+    let node_id = iroh::SecretKey::generate().public();
+    let dedup_config = put_config(realm_id, group_id, node_id);
+    let dedup_output = hashed(test_location(dedup_config.user_id));
+    let mut dedup = publishing(dedup_config, dedup_output);
+    dedup.new_blob = false;
+    let Ok(Next::Then { calls, .. }) = dedup.finish_publish() else {
+        panic!("expected publish calls for dedup hit");
+    };
+    let has_dht = |calls: &[IoCall]| {
+        calls
+            .iter()
+            .any(|call| matches!(call, IoCall::Effect(effect) if matches!(effect.as_ref(), Effect::Net(_))))
+    };
+    assert!(has_dht(&calls), "ordinary dedup hit still registers in DHT");
+}
+
+#[test]
 fn generation_increments() {
     let config = put_config(
         RealmId::from_bytes([1u8; 32]),

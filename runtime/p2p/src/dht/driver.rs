@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use aruna_core::alpn::Alpn;
@@ -226,6 +226,43 @@ struct RevisionRequest {
     span: Span,
 }
 
+/// Serializes concurrent storage mutations targeting the same DHT key while allowing distinct
+/// keys to execute concurrently without contention.
+#[derive(Default)]
+pub(super) struct KeyLocks {
+    locks: std::sync::Mutex<HashMap<DhtKeyId, Weak<tokio::sync::Mutex<()>>>>,
+}
+
+impl KeyLocks {
+    pub(super) fn lock_for(&self, key: DhtKeyId) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self.locks.lock().expect("dht key locks mutex poisoned");
+        if let Some(lock) = map.get(&key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        if map.len() >= 256 {
+            map.retain(|_, weak| weak.strong_count() > 0);
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        map.insert(key, Arc::downgrade(&lock));
+        lock
+    }
+}
+
+/// Coordinates concurrent DHT storage mutations: per-key serialization for every key and a
+/// separate lock for transactions that modify the global `KEY_COUNT_KEY` row.
+/// Lock order is strictly `count_lock` before `key_lock`.
+#[derive(Default)]
+pub(super) struct StorageLocks {
+    key_locks: KeyLocks,
+    count_lock: tokio::sync::Mutex<()>,
+}
+
+impl StorageLocks {
+    pub(super) fn lock_for(&self, key: DhtKeyId) -> Arc<tokio::sync::Mutex<()>> {
+        self.key_locks.lock_for(key)
+    }
+}
+
 pub struct DhtDriver {
     state: DhtStateMachine,
     clock: DhtClock,
@@ -233,6 +270,7 @@ pub struct DhtDriver {
     endpoint: Endpoint,
     connection_pool: ConnectionPool,
     storage: Arc<dyn StoragePort>,
+    storage_locks: Arc<StorageLocks>,
     cmd_rx: DriverCmdReceiver,
     inbound_rx: InboundReceiver,
     io_tx: IoSender,
@@ -394,6 +432,7 @@ impl DhtDriver {
             endpoint,
             connection_pool,
             storage,
+            storage_locks: Arc::new(StorageLocks::default()),
             cmd_rx,
             inbound_rx,
             io_tx,
@@ -1350,12 +1389,21 @@ impl DhtDriver {
         let storage = self.storage.clone();
         let io_tx = self.io_tx.clone();
         let clock = self.clock.clone();
+        let locks = self.storage_locks.clone();
         tokio::spawn(
             async move {
                 let mutation = StorageMutation::Merge { entries };
                 match run_storage_io(
                     stage,
-                    mutate_storage_checked(&storage, op_id, stage, key, &mutation, &clock),
+                    mutate_storage_checked(
+                        &storage,
+                        op_id,
+                        stage,
+                        key,
+                        &mutation,
+                        &clock,
+                        Some(&locks),
+                    ),
                 )
                 .await
                 {
@@ -1394,6 +1442,7 @@ impl DhtDriver {
         let storage = self.storage.clone();
         let io_tx = self.io_tx.clone();
         let clock = self.clock.clone();
+        let locks = self.storage_locks.clone();
         tokio::spawn(
             async move {
                 let mutation = StorageMutation::Prune {
@@ -1401,8 +1450,16 @@ impl DhtDriver {
                     entry,
                     now_secs,
                 };
-                match mutate_storage_checked(&storage, op_id, stage, entry.key, &mutation, &clock)
-                    .await
+                match mutate_storage_checked(
+                    &storage,
+                    op_id,
+                    stage,
+                    entry.key,
+                    &mutation,
+                    &clock,
+                    Some(&locks),
+                )
+                .await
                 {
                     Ok(()) => {
                         let _ = io_tx.send(DhtIo::StorageWriteResult { op_id, stage }).await;
@@ -1489,6 +1546,11 @@ enum StorageMutation {
 enum TransactionFailure {
     Conflict,
     Failed(DhtIoError),
+}
+
+enum TxnOutcome {
+    Done,
+    NeedCountLock,
 }
 
 struct ReclaimRow {
@@ -1675,7 +1737,7 @@ async fn mutate_storage_entries(
     key: DhtKeyId,
     mutation: &StorageMutation,
 ) -> Result<(), DhtIoError> {
-    mutate_storage_with(storage, op_id, stage, key, mutation, None).await
+    mutate_storage_with(storage, op_id, stage, key, mutation, None, None).await
 }
 
 async fn mutate_storage_checked(
@@ -1685,8 +1747,16 @@ async fn mutate_storage_checked(
     key: DhtKeyId,
     mutation: &StorageMutation,
     clock: &DhtClock,
+    locks: Option<&StorageLocks>,
 ) -> Result<(), DhtIoError> {
-    mutate_storage_with(storage, op_id, stage, key, mutation, Some(clock)).await
+    mutate_storage_with(storage, op_id, stage, key, mutation, Some(clock), locks).await
+}
+
+fn conflict_backoff(op_id: OpId, key: DhtKeyId, attempt: usize) -> Duration {
+    let shift = attempt.min(5) as u32;
+    let base_ms = 2u64 << shift;
+    let jitter = (op_id ^ u64::from(key.as_bytes()[0])).wrapping_mul(17) % 7;
+    Duration::from_millis(base_ms + jitter)
 }
 
 async fn mutate_storage_with(
@@ -1696,26 +1766,59 @@ async fn mutate_storage_with(
     key: DhtKeyId,
     mutation: &StorageMutation,
     clock: Option<&DhtClock>,
+    locks: Option<&StorageLocks>,
 ) -> Result<(), DhtIoError> {
-    for _ in 0..STORAGE_MUTATION_RETRIES {
-        let mut owner = match start_storage_txn(storage, op_id, stage).await {
-            Ok(owner) => owner,
-            Err(TransactionFailure::Conflict) => continue,
-            Err(TransactionFailure::Failed(error)) => return Err(error),
-        };
-        let Some(txn_id) = owner.id() else {
-            return Err(DhtIoError::storage(
-                "DHT transaction owner missing transaction",
-            ));
+    let key_lock = locks.map(|locks| locks.lock_for(key));
+    let mut need_count_lock = false;
+    let mut conflict_attempts = 0usize;
+    loop {
+        let outcome = {
+            // Strict lock order: count_lock before key_lock; both drop before any retry sleep.
+            let _count_guard = match (need_count_lock, locks) {
+                (true, Some(locks)) => Some(locks.count_lock.lock().await),
+                _ => None,
+            };
+            let _key_guard = match key_lock.as_ref() {
+                Some(lock) => Some(lock.lock().await),
+                None => None,
+            };
+            let defer_count_lock = locks.is_some() && _count_guard.is_none();
+            match start_storage_txn(storage, op_id, stage).await {
+                Ok(mut owner) => match owner.id() {
+                    Some(txn_id) => {
+                        run_storage_txn(
+                            storage,
+                            op_id,
+                            stage,
+                            key,
+                            txn_id,
+                            &mut owner,
+                            mutation,
+                            clock,
+                            defer_count_lock,
+                        )
+                        .await
+                    }
+                    None => Err(TransactionFailure::Failed(DhtIoError::storage(
+                        "DHT transaction owner missing transaction",
+                    ))),
+                },
+                Err(error) => Err(error),
+            }
         };
 
-        match run_storage_txn(
-            storage, op_id, stage, key, txn_id, &mut owner, mutation, clock,
-        )
-        .await
-        {
-            Ok(()) => return Ok(()),
-            Err(TransactionFailure::Conflict) => continue,
+        match outcome {
+            Ok(TxnOutcome::Done) => return Ok(()),
+            Ok(TxnOutcome::NeedCountLock) => {
+                need_count_lock = true;
+            }
+            Err(TransactionFailure::Conflict) => {
+                conflict_attempts += 1;
+                if conflict_attempts >= STORAGE_MUTATION_RETRIES {
+                    break;
+                }
+                tokio::time::sleep(conflict_backoff(op_id, key, conflict_attempts - 1)).await;
+            }
             Err(TransactionFailure::Failed(error)) => return Err(error),
         }
     }
@@ -1951,7 +2054,8 @@ async fn run_storage_txn(
     owner: &mut TransactionOwner,
     mutation: &StorageMutation,
     clock: Option<&DhtClock>,
-) -> Result<(), TransactionFailure> {
+    defer_count_lock: bool,
+) -> Result<TxnOutcome, TransactionFailure> {
     let read = Effect::Storage(StorageEffect::Read {
         key_space: DHT_KEYSPACE.to_string(),
         key: ByteView::from(key.as_bytes().as_slice()),
@@ -2054,7 +2158,7 @@ async fn run_storage_txn(
         && entries == original_entries
     {
         abort_storage_txn(storage, op_id, stage, owner).await;
-        return Ok(());
+        return Ok(TxnOutcome::Done);
     }
 
     let mut delete_keys = Vec::with_capacity(3);
@@ -2103,6 +2207,13 @@ async fn run_storage_txn(
         }
     }
 
+    let inserting_key = !had_value && deadline.is_some();
+    let deleting_key = had_value && entries.is_empty() && !preserve_row;
+    if defer_count_lock && (inserting_key || deleting_key) {
+        abort_storage_txn(storage, op_id, stage, owner).await;
+        return Ok(TxnOutcome::NeedCountLock);
+    }
+
     let reclaimed = if let (false, Some((index, _))) = (had_value, deadline) {
         match reserve_key_slot(storage, op_id, stage, txn_id, index, now_secs).await {
             Ok(reclaimed) => reclaimed,
@@ -2114,11 +2225,7 @@ async fn run_storage_txn(
     } else {
         None
     };
-    if had_value
-        && entries.is_empty()
-        && !preserve_row
-        && let Err(error) = decrement_key_count(storage, op_id, stage, txn_id).await
-    {
+    if deleting_key && let Err(error) = decrement_key_count(storage, op_id, stage, txn_id).await {
         abort_storage_txn(storage, op_id, stage, owner).await;
         return Err(error);
     }
@@ -2139,7 +2246,7 @@ async fn run_storage_txn(
         .into_iter()
         .map(|key| (DHT_META_KEYSPACE.to_string(), ByteView::from(key)))
         .collect::<Vec<_>>();
-    if had_value && entries.is_empty() && !preserve_row {
+    if deleting_key {
         deletes.push((
             DHT_KEYSPACE.to_string(),
             ByteView::from(key.as_bytes().as_slice()),
@@ -2161,7 +2268,8 @@ async fn run_storage_txn(
         return Err(error);
     }
 
-    commit_storage_txn(storage, op_id, stage, owner).await
+    commit_storage_txn(storage, op_id, stage, owner).await?;
+    Ok(TxnOutcome::Done)
 }
 
 async fn apply_batch_delete(
