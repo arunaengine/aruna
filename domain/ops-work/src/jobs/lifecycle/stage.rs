@@ -7,7 +7,9 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::execution::job::input::{InputSelection, InputSource};
+use aruna_core::structs::execution::job::input::{
+    InputSelection, InputSource, JobPayload, WORKFLOW_UNPROTECTED_TAG,
+};
 use aruna_core::structs::execution::job::local::{JobError, JobRecord};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
@@ -53,6 +55,7 @@ pub struct StageInputOperation {
     version: Ulid,
     blake3: [u8; 32],
     serving: ServingNode,
+    disallow_encrypted: bool,
     /// Holders still to try, the next one last.
     holders: Vec<NodeId>,
     /// Reads of the current holder still to try, the next one last.
@@ -83,6 +86,10 @@ impl StageInputOperation {
             .iter()
             .find(|captured| captured.destination_key == input.dest_key)
             .map(|captured| captured.source_node_id);
+        let disallow_encrypted = match &record.payload {
+            JobPayload::Execution(spec) => spec.tags.contains_key(WORKFLOW_UNPROTECTED_TAG),
+            _ => false,
+        };
         Self {
             created_by: record.created_by,
             source_node: input.source_node_id,
@@ -92,6 +99,7 @@ impl StageInputOperation {
             version,
             blake3,
             serving,
+            disallow_encrypted,
             holders: Vec::new(),
             targets: Vec::new(),
             holder: None,
@@ -136,7 +144,7 @@ impl StageInputOperation {
                     destination: None,
                     known_refs: Vec::new(),
                     range: None,
-                    disallow_encrypted: false,
+                    disallow_encrypted: self.disallow_encrypted,
                 };
                 let read = ManagedReadOperation::new(holder, request);
                 return Ok(Next::Call(IoCall::child(read)));
@@ -342,5 +350,30 @@ mod tests {
             Some(BaoReadError::NoDestination),
         );
         assert_eq!(error, expected);
+    }
+
+    // Unprotected workflow child jobs propagate `disallow_encrypted` into remote Bao staging.
+    #[test]
+    fn propagates_unprotected_tag() {
+        let mut spec = payload();
+        spec.tags
+            .insert(WORKFLOW_UNPROTECTED_TAG.to_owned(), "1".to_owned());
+        let record = JobRecord::new(
+            JobId::from_bytes([2u8; 16]),
+            JobPayload::Execution(spec),
+            user(),
+            node(1),
+            1,
+            1,
+            None,
+        );
+        let staged = StageInputOperation::new(
+            &record,
+            &input(),
+            Ulid::nil(),
+            [2u8; 32],
+            Some((node(1), REALM)),
+        );
+        assert!(staged.disallow_encrypted);
     }
 }

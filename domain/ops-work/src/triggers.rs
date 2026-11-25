@@ -1829,6 +1829,7 @@ mod tests {
             version_id: Ulid::nil(),
             head: true,
             range: None,
+            disallow_encrypted: false,
         };
         let native = peer_request(Alpn::NativeReference, PeerRequest::Native(request));
         assert!(matches!(

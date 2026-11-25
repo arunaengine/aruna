@@ -23,7 +23,7 @@ use aruna_core::structs::execution::job::identity::{JobId, JobState, RETENTION_M
 use aruna_core::structs::execution::job::input::{
     ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, OutputDestination,
     OutputSelection, TaskSecretBinding, WORKFLOW_RUN_TAG, WORKFLOW_SECRETS_TAG, WORKFLOW_TASK_TAG,
-    encode_workflow_secrets, run_area_bucket,
+    WORKFLOW_UNPROTECTED_TAG, encode_workflow_secrets, run_area_bucket,
 };
 use aruna_core::structs::execution::job::local::{
     JobRecord, JobResultPayload, OutputObject, WorkspaceMode,
@@ -220,6 +220,9 @@ pub fn task_spec(
         (WORKFLOW_RUN_TAG.to_owned(), record.run_id.to_string()),
         (WORKFLOW_TASK_TAG.to_owned(), task_key.to_owned()),
     ]);
+    if !record.protected {
+        tags.insert(WORKFLOW_UNPROTECTED_TAG.to_owned(), "1".to_owned());
+    }
     if request.network_allowed {
         tags.insert(NETWORK_TAG_KEY.to_owned(), "open".to_owned());
     }

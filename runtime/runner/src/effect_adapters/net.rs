@@ -294,6 +294,7 @@ async fn granted_read(
         version_id: read.version_id,
         head: read.head,
         range: read.range,
+        disallow_encrypted: read.disallow_encrypted,
     };
     let (response, stream) = send_request(net, holder, request).await?;
     match response {
@@ -331,6 +332,7 @@ async fn delegated_read(
         version_id: read.version_id,
         head: read.head,
         range: read.range,
+        disallow_encrypted: false,
     };
     let (response, stream) = send_request(net, holder, request).await?;
     let (metadata, group_id) = match response {

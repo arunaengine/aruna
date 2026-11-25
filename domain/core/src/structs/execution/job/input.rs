@@ -207,6 +207,8 @@ pub const WORKFLOW_RUN_TAG: &str = "aruna-engine.org/workflow-run";
 pub const WORKFLOW_TASK_TAG: &str = "aruna-engine.org/workflow-task";
 /// The vault secret bindings of a workflow child job, as JSON; never carries secret values.
 pub const WORKFLOW_SECRETS_TAG: &str = "aruna-engine.org/workflow-secrets";
+/// Marks an unprotected workflow child job so input staging refuses encrypted buckets.
+pub const WORKFLOW_UNPROTECTED_TAG: &str = "aruna-engine.org/workflow-unprotected";
 
 /// One vault secret binding carried by a workflow child job for attempt-time `vault_env` release.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,7 +216,7 @@ pub struct TaskSecretBinding {
     pub workflow_id: Ulid,
     pub scope: crate::structs::execution::workflow_run::WorkflowSecretScope,
     pub name: crate::secrets::SecretName,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub field: Option<String>,
 }
 
