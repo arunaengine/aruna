@@ -13,6 +13,7 @@ pub mod events;
 pub mod log;
 pub mod plan;
 pub mod provenance;
+pub mod publish;
 pub mod reads;
 pub mod recover;
 pub mod remote;
