@@ -86,6 +86,9 @@ impl Operation for RunAccessOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, CatalogError> {
         let Some(record) = self.record.take() else {
             let record = run_answer(result)?.ok_or(CatalogError::NotFound)?;
+            if record.local_only && record.created_by != self.auth.user_id {
+                return Err(CatalogError::NotFound);
+            }
             let check = GroupAccessOperation::new(&self.auth, [record.group_id]);
             self.record = Some(record);
             return Ok(Next::Call(IoCall::child(check)));

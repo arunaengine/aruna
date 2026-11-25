@@ -103,7 +103,9 @@ impl Operation for ListRunsOperation {
             let (rows, next) = result.page()?;
             for (_, value) in rows {
                 let record = WorkflowRunRecord::from_bytes(&value)?;
-                if self.filter.keeps(&record) {
+                if self.filter.keeps(&record)
+                    && (!record.local_only || record.created_by == self.auth.user_id)
+                {
                     self.found.push(record);
                 }
             }

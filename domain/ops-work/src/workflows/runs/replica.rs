@@ -264,7 +264,9 @@ impl Operation for StoreReplicaOperation {
                 let config = (result.child::<RealmConfigDocument, GetConfigError>())
                     .map_err(|_| MetadataReadError::Unavailable)?
                     .map_err(|_| MetadataReadError::Unavailable)?;
-                let member = config.node_kind(&self.peer).is_some();
+                let member = config
+                    .node_kind(&self.peer)
+                    .is_some_and(|kind| kind.is_sync_eligible());
                 let holders = record_holders(&config, self.run.group_id, self.peer);
                 if !member || !holders.contains(&self.local.0) {
                     return Err(MetadataReadError::Forbidden);

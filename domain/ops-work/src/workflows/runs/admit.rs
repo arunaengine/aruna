@@ -19,7 +19,7 @@ use aruna_core::structs::execution::job::input::JobPayload;
 use aruna_core::structs::execution::job::local::{WorkspaceMode, user_dedup_key};
 use aruna_core::structs::execution::workflow_run::{
     CacheScope, RunKeyRecord, RunOutput, RunState, WorkflowRunRecord, WorkflowRunSpec,
-    WorkflowSecretBinding, run_key, run_key_row,
+    WorkflowSecretBinding, WorkflowSecretScope, run_key, run_key_row,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -461,16 +461,28 @@ impl Operation for StartRunOperation {
             }
             AdmitStep::Config(view, protected) => {
                 let config = result.child::<RealmConfigDocument, GetConfigError>()?;
-                let local_only = match config.ok().and_then(|cfg| node_kind(&cfg, self.node.0)) {
-                    Some(kind) => match kind.owner() {
-                        Some(owner) if owner != self.auth.user_id => {
-                            return Err(CatalogError::Forbidden);
-                        }
-                        Some(_) => true,
-                        None => false,
-                    },
+                let cfg = config.map_err(|error| CatalogError::Storage(error.to_string()))?;
+                let kind = node_kind(&cfg, self.node.0).ok_or_else(|| {
+                    CatalogError::Storage("this node is not in the realm configuration".into())
+                })?;
+                let local_only = match kind.owner() {
+                    Some(owner) if owner != self.auth.user_id => {
+                        return Err(CatalogError::Forbidden);
+                    }
+                    Some(_) => true,
                     None => false,
                 };
+                if local_only
+                    && self
+                        .request
+                        .secrets
+                        .values()
+                        .any(|binding| binding.scope != WorkflowSecretScope::Node)
+                {
+                    return Err(CatalogError::Unsupported(
+                        "user, group, and realm vault secrets require a realm server".into(),
+                    ));
+                }
                 self.record(*view, protected, local_only)
             }
             AdmitStep::Record => {
