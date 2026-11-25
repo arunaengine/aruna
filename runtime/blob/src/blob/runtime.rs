@@ -662,6 +662,7 @@ impl BlobHandler {
             source_stats: Default::default(),
             read_pins: Default::default(),
             reservation_active: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            stats_locks: Arc::default(),
             part_chains: Arc::default(),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             close_lock: Arc::new(std::sync::RwLock::new(())),

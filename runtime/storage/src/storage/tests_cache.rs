@@ -11,7 +11,9 @@ use super::worker::{FjallStorage, SlowQueueAggregator};
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{AUTH_KEYSPACE, S3_BUCKET_KEYSPACE};
+use aruna_core::keyspaces::{
+    AUTH_KEYSPACE, GROUP_KEYSPACE, NODE_INFO_KEYSPACE, S3_BUCKET_KEYSPACE,
+};
 use aruna_core::structs::storage::distribution::accounting::RangeCounters;
 use aruna_core::structs::storage::usage::{BucketDelta, UsageDelta};
 use byteview::ByteView;
@@ -381,4 +383,40 @@ fn counters_drop_rows() {
         vec![row(S3_BUCKET_KEYSPACE, TOKEN)]
     );
     assert!(writer.rows(&counters(OTHER)).is_empty());
+}
+
+#[tokio::test]
+async fn group_keyspace_cached() {
+    let (_dir, handle) = open();
+    for space in [GROUP_KEYSPACE, NODE_INFO_KEYSPACE] {
+        write(&handle, space, b"stored", None).await;
+        assert_eq!(read(&handle, space, None).await, bytes(b"stored"));
+        assert_eq!(
+            cache(&handle).get(&row(space, TOKEN)),
+            Some(bytes(b"stored"))
+        );
+
+        plant(&handle, space, TOKEN, b"planted");
+        assert_eq!(read(&handle, space, None).await, bytes(b"planted"));
+
+        write(&handle, space, b"direct", None).await;
+        assert_eq!(cache(&handle).get(&row(space, TOKEN)), None);
+        assert_eq!(read(&handle, space, None).await, bytes(b"direct"));
+
+        let txn_id = start_write_transaction(&handle).await;
+        write(&handle, space, b"txn", Some(txn_id)).await;
+        assert_eq!(read(&handle, space, None).await, bytes(b"direct"));
+        commit_transaction(&handle, txn_id).await;
+        assert_eq!(cache(&handle).get(&row(space, TOKEN)), None);
+        assert_eq!(read(&handle, space, None).await, bytes(b"txn"));
+
+        let delete = StorageEffect::Delete {
+            key_space: space.to_string(),
+            key: ByteView::from(TOKEN),
+            txn_id: None,
+        };
+        handle.send_storage_effect(delete).await;
+        assert_eq!(cache(&handle).get(&row(space, TOKEN)), None);
+        assert_eq!(read(&handle, space, None).await, None);
+    }
 }

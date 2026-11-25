@@ -36,6 +36,7 @@ use crate::server::state::ServerState;
 const GRAPH_IRI_PREFIX: &str = "https://w3id.org/aruna/";
 const METADATA_PREFIX: &str = "oai_dc";
 const PAGE_SIZE: usize = 100;
+const OAI_EXPORT_CONCURRENCY: usize = 8;
 const REPOSITORY_NAME: &str = "Aruna";
 const ADMIN_EMAIL: &str = "admin@localhost";
 const OAI_PATH: &str = "/oai";
@@ -432,24 +433,29 @@ async fn list(
         "ListIdentifiers"
     };
     let mut body = format!("<{tag}>");
-    let mut emitted = 0usize;
-    let mut last_cursor = None;
-    for (cursor, record) in page.entries.iter().take(PAGE_SIZE) {
-        let rendered = if include_metadata {
-            render_record(state, ctx, realm_id, record).await?
-        } else {
-            render_header(record)
-        };
-        if body.len() + rendered.len() > budget {
-            if emitted == 0 {
-                return Err(OaiFault::Unavailable);
+    let entries = &page.entries[..page.entries.len().min(PAGE_SIZE)];
+    let (emitted, last_cursor) = if include_metadata {
+        assemble_records(entries, budget, &mut body, |record| {
+            render_record(state, ctx, realm_id, record)
+        })
+        .await?
+    } else {
+        let mut emitted = 0usize;
+        let mut last_cursor = None;
+        for (cursor, record) in entries {
+            let rendered = render_header(record);
+            if body.len() + rendered.len() > budget {
+                if emitted == 0 {
+                    return Err(OaiFault::Unavailable);
+                }
+                break;
             }
-            break;
+            body.push_str(&rendered);
+            emitted += 1;
+            last_cursor = Some(cursor.clone());
         }
-        body.push_str(&rendered);
-        emitted += 1;
-        last_cursor = Some(cursor.clone());
-    }
+        (emitted, last_cursor)
+    };
 
     // Records held back here resume at the last emitted cursor; a fully emitted
     // page resumes past the last key the scan inspected.
@@ -471,6 +477,39 @@ async fn list(
     }
     body.push_str(&format!("</{tag}>"));
     Ok(body)
+}
+
+/// Renders metadata records in bounded concurrent chunks and appends them in order until `budget`
+/// is reached; errors on records past the budget cut-off are never propagated to the current page.
+async fn assemble_records<'a, F, Fut>(
+    entries: &'a [(aruna_core::types::Key, MetadataRegistryRecord)],
+    budget: usize,
+    body: &mut String,
+    mut render: F,
+) -> Result<(usize, Option<aruna_core::types::Key>), OaiFault>
+where
+    F: FnMut(&'a MetadataRegistryRecord) -> Fut,
+    Fut: std::future::Future<Output = Result<String, OaiFault>>,
+{
+    let mut emitted = 0usize;
+    let mut last_cursor = None;
+    'chunks: for chunk in entries.chunks(OAI_EXPORT_CONCURRENCY) {
+        let rendered =
+            futures_util::future::join_all(chunk.iter().map(|(_, record)| render(record))).await;
+        for ((cursor, _), item) in chunk.iter().zip(rendered) {
+            let item = item?;
+            if body.len() + item.len() > budget {
+                if emitted == 0 {
+                    return Err(OaiFault::Unavailable);
+                }
+                break 'chunks;
+            }
+            body.push_str(&item);
+            emitted += 1;
+            last_cursor = Some(cursor.clone());
+        }
+    }
+    Ok((emitted, last_cursor))
 }
 
 /// Resolve the datestamp window and start cursor. A `resumptionToken` is

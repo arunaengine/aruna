@@ -20,6 +20,8 @@ impl AdminDocumentState {
     ) -> Result<AdminApplyStatus, AdminDocumentError> {
         match &event.op {
             AdminDocumentOperation::ConfigNodeEnsured { node_id, kind } => {
+                // A promotion replaces the add of a legacy node too, so its interval is kept.
+                self.keep_legacy_node(node_id);
                 self.apply_config_node(event, node_id, Some(node_kind_value(kind)));
                 if matches!(kind, RealmNodeKind::Server | RealmNodeKind::Management) {
                     self.record_membership(event, node_id, false);
@@ -32,6 +34,8 @@ impl AdminDocumentState {
                 if sorted.len() != cutoffs.len() || sorted.len() > MAX_CUTOFFS {
                     return Err(AdminDocumentError::InvalidCutoffs);
                 }
+                // A node added before the history was kept would otherwise lose its interval.
+                self.keep_legacy_node(node_id);
                 self.apply_config_node(event, node_id, None);
                 self.record_membership(event, node_id, true);
                 let value = serde_json::to_string(&sorted)

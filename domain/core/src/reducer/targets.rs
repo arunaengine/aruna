@@ -836,27 +836,18 @@ impl AdminDocumentState {
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
             return Vec::new();
         }
+        let events = self.membership_events();
         let mut adds = Vec::new();
         let mut removals = Vec::new();
-        let history = (self
-            .user_subject_ids
-            .range(NODE_HISTORY_PREFIX.to_string()..))
-        .take_while(|(path, _)| path.starts_with(NODE_HISTORY_PREFIX));
-        for (path, version) in history {
-            let Some(node_id) = (path.strip_prefix(NODE_HISTORY_PREFIX))
-                .and_then(|rest| rest.split_once('.'))
-                .and_then(|(node, _)| NodeId::from_str(node).ok())
-            else {
-                continue;
-            };
-            match version.value.as_deref().map(serde_json::from_str) {
-                Some(Ok(MembershipEvent::Added { dot })) => adds.push((node_id, dot)),
-                Some(Ok(MembershipEvent::Removed { dot, observed })) => {
-                    removals.push((node_id, dot, observed));
+        for (node_id, event) in &events {
+            match event {
+                MembershipEvent::Added { dot } => adds.push((*node_id, *dot)),
+                MembershipEvent::Removed { dot, observed } => {
+                    removals.push((*node_id, *dot, observed));
                 }
-                _ => {}
             }
         }
+        adds.extend(self.legacy_adds(&events));
         (adds.into_iter())
             .map(|(node_id, added)| {
                 let removed = (removals.iter())
@@ -875,6 +866,87 @@ impl AdminDocumentState {
                 }
             })
             .collect()
+    }
+
+    /// Every stored membership event with its node; an unreadable entry is skipped.
+    fn membership_events(&self) -> Vec<(NodeId, MembershipEvent)> {
+        let history = (self.user_subject_ids)
+            .range(NODE_HISTORY_PREFIX.to_string()..)
+            .take_while(|(path, _)| path.starts_with(NODE_HISTORY_PREFIX));
+        let event = |(path, version): (&String, &AdminAttributeVersion)| {
+            let node_id = (path.strip_prefix(NODE_HISTORY_PREFIX))
+                .and_then(|rest| rest.split_once('.'))
+                .and_then(|(node, _)| NodeId::from_str(node).ok())?;
+            let event = serde_json::from_str(version.value.as_deref()?).ok()?;
+            Some((node_id, event))
+        };
+        history.filter_map(event).collect()
+    }
+
+    /// The infrastructure adds the config holds without a history entry, as in a realm config
+    /// written before the history was kept. Each keeps the dot of its add.
+    fn legacy_adds(&self, events: &[(NodeId, MembershipEvent)]) -> Vec<(NodeId, AdminDocumentDot)> {
+        let recorded: BTreeSet<(NodeId, AdminDocumentDot)> = (events.iter())
+            .filter_map(|(node_id, event)| match event {
+                MembershipEvent::Added { dot } => Some((*node_id, *dot)),
+                MembershipEvent::Removed { .. } => None,
+            })
+            .collect();
+        let mut legacy = Vec::new();
+        for (node_id, kind) in self.materialized_config_nodes() {
+            if !matches!(kind, RealmNodeKind::Server | RealmNodeKind::Management) {
+                continue;
+            }
+            let path = config_node_path(&node_id);
+            let Some(version) = self.user_subject_ids.get(&path) else {
+                continue;
+            };
+            let equivalent = self.equivalent_value_dots.get(&path).into_iter().flatten();
+            for dot in std::iter::once(&version.dot).chain(equivalent) {
+                if !recorded.contains(&(node_id, *dot)) {
+                    legacy.push((node_id, *dot));
+                }
+            }
+        }
+        legacy
+    }
+
+    /// Stores the history entry of every legacy add as its add event would have, so each node
+    /// and each rerun writes the same entries once. Answers how many it wrote.
+    pub fn keep_legacy_history(&mut self) -> usize {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return 0;
+        }
+        let legacy = self.legacy_adds(&self.membership_events());
+        let kept = legacy
+            .into_iter()
+            .filter(|(node_id, dot)| self.keep_legacy_add(node_id, *dot));
+        kept.count()
+    }
+
+    /// Keeps the legacy add of `node_id` before a removal or a new kind replaces the add.
+    pub(super) fn keep_legacy_node(&mut self, node_id: &NodeId) {
+        let legacy = self.legacy_adds(&self.membership_events());
+        for (_, dot) in legacy
+            .iter()
+            .filter(|(legacy_node, _)| legacy_node == node_id)
+        {
+            self.keep_legacy_add(node_id, *dot);
+        }
+    }
+
+    fn keep_legacy_add(&mut self, node_id: &NodeId, dot: AdminDocumentDot) -> bool {
+        let Ok(value) = serde_json::to_string(&MembershipEvent::Added { dot }) else {
+            return false;
+        };
+        // The path the add event writes since the history is kept, so the entry is the same.
+        let path = node_history_path(node_id, dot.event_id);
+        let version = AdminAttributeVersion {
+            value: Some(value),
+            dot,
+        };
+        self.user_subject_ids.insert(path, version);
+        true
     }
 }
 

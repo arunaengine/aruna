@@ -268,6 +268,10 @@ impl FjallStorage {
     }
 
     pub(super) fn note_deletes(&mut self, key_space: &str, count: u64) {
+        if count == 0 {
+            return;
+        }
+        self.compactor.note_deleted(key_space);
         let total = self.deletes.entry(key_space.to_string()).or_default();
         *total += count;
         if *total < DELETE_THRESHOLD {

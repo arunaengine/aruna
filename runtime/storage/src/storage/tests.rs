@@ -2375,6 +2375,144 @@ fn deletes_below_threshold() {
 }
 
 #[test]
+fn slow_scan_compacts() {
+    let dir = tempdir().unwrap();
+    let (handle, _receivers) = StorageHandle::new();
+    let mut storage = worker(&dir, &handle);
+    let jobs = stub_compactor(&mut storage);
+    let keyspace = storage.store.resolve_keyspace("node_stats").unwrap();
+    let compactor = storage.compactor.handle();
+
+    let empty = StorageEvent::IterResult {
+        values: Vec::new(),
+        next_start_after: None,
+    };
+    let fast = std::time::Duration::from_millis(10);
+    let slow = std::time::Duration::from_millis(250);
+    super::worker::compact_slow_scan(
+        &storage.store,
+        &compactor,
+        true,
+        Some("node_stats"),
+        slow,
+        &empty,
+    );
+    assert!(jobs.try_recv().is_err(), "empty keyspaces do not compact");
+
+    // Flush > 1 MiB of non-compressible bytes so the keyspace holds an SSTable on disk.
+    let mut payload = vec![0u8; 4096];
+    for index in 0..320u32 {
+        for (offset, byte) in payload.iter_mut().enumerate() {
+            *byte = ((index as usize).wrapping_mul(31) ^ offset.wrapping_mul(17)) as u8;
+        }
+        keyspace
+            .insert(format!("k-{index:04}"), payload.as_slice())
+            .unwrap();
+    }
+    keyspace.inner().rotate_memtable_and_wait().unwrap();
+    assert!(keyspace.inner().disk_space() >= crate::compaction::MIN_SCAN_BYTES);
+
+    // Without observed deletes, even a slow empty scan must not schedule major compaction.
+    super::worker::compact_slow_scan(
+        &storage.store,
+        &compactor,
+        true,
+        Some("node_stats"),
+        slow,
+        &empty,
+    );
+    assert!(
+        jobs.try_recv().is_err(),
+        "keyspaces with zero observed deletes do not compact"
+    );
+
+    // Record a committed delete on this keyspace.
+    storage.note_deletes("node_stats", 1);
+
+    // `Last` is never a range/prefix scan and must never trigger slow-scan compaction.
+    assert!(!super::worker::is_scan_effect(&StorageEffect::Last {
+        key_space: "node_stats".to_string(),
+        prefix: None,
+        txn_id: None,
+    }));
+    assert!(super::worker::is_scan_effect(&StorageEffect::Iter {
+        key_space: "node_stats".to_string(),
+        prefix: None,
+        start: None,
+        limit: 1,
+        txn_id: None,
+    }));
+    super::worker::compact_slow_scan(
+        &storage.store,
+        &compactor,
+        false,
+        Some("node_stats"),
+        slow,
+        &empty,
+    );
+    assert!(
+        jobs.try_recv().is_err(),
+        "Last reads must never trigger slow-scan compaction"
+    );
+
+    super::worker::compact_slow_scan(
+        &storage.store,
+        &compactor,
+        true,
+        Some("node_stats"),
+        fast,
+        &empty,
+    );
+    assert!(jobs.try_recv().is_err(), "fast scans do not compact");
+
+    let multi = StorageEvent::IterResult {
+        values: vec![
+            (b"a".as_slice().into(), b"1".as_slice().into()),
+            (b"b".as_slice().into(), b"2".as_slice().into()),
+        ],
+        next_start_after: None,
+    };
+    super::worker::compact_slow_scan(
+        &storage.store,
+        &compactor,
+        true,
+        Some("node_stats"),
+        slow,
+        &multi,
+    );
+    assert!(jobs.try_recv().is_err(), "multi-row scans do not compact");
+
+    super::worker::compact_slow_scan(
+        &storage.store,
+        &compactor,
+        true,
+        Some("node_stats"),
+        slow,
+        &empty,
+    );
+    let job = jobs
+        .try_recv()
+        .expect("slow empty scan after delete queues compaction");
+    assert_eq!(job.key_space, "node_stats");
+
+    // Once compaction runs and clears the delete flag, another slow scan without new deletes
+    // does not re-queue compaction.
+    crate::compaction::run_job(job, &storage.compactor.active, &storage.compactor.deleted);
+    super::worker::compact_slow_scan(
+        &storage.store,
+        &compactor,
+        true,
+        Some("node_stats"),
+        slow,
+        &empty,
+    );
+    assert!(
+        jobs.try_recv().is_err(),
+        "compacted keyspace with no new deletes does not re-compact"
+    );
+}
+
+#[test]
 fn deletes_cross_threshold() {
     let dir = tempdir().unwrap();
     let (handle, _receivers) = StorageHandle::new();
@@ -2388,17 +2526,23 @@ fn deletes_cross_threshold() {
     assert_eq!(job.deletes, crate::compaction::DELETE_THRESHOLD);
     assert_eq!(storage.deletes.get("dht_meta_v2").copied(), Some(0));
     let active = storage.compactor.active.clone();
+    let deleted = storage.compactor.deleted.clone();
     crate::compaction::run_job(
         crate::compaction::CompactionJob {
             key_space: job.key_space,
             deletes: job.deletes,
+            require_deletes: job.require_deletes,
             run: Box::new(move || {
                 (job.run)().expect("keyspace compacts");
                 storage.process_effect(delete_batch(crate::compaction::DELETE_THRESHOLD));
                 let successor = jobs.try_recv().expect("successor is queued");
                 storage.process_effect(delete_batch(crate::compaction::DELETE_THRESHOLD));
                 assert!(jobs.try_recv().is_err(), "only one successor is queued");
-                crate::compaction::run_job(successor, &storage.compactor.active);
+                crate::compaction::run_job(
+                    successor,
+                    &storage.compactor.active,
+                    &storage.compactor.deleted,
+                );
                 assert!(
                     storage
                         .compactor
@@ -2411,6 +2555,7 @@ fn deletes_cross_threshold() {
             }),
         },
         &active,
+        &deleted,
     );
 }
 
@@ -2425,7 +2570,11 @@ fn compactions_handed_on() {
 
     storage.process_effect(delete_batch(crate::compaction::DELETE_THRESHOLD));
     let job = jobs.try_recv().expect("compaction is queued");
-    crate::compaction::run_job(job, &storage.compactor.active.clone());
+    crate::compaction::run_job(
+        job,
+        &storage.compactor.active.clone(),
+        &storage.compactor.deleted.clone(),
+    );
     storage.process_effect(delete_batch(crate::compaction::DELETE_THRESHOLD));
 
     let next = jobs.try_recv().expect("the next compaction is handed on");
@@ -2753,4 +2902,84 @@ async fn sweep_drops_journals() {
     storage.compactor.sweep(db.clone());
     (jobs.try_recv().expect("sweep is queued").run)().unwrap();
     first_dropped(dir.path()).await;
+}
+
+#[test]
+fn read_pool_clamped() {
+    assert_eq!(super::worker::scale_read_pool(1), 4);
+    assert_eq!(super::worker::scale_read_pool(4), 4);
+    assert_eq!(super::worker::scale_read_pool(8), 8);
+    assert_eq!(super::worker::scale_read_pool(16), 16);
+    assert_eq!(super::worker::scale_read_pool(64), 16);
+}
+
+#[tokio::test]
+async fn batch_read_mixed() {
+    let dir = tempdir().unwrap();
+    let handle = FjallStorage::open_test(dir.path().to_str().unwrap()).unwrap();
+    let mut writes = Vec::new();
+    for index in 0..320usize {
+        let key = ByteView::from(format!("k-{index:04}"));
+        let value = ByteView::from(format!("v-{index:04}"));
+        let space = if index % 2 == 0 { "alpha" } else { "beta" };
+        writes.push((space.to_string(), key, value));
+    }
+    let event = handle
+        .send_storage_effect(StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        })
+        .await;
+    assert!(matches!(
+        event,
+        Event::Storage(StorageEvent::BatchWriteResult { .. })
+    ));
+
+    let single: Vec<_> = (0..320usize)
+        .step_by(2)
+        .map(|index| ("alpha".to_string(), ByteView::from(format!("k-{index:04}"))))
+        .collect();
+    let Event::Storage(StorageEvent::BatchReadResult { values }) = handle
+        .send_storage_effect(StorageEffect::BatchRead {
+            reads: single,
+            txn_id: None,
+        })
+        .await
+    else {
+        panic!("expected single-keyspace batch read");
+    };
+    assert_eq!(values.len(), 160);
+    assert_eq!(values[0].1, Some(ByteView::from("v-0000")));
+    assert_eq!(values[159].1, Some(ByteView::from("v-0318")));
+
+    let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = handle
+        .send_storage_effect(StorageEffect::StartTransaction { read: true })
+        .await
+    else {
+        panic!("expected read transaction");
+    };
+    let mixed = vec![
+        ("alpha".to_string(), ByteView::from("k-0000")),
+        ("missing".to_string(), ByteView::from("k-0000")),
+        ("beta".to_string(), ByteView::from("k-0001")),
+        ("alpha".to_string(), ByteView::from("k-9999")),
+    ];
+    let Event::Storage(StorageEvent::BatchReadResult { values }) = handle
+        .send_storage_effect(StorageEffect::BatchRead {
+            reads: mixed,
+            txn_id: Some(txn_id),
+        })
+        .await
+    else {
+        panic!("expected mixed-keyspace batch read");
+    };
+    assert_eq!(
+        values,
+        vec![
+            (ByteView::from("k-0000"), Some(ByteView::from("v-0000"))),
+            (ByteView::from("k-0000"), None),
+            (ByteView::from("k-0001"), Some(ByteView::from("v-0001"))),
+            (ByteView::from("k-9999"), None),
+        ]
+    );
 }

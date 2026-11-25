@@ -693,7 +693,8 @@ pub(super) fn materialization_failure_kind(
             | MetadataError::TaskJoin(_)
             | MetadataError::HandleMissing
             | MetadataError::Persist(_)
-            | MetadataError::Storage(_),
+            | MetadataError::Storage(_)
+            | MetadataError::LocalUnavailable(_),
         ) => MaterializationFailureKind::Transient,
         _ => MaterializationFailureKind::Application,
     }

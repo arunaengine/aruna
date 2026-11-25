@@ -683,7 +683,8 @@ mod tests {
         };
         assert_eq!(child.start().len(), 1, "the projection reads its cache");
         let error = StorageError::TransactionConflict;
-        let effects = child.step(Event::Storage(StorageEvent::Error { error }));
+        let read = Ok::<_, IoError>(StorageEvent::Error { error });
+        let effects = child.step(Event::Child(ChildOutcome::new(read)));
         assert!(
             matches!(effects.as_slice(), [Effect::Delay(_)]),
             "{effects:?}"

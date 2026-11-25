@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound::{self, Excluded, Included, Unbounded};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -32,7 +32,7 @@ use super::persistence::FjallPersistPolicy;
 use super::records::run_read;
 use super::telemetry::{storage_effect_kind, storage_event_kind};
 use super::transactions::PendingChanges;
-use crate::compaction::Compactor;
+use crate::compaction::{Compactor, CompactorHandle};
 
 /// An open transaction; a read pool thread holds a clone while it reads in it.
 #[derive(Clone)]
@@ -97,27 +97,36 @@ pub(super) fn effect_keyspace(effect: &StorageEffect) -> Option<&str> {
     }
 }
 const STORAGE_EFFECT_THRESHOLD: Duration = Duration::from_millis(50);
+const SLOW_SCAN_THRESHOLD: Duration = Duration::from_millis(200);
 const QUEUE_LOG_INTERVAL: Duration = Duration::from_secs(1);
 pub(super) const MAX_GROUP_COMMIT: usize = 256;
 pub(super) const READ_POOL_THREADS: usize = 4;
+pub(super) const READ_POOL_MAX: usize = 16;
 pub(super) const BULK_POOL_THREADS: usize = 2;
-/// Point reads on a network disk wait on its latency, so a batch of more than `READ_CHUNK`
-/// keys is read by up to `READ_THREADS` threads at once.
+/// Batches larger than this read on the bulk pool so small foreground reads never wait behind them.
 const READ_CHUNK: usize = 256;
-const READ_THREADS: usize = 8;
 // Count foreground effects so large batches cannot starve the bulk lane under load.
 pub(super) const FOREGROUND_PER_BULK: usize = 8;
+
+pub(super) fn scale_read_pool(cpus: usize) -> usize {
+    cpus.clamp(READ_POOL_THREADS, READ_POOL_MAX)
+}
+
+pub(super) fn read_pool_threads() -> usize {
+    scale_read_pool(thread::available_parallelism().map_or(READ_POOL_THREADS, usize::from))
+}
+
 #[derive(Clone)]
 pub(super) struct Store {
     pub(super) db: OptimisticTxDatabase,
-    pub(super) keyspaces: Arc<Mutex<HashMap<String, OptimisticTxKeyspace>>>,
+    pub(super) keyspaces: Arc<RwLock<HashMap<String, OptimisticTxKeyspace>>>,
 }
 
 impl Store {
     pub(super) fn new(db: OptimisticTxDatabase) -> Self {
         Self {
             db,
-            keyspaces: Arc::new(Mutex::new(HashMap::new())),
+            keyspaces: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -127,8 +136,8 @@ impl Store {
     ) -> Result<OptimisticTxKeyspace, StorageError> {
         if let Some(ks) = self
             .keyspaces
-            .lock()
-            .expect("storage keyspace cache mutex poisoned")
+            .read()
+            .expect("storage keyspace cache lock poisoned")
             .get(name)
         {
             return Ok(ks.clone());
@@ -138,8 +147,8 @@ impl Store {
             Ok(ks) => {
                 let mut keyspaces = self
                     .keyspaces
-                    .lock()
-                    .expect("storage keyspace cache mutex poisoned");
+                    .write()
+                    .expect("storage keyspace cache lock poisoned");
                 Ok(keyspaces
                     .entry(name.to_string())
                     .or_insert_with(|| ks.clone())
@@ -154,12 +163,15 @@ impl Store {
         &self,
         name: &str,
     ) -> Result<Option<OptimisticTxKeyspace>, StorageError> {
-        let cached = self
+        if let Some(ks) = self
             .keyspaces
-            .lock()
-            .expect("storage keyspace cache mutex poisoned")
-            .contains_key(name);
-        match cached || self.db.keyspace_exists(name) {
+            .read()
+            .expect("storage keyspace cache lock poisoned")
+            .get(name)
+        {
+            return Ok(Some(ks.clone()));
+        }
+        match self.db.keyspace_exists(name) {
             true => self.resolve_keyspace(name).map(Some),
             false => Ok(None),
         }
@@ -525,6 +537,7 @@ impl FjallStorage {
         let (effect, mut response_tx, span, enqueued_at, in_flight) = item;
         let _guard = span.enter();
         let operation = storage_effect_kind(&effect);
+        let is_scan = is_scan_effect(&effect);
         let key_space = effect_keyspace(&effect).map(str::to_string);
         let cleanup = cleanup_effect(&effect);
         let queue_wait = enqueued_at.elapsed();
@@ -564,6 +577,14 @@ impl FjallStorage {
             queue_wait,
             service_elapsed,
             result,
+        );
+        compact_slow_scan(
+            &self.store,
+            &self.compactor.handle(),
+            is_scan,
+            key_space.as_deref(),
+            service_elapsed,
+            &event,
         );
         drop(in_flight);
         Self::deliver_response(response_tx, event, operation, result);
@@ -794,30 +815,13 @@ pub(super) fn store_read(
     }
 }
 
-pub(super) fn batch_read_with<R: Readable + Sync>(
+pub(super) fn batch_read_with<R: Readable>(
     store: &Store,
     reader: &R,
     reads: Vec<(String, ByteView)>,
     create: bool,
 ) -> StorageEvent {
-    let chunk = reads.len().div_ceil(READ_THREADS).max(READ_CHUNK);
-    let values = match reads.len() > chunk {
-        false => read_keys(store, reader, &reads, create),
-        true => thread::scope(|scope| {
-            let parts: Vec<_> = (reads.chunks(chunk))
-                .map(|part| scope.spawn(move || read_keys(store, reader, part, create)))
-                .collect();
-            let mut values = Vec::with_capacity(reads.len());
-            for part in parts {
-                let part = part
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-                values.extend(part?);
-            }
-            Ok(values)
-        }),
-    };
-    match values {
+    match read_keys(store, reader, &reads, create) {
         Ok(values) => StorageEvent::BatchReadResult { values },
         Err(error) => StorageEvent::Error { error },
     }
@@ -829,17 +833,36 @@ fn read_keys<R: Readable>(
     reads: &[(String, ByteView)],
     create: bool,
 ) -> Result<Vec<(ByteView, Option<ByteView>)>, StorageError> {
+    let mut resolved: HashMap<&str, Option<OptimisticTxKeyspace>> = HashMap::new();
+    for (key_space, _) in reads {
+        if let std::collections::hash_map::Entry::Vacant(slot) = resolved.entry(key_space.as_str())
+        {
+            let keyspace = match create {
+                true => store.resolve_keyspace(key_space).map(Some),
+                false => store.existing_keyspace(key_space),
+            }?;
+            slot.insert(keyspace);
+        }
+    }
     let mut values = Vec::with_capacity(reads.len());
+    if resolved.len() == 1 {
+        let keyspace = resolved.values().next().and_then(Option::as_ref);
+        for (_, key) in reads {
+            let value = match keyspace {
+                Some(keyspace) => reader.get(keyspace, key),
+                None => Ok(None),
+            }
+            .map_err(|error| StorageError::ReadError(error.to_string()))?;
+            values.push((key.clone(), value.map(Into::into)));
+        }
+        return Ok(values);
+    }
     for (key_space, key) in reads {
-        let keyspace = match create {
-            true => store.resolve_keyspace(key_space).map(Some),
-            false => store.existing_keyspace(key_space),
-        }?;
-        let value = match keyspace {
-            Some(keyspace) => reader.get(&keyspace, key),
+        let value = match resolved.get(key_space.as_str()).and_then(Option::as_ref) {
+            Some(keyspace) => reader.get(keyspace, key),
             None => Ok(None),
-        };
-        let value = value.map_err(|error| StorageError::ReadError(error.to_string()))?;
+        }
+        .map_err(|error| StorageError::ReadError(error.to_string()))?;
         values.push((key.clone(), value.map(Into::into)));
     }
     Ok(values)
@@ -1193,28 +1216,68 @@ fn reject_bulk_read(item: EffectHandle) {
     });
 }
 
+pub(super) fn is_scan_effect(effect: &StorageEffect) -> bool {
+    matches!(
+        effect,
+        StorageEffect::Iter { .. } | StorageEffect::IterRange { .. }
+    )
+}
+
+pub(super) fn compact_slow_scan(
+    store: &Store,
+    compactor: &CompactorHandle,
+    is_scan: bool,
+    key_space: Option<&str>,
+    elapsed: Duration,
+    event: &StorageEvent,
+) {
+    if !is_scan || elapsed < SLOW_SCAN_THRESHOLD {
+        return;
+    }
+    let StorageEvent::IterResult { values, .. } = event else {
+        return;
+    };
+    if values.len() > 1 {
+        return;
+    }
+    let Some(name) = key_space else {
+        return;
+    };
+    if !compactor.has_deletes(name) {
+        return;
+    }
+    if let Ok(Some(keyspace)) = store.existing_keyspace(name) {
+        let inner = keyspace.inner();
+        if crate::compaction::scan_compactable(inner.disk_space(), inner.table_count()) {
+            compactor.submit_scan(name, store.db.clone(), keyspace);
+        }
+    }
+}
+
 pub(super) fn spawn_read_pool(
     store: Store,
+    compactor: CompactorHandle,
     threads: usize,
     capacity: usize,
 ) -> (PoolSender, Vec<thread::JoinHandle<()>>) {
     let (sender, receiver) = mpmc::bounded_blocking(capacity);
     let handles = (0..threads)
         .map(|_| {
-            let (store, receiver) = (store.clone(), receiver.clone());
-            thread::spawn(move || read_pool_loop(store, receiver))
+            let (store, compactor, receiver) = (store.clone(), compactor.clone(), receiver.clone());
+            thread::spawn(move || read_pool_loop(store, compactor, receiver))
         })
         .collect();
     (sender, handles)
 }
 
-fn read_pool_loop(store: Store, receiver: PoolReceiver) {
+fn read_pool_loop(store: Store, compactor: CompactorHandle, receiver: PoolReceiver) {
     while let Ok(((effect, response_tx, span, enqueued_at, in_flight), txn)) = receiver.recv() {
         let _guard = span.enter();
         if response_tx.is_closed() {
             continue;
         }
         let operation = storage_effect_kind(&effect);
+        let is_scan = is_scan_effect(&effect);
         let key_space = effect_keyspace(&effect).map(str::to_string);
         let queue_wait = enqueued_at.elapsed();
         let service_started = Instant::now();
@@ -1236,6 +1299,14 @@ fn read_pool_loop(store: Store, receiver: PoolReceiver) {
                 "Slow storage read"
             );
         }
+        compact_slow_scan(
+            &store,
+            &compactor,
+            is_scan,
+            key_space.as_deref(),
+            service_elapsed,
+            &event,
+        );
         drop(in_flight);
         let _ = response_tx.send(event);
     }

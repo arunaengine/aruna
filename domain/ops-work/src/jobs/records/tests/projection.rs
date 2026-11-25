@@ -3,8 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::events::StorageEvent;
 use aruna_core::keyspaces::{FAMILY_PROJECTION_KEYSPACE, JOB_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::family::{
@@ -58,6 +57,16 @@ impl Run {
 /// Answers one projection's calls: `rows` are the stored family records, `cache` the stored
 /// cache row, and `local` the job row every alias read answers with.
 fn run(family: &Family, rows: &[(Key, Value)], cache: Option<Value>, local: Option<Value>) -> Run {
+    run_fenced(family, rows, [cache.clone(), cache], local)
+}
+
+/// As `run`, with the cache row the read outside and the read inside the transaction find.
+fn run_fenced(
+    family: &Family,
+    rows: &[(Key, Value)],
+    [cache, inside]: [Option<Value>; 2],
+    local: Option<Value>,
+) -> Run {
     let mut operation = ProjectFamilyOperation::new(ProjectFamilyConfig {
         family: FamilyRef::Family(family.family()),
         now_ms: 3_100,
@@ -76,15 +85,15 @@ fn run(family: &Family, rows: &[(Key, Value)], cache: Option<Value>, local: Opti
             Err(error) => break Err(error),
         };
         let result = match call {
-            IoCall::Effect(effect) => match *effect {
-                Effect::Storage(StorageEffect::Read { key, .. }) => {
-                    IoResult::Event(Box::new(Event::Storage(StorageEvent::ReadResult {
-                        key,
-                        value: cache.clone(),
-                    })))
-                }
-                other => panic!("unexpected effect: {other:?}"),
-            },
+            // The cache is read by a child outside the transaction.
+            IoCall::Child(_) => {
+                let read = StorageEvent::ReadResult {
+                    key: Key::from(Vec::new()),
+                    value: cache.clone(),
+                };
+                let outcome = Ok::<_, aruna_core::calls::IoError>(read);
+                IoResult::Child(aruna_core::calls::ChildOutcome::new(outcome))
+            }
             IoCall::Page { limit, .. } => {
                 let page: Vec<(Key, Value)> =
                     rows.iter().skip(offset).take(limit).cloned().collect();
@@ -93,6 +102,14 @@ fn run(family: &Family, rows: &[(Key, Value)], cache: Option<Value>, local: Opti
                     rows: page,
                     next: None,
                 }
+            }
+            // The rebuild reads the cache again in its transaction.
+            IoCall::Read(reads)
+                if reads
+                    .first()
+                    .is_some_and(|(space, _)| space == FAMILY_PROJECTION_KEYSPACE) =>
+            {
+                IoResult::Values(vec![inside.clone()])
             }
             IoCall::Read(reads) => {
                 bridged = true;
@@ -270,6 +287,35 @@ fn old_version_rebuilds() {
 }
 
 #[test]
+fn rechecks_cache_revision() {
+    // A rebuild reads the cache again in its transaction: one another rebuild published since
+    // the read outside answers as it is, and a newer stale one sets the revision that follows.
+    let family = Family::new([7u8; 32]);
+    let records = family.run(1, 0, PhysicalExecutionState::Succeeded);
+    let stored = rows(&records, records.len());
+    let stale = |revision| ProjectionCache {
+        revision,
+        ..ProjectionCache::invalidated(None)
+    };
+    let published = ProjectionCache {
+        revision: 4,
+        stale: false,
+        projection: reduce_family(family.family(), &records).expect("records reduce"),
+        ..stale(4)
+    };
+    let caches = [Some(encoded(&stale(3))), Some(encoded(&published))];
+    let fresh = run_fenced(&family, &stored, caches, None);
+    assert!(fresh.projected().cached);
+    assert_eq!(fresh.projected().revision, 4);
+    assert!(fresh.writes.is_empty());
+
+    let caches = [Some(encoded(&stale(3))), Some(encoded(&stale(4)))];
+    let rebuilt = run_fenced(&family, &stored, caches, None);
+    assert_eq!(rebuilt.cache_row().expect("cache row written").revision, 5);
+    assert_eq!(rebuilt.projected().revision, 5);
+}
+
+#[test]
 fn reads_cache_outside() {
     // The cache read is a plain storage effect, so a fresh cache opens no transaction.
     let family = Family::new([6u8; 32]);
@@ -282,10 +328,10 @@ fn reads_cache_outside() {
         operation.transaction(),
         aruna_core::operation::TransactionMode::Write
     );
+    // A child reads the cache, so the projection's transaction does not start with it.
     assert!(matches!(
         operation.first(),
-        Ok(Next::Call(IoCall::Effect(effect)))
-            if matches!(*effect, Effect::Storage(StorageEffect::Read { txn_id: None, .. }))
+        Ok(Next::Call(IoCall::Child(_)))
     ));
     assert!(matches!(
         operation.next(IoResult::Done),

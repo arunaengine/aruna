@@ -5,8 +5,9 @@
 use ulid::Ulid;
 
 use super::super::fixtures::{
-    actor, batch_event, check_plan, checked, child, config_target, config_topic, failed, node,
-    realm, run_event, signature, single_event, snapshot_event, wrapped,
+    actor, batch_event, check_plan, checked, child, config_target, config_topic, failed,
+    info_target, info_upsert, info_upsert_epoch, node, realm, run_event, signature, single_event,
+    snapshot_event, wrapped,
 };
 use super::*;
 use crate::calls::IoError;
@@ -224,6 +225,79 @@ fn keeps_given_rejections() {
     let mut batch =
         ApplyBatchOperation::new(config_topic(), realm(), Vec::new(), vec![rejection.clone()]);
     assert_eq!(done(batch.first()).rejections, vec![rejection]);
+}
+
+// A newer heartbeat that applied drops the decode rejection of an earlier one from the same
+// batch before its evidence is written; a policy refusal stays, and so does all of it when the
+// heartbeat changed nothing.
+#[test]
+fn drops_obsolete_rejections() {
+    let decode = "invalid node info document: Found a bool that wasn't 0 or 1";
+    let policy = "shard publisher is outside the current holder set";
+    let rejected = |seq: u64, reason: &str| {
+        let (identity, event) = info_upsert(seq, node());
+        SyncRejection::new(identity, event, reason)
+    };
+    let given = vec![rejected(3, decode), rejected(4, policy)];
+    let (identity, event) = info_upsert(5, node());
+    let heartbeat = BatchEvent {
+        event,
+        actor: identity.actor,
+        actor_seq: identity.actor_seq,
+        publisher_allowed: true,
+    };
+    for (applied, kept) in [(true, 1), (false, 2)] {
+        let topic = identity.topic;
+        let events = vec![heartbeat.clone()];
+        let mut batch = ApplyBatchOperation::new(topic, realm(), events, given.clone());
+        assert!(matches!(batch.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let outcome = ApplyOutcome::Applied {
+            target: info_target(node()),
+            tombstone: None,
+            git_document: None,
+        };
+        let cleanup = batch.next(child(outcome));
+        assert!(matches!(cleanup, Ok(Next::Call(IoCall::Child(_)))));
+        let outcome = done(batch.next(child(applied)));
+        assert_eq!(outcome.rejections.len(), kept);
+        assert_eq!(outcome.rejections.last(), given.last());
+    }
+
+    // A byte-identical replay at a higher sequence keeps a newer-epoch pending rejection.
+    use crate::structs::storage::node_info::AdvertisementEpoch;
+    let epoch = |step| AdvertisementEpoch {
+        membership_generation: 1,
+        publisher_generation: step,
+        observed_at_ms: step,
+    };
+    let (newer_id, newer_event) = info_upsert_epoch(3, node(), epoch(10));
+    let newer_rej = SyncRejection::new(newer_id, newer_event, decode);
+    let (mut replay_id, replay_event) = info_upsert_epoch(1, node(), epoch(5));
+    replay_id.actor_seq = 5;
+    let replay = BatchEvent {
+        event: replay_event,
+        actor: replay_id.actor,
+        actor_seq: replay_id.actor_seq,
+        publisher_allowed: true,
+    };
+    let mut batch = ApplyBatchOperation::new(
+        replay_id.topic,
+        realm(),
+        vec![replay],
+        vec![newer_rej.clone()],
+    );
+    assert!(matches!(batch.first(), Ok(Next::Call(IoCall::Child(_)))));
+    let outcome = ApplyOutcome::Applied {
+        target: info_target(node()),
+        tombstone: None,
+        git_document: None,
+    };
+    assert!(matches!(
+        batch.next(child(outcome)),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    let outcome = done(batch.next(child(true)));
+    assert_eq!(outcome.rejections, vec![newer_rej]);
 }
 
 #[test]

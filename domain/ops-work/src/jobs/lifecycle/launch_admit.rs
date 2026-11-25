@@ -6,6 +6,7 @@
 use std::time::Duration;
 
 use aruna_core::admin_documents::AdminDocumentClock;
+use aruna_core::backoff::conflict_backoff;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::{ExecutorCapability, ResourceEnvelope};
 use aruna_core::effects::{
@@ -64,8 +65,8 @@ use aruna_ops_identity::secrets::owner::WriterView;
 /// Wall-clock budget of the record fetch that pulls a missing stored spec.
 const FETCH_DEADLINE: Duration = Duration::from_secs(10);
 /// Reservation attempts one offer makes while no commit of its own became
-/// durable: a lost race or a write storage never accepted.
-pub(crate) const RESERVE_ATTEMPTS: u32 = 3;
+/// durable: a lost race or a write storage never accepted. Each retry waits a jittered backoff.
+pub(crate) const RESERVE_ATTEMPTS: u32 = 6;
 
 /// An admitted receipt or the reason the offer was refused.
 pub(crate) type LaunchDecision = Result<ReceiptFrame, LaunchDecline>;
@@ -204,6 +205,8 @@ pub(crate) fn classify(error: &LifecycleError) -> CommitVerdict {
 #[derive(Debug, PartialEq)]
 enum CommitStep {
     Reserve,
+    /// Waits before the next reservation attempt, so launches racing on this node spread out.
+    Backoff,
     Receipts(CommitVerdict),
     Settle,
 }
@@ -239,6 +242,20 @@ impl CommitReceiptOperation {
         self.step = CommitStep::Reserve;
         let reserve = ReserveExecutionOperation::new(self.config.clone());
         Ok(Next::Call(IoCall::child(reserve)))
+    }
+
+    /// The next reservation attempt after a jittered backoff; none is left after the last one.
+    fn reserve_later(&mut self) -> CommitNext {
+        if self.attempt >= RESERVE_ATTEMPTS {
+            return Err(LaunchUndecided);
+        }
+        self.step = CommitStep::Backoff;
+        let seed = self.config.execution_id.to_bytes();
+        let attempt = usize::try_from(self.attempt.saturating_sub(1)).unwrap_or(usize::MAX);
+        Ok(Next::Call(IoCall::Delay(conflict_backoff(
+            attempt,
+            &seed[8..],
+        ))))
     }
 
     fn settle(&mut self, decision: LaunchDecision) -> CommitNext {
@@ -277,7 +294,7 @@ impl CommitReceiptOperation {
                     attempt = self.attempt,
                     "Storage refused the reservation write; retrying"
                 );
-                self.reserve()
+                self.reserve_later()
             }
             CommitVerdict::Uncertain => {
                 warn!(error = %error, "Execution commit outcome is unknown; reconciling");
@@ -307,7 +324,7 @@ impl CommitReceiptOperation {
                     attempt = self.attempt,
                     "Execution reservation lost a race and retries"
                 );
-                self.reserve()
+                self.reserve_later()
             }
             None => Err(LaunchUndecided),
         }
@@ -328,6 +345,14 @@ impl Operation for CommitReceiptOperation {
                 let reserved = result.child::<Ulid, LifecycleError>()?;
                 self.reserved(reserved)
             }
+            CommitStep::Backoff => match result {
+                IoResult::Woke => self.reserve(),
+                other => Err(IoError::Unexpected {
+                    expected: "IoResult::Woke",
+                    got: other.label(),
+                }
+                .into()),
+            },
             CommitStep::Receipts(verdict) => self.receipts(verdict, result),
             CommitStep::Settle => {
                 let answer = result.child::<LaunchAnswer, LaunchUndecided>()??;
@@ -384,8 +409,7 @@ impl PullFamilyOperation {
             return Ok(Next::Done(()));
         };
         self.step = PullStep::Append(frames);
-        let append = self.node.append(frame, self.origin);
-        Ok(Next::Call(IoCall::child(append)))
+        Ok(Next::Call(self.node.append(frame, self.origin)))
     }
 }
 
@@ -492,15 +516,18 @@ pub struct LaunchNode {
 }
 
 impl LaunchNode {
-    fn append(&self, record: JobRecordFrame, origin: RecordOrigin) -> AppendRecordOperation {
-        AppendRecordOperation::new(AppendRecordConfig {
+    /// The append of `record`; a lost commit conflict appends again after a short backoff.
+    fn append(&self, record: JobRecordFrame, origin: RecordOrigin) -> IoCall {
+        let seed = record.envelope().digest().unwrap_or_default();
+        let config = AppendRecordConfig {
             realm_id: self.realm_id,
             local_node_id: self.local,
             record,
             local: None,
             origin,
             now_ms: self.now_ms,
-        })
+        };
+        IoCall::retry_with(move || AppendRecordOperation::new(config.clone()), &seed)
     }
 }
 
@@ -643,7 +670,7 @@ impl AdmitLaunchOperation {
             JobRecordFrame::new(self.launch.envelope().clone()).map_err(|_| LaunchUndecided);
         let origin = RecordOrigin::Peer(self.intent()?.scheduler_node_id);
         let append = self.node.append(frame?, origin);
-        self.call(AdmitStep::Append { retried }, IoCall::child(append))
+        self.call(AdmitStep::Append { retried }, append)
     }
 
     fn decide(&mut self, records: Vec<JobRecordEnvelope>) -> AdmitNext {
@@ -673,11 +700,22 @@ impl AdmitLaunchOperation {
     /// A launch binds the target's membership interval the scheduler saw; an interval that
     /// closed since then never accepts it, also after the target was added again.
     fn bound(&mut self, view: WriterView) -> AdmitNext {
-        let cited = &self.intent()?.config_clock;
+        let (family, intent) = (self.family(), self.intent()?);
+        let (launch_id, cited) = (intent.launch_id, &intent.config_clock);
         match membership(self.node.local, cited, &view.intervals, &view.clock) {
             Membership::Open => self.clock = view.clock,
-            Membership::Unknown => return Err(LaunchUndecided),
-            Membership::Left | Membership::Absent => {
+            Membership::Unknown => {
+                debug!(family = ?family, %launch_id, "Launch cites a config clock not applied here yet");
+                return Err(LaunchUndecided);
+            }
+            membership @ (Membership::Left | Membership::Absent) => {
+                warn!(
+                    family = ?family,
+                    %launch_id,
+                    membership = ?membership,
+                    intervals = view.intervals.len(),
+                    "Launch cites no open membership interval of this target; declined"
+                );
                 return Ok(Next::Done(Err(LaunchDecline::WrongInterval)));
             }
         }
@@ -702,10 +740,13 @@ impl AdmitLaunchOperation {
         }
         // An advertisement that lags the config, as after a restart, is undecided: the holder
         // retries once it is refreshed, where a refusal would exclude this target for good.
+        let (family, launch_id) = (self.family(), self.intent()?.launch_id);
         if self.node.config_digest != Some(capability.config_digest) {
+            debug!(family = ?family, %launch_id, "Executor advertisement lags its config");
             return Err(LaunchUndecided);
         }
         if !hosts_offer(spec, &capability) || !suits_offer(spec, &capability) {
+            debug!(family = ?family, %launch_id, "Executor cannot host or suit the launch now");
             return Err(LaunchUndecided);
         }
         let read = ReadInfoOperation::new(vec![self.node.local]);
@@ -907,8 +948,16 @@ impl Operation for AdmitLaunchOperation {
             },
             AdmitStep::Checks => match result.child::<Verdict, CheckError>()? {
                 Ok(Ok(capability)) => self.checked(capability),
-                Ok(Err(reason)) => Ok(Next::Done(Err(reason))),
-                Err(_) => Err(LaunchUndecided),
+                Ok(Err(reason)) => {
+                    let launch_id = self.intent()?.launch_id;
+                    warn!(family = ?self.family(), %launch_id, reason = ?reason, "Launch checks declined the offer");
+                    Ok(Next::Done(Err(reason)))
+                }
+                Err(error) => {
+                    let launch_id = self.intent()?.launch_id;
+                    debug!(family = ?self.family(), %launch_id, error = ?error, "Launch checks stay undecided");
+                    Err(LaunchUndecided)
+                }
             },
             AdmitStep::Membership(capability) => {
                 let info = result.child::<BTreeMap<NodeId, NodeInfoDocument>, NodeInfoError>()?;
@@ -1197,6 +1246,73 @@ mod tests {
         let mut behind = prepared(&family, Some(limits()));
         cite(&mut behind, &clock);
         assert_eq!(behind.bound(WriterView::default()), Err(LaunchUndecided));
+    }
+
+    // A realm config written before the node history was kept still admits a launch to its
+    // server, and that server's secret writes still count.
+    #[test]
+    fn legacy_config_admits() {
+        use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
+        use aruna_core::reducer::AdminDocumentState;
+        use aruna_core::reducer::paths::NODE_HISTORY_PREFIX;
+        use aruna_core::register::RegisterStamp;
+        use aruna_core::secret_registers::{
+            SecretBody, SecretDocument, SecretLifecycle, SecretOwner,
+        };
+        use aruna_core::secrets::{SecretKind, SecretName};
+        use aruna_core::structs::identity::auth::Actor;
+        use aruna_core::structs::identity::realm::RealmNodeKind;
+        use aruna_core::user::id::UserId;
+        let family = Family::new([8; 32]);
+        let mut operation = prepared(&family, Some(limits()));
+        let local = operation.node.local;
+        let author = UserId::local(Ulid::from_parts(1, 1), REALM);
+        let actor = Actor {
+            node_id: family.holder.public(),
+            user_id: author,
+            realm_id: REALM,
+        };
+        let target = AdminDocumentTarget::RealmConfig { realm_id: REALM };
+        let mut state = AdminDocumentState::new(target);
+        let ensure = AdminDocumentOperation::ConfigNodeEnsured {
+            node_id: local,
+            kind: RealmNodeKind::Server,
+        };
+        state
+            .apply_operation(&actor, ensure, Ulid::from_parts(1, 2))
+            .unwrap();
+        state
+            .user_subject_ids
+            .retain(|path, _| !path.starts_with(NODE_HISTORY_PREFIX));
+        let stored = postcard::to_allocvec(&state).unwrap();
+        let view = WriterView::read(Some(&stored)).unwrap();
+        operation.intent.as_mut().expect("intent").config_clock = state.clock.clone();
+        assert!(matches!(
+            operation.bound(view.clone()),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let created = SecretLifecycle::Created {
+            kind: SecretKind::parse("bearer").unwrap(),
+            readable: false,
+        };
+        let document = SecretDocument {
+            owner: SecretOwner::Group(Ulid::from_parts(2, 2)),
+            name: SecretName::try_from("catalog-key".to_string()).unwrap(),
+            stamp: RegisterStamp {
+                counter: 1,
+                node_id: local,
+                write_id: Ulid::from_parts(3, 3),
+            },
+            incarnation: Ulid::from_parts(3, 3),
+            config_clock: state.clock.clone(),
+            author,
+            written_at_ms: 1,
+            body: SecretBody::Lifecycle(created),
+        };
+        assert!(
+            view.counts(&document),
+            "the legacy server is a counted writer"
+        );
     }
 
     // A replayed offer answers with the stored receipt instead of reserving again.

@@ -222,6 +222,15 @@ impl UpdateDocumentOperation {
         self
     }
 
+    /// A pristine operation with the same inputs, for a conflict retry: it plans again against
+    /// the graph the winning commit left.
+    pub fn fresh_copy(&self) -> Self {
+        let mut fresh = Self::new(self.config.clone()).with_message(self.message.clone());
+        fresh.expected_graph = self.expected_graph.clone();
+        fresh.route_profile_status = self.route_profile_status.clone();
+        fresh
+    }
+
     /// Records `message` as the commit message of this update's ARC snapshot.
     pub fn with_message(mut self, message: Option<String>) -> Self {
         self.message = message;

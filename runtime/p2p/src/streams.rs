@@ -22,7 +22,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span, field, info_span, trace, warn};
 
-use crate::connection_pool::{ConnectionLease, ConnectionPool};
+use crate::connection_pool::{ConnectionLease, ConnectionPool, PoolConnectError};
 use crate::device_limits::{DeviceLimiter, DeviceLimits, DevicePermit, DeviceRefusal};
 use crate::document_sync::DocumentSyncService;
 use crate::error::{NetError, Result};
@@ -650,7 +650,14 @@ impl StreamsService {
                         error = %error,
                         "Iroh stream connect failed"
                     );
-                    return Err(NetError::Connection(error.to_string()));
+                    return Err(match error {
+                        PoolConnectError::TooManyConnections | PoolConnectError::Shutdown => {
+                            NetError::LocalUnavailable(error.to_string())
+                        }
+                        PoolConnectError::Timeout | PoolConnectError::Connection(_) => {
+                            NetError::Connection(error.to_string())
+                        }
+                    });
                 }
             };
 

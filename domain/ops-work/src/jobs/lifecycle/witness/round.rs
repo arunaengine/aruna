@@ -156,9 +156,10 @@ enum Amend {
     Answer(DeferredTarget),
 }
 
-/// The offer under way: its target and the delay a missing answer retries after.
+/// The offer under way: its launch, its target and the delay a missing answer retries after.
 #[derive(Debug, PartialEq)]
 struct OfferState {
+    launch_id: Ulid,
     target: ExecutionTargetId,
     retry_after_ms: u64,
 }
@@ -410,16 +411,19 @@ impl WitnessRoundOperation {
         self.call(step, IoCall::Effect(Box::new(effect)))
     }
 
+    /// A lost commit conflict appends again after a short backoff instead of a whole round.
     fn append(&mut self, frame: JobRecordFrame, realm_id: RealmId, step: RoundStep) -> RoundNext {
-        let append = AppendRecordOperation::new(AppendRecordConfig {
+        let seed = frame.envelope().digest().unwrap_or_default();
+        let config = AppendRecordConfig {
             realm_id,
             local_node_id: self.node()?.local,
             record: frame,
             local: None,
             origin: RecordOrigin::Local,
             now_ms: self.now_ms,
-        });
-        self.call(step, IoCall::child(append))
+        };
+        let append = move || AppendRecordOperation::new(config.clone());
+        self.call(step, IoCall::retry_with(append, &seed))
     }
 
     fn explain_read(&self) -> Result<IoCall, IoError> {
@@ -780,7 +784,12 @@ impl WitnessRoundOperation {
             return finished();
         };
         let target_node = target.node_id;
+        let launch_id = match &launch.envelope().record {
+            JobFamilyRecord::Launch(intent) => intent.launch_id,
+            _ => Ulid::nil(),
+        };
         self.facts()?.offer = Some(OfferState {
+            launch_id,
             target,
             retry_after_ms,
         });
@@ -812,6 +821,24 @@ impl WitnessRoundOperation {
 
     fn settle(&mut self, outcome: OfferOutcome) -> RoundNext {
         let offer = self.offer_state()?;
+        let (family, launch_id, target) = (self.family, offer.launch_id, &offer.target);
+        match &outcome {
+            OfferOutcome::Accepted(_) => {}
+            OfferOutcome::Declined(reason) => warn!(
+                family = ?family,
+                %launch_id,
+                target = ?target,
+                reason = ?reason,
+                permanent = permanent_decline(reason),
+                "Launch offer was declined"
+            ),
+            OfferOutcome::Unavailable => debug!(
+                family = ?family,
+                %launch_id,
+                target = ?target,
+                "Launch offer stays undecided; the round retries"
+            ),
+        }
         match outcome {
             OfferOutcome::Accepted(receipt) => {
                 let realm_id = self.node()?.realm_id;

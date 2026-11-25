@@ -333,9 +333,10 @@ fn refused_rolls_back() {
     // A second abort finds nothing left to do.
     assert!(operation.abort().is_empty());
 
-    // A lost conflict is the same refusal.
+    // A lost conflict past its retries is the same refusal.
     let composed = composed_location(Ulid::from_bytes([5u8; 16]));
     let mut operation = finalize_waiting(open_upload_record(&input), composed.clone());
+    operation.conflicts = CONFLICT_RETRIES;
     let conflict = StorageError::TransactionConflict;
     operation
         .next(finalize_answer(Err(conflict.into())))
@@ -347,6 +348,60 @@ fn refused_rolls_back() {
     ));
     assert_eq!(operation.composed_location, None);
     drop(composed);
+}
+
+#[test]
+fn finalize_conflict_retries() {
+    // A lost finalize conflict publishes again after a jittered backoff with the same composed
+    // object and parts; nothing is rolled back in between.
+    let input = finalize_input();
+    let composed = composed_location(Ulid::from_bytes([5u8; 16]));
+    let mut operation = finalize_waiting(open_upload_record(&input), composed.clone());
+    let conflict = StorageError::TransactionConflict;
+    let turn = operation.next(finalize_answer(Err(conflict.into())));
+    let Ok(Next::Call(IoCall::Delay(wait))) = turn else {
+        panic!("expected a backoff, got {turn:?}");
+    };
+    assert!(wait >= std::time::Duration::from_millis(25));
+    assert_eq!(operation.composed_location, Some(composed.clone()));
+    let turn = operation.next(IoResult::Woke);
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    assert_eq!(operation.state, CompleteUploadState::Finalize);
+    let child = operation.finalize_child();
+    assert_eq!(child.composed_location, Some(composed));
+    assert_eq!(operation.conflicts, 1);
+}
+
+#[test]
+fn purged_never_publishes() {
+    // A purge that aborted the upload while the finalize waited out a conflict, or an attempt
+    // that took the lease over, ends the retried finalize before it publishes.
+    let input = finalize_input();
+    let composed = composed_location(Ulid::from_bytes([5u8; 16]));
+    let mut operation = finalize_waiting(open_upload_record(&input), composed);
+    let conflict = StorageError::TransactionConflict;
+    let turn = operation.next(finalize_answer(Err(conflict.into())));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Delay(_)))));
+    let turn = operation.next(IoResult::Woke);
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    let mut child = operation.finalize_child();
+    let gone = child.upload_record_read(None);
+    assert_eq!(gone.err(), Some(CompleteUploadError::NoSuchUpload));
+    let mut record = open_upload_record(&input);
+    for (status, since) in [
+        (MultipartUploadStatus::Aborting, Some(TEST_NOW_MS)),
+        (MultipartUploadStatus::Completing, Some(TEST_NOW_MS + 1)),
+    ] {
+        (record.status, record.completing_since_ms) = (status, since);
+        let row = Some(Value::from(record.to_bytes().unwrap()));
+        let other = child.upload_record_read(row);
+        assert_eq!(other.err(), Some(CompleteUploadError::UploadNotOpen));
+    }
+    record.completing_since_ms = Some(TEST_NOW_MS);
+    let own = child.upload_record_read(Some(Value::from(record.to_bytes().unwrap())));
+    assert!(own.is_ok());
+    let turn = operation.next(finalize_answer(Err(CompleteUploadError::NoSuchUpload)));
+    assert_eq!(turn.err(), Some(CompleteUploadError::NoSuchUpload));
 }
 
 #[test]
@@ -450,25 +505,117 @@ fn uncertain_keeps_object() {
 
 #[test]
 fn conflict_keeps_object() {
-    // The in-place object is the only copy of its parts, so a refused finalize keeps it.
+    // The in-place object is fenced against current ownership before writing its upload row.
     let input = finalize_input();
     let target = composed_location(Ulid::from_bytes([5u8; 16]));
     let mut operation = finalize_waiting(in_place_record(&input, &target), target.clone());
+    operation.conflicts = CONFLICT_RETRIES;
 
     let conflict = StorageError::TransactionConflict;
     operation
         .next(finalize_answer(Err(conflict.into())))
         .unwrap_err();
 
+    let calls = operation.abort();
+    assert!(matches!(
+        calls.as_slice(),
+        [IoCall::Child(_), IoCall::Child(_)]
+    ));
+    assert!(cleanup_works(&calls).is_empty());
+
+    let mut keep = KeepUploadTarget {
+        upload_id: input.upload_id,
+        attempt_ms: input.now_ms,
+        location: target.clone(),
+        written: false,
+    };
+    assert_eq!(keep.transaction(), TransactionMode::Write);
+    assert!(matches!(keep.first(), Ok(Next::Call(IoCall::Read(_)))));
+    let mut record = open_upload_record(&input);
+    record.status = MultipartUploadStatus::Open;
+    let open = Value::from(record.to_bytes().unwrap());
+    let turn = keep.next(IoResult::Values(vec![Some(open.clone()), None]));
+    let Ok(Next::Call(call)) = turn else {
+        panic!("expected cleanup write");
+    };
     assert_eq!(
-        cleanup_works(&operation.abort()),
+        cleanup_works(&[call]),
         [BlobCleanupWork::ReconcileWrite {
-            location: target,
+            location: target.clone(),
             owner: WriteOwner::Upload {
                 upload_id: input.upload_id,
             },
         }]
     );
+
+    // A deleted upload, successor blob owner, or takeover lease must not be overwritten.
+    let mut gone = KeepUploadTarget {
+        upload_id: input.upload_id,
+        attempt_ms: input.now_ms,
+        location: target.clone(),
+        written: false,
+    };
+    assert!(matches!(
+        gone.next(IoResult::Values(vec![None, None])),
+        Ok(Next::Done(()))
+    ));
+    let published = Value::from(
+        BlobCleanupWork::ReconcileWrite {
+            location: target.clone(),
+            owner: WriteOwner::Blob {
+                blake3: [7u8; 32],
+                realm_id: input.realm_id,
+                ttl_ms: RoCrateLimits::default().holder_ttl_ms,
+                announce: true,
+            },
+        }
+        .to_bytes()
+        .unwrap(),
+    );
+    let mut owned = KeepUploadTarget {
+        upload_id: input.upload_id,
+        attempt_ms: input.now_ms,
+        location: target.clone(),
+        written: false,
+    };
+    assert!(matches!(
+        owned.next(IoResult::Values(vec![Some(open), Some(published)])),
+        Ok(Next::Done(()))
+    ));
+    let mut takeover = open_upload_record(&input);
+    takeover.status = MultipartUploadStatus::Completing;
+    takeover.completing_since_ms = Some(input.now_ms + 1);
+    let mut taken = KeepUploadTarget {
+        upload_id: input.upload_id,
+        attempt_ms: input.now_ms,
+        location: target,
+        written: false,
+    };
+    assert!(matches!(
+        taken.next(IoResult::Values(vec![
+            Some(Value::from(takeover.to_bytes().unwrap())),
+            None
+        ])),
+        Ok(Next::Done(()))
+    ));
+}
+
+#[test]
+fn aborting_never_reopens() {
+    // An abort keeps the old completing timestamp; failed finalize must not reopen it to Open.
+    let input = finalize_input();
+    let mut record = open_upload_record(&input);
+    record.status = MultipartUploadStatus::Aborting;
+    record.completing_since_ms = Some(input.now_ms);
+    let mut reopen = ReopenUpload {
+        input,
+        plan: None,
+        reclaim_pending: false,
+        recheck_pending: false,
+        step: ReopenStep::ReadRecord,
+    };
+    let row = Some(Value::from(record.to_bytes().unwrap()));
+    assert!(matches!(reopen.record_read(row), Ok(Next::Done(()))));
 }
 
 #[test]
@@ -1366,6 +1513,7 @@ fn conflict_recheck(epoch: u64) -> Reopened {
     let input = finalize_input();
     let location = composed_location(Ulid::from_parts(9, 9));
     let mut operation = finalize_waiting(sealed_record(&input), location);
+    operation.conflicts = CONFLICT_RETRIES;
     let conflict = StorageError::TransactionConflict;
     operation
         .next(finalize_answer(Err(conflict.into())))

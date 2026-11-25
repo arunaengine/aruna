@@ -62,19 +62,21 @@ pub(crate) fn event_trigger(kind: SourceKind) -> TriggerKind {
     }
 }
 
-/// One page of pending rows in one transaction, matched with at most `bound` forward rows per
-/// install: the forward rows and gaps of the targets each row matches, and the pending rows
-/// deleted. Answers how many rows were read; a full page of `JOURNAL_PAGE` means more may follow.
+/// The pending rows `keys` in one transaction, each queued for the installs it matches with at
+/// most `bound` forward rows per install or counted as a gap, then deleted. Answers how many were
+/// still there; only these keys join the read set, so a row journaled meanwhile never conflicts.
 pub(crate) fn match_page(
     (targets, keep): (&[Target], bool),
     now_ms: u64,
     bound: usize,
+    keys: Vec<Vec<u8>>,
 ) -> MatchPage {
     MatchPage {
         targets: targets.to_vec(),
         keep,
         now_ms,
         bound,
+        keys,
         phase: MatchPhase::Reading,
     }
 }
@@ -85,6 +87,7 @@ pub struct MatchPage {
     keep: bool,
     now_ms: u64,
     bound: usize,
+    keys: Vec<Vec<u8>>,
     phase: MatchPhase,
 }
 
@@ -193,18 +196,18 @@ impl Operation for MatchPage {
     }
 
     fn first(&mut self) -> Result<Next<usize>, StoreError> {
-        Ok(Next::Call(page_call(
-            EVENT_JOURNAL_KEYSPACE,
-            vec![PENDING_ROW],
-            None,
-            JOURNAL_PAGE,
-        )))
+        let keys = (self.keys.iter()).map(|key| (EVENT_JOURNAL_KEYSPACE, key.clone()));
+        Ok(Next::Call(read_call(keys.collect())))
     }
 
     fn next(&mut self, answer: IoResult) -> Result<Next<usize>, StoreError> {
         match std::mem::replace(&mut self.phase, MatchPhase::Deleting(0)) {
             MatchPhase::Reading => {
-                let (rows, _) = page_of(answer)?;
+                // A row another page matched meanwhile is gone; it is not matched twice.
+                let keys = std::mem::take(&mut self.keys).into_iter();
+                let rows: Rows = (keys.zip(all_values(answer)?))
+                    .filter_map(|(key, value)| Some((key, value?)))
+                    .collect();
                 if rows.is_empty() {
                     return Ok(Next::Done(0));
                 }
@@ -431,6 +434,8 @@ pub struct MatchJournal {
     now_ms: u64,
     bound: usize,
     read: usize,
+    /// The size of the scanned page while its match runs; `None` while scanning.
+    scanned: Option<usize>,
 }
 
 impl MatchJournal {
@@ -441,12 +446,28 @@ impl MatchJournal {
             now_ms,
             bound,
             read: 0,
+            scanned: None,
         }
     }
 
-    fn page(&self) -> IoCall {
-        let matched = (&self.targets[..], self.keep);
-        IoCall::child(match_page(matched, self.now_ms, self.bound))
+    /// Scans the next pending page outside any transaction, so rows journaled meanwhile never
+    /// conflict the match.
+    fn scan(&mut self) -> IoCall {
+        self.scanned = None;
+        page_call(
+            EVENT_JOURNAL_KEYSPACE,
+            vec![PENDING_ROW],
+            None,
+            JOURNAL_PAGE,
+        )
+    }
+
+    /// Matches the scanned keys; a page that loses a conflict runs again after a backoff.
+    fn page(&self, keys: Vec<Vec<u8>>) -> IoCall {
+        let (targets, keep, now_ms, bound) =
+            (self.targets.clone(), self.keep, self.now_ms, self.bound);
+        let build = move || match_page((&targets[..], keep), now_ms, bound, keys.clone());
+        IoCall::retry_with(build, &now_ms.to_le_bytes())
     }
 }
 
@@ -455,15 +476,23 @@ impl Operation for MatchJournal {
     type Error = StoreError;
 
     fn first(&mut self) -> Result<Next<usize>, StoreError> {
-        Ok(Next::Call(self.page()))
+        Ok(Next::Call(self.scan()))
     }
 
     fn next(&mut self, answer: IoResult) -> Result<Next<usize>, StoreError> {
-        let count = answer.child::<usize, StoreError>()??;
-        self.read += count;
-        Ok(match count < JOURNAL_PAGE {
+        let Some(scanned) = self.scanned else {
+            let (rows, _) = page_of(answer)?;
+            if rows.is_empty() {
+                return Ok(Next::Done(self.read));
+            }
+            self.scanned = Some(rows.len());
+            let keys = rows.into_iter().map(|(key, _)| key).collect();
+            return Ok(Next::Call(self.page(keys)));
+        };
+        self.read += answer.child::<usize, StoreError>()??;
+        Ok(match scanned < JOURNAL_PAGE {
             true => Next::Done(self.read),
-            false => Next::Call(self.page()),
+            false => Next::Call(self.scan()),
         })
     }
 }

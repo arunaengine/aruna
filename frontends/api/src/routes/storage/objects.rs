@@ -17,6 +17,7 @@ use aruna_ops_data::s3::object::pages::{
     encode_resume, listing_path,
 };
 use aruna_ops_data::s3::object::range_list::MemberAccess;
+use aruna_ops_identity::auth::request_authorization::{BucketAccess, BucketAccessOperation};
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::{Extension, Json};
@@ -25,7 +26,7 @@ use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ValidatedBearer, ensure_permission, require_realm_auth};
+use crate::auth::{ValidatedBearer, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::lookup::bucket_info;
 use crate::lookup::{ObjectOutput, object_output};
@@ -171,13 +172,26 @@ pub(crate) fn bearer_access(bearer: Option<&ValidatedBearer>) -> MemberAccess {
 pub(crate) async fn object_page(
     state: &ServerState,
     info: &BucketInfo,
+    caller: (Option<&ValidatedBearer>, Option<pages::Caller<'_>>),
+    request: ListRequest,
+) -> ServerResult<ObjectListResponse> {
+    run_page(state, info, caller, None, request).await
+}
+
+async fn run_page(
+    state: &ServerState,
+    info: &BucketInfo,
     (bearer, caller): (Option<&ValidatedBearer>, Option<pages::Caller<'_>>),
+    loaded: Option<Arc<BucketAccess>>,
     request: ListRequest,
 ) -> ServerResult<ObjectListResponse> {
     let bucket = request.bucket.clone();
     let access = bearer_access(bearer);
     let node = page_node(state);
-    let list = ObjectPageOperation::<ObjectOutput>::new(node, access, info, caller, request);
+    let mut list = ObjectPageOperation::<ObjectOutput>::new(node, access, info, caller, request);
+    if let Some(loaded) = loaded {
+        list = list.with_access(loaded);
+    }
     let page = drive(list, &state.get_ctx()).await;
     Ok(listed(bucket, page.map_err(page_error)?))
 }
@@ -308,9 +322,20 @@ pub async fn list_objects(
     let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());
     let ids = (realm_id, info.group_id, node_id);
     let path = listing_path(ids, &bucket, query.prefix.as_deref());
-    ensure_permission(&state, &auth, path, Permission::READ)
-        .await
+    let started = std::time::Instant::now();
+    let loaded = drive(
+        BucketAccessOperation::new(&auth, ids, &bucket),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(ServerError::from)
+    .map_err(hidden)?;
+    loaded
+        .enforce(&path, &Permission::READ)
+        .map_err(ServerError::from)
         .map_err(hidden)?;
+    aruna_core::telemetry::record_stage("permission", started.elapsed());
+    let loaded = Arc::new(loaded);
     // A start key resumes like a cursor after that key, past the whole common prefix it names.
     let start = (query.start_after.clone().filter(|key| !key.is_empty()))
         .map(|key| {
@@ -336,12 +361,20 @@ pub async fn list_objects(
         let bucket = request.bucket.clone();
         let access = bearer_access(bearer.as_ref());
         let node = page_node(&state);
-        let list = ObjectPageOperation::<ObjectOutput>::new(node, access, &info, caller, request);
-        let list = list.for_range(query.start_after, bounds);
+        let list = ObjectPageOperation::<ObjectOutput>::new(node, access, &info, caller, request)
+            .with_access(loaded)
+            .for_range(query.start_after, bounds);
         let page = drive(list, &state.get_ctx()).await;
         return Ok(Json(listed(bucket, page.map_err(page_error)?)));
     }
-    let page = object_page(&state, &info, (bearer.as_ref(), caller), request).await?;
+    let page = run_page(
+        &state,
+        &info,
+        (bearer.as_ref(), caller),
+        Some(loaded),
+        request,
+    )
+    .await?;
     Ok(Json(page))
 }
 

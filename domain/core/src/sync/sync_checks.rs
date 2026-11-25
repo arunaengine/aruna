@@ -24,6 +24,7 @@ use crate::structs::placement::policy::document::{
 use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
 use crate::structs::storage::node_info::NodeInfoDocument;
 use crate::structs::storage::usage::{NodeUsageSnapshot, usage_node_id};
+use crate::structs::sync_quarantine::SyncQuarantineRecord;
 use crate::user::id::UserId;
 
 /// Validates a replicated node-usage snapshot against its target: the payload
@@ -227,7 +228,7 @@ pub fn validate_node_upsert(
         return Err("target is not a node info document".to_string());
     };
     let document = NodeInfoDocument::from_bytes(bytes)
-        .map_err(|error| format!("invalid node info document: {error}"))?;
+        .map_err(|error| format!("{NODE_INFO_INVALID}: {error}"))?;
     if document.node_id != *node_id {
         return Err(format!(
             "node info document node id {} does not match target node id {node_id}",
@@ -235,6 +236,38 @@ pub fn validate_node_upsert(
         ));
     }
     Ok(document)
+}
+
+/// The reason prefix of every node info payload that failed validation.
+pub const NODE_INFO_INVALID: &str = "invalid node info document";
+
+/// The node info document a quarantined upsert carries when this version accepts it: one
+/// refused only for its payload on the node info topic of `realm_id`, from the node it describes.
+/// A rejection for any other reason, such as the shard publisher policy, is not recovered.
+pub fn quarantined_node_info(
+    record: &SyncQuarantineRecord,
+    realm_id: RealmId,
+) -> Option<(DocumentTarget, NodeInfoDocument, Vec<u8>)> {
+    if !record.reason.starts_with(NODE_INFO_INVALID) {
+        return None;
+    }
+    let event = record.decoded_event()?;
+    let target = event.target();
+    let local =
+        matches!(target, DocumentTarget::NodeInfo { realm_id: own, .. } if *own == realm_id);
+    if !local {
+        return None;
+    }
+    let topic = target.sync_topic_id(realm_id, &event.placement());
+    if topic != record.identity.topic {
+        return None;
+    }
+    shared_verdict(record.identity.topic, record.identity.actor, &event).ok()?;
+    let DocumentEvent::Upsert { target, bytes, .. } = event else {
+        return None;
+    };
+    let document = validate_node_upsert(&target, &bytes).ok()?;
+    Some((target, document, bytes))
 }
 
 /// Whether an incoming advertisement replaces the stored one. Undecodable
@@ -527,7 +560,7 @@ pub fn shared_verdict(
             .map_err(|reason| format!("invalid watch interest digest: {reason}")),
         _ => validate_node_upsert(target, bytes)
             .map(|_| ())
-            .map_err(|reason| format!("invalid node info document: {reason}")),
+            .map_err(|reason| format!("{NODE_INFO_INVALID}: {reason}")),
     }
 }
 

@@ -24,8 +24,9 @@ use aruna_core::types::Key;
 use ulid::Ulid;
 
 use super::{
-    BuildTurn, Candidate, Checked, HeadCandidate, HitBuilder, HitWalk, ObjectKeyMatch,
-    SearchNodeHit, SearchNodePage, SearchObjectsError, SearchObjectsInput, SearchTurn, WalkTurn,
+    BuildTurn, Candidate, Checked, HeadCandidate, HitBuilder, HitWalk, MIN_SCAN_BATCH,
+    ObjectKeyMatch, SearchNodeHit, SearchNodePage, SearchObjectsError, SearchObjectsInput,
+    SearchTurn, WalkTurn,
 };
 use crate::replication::members::{ReadRecordOperation, RecordError};
 use crate::transfer::feed_walks::{FeedError, RangeProgressOperation, state_key};
@@ -71,6 +72,8 @@ pub(super) struct RangeSearchOperation {
     chunks: VecDeque<Vec<Ulid>>,
     found: VecDeque<(Ulid, Option<RangeFound>)>,
     current: Option<KeyPage>,
+    pending_keys: VecDeque<String>,
+    key_scale: usize,
     walk: HitWalk,
     unready: Vec<(Ulid, Option<Option<String>>)>,
     certain: bool,
@@ -102,6 +105,8 @@ impl RangeSearchOperation {
             chunks: VecDeque::new(),
             found: VecDeque::new(),
             current: None,
+            pending_keys: VecDeque::new(),
+            key_scale: 2,
             walk: HitWalk::default(),
             unready: Vec::new(),
             certain: true,
@@ -287,12 +292,18 @@ impl RangeSearchOperation {
         (range_id, through): (Ulid, String),
         mut pending: VecDeque<Candidate>,
     ) -> RangeTurn {
-        let Some(candidate) = pending.pop_front() else {
-            return self.through_known(range_id, through, false);
-        };
-        let call = self.walk.check.begin(&self.input, &candidate.hit);
-        self.step = RangeStep::ThroughCheck(range_id, through, pending, Some(candidate));
-        Ok(Next::Call(call))
+        while let Some(candidate) = pending.pop_front() {
+            match self.walk.check.begin(&self.input, &candidate.hit)? {
+                Checked::Call(call) => {
+                    let candidate = Some(candidate);
+                    self.step = RangeStep::ThroughCheck(range_id, through, pending, candidate);
+                    return Ok(Next::Call(call));
+                }
+                Checked::Decided(true) => return self.through_known(range_id, through, true),
+                Checked::Decided(false) => {}
+            }
+        }
+        self.through_known(range_id, through, false)
     }
 
     fn through_known(&mut self, range_id: Ulid, through: String, shown: bool) -> RangeTurn {
@@ -317,10 +328,26 @@ impl RangeSearchOperation {
         let (key_match, query) = (self.input.key_match, &self.input.query);
         let mut keys = std::mem::take(&mut page.keys);
         keys.retain(|key| key_match.matches(key, query));
-        if keys.is_empty() {
+        self.pending_keys = keys.into();
+        self.key_scale = 2;
+        self.next_keys()
+    }
+
+    fn next_keys(&mut self) -> RangeTurn {
+        if self.pending_keys.is_empty() {
             return self.range_done();
         }
-        let read = self.resolve(&keys);
+        let needed = self
+            .input
+            .limit
+            .saturating_add(1)
+            .saturating_sub(self.walk.visible.len());
+        let take = needed
+            .saturating_mul(self.key_scale)
+            .clamp(MIN_SCAN_BATCH, EXAMINE_BUDGET)
+            .min(self.pending_keys.len());
+        let batch: Vec<_> = self.pending_keys.drain(..take).collect();
+        let read = self.resolve(&batch);
         self.step = RangeStep::Keys;
         Ok(Next::Call(read))
     }
@@ -331,7 +358,10 @@ impl RangeSearchOperation {
                 self.step = RangeStep::Walk;
                 Ok(Next::Call(call))
             }
-            WalkTurn::Drained => self.range_done(),
+            WalkTurn::Drained => {
+                self.key_scale = self.key_scale.saturating_mul(2).min(EXAMINE_BUDGET);
+                self.next_keys()
+            }
             WalkTurn::Full(next) => self.finish(next),
         }
     }
@@ -456,7 +486,7 @@ impl Operation for RangeSearchOperation {
             RangeStep::Keys => {
                 let found = result.child::<Vec<Candidate>, SearchObjectsError>()??;
                 self.walk.add(found);
-                let turn = self.walk.advance(&self.input);
+                let turn = self.walk.advance(&self.input)?;
                 self.walked(turn)
             }
             RangeStep::Walk => {

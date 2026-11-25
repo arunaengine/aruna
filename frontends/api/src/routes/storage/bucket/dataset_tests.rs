@@ -209,3 +209,43 @@ async fn waits_until_readable() {
     assert!(!becomes_readable(never).await);
     assert_eq!(reads.get(), READY_DELAYS.len() + 1);
 }
+
+// Concurrent describe calls on one bucket produce one dataset, 409 for the rest, and zero orphans.
+#[tokio::test]
+async fn concurrent_describe_clean() {
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::DOCUMENT_LIFECYCLE_KEYSPACE;
+
+    let test = setup_network_state().await;
+    add_bucket(&test).await;
+    let results = futures_util::future::join_all((0..8).map(|_| post(&test, body()))).await;
+    let mut created = Vec::new();
+    let mut conflicts = 0usize;
+    for result in results {
+        match result {
+            Ok(response) => created.push(response),
+            Err(ServerError::Conflict(_)) => conflicts += 1,
+            Err(other) => panic!("unexpected concurrent describe error: {other:?}"),
+        }
+    }
+    assert_eq!(created.len(), 1, "exactly one caller wins");
+    assert_eq!(conflicts, 7, "all losing callers get 409 Conflict");
+
+    drain_metadata_background(test.state.as_ref()).await;
+    let event = test
+        .state
+        .get_ctx()
+        .storage_handle
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
+            prefix: None,
+            start: None,
+            limit: 64,
+            txn_id: None,
+        })
+        .await;
+    let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
+        panic!("unexpected storage event: {event:?}");
+    };
+    assert_eq!(values.len(), 1, "zero orphaned datasets created");
+}

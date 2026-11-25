@@ -150,8 +150,16 @@ impl PutObjectOperation {
         self.read_object_lookup()
     }
 
-    /// The location row of the published bytes, written with the head or the path index, so
-    /// a version an import registered meanwhile commits nothing.
+    /// The location row of new bytes, written with the head or the path index, so a version an
+    /// import registered meanwhile commits nothing. A row read in this transaction is not
+    /// rewritten: identical uploads would conflict on it, and its read already fences a reclaim.
+    pub(super) fn location_rows(&self) -> Result<Vec<(String, Key, Value)>, PutObjectError> {
+        match self.new_blob {
+            true => Ok(vec![self.location_row()?]),
+            false => Ok(Vec::new()),
+        }
+    }
+
     pub(super) fn location_row(&self) -> Result<(String, Key, Value), PutObjectError> {
         let location = self.get_output().cloned();
         let location = location.ok_or(PutObjectError::MissingOutput)?;
@@ -249,7 +257,8 @@ impl PutObjectOperation {
             pointer.to_bytes()?.into(),
         );
         self.head_pointer = Some(pointer);
-        let rows = vec![self.location_row()?, head];
+        let mut rows = self.location_rows()?;
+        rows.push(head);
         self.call(PutObjectState::WriteBlobHead, IoCall::Write(rows))
     }
 
@@ -296,7 +305,7 @@ impl PutObjectOperation {
         let mut rows = Vec::with_capacity(2);
         // A history write moves no head, so its location row goes with the path index.
         if self.keep_head {
-            rows.push(self.location_row()?);
+            rows.extend(self.location_rows()?);
         }
         rows.push((
             PATHS_INDEX_KEYSPACE.to_string(),

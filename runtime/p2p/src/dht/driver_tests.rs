@@ -1143,6 +1143,7 @@ async fn batch_merge_persists() {
         key,
         &mutation,
         &clock,
+        None,
     )
     .await
     .expect("batch merge succeeds");
@@ -1180,6 +1181,7 @@ async fn writeback_drops_stale() {
         key,
         &batch,
         &clock,
+        None,
     )
     .await
     .expect("read-repair commits fresh subset");
@@ -1322,4 +1324,169 @@ async fn stale_merge_rejected() {
         event,
         Event::Storage(StorageEvent::ReadResult { value: None, .. })
     ));
+}
+
+#[tokio::test]
+async fn concurrent_new_keys() {
+    let (_directory, storage) = open_storage();
+    let locks = Arc::new(StorageLocks::default());
+    let clock = DhtClock::new();
+    let expires_at = unix_timestamp_secs().saturating_add(200);
+    let mut tasks = tokio::task::JoinSet::new();
+    for index in 1..=16u8 {
+        let storage = storage.clone();
+        let locks = locks.clone();
+        let clock = clock.clone();
+        let key = DhtKeyId::from_data(&[index; 32]);
+        let mutation = StorageMutation::Merge {
+            entries: vec![make_entry(index, key, expires_at)],
+        };
+        tasks.spawn(async move {
+            mutate_storage_checked(
+                &storage,
+                u64::from(index),
+                StorageStage::PutLocalMerge,
+                key,
+                &mutation,
+                &clock,
+                Some(&locks),
+            )
+            .await
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        result
+            .expect("task joins")
+            .expect("concurrent put succeeds");
+    }
+    assert_eq!(storage.snapshot_metrics().conflicts_total, 0);
+    assert_eq!(read_count(&storage).await, 16);
+}
+
+#[tokio::test]
+async fn same_key_serialized() {
+    let (_directory, storage) = open_storage();
+    let locks = Arc::new(StorageLocks::default());
+    let clock = DhtClock::new();
+    let key = DhtKeyId::from_data(b"serialized-same-key");
+    let expires_at = unix_timestamp_secs().saturating_add(200);
+    let mut tasks = tokio::task::JoinSet::new();
+    for index in 1..=8u8 {
+        let storage = storage.clone();
+        let locks = locks.clone();
+        let clock = clock.clone();
+        let mutation = StorageMutation::Merge {
+            entries: vec![make_entry(index, key, expires_at)],
+        };
+        tasks.spawn(async move {
+            mutate_storage_checked(
+                &storage,
+                u64::from(index),
+                StorageStage::PutLocalMerge,
+                key,
+                &mutation,
+                &clock,
+                Some(&locks),
+            )
+            .await
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        result
+            .expect("task joins")
+            .expect("serialized put succeeds");
+    }
+    assert_eq!(storage.snapshot_metrics().conflicts_total, 0);
+    assert_eq!(read_entries(&storage, key).await.len(), 8);
+    assert_eq!(read_count(&storage).await, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn inbound_bounds_lock() {
+    // Waiting on a held per-key lock counts against the 8s inbound storage budget.
+    let (_directory, storage) = open_storage();
+    let locks = Arc::new(StorageLocks::default());
+    let clock = DhtClock::new();
+    let key = DhtKeyId::from_data(b"inbound-budget-key");
+    let key_lock = locks.lock_for(key);
+    let _held = key_lock.lock().await;
+    let mutation = StorageMutation::Merge {
+        entries: vec![make_entry(
+            1,
+            key,
+            unix_timestamp_secs().saturating_add(200),
+        )],
+    };
+    let result = run_storage_io(
+        StorageStage::InboundPutMerge,
+        mutate_storage_checked(
+            &storage,
+            99,
+            StorageStage::InboundPutMerge,
+            key,
+            &mutation,
+            &clock,
+            Some(&locks),
+        ),
+    )
+    .await;
+    assert!(matches!(result, Err(DhtIoError::Timeout)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn lock_drops_backoff() {
+    // A transaction conflict releases the per-key lock before sleeping in retry backoff.
+    let (storage, receivers) = StorageHandle::new();
+    let receiver = receivers.foreground;
+    let locks = Arc::new(StorageLocks::default());
+    let key = DhtKeyId::from_data(b"backoff-release-key");
+    let mutation = StorageMutation::Merge {
+        entries: vec![make_entry(
+            1,
+            key,
+            unix_timestamp_secs().saturating_add(200),
+        )],
+    };
+    let (conflicted_tx, conflicted_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let (_, response, ..) = receiver.recv().expect("first txn start");
+        response.send(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        });
+        let _ = conflicted_tx.send(());
+        let _ = resume_rx.recv();
+        if let Ok((_, response, ..)) = receiver.recv() {
+            response.send(StorageEvent::Error {
+                error: StorageError::Closed,
+            });
+        }
+    });
+    let task_locks = locks.clone();
+    let task = tokio::spawn(async move {
+        mutate_storage_with(
+            &storage,
+            100,
+            StorageStage::PutLocalMerge,
+            key,
+            &mutation,
+            None,
+            Some(&task_locks),
+        )
+        .await
+    });
+    conflicted_rx.await.expect("first attempt conflicted");
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    let key_lock = locks.lock_for(key);
+    let acquired = key_lock.try_lock().is_ok();
+    let _ = resume_tx.send(());
+    let result = task.await.expect("task joins");
+    worker.join().expect("worker joins");
+    assert!(result.is_err());
+    assert!(
+        acquired,
+        "key lock must not be held during retry backoff sleep"
+    );
 }

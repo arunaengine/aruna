@@ -21,7 +21,7 @@ use aruna_core::types::TxnId;
 use byteview::ByteView;
 use opendal::Operator;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, PoisonError, Weak};
 use std::time::Duration;
 
 use aruna_core::backoff::capped_backoff;
@@ -298,14 +298,38 @@ impl BlobHandler {
         ))
     }
 
+    /// The lock of one hidden bucket's counter row, shared by all its current holders. Other
+    /// writers of the row still conflict, so the retry loops stay.
+    pub(super) fn stats_lock(
+        &self,
+        backend: &BackendRef,
+        bucket: &str,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = (self.stats_locks.lock()).unwrap_or_else(PoisonError::into_inner);
+        let key = (backend.clone(), bucket.to_string());
+        if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        // The locks of idle buckets are gone, so their entries go too.
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let lock = Arc::default();
+        locks.insert(key, Arc::downgrade(&lock));
+        lock
+    }
+
     pub(super) async fn release_hidden_key(&self, key: &HiddenBlobKey) -> Result<(), BlobError> {
         if !self.stats_managed(&key.backend, &key.storage_bucket) {
             return Ok(());
         }
         let marker = reservation_key(key)?;
+        let lock = self.stats_lock(&key.backend, &key.storage_bucket);
         let mut last_error = None;
         for attempt in 0..BUCKET_STATS_RETRIES {
-            match self.release_key_txn(key, &marker).await {
+            let outcome = {
+                let _queued = lock.lock().await;
+                self.release_key_txn(key, &marker).await
+            };
+            match outcome {
                 Ok(LoadUpdate::Applied) => return Ok(()),
                 Ok(LoadUpdate::Conflict) if attempt + 1 < BUCKET_STATS_RETRIES => {
                     tokio::time::sleep(conflict_backoff(attempt)).await;
@@ -338,12 +362,15 @@ impl BlobHandler {
             return Ok(LoadUpdate::Applied);
         }
         let marker = reservation_key(key)?;
+        let lock = self.stats_lock(backend, bucket);
         let mut last_error = None;
         for attempt in 0..BUCKET_STATS_RETRIES {
-            match self
-                .reserve_key_txn(backend, bucket, &marker, capacity)
-                .await
-            {
+            let outcome = {
+                let _queued = lock.lock().await;
+                self.reserve_key_txn(backend, bucket, &marker, capacity)
+                    .await
+            };
+            match outcome {
                 Ok(LoadUpdate::Conflict) if attempt + 1 < BUCKET_STATS_RETRIES => {
                     tokio::time::sleep(conflict_backoff(attempt)).await;
                 }
@@ -848,9 +875,14 @@ impl BlobHandler {
         if !self.stats_managed(&location.backend, &location.storage_bucket) {
             return self.clear_marker(location).await;
         }
+        let lock = self.stats_lock(&location.backend, &location.storage_bucket);
         let mut last_error = None;
         for attempt in 0..BUCKET_STATS_RETRIES {
-            match self.release_marker(location).await {
+            let outcome = {
+                let _queued = lock.lock().await;
+                self.release_marker(location).await
+            };
+            match outcome {
                 Ok(ReleaseUpdate::Applied) => return Ok(()),
                 Ok(ReleaseUpdate::Missing) => {
                     self.clear_active(location.ulid);
@@ -1149,12 +1181,15 @@ impl BlobHandler {
             }
             return Ok(LoadUpdate::Applied);
         }
+        let lock = self.stats_lock(backend, bucket);
 
         for attempt in 0..BUCKET_STATS_RETRIES {
-            match self
-                .try_adjust_load(backend, bucket, delta, capacity, location)
-                .await?
-            {
+            let outcome = {
+                let _queued = lock.lock().await;
+                self.try_adjust_load(backend, bucket, delta, capacity, location)
+                    .await?
+            };
+            match outcome {
                 LoadUpdate::Conflict => {}
                 outcome => return Ok(outcome),
             }

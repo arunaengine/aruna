@@ -313,9 +313,18 @@ impl BucketAccess {
             Some(key) => format!("{}/{key}", self.bucket_path),
             None => self.bucket_path.clone(),
         };
+        self.enforce(&path, permission).is_ok()
+    }
+
+    /// Enforces `permission` on `path` with the already-loaded role rules and policy sets.
+    pub fn enforce(&self, path: &str, permission: &Permission) -> Result<(), AuthorizeError> {
+        if !self.rules.allows(path, permission) {
+            return Err(AuthorizeError::PermissionDenied);
+        }
         let extras = PolicyRequestExtras::rest();
-        let request = policy_request_with(&path, permission, Some(&self.auth), extras);
-        self.rules.allows(&path, permission) && self.policies.evaluate(&request).is_ok()
+        let request = policy_request_with(path, permission, Some(&self.auth), extras);
+        self.policies.evaluate(&request)?;
+        Ok(())
     }
 
     /// Whether the caller may read every key that starts with `prefix`: READ by a grant on all
@@ -384,6 +393,14 @@ impl Operation for BucketAccessOperation {
             rules,
             policies,
         }))
+    }
+
+    fn expected_error(error: &AuthorizeError) -> bool {
+        matches!(
+            error,
+            AuthorizeError::PermissionDenied
+                | AuthorizeError::Policy(PolicyEnforcementError::Denied { .. })
+        )
     }
 }
 

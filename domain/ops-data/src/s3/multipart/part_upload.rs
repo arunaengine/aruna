@@ -5,6 +5,7 @@
 use crate::s3::multipart::target::{StatusCheck, UploadTargetError, validate_upload};
 use crate::s3::purge_fence::{PurgeFenceError, check_fence_row, fence_key};
 use crate::s3::write_cleanup::{ReleaseWrite, RollbackWrite};
+use aruna_core::backoff::conflict_backoff;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
@@ -38,8 +39,8 @@ use tracing::warn;
 use ulid::Ulid;
 
 /// Bounded retries for an SSI conflict on the part commit. A refused
-/// transaction is contention, not a failed request.
-const CONFLICT_RETRIES: u8 = 4;
+/// transaction is contention, not a failed request. Each retry waits a jittered backoff.
+const CONFLICT_RETRIES: u8 = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PartStep {
@@ -48,6 +49,8 @@ enum PartStep {
     ReadSaved,
     WritePart,
     Publish,
+    /// Waits out a lost record conflict before the next record transaction.
+    Backoff,
     /// The record transaction answered with a failure, so no commit is in flight.
     Refused,
     Release,
@@ -379,13 +382,22 @@ impl UploadPartOperation {
         };
         if *storage == StorageError::TransactionConflict && self.conflicts < CONFLICT_RETRIES {
             self.conflicts += 1;
-            return self.publish();
+            return self.publish_later();
         }
         // Only a proven refusal rolls the part back; any other failure may already own it.
         if !storage.proves_no_commit() {
             self.keep_written(storage);
         }
         Err(error)
+    }
+
+    /// Spreads parts that lost one row apart; the written copy's random id seeds the jitter.
+    fn publish_later(&mut self) -> PartTurn {
+        let seed =
+            (self.written_location.as_ref()).map_or([0; 16], |written| written.ulid.to_bytes());
+        let attempt = usize::from(self.conflicts.saturating_sub(1));
+        let wait = conflict_backoff(attempt, &seed[8..]);
+        self.call(PartStep::Backoff, IoCall::Delay(wait))
     }
 
     /// The bytes go to the reconciliation queue: the committed part record decides their fate.
@@ -473,6 +485,14 @@ impl Operation for UploadPartOperation {
             PartStep::ReadSaved => self.write_piece(result.page()?.0),
             PartStep::WritePart => self.write_finished(result.event()?),
             PartStep::Publish => self.published(result.child::<(), UploadPartError>()?),
+            PartStep::Backoff => match result {
+                IoResult::Woke => self.publish(),
+                other => Err(IoError::Unexpected {
+                    expected: "IoResult::Woke",
+                    got: other.label(),
+                }
+                .into()),
+            },
             PartStep::Refused => Err(IoError::Unfinished.into()),
             PartStep::Release => self.released(result.child::<(), StorageError>()?),
         }
@@ -1117,6 +1137,11 @@ mod test {
         let mut op = publishing();
         let location = op.written_location.clone();
         let turn = op.next(failed(StorageError::TransactionConflict));
+        assert!(
+            matches!(turn, Ok(Next::Call(IoCall::Delay(_)))),
+            "backs off first"
+        );
+        let turn = op.next(IoResult::Woke);
         assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
         assert_eq!(op.written_location, location);
         assert_eq!(op.conflicts, 1);

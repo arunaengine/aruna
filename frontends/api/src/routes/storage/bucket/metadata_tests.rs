@@ -87,3 +87,25 @@ async fn description_in_dataset() {
     assert!(missing.is_err(), "{missing:?}");
     assert!(stored(&node).await.is_none(), "nothing was linked");
 }
+
+#[test]
+fn conflict_maps_refusal() {
+    // Exhausted transaction conflicts definitely did not commit and map to Conflict so dataset
+    // creation cleans up the unlinked dataset; genuinely ambiguous storage faults stay Internal.
+    assert!(matches!(
+        put_metadata_error(PutMetadataError::Storage(StorageError::TransactionConflict)),
+        ServerError::Conflict(_)
+    ));
+    assert!(matches!(
+        put_metadata_error(PutMetadataError::Changed),
+        ServerError::Conflict(_)
+    ));
+    assert!(matches!(
+        put_metadata_error(PutMetadataError::Storage(StorageError::CommitFailed)),
+        ServerError::InternalError(_)
+    ));
+    assert!(matches!(
+        put_metadata_error(PutMetadataError::Storage(StorageError::Timeout)),
+        ServerError::InternalError(_)
+    ));
+}

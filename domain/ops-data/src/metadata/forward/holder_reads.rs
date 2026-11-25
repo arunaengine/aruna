@@ -4,10 +4,17 @@
 
 use std::time::Duration;
 
+use aruna_core::calls::IoCall;
+use aruna_core::effects::{Effect, EffectGroup, GroupForm, NetEffect};
+#[cfg(test)]
+use aruna_core::events::MetadataAnswer;
+use aruna_core::events::{Event, GroupResult, NetEvent, PeerRequestError};
 use aruna_core::id::NodeId;
 use aruna_core::metadata::api::ExportMetadataResult;
 use aruna_core::metadata::protocol::MetadataReadError;
-use aruna_core::metadata::{MetadataMergedRevision, MetadataRawRevision, raw_context_digest};
+use aruna_core::metadata::{
+    MetadataError, MetadataMergedRevision, MetadataRawRevision, raw_context_digest,
+};
 use ulid::Ulid;
 
 /// Holders one routed read asks at a time.
@@ -15,6 +22,36 @@ pub const READ_FANOUT_LIMIT: usize = 8;
 
 /// How long one holder may take to answer a routed read.
 pub const READ_PEER_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Whether a failed remote holder answer reflects a peer-attributable network or timeout fault
+/// rather than a local missing-handle or frame-validation error.
+pub(crate) fn peer_transport_fault(member: &GroupResult) -> bool {
+    let GroupResult::Done(event) = member else {
+        return false;
+    };
+    let Event::Net(NetEvent::MetadataAnswer(answer)) = event.as_ref() else {
+        return false;
+    };
+    matches!(
+        &answer.result,
+        Err(PeerRequestError::TimedOut
+            | PeerRequestError::Failed(MetadataError::Backend(_))
+            | PeerRequestError::NotSent(MetadataError::Backend(_)))
+    )
+}
+
+/// Marks remote holders that failed with peer-attributable transport faults as avoided.
+pub(crate) fn avoid_holders_call(peers: Vec<NodeId>, now_ms: u64) -> IoCall {
+    let members = peers
+        .into_iter()
+        .map(|node_id| Effect::Net(NetEffect::AvoidHolder { node_id, now_ms }))
+        .collect();
+    IoCall::Group(EffectGroup {
+        members,
+        limit: READ_FANOUT_LIMIT,
+        form: GroupForm::All { deadline: None },
+    })
+}
 
 /// The raw revision a device serves from its replica.
 pub fn device_raw_revision(
@@ -111,4 +148,16 @@ pub fn reduce_holder_reads<T>(
     } else {
         ReadDecision::Unavailable
     }
+}
+
+#[cfg(test)]
+pub(crate) fn peer_error_result(peer: NodeId, error: PeerRequestError) -> GroupResult {
+    let answer = MetadataAnswer {
+        peer,
+        elapsed: READ_PEER_TIMEOUT,
+        result: Err(error),
+    };
+    GroupResult::Done(Box::new(Event::Net(NetEvent::MetadataAnswer(Box::new(
+        answer,
+    )))))
 }

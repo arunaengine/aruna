@@ -8,14 +8,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use aruna_core::effects::StorageEffect;
-use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE};
+use aruna_core::keyspaces::{
+    AUTH_KEYSPACE, GROUP_KEYSPACE, NODE_INFO_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
+};
 use byteview::ByteView;
 use ulid::Ulid;
 
 /// Keyspaces whose point reads are cached; a row names one by its index here.
-const CACHED_KEYSPACES: [&str; 3] = [REALM_CONFIG_KEYSPACE, AUTH_KEYSPACE, S3_BUCKET_KEYSPACE];
+const CACHED_KEYSPACES: [&str; 5] = [
+    REALM_CONFIG_KEYSPACE,
+    AUTH_KEYSPACE,
+    S3_BUCKET_KEYSPACE,
+    GROUP_KEYSPACE,
+    NODE_INFO_KEYSPACE,
+];
 /// Entries across all cached keyspaces; a full cache is cleared before the next new entry.
-pub(super) const CAPACITY: usize = 1024;
+pub(super) const CAPACITY: usize = 4096;
 
 /// The index of a cached keyspace and a key in it.
 pub(super) type Row = (usize, ByteView);

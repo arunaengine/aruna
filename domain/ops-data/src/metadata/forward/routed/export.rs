@@ -3,19 +3,22 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::effects::Effect;
-use aruna_core::events::Event;
+use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
+use aruna_core::effects::{Effect, EffectGroup, GroupForm, NetEffect};
+use aruna_core::events::{Event, GroupEvent, GroupResult};
 use aruna_core::id::NodeId;
 use aruna_core::metadata::{AuthToken, MaterializationState, MetadataEffect, MetadataEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::placement::read_holder_sets;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 
-use super::super::holder_reads::{AuthFailure, ReadDecision, reduce_holder_reads};
-use super::super::holder_reads::{READ_FANOUT_LIMIT, READ_PEER_TIMEOUT, device_raw_revision};
-use crate::device::replica::{ReplicaRecord, read_answer, replica_read};
+use super::super::holder_reads::{
+    AuthFailure, READ_FANOUT_LIMIT, READ_PEER_TIMEOUT, ReadDecision, avoid_holders_call,
+    device_raw_revision, peer_transport_fault, reduce_holder_reads,
+};
+use super::super::read::METADATA_READ_DEADLINE;
+use crate::device::replica::{ReplicaRecord, read_answer as replica_answer, replica_read};
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::export::ExportOperation;
 use crate::metadata::api::export_types::{
@@ -25,14 +28,26 @@ use crate::metadata::api::readable::RecordReadableOperation;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::device::selection::keep_read;
+use crate::metadata::forward::write::read_error;
 use aruna_core::metadata::api::{ExportMetadataResult, MetadataRawView, RoCrateExportView};
-use aruna_core::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
+use aruna_core::metadata::protocol::{
+    MetadataReadError, MetadataTransportMessage, encode_message, metadata_request,
+};
 use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
-use aruna_ops_identity::forward::fetch::{FanoutOperation, FetchError, PeerAnswer};
+use aruna_ops_identity::forward::fetch::read_answer;
 use aruna_ops_identity::realm::mutate_placement::node_kind;
 use aruna_ops_identity::realm::peer_trust::is_sync_eligible;
 
 type ExportTurn = Result<Next<ExportMetadataResult>, MetadataApiError>;
+
+#[derive(Debug, PartialEq)]
+enum ExportOutcome {
+    Found(ExportMetadataResult),
+    /// At least one holder answered NotFound without full agreement; fail closed without
+    /// falling back to an unselected device replica.
+    Conflict,
+    Error(MetadataApiError),
+}
 
 /// Refuses an export larger than `metadata_bytes`.
 pub fn ensure_export_limit(
@@ -232,20 +247,21 @@ pub fn owner_reads(
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, PartialEq)]
 enum RoutedStage {
     Local,
     Config,
     Replica,
-    Holder,
-    Peers,
+    SoleLocal,
+    Holders,
+    Avoid(Box<ExportOutcome>),
     Kept,
     Device,
 }
 
-/// Exports one document on its holders: this node's own copy when it holds the document, the
-/// other holders' answers otherwise. A device answers from its pinned replica while the realm is
-/// out of reach.
+/// Exports one document directly when this node is the sole holder, or on all holders at once
+/// under one deadline so denials and deletions are never overridden by a lagging replica. A
+/// device answers from its pinned replica while the realm is out of reach.
 #[derive(Debug, PartialEq)]
 pub struct RoutedExportOperation {
     local_node: Option<NodeId>,
@@ -253,14 +269,11 @@ pub struct RoutedExportOperation {
     request: ExportMetadataRequest,
     forward_token: Option<AuthToken>,
     metadata_bytes: u64,
+    now_ms: u64,
     stage: RoutedStage,
     config: Option<RealmConfigDocument>,
     replica: Option<ReplicaRecord>,
-    peers: Vec<NodeId>,
-    holder_count: usize,
-    answers: Vec<(NodeId, Result<ExportMetadataResult, MetadataReadError>)>,
-    /// The other holders' requests, sent once this node's own copy answered.
-    pending_fanout: Option<Vec<(NodeId, MetadataTransportMessage)>>,
+    holders: Vec<NodeId>,
     /// The export that answers once this device kept its document.
     kept: Option<ExportMetadataResult>,
 }
@@ -280,23 +293,21 @@ impl RoutedExportOperation {
             request,
             forward_token,
             metadata_bytes,
+            now_ms: 0,
             stage: RoutedStage::Config,
             config: None,
             replica: None,
-            peers: Vec::new(),
-            holder_count: 0,
-            answers: Vec::new(),
-            pending_fanout: None,
+            holders: Vec::new(),
             kept: None,
         }
     }
 
+    fn export_within(&self) -> ExportWithinOperation {
+        ExportWithinOperation::new(self.realm_id, self.request.clone(), self.metadata_bytes)
+    }
+
     fn within(&self) -> IoCall {
-        IoCall::child(ExportWithinOperation::new(
-            self.realm_id,
-            self.request.clone(),
-            self.metadata_bytes,
-        ))
+        IoCall::child(self.export_within())
     }
 
     fn config_read(&mut self, result: IoResult) -> ExportTurn {
@@ -317,7 +328,7 @@ impl RoutedExportOperation {
 
     /// Like a read, an unselected replica answers only while the realm is out of reach.
     fn replica_read(&mut self, result: IoResult) -> ExportTurn {
-        let replica = read_answer(&result.event()?).filter(ReplicaRecord::serves_reads);
+        let replica = replica_answer(&result.event()?).filter(ReplicaRecord::serves_reads);
         let pinned = replica
             .as_ref()
             .is_some_and(|replica| replica.selected || replica.pending_edits > 0);
@@ -333,16 +344,17 @@ impl RoutedExportOperation {
             .config
             .as_ref()
             .ok_or(MetadataApiError::ServiceUnavailable)?;
-        let config_digest = config
-            .digest()
-            .map_err(|_| MetadataApiError::ServiceUnavailable)?;
         let placement = resolve_metadata_id(config, self.realm_id, None, self.request.document_id)
             .map_err(|_| MetadataApiError::ServiceUnavailable)?;
         let holders =
             read_holder_sets(config, &placement).map_err(MetadataApiError::PlacementUnavailable)?;
-        self.holder_count = holders.len();
-        let holds = self.local_node.is_some_and(|node| holders.contains(&node));
-        let local_node = self.local_node;
+        if holders.len() == 1 && Some(holders[0]) == self.local_node {
+            self.stage = RoutedStage::SoleLocal;
+            return Ok(Next::Call(self.within()));
+        }
+        let config_digest = config
+            .digest()
+            .map_err(|_| MetadataApiError::ServiceUnavailable)?;
         let message = MetadataTransportMessage::ForwardExportDocument {
             auth_token: self.forward_token.clone(),
             config_digest,
@@ -353,39 +365,80 @@ impl RoutedExportOperation {
             offset: self.request.offset,
             after: self.request.after.clone(),
         };
-        self.peers = holders
-            .into_iter()
-            .filter(|holder| Some(*holder) != local_node)
-            .collect();
-        let requests = self
-            .peers
+        let frame = encode_message(&message).map_err(MetadataApiError::Internal)?;
+        let members = holders
             .iter()
-            .map(|peer| (*peer, message.clone()))
+            .map(|holder| match Some(*holder) == self.local_node {
+                true => Effect::SubOperation(boxed_suboperation(self.export_within(), |result| {
+                    Event::Child(ChildOutcome::new(result))
+                })),
+                false => Effect::Net(NetEffect::MetadataRequest(Box::new(metadata_request(
+                    *holder,
+                    frame.clone(),
+                    READ_PEER_TIMEOUT,
+                )))),
+            })
             .collect();
-        if holds {
-            self.stage = RoutedStage::Holder;
-            self.pending_fanout = Some(requests);
-            return Ok(Next::Call(self.within()));
-        }
-        self.ask(requests)
+        self.holders = holders;
+        self.stage = RoutedStage::Holders;
+        Ok(Next::Call(IoCall::Group(EffectGroup {
+            members,
+            limit: READ_FANOUT_LIMIT,
+            form: GroupForm::All {
+                deadline: Some(METADATA_READ_DEADLINE),
+            },
+        })))
     }
 
-    fn ask(&mut self, requests: Vec<(NodeId, MetadataTransportMessage)>) -> ExportTurn {
-        if requests.is_empty() {
-            return self.collect();
+    fn sole_local_answered(&mut self, result: IoResult) -> ExportTurn {
+        match result.child::<ExportMetadataResult, MetadataApiError>()? {
+            Ok(export) => self.found(export),
+            Err(
+                error @ (MetadataApiError::Unauthorized
+                | MetadataApiError::Forbidden
+                | MetadataApiError::NotFound
+                | MetadataApiError::TooLarge),
+            ) => Err(error),
+            Err(_) => self.fall_back(MetadataApiError::ServiceUnavailable),
         }
-        self.stage = RoutedStage::Peers;
-        let fanout = FanoutOperation::new(requests, READ_FANOUT_LIMIT, READ_PEER_TIMEOUT);
-        Ok(Next::Call(IoCall::child(fanout)))
     }
 
-    fn collect(&mut self) -> ExportTurn {
+    fn holder_export(
+        &self,
+        holder: NodeId,
+        member: GroupResult,
+    ) -> Result<ExportMetadataResult, MetadataReadError> {
+        match (Some(holder) == self.local_node, member) {
+            (true, GroupResult::Done(event)) => match *event {
+                Event::Child(outcome) => outcome
+                    .take::<ExportMetadataResult, MetadataApiError>()
+                    .ok_or(MetadataReadError::Unavailable)?
+                    .map_err(read_error),
+                _ => Err(MetadataReadError::Unavailable),
+            },
+            (true, _) => Err(MetadataReadError::Unavailable),
+            (false, member) => match read_answer(holder, Some(member)) {
+                Ok(MetadataTransportMessage::ExportAnswer { result }) => result.map(|e| *e),
+                _ => Err(MetadataReadError::Unavailable),
+            },
+        }
+    }
+
+    fn collect(&mut self, results: Vec<GroupResult>) -> ExportTurn {
+        let holder_count = self.holders.len();
         let mut not_found = 0usize;
         let mut success = None;
         let mut auth_error = None;
         let (mut unavailable, mut too_large) = (false, false);
-        for (_, response) in std::mem::take(&mut self.answers) {
-            match response {
+        let mut faulted = Vec::new();
+        let mut results = results.into_iter();
+        for holder in std::mem::take(&mut self.holders) {
+            let member = results.next().unwrap_or(GroupResult::Unfinished);
+            if Some(holder) != self.local_node && peer_transport_fault(&member) {
+                faulted.push(holder);
+            }
+            unavailable |= matches!(member, GroupResult::Unfinished);
+            match self.holder_export(holder, member) {
                 Ok(export) => {
                     success.get_or_insert(export);
                 }
@@ -398,8 +451,8 @@ impl RoutedExportOperation {
             }
         }
         let conflict = success.is_some() && not_found > 0;
-        let all_not_found = self.holder_count > 0 && not_found == self.holder_count;
-        let routed = match reduce_holder_reads(
+        let all_not_found = holder_count > 0 && not_found == holder_count;
+        let outcome = match reduce_holder_reads(
             success,
             auth_error,
             all_not_found,
@@ -407,17 +460,36 @@ impl RoutedExportOperation {
             unavailable,
             AuthFailure::Fatal,
         ) {
-            ReadDecision::Success(export) => return self.found(export),
-            ReadDecision::NotFound => MetadataApiError::NotFound,
-            ReadDecision::Auth(MetadataReadError::Unauthorized) => MetadataApiError::Unauthorized,
-            ReadDecision::Auth(MetadataReadError::Forbidden) => MetadataApiError::Forbidden,
+            ReadDecision::Success(export) => ExportOutcome::Found(export),
+            ReadDecision::NotFound => ExportOutcome::Error(MetadataApiError::NotFound),
+            ReadDecision::Auth(MetadataReadError::Unauthorized) => {
+                ExportOutcome::Error(MetadataApiError::Unauthorized)
+            }
+            ReadDecision::Auth(MetadataReadError::Forbidden) => {
+                ExportOutcome::Error(MetadataApiError::Forbidden)
+            }
+            ReadDecision::Unavailable if conflict || not_found > 0 => ExportOutcome::Conflict,
             // A holder that found the page too large answered for every holder of the graph.
-            ReadDecision::Unavailable if too_large => MetadataApiError::TooLarge,
+            ReadDecision::Unavailable if too_large => {
+                ExportOutcome::Error(MetadataApiError::TooLarge)
+            }
             ReadDecision::Auth(_) | ReadDecision::Unavailable => {
-                MetadataApiError::ServiceUnavailable
+                ExportOutcome::Error(MetadataApiError::ServiceUnavailable)
             }
         };
-        self.fall_back(routed)
+        if !faulted.is_empty() {
+            self.stage = RoutedStage::Avoid(Box::new(outcome));
+            return Ok(Next::Call(avoid_holders_call(faulted, self.now_ms)));
+        }
+        self.finish_routed(outcome)
+    }
+
+    fn finish_routed(&mut self, outcome: ExportOutcome) -> ExportTurn {
+        match outcome {
+            ExportOutcome::Found(export) => self.found(export),
+            ExportOutcome::Conflict => Err(MetadataApiError::ServiceUnavailable),
+            ExportOutcome::Error(error) => self.fall_back(error),
+        }
     }
 
     /// The owner's own online export is kept on this device before it answers, like a read.
@@ -454,6 +526,10 @@ impl Operation for RoutedExportOperation {
     type Output = ExportMetadataResult;
     type Error = MetadataApiError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
     fn first(&mut self) -> ExportTurn {
         if self.local_node.is_none() {
             self.stage = RoutedStage::Local;
@@ -465,37 +541,20 @@ impl Operation for RoutedExportOperation {
     }
 
     fn next(&mut self, result: IoResult) -> ExportTurn {
-        match self.stage {
+        match std::mem::replace(&mut self.stage, RoutedStage::Config) {
             RoutedStage::Local => Ok(Next::Done(
                 result.child::<ExportMetadataResult, MetadataApiError>()??,
             )),
             RoutedStage::Config => self.config_read(result),
             RoutedStage::Replica => self.replica_read(result),
-            RoutedStage::Holder => {
-                let local = result
-                    .child::<ExportMetadataResult, MetadataApiError>()?
-                    .map_err(crate::metadata::forward::write::read_error);
-                if let Some(node) = self.local_node {
-                    self.answers.push((node, local));
-                }
-                let requests = self.pending_fanout.take().unwrap_or_default();
-                self.ask(requests)
+            RoutedStage::SoleLocal => self.sole_local_answered(result),
+            RoutedStage::Holders => {
+                let IoResult::Group(GroupEvent::Finished { results }) = result else {
+                    return Err(MetadataApiError::ServiceUnavailable);
+                };
+                self.collect(results)
             }
-            RoutedStage::Peers => {
-                let answers = result
-                    .child::<Vec<PeerAnswer>, FetchError>()?
-                    .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-                for (peer, answer) in answers {
-                    let export = match answer {
-                        Ok(MetadataTransportMessage::ExportAnswer { result }) => {
-                            result.map(|export| *export)
-                        }
-                        _ => Err(MetadataReadError::Unavailable),
-                    };
-                    self.answers.push((peer, export));
-                }
-                self.collect()
-            }
+            RoutedStage::Avoid(outcome) => self.finish_routed(*outcome),
             // Keeping is best effort: a full cache or a failed write never fails the export.
             RoutedStage::Kept => (self.kept.take())
                 .map(Next::Done)

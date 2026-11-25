@@ -24,20 +24,21 @@ use aruna_core::structs::storage::blob::{
     VersionKey, object_permission_path,
 };
 use aruna_core::structs::storage::replication::W3idIdentifier;
-use aruna_core::types::{Key, Value};
+use aruna_core::types::{GroupId, Key, Value};
 
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
-use aruna_ops_identity::auth::check_permissions::{
-    CheckPermissionsConfig, CheckPermissionsOperation,
-};
 use aruna_ops_identity::auth::enforcement::{PolicyBulkOperation, PolicyEvaluators};
 use aruna_ops_identity::auth::error::PolicyEnforcementError;
+use aruna_ops_identity::auth::permission_rules::{
+    PermissionRules, PermissionRulesConfig, PermissionRulesOperation,
+};
 
 #[path = "index_search.rs"]
 mod index_search;
 
 const HEAD_SCAN_BATCH: usize = 1_000;
+const MIN_SCAN_BATCH: usize = 32;
 /// Changed keys one node page passes at most; the page then ends at the last of them.
 const CHANGED_PAGE_CAP: usize = SEARCH_MAX_LIMIT;
 /// Versions one read returns while learning whether a changed key existed at the snapshot.
@@ -117,21 +118,27 @@ enum Checked {
 #[derive(Debug, Default, PartialEq)]
 enum CheckWait {
     #[default]
-    Permission,
+    Rules,
     Policy(String),
 }
 
 /// Whether the caller may read a hit: group READ on its full object path, token path
-/// restrictions and the request policies of its group, each loaded once.
+/// restrictions and the request policies of its group. Rules and policies of a group are each
+/// loaded once, so the hits of one group are decided in memory.
 #[derive(Debug, Default, PartialEq)]
 struct HitCheck {
+    rules: HashMap<GroupId, PermissionRules>,
     evaluators: PolicyEvaluators,
     path: String,
     wait: CheckWait,
 }
 
 impl HitCheck {
-    fn begin(&mut self, input: &SearchObjectsInput, hit: &SearchNodeHit) -> IoCall {
+    fn begin(
+        &mut self,
+        input: &SearchObjectsInput,
+        hit: &SearchNodeHit,
+    ) -> Result<Checked, SearchObjectsError> {
         self.path = object_permission_path(
             input.realm_id,
             hit.hit.group_id,
@@ -139,12 +146,16 @@ impl HitCheck {
             &hit.hit.bucket,
             &hit.hit.key,
         );
-        self.wait = CheckWait::Permission;
-        IoCall::child(CheckPermissionsOperation::new(CheckPermissionsConfig {
+        if let Some(rules) = self.rules.get(&hit.hit.group_id) {
+            let allowed = rules.allows(&self.path, &Permission::READ);
+            return self.permitted(input, hit, allowed);
+        }
+        self.wait = CheckWait::Rules;
+        let rules = PermissionRulesOperation::new(PermissionRulesConfig {
             auth_context: input.auth.clone(),
             path: self.path.clone(),
-            required_permission: Permission::READ,
-        }))
+        });
+        Ok(Checked::Call(IoCall::child(rules)))
     }
 
     fn answer(
@@ -153,23 +164,49 @@ impl HitCheck {
         hit: &SearchNodeHit,
         result: IoResult,
     ) -> Result<Checked, SearchObjectsError> {
-        let scope = (input.realm_id, hit.hit.group_id);
         match std::mem::take(&mut self.wait) {
-            CheckWait::Permission => {
-                if !(result.child::<bool, AuthorizationError>()?).unwrap_or(false) {
-                    return Ok(Checked::Decided(false));
+            // A failed collection denies this hit as a failed check did; the next hit reads again.
+            CheckWait::Rules => match result.child::<PermissionRules, AuthorizationError>()? {
+                Ok(rules) => {
+                    let allowed = rules.allows(&self.path, &Permission::READ);
+                    self.rules.insert(hit.hit.group_id, rules);
+                    self.permitted(input, hit, allowed)
                 }
-                if !self.evaluators.contains_key(&scope) {
-                    self.wait = CheckWait::Policy(self.path.clone());
-                    let bulk = PolicyBulkOperation::new(vec![scope]);
-                    return Ok(Checked::Call(IoCall::child(bulk)));
-                }
-            }
+                Err(_) => Ok(Checked::Decided(false)),
+            },
             CheckWait::Policy(_) => {
                 let loaded = result.child::<PolicyEvaluators, PolicyEnforcementError>()??;
                 self.evaluators.extend(loaded);
+                self.decide(input, hit)
             }
         }
+    }
+
+    /// Past the group rules: the group's request policies, loaded once, decide the hit.
+    fn permitted(
+        &mut self,
+        input: &SearchObjectsInput,
+        hit: &SearchNodeHit,
+        allowed: bool,
+    ) -> Result<Checked, SearchObjectsError> {
+        if !allowed {
+            return Ok(Checked::Decided(false));
+        }
+        let scope = (input.realm_id, hit.hit.group_id);
+        if !self.evaluators.contains_key(&scope) {
+            self.wait = CheckWait::Policy(self.path.clone());
+            let bulk = PolicyBulkOperation::new(vec![scope]);
+            return Ok(Checked::Call(IoCall::child(bulk)));
+        }
+        self.decide(input, hit)
+    }
+
+    fn decide(
+        &mut self,
+        input: &SearchObjectsInput,
+        hit: &SearchNodeHit,
+    ) -> Result<Checked, SearchObjectsError> {
+        let scope = (input.realm_id, hit.hit.group_id);
         let request = policy_request_with(
             &self.path,
             &Permission::READ,
@@ -209,13 +246,24 @@ impl HitWalk {
         self.pending.extend(candidates);
     }
 
-    fn advance(&mut self, input: &SearchObjectsInput) -> WalkTurn {
-        let Some(candidate) = self.pending.pop_front() else {
-            return WalkTurn::Drained;
-        };
-        let call = self.check.begin(input, &candidate.hit);
-        self.current = Some(candidate);
-        WalkTurn::Call(call)
+    /// Decides candidates in memory while their group's rules and policies are loaded, and
+    /// stops at the first that needs a read or at a full page.
+    fn advance(&mut self, input: &SearchObjectsInput) -> Result<WalkTurn, SearchObjectsError> {
+        while let Some(candidate) = self.pending.pop_front() {
+            match self.check.begin(input, &candidate.hit)? {
+                Checked::Call(call) => {
+                    self.current = Some(candidate);
+                    return Ok(WalkTurn::Call(call));
+                }
+                Checked::Decided(false) => {}
+                Checked::Decided(true) => {
+                    if let Some(full) = self.accept(input, candidate) {
+                        return Ok(full);
+                    }
+                }
+            }
+        }
+        Ok(WalkTurn::Drained)
     }
 
     fn answer(
@@ -229,28 +277,32 @@ impl HitWalk {
                 self.current = Some(candidate);
                 Ok(WalkTurn::Call(call))
             }
-            Checked::Decided(false) => Ok(self.advance(input)),
-            Checked::Decided(true) => Ok(self.accept(input, candidate)),
+            Checked::Decided(false) => self.advance(input),
+            Checked::Decided(true) => match self.accept(input, candidate) {
+                Some(full) => Ok(full),
+                None => self.advance(input),
+            },
         }
     }
 
-    fn accept(&mut self, input: &SearchObjectsInput, candidate: Candidate) -> WalkTurn {
+    /// Adds an authorized candidate to the page; `Some` once the page is full.
+    fn accept(&mut self, input: &SearchObjectsInput, candidate: Candidate) -> Option<WalkTurn> {
         if candidate.changed {
             self.changed.push(candidate.hit.cursor_key);
             if self.changed.len() >= CHANGED_PAGE_CAP {
-                return WalkTurn::Full(self.changed.last().cloned());
+                return Some(WalkTurn::Full(self.changed.last().cloned()));
             }
-            return self.advance(input);
+            return None;
         }
         self.visible.push(candidate.hit);
         let limit = input.limit.clamp(1, SEARCH_MAX_LIMIT);
         if self.visible.len() <= limit {
-            return self.advance(input);
+            return None;
         }
         let next = (self.visible.get(limit - 1)).map(|hit| hit.cursor_key.clone());
         self.visible.truncate(limit);
         changed_until(&mut self.changed, next.as_deref());
-        WalkTurn::Full(next)
+        Some(WalkTurn::Full(next))
     }
 }
 
@@ -282,8 +334,8 @@ struct ExistedRead {
 enum BuildStep {
     Versions(Vec<HeadCandidate>),
     Existed(Box<ExistedRead>),
-    Buckets,
-    Locations(Vec<Option<Value>>, Vec<usize>),
+    Buckets(Vec<String>),
+    Locations(HashMap<String, GroupId>, Vec<usize>),
 }
 
 /// Turns current heads into hits inside the read transaction of the operation that holds it:
@@ -302,7 +354,7 @@ impl HitBuilder {
             input,
             loaded: VecDeque::new(),
             live: Vec::new(),
-            step: BuildStep::Buckets,
+            step: BuildStep::Buckets(Vec::new()),
         }
     }
 
@@ -359,27 +411,49 @@ impl HitBuilder {
         if self.live.is_empty() {
             return Ok(BuildTurn::Done(Vec::new()));
         }
-        let reads = (self.live.iter())
-            .map(|candidate| {
-                let bucket = candidate.head.bucket.as_bytes().to_vec();
-                (S3_BUCKET_KEYSPACE.to_string(), Key::from(bucket))
+        let mut names = Vec::new();
+        for candidate in &self.live {
+            if !names
+                .iter()
+                .any(|name: &String| name == &candidate.head.bucket)
+            {
+                names.push(candidate.head.bucket.clone());
+            }
+        }
+        let reads = (names.iter())
+            .map(|name| {
+                (
+                    S3_BUCKET_KEYSPACE.to_string(),
+                    Key::from(name.as_bytes().to_vec()),
+                )
             })
             .collect();
-        self.step = BuildStep::Buckets;
+        self.step = BuildStep::Buckets(names);
         Ok(BuildTurn::Call(IoCall::Read(reads)))
     }
 
     fn read_locations(
         &mut self,
+        names: Vec<String>,
         buckets: Vec<Option<Value>>,
     ) -> Result<BuildTurn, SearchObjectsError> {
-        if buckets.len() != self.live.len() {
+        if buckets.len() != names.len() {
             return Err(SearchObjectsError::Storage(
                 "object inventory bucket batch length mismatch".to_string(),
             ));
         }
+        let mut groups = HashMap::with_capacity(names.len());
+        for (name, bucket) in names.into_iter().zip(buckets) {
+            if let Some(bucket) = bucket {
+                let info = BucketInfo::from_bytes(bucket.as_ref())?;
+                groups.insert(name, info.group_id);
+            }
+        }
         let (mut slots, mut reads) = (Vec::new(), Vec::new());
         for (index, candidate) in self.live.iter().enumerate() {
+            if !groups.contains_key(&candidate.head.bucket) {
+                continue;
+            }
             if let Some(key) = candidate.version.location_key() {
                 slots.push(index);
                 reads.push((
@@ -389,25 +463,24 @@ impl HitBuilder {
             }
         }
         if reads.is_empty() {
-            return self.build(buckets, HashMap::new());
+            return self.build(groups, HashMap::new());
         }
-        self.step = BuildStep::Locations(buckets, slots);
+        self.step = BuildStep::Locations(groups, slots);
         Ok(BuildTurn::Call(IoCall::Read(reads)))
     }
 
     fn build(
         &mut self,
-        buckets: Vec<Option<Value>>,
+        groups: HashMap<String, GroupId>,
         location_by_index: HashMap<usize, BackendLocation>,
     ) -> Result<BuildTurn, SearchObjectsError> {
         let input = &self.input;
         let live = std::mem::take(&mut self.live);
         let mut candidates = Vec::new();
-        for (index, (candidate, bucket)) in live.into_iter().zip(buckets).enumerate() {
-            let Some(bucket) = bucket else {
+        for (index, candidate) in live.into_iter().enumerate() {
+            let Some(&group_id) = groups.get(&candidate.head.bucket) else {
                 continue;
             };
-            let bucket = BucketInfo::from_bytes(bucket.as_ref())?;
             let (content_w3id, checksum, size, updated_at) = match &candidate.version.state {
                 // Only its key is used: it is authorized and counted, never shown.
                 _ if candidate.changed => (None, None, None, None),
@@ -445,7 +518,7 @@ impl HitBuilder {
                 cursor_key: candidate.cursor_key,
                 hit: ObjectInventoryHit {
                     node_id: input.node_id,
-                    group_id: bucket.group_id,
+                    group_id,
                     bucket: candidate.head.bucket,
                     key: candidate.head.key,
                     content_w3id,
@@ -465,7 +538,7 @@ impl HitBuilder {
     }
 
     fn answer(&mut self, result: IoResult) -> Result<BuildTurn, SearchObjectsError> {
-        match std::mem::replace(&mut self.step, BuildStep::Buckets) {
+        match std::mem::replace(&mut self.step, BuildStep::Buckets(Vec::new())) {
             BuildStep::Versions(heads) => {
                 let versions = result.values()?;
                 if versions.len() != heads.len() {
@@ -509,15 +582,15 @@ impl HitBuilder {
                 }
                 self.settle()
             }
-            BuildStep::Buckets => self.read_locations(result.values()?),
-            BuildStep::Locations(buckets, slots) => {
+            BuildStep::Buckets(names) => self.read_locations(names, result.values()?),
+            BuildStep::Locations(groups, slots) => {
                 let mut locations = HashMap::new();
                 for (index, value) in slots.into_iter().zip(result.values()?) {
                     if let Some(value) = value {
                         locations.insert(index, BackendLocation::from_bytes(value.as_ref())?);
                     }
                 }
-                self.build(buckets, locations)
+                self.build(groups, locations)
             }
         }
     }
@@ -545,6 +618,7 @@ struct ScanBatchOperation {
     input: SearchObjectsInput,
     start: Option<IterStart>,
     distributed: HashMap<String, bool>,
+    limit: usize,
     next_start: Option<IterStart>,
     hits: HitBuilder,
     step: ScanStep,
@@ -557,12 +631,14 @@ impl ScanBatchOperation {
         input: SearchObjectsInput,
         start: Option<IterStart>,
         distributed: HashMap<String, bool>,
+        limit: usize,
     ) -> Self {
         Self {
             hits: HitBuilder::new(input.clone()),
             input,
             start,
             distributed,
+            limit: limit.clamp(1, HEAD_SCAN_BATCH),
             next_start: None,
             step: ScanStep::Heads,
         }
@@ -652,7 +728,7 @@ impl Operation for ScanBatchOperation {
             key_space: BLOB_HEAD_KEYSPACE.to_string(),
             prefix: prefix.map(Into::into),
             start: self.start.take(),
-            limit: HEAD_SCAN_BATCH,
+            limit: self.limit,
             txn_id: None,
         };
         Ok(Next::Call(Effect::Storage(scan).into()))
@@ -711,6 +787,7 @@ pub struct SearchObjectsOperation {
     start: Option<IterStart>,
     next_start: Option<IterStart>,
     distributed: HashMap<String, bool>,
+    scan_scale: usize,
     walk: HitWalk,
     now_ms: u64,
     step: SearchStep,
@@ -726,10 +803,22 @@ impl SearchObjectsOperation {
             indexed,
             next_start: None,
             distributed: HashMap::new(),
+            scan_scale: 2,
             walk: HitWalk::default(),
             now_ms: 0,
             step: SearchStep::Batch,
         }
+    }
+
+    fn batch_limit(&self) -> usize {
+        let needed = self
+            .input
+            .limit
+            .saturating_add(1)
+            .saturating_sub(self.walk.visible.len());
+        needed
+            .saturating_mul(self.scan_scale)
+            .clamp(MIN_SCAN_BATCH, HEAD_SCAN_BATCH)
     }
 
     fn read_batch(&mut self) -> PageTurn {
@@ -737,6 +826,7 @@ impl SearchObjectsOperation {
             self.input.clone(),
             self.start.take(),
             std::mem::take(&mut self.distributed),
+            self.batch_limit(),
         );
         self.step = SearchStep::Batch;
         Ok(Next::Call(IoCall::child(batch)))
@@ -750,6 +840,7 @@ impl SearchObjectsOperation {
             }
             WalkTurn::Drained => match self.next_start.take() {
                 Some(next) => {
+                    self.scan_scale = self.scan_scale.saturating_mul(2).min(HEAD_SCAN_BATCH);
                     self.start = Some(next);
                     self.read_batch()
                 }
@@ -811,7 +902,7 @@ impl Operation for SearchObjectsOperation {
                 self.distributed = batch.distributed;
                 self.next_start = batch.next_start;
                 self.walk.add(batch.candidates);
-                let turn = self.walk.advance(&self.input);
+                let turn = self.walk.advance(&self.input)?;
                 self.walked(turn)
             }
             SearchStep::Walk => {
@@ -1371,7 +1462,8 @@ mod tests {
 
     #[test]
     fn empty_scan_finishes() {
-        let mut scan = ScanBatchOperation::new(step_input(None), None, HashMap::new());
+        let mut scan =
+            ScanBatchOperation::new(step_input(None), None, HashMap::new(), HEAD_SCAN_BATCH);
         assert_eq!(scan.transaction(), TransactionMode::ReadSnapshot);
         assert!(matches!(scan.first(), Ok(Next::Call(IoCall::Effect(_)))));
         let event = Event::Storage(StorageEvent::IterResult {
@@ -1383,6 +1475,96 @@ mod tests {
         };
         assert!(batch.candidates.is_empty());
         assert_eq!(batch.next_start, None);
+    }
+
+    #[test]
+    fn batch_sizes_small() {
+        let mut req = step_input(None);
+        req.limit = 20;
+        let mut search = SearchObjectsOperation::new(req.clone(), false);
+        assert_eq!(search.batch_limit(), 42);
+        let mut scan = ScanBatchOperation::new(req, None, HashMap::new(), search.batch_limit());
+        let Ok(Next::Call(IoCall::Effect(effect))) = scan.first() else {
+            panic!("expected head scan effect");
+        };
+        assert!(matches!(
+            *effect,
+            Effect::Storage(StorageEffect::Iter { limit: 42, .. })
+        ));
+        search.next_start = Some(IterStart::After(Key::from(b"k".as_slice())));
+        let _ = search.walked(WalkTurn::Drained).unwrap();
+        assert_eq!(search.batch_limit(), 84);
+    }
+
+    #[test]
+    fn dedups_bucket_reads() {
+        let req = step_input(None);
+        let group_a = Ulid::from_parts(1, 1);
+        let group_b = Ulid::from_parts(2, 2);
+        let bucket_bytes = |group_id| {
+            BucketInfo {
+                group_id,
+                created_at: UNIX_EPOCH,
+                created_by: req.auth.user_id,
+                cors_configuration: None,
+                storage_routing: Vec::new(),
+                placement_policies: Vec::new(),
+                placement_policy_generation: 0,
+                compression: aruna_core::structs::storage::format::Compression::Off,
+                distribution: None,
+            }
+            .to_bytes()
+            .unwrap()
+            .into()
+        };
+        let mut builder = HitBuilder::new(req.clone());
+        let mut heads = Vec::new();
+        let mut versions = Vec::new();
+        for index in 0..50usize {
+            let bucket = if index % 2 == 0 { "alpha" } else { "beta" };
+            let key = format!("needle-{index:02}");
+            let version_id = Ulid::from_parts(10, index as u128 + 1);
+            let head = BlobHeadKey::new(bucket, &key);
+            heads.push(HeadCandidate {
+                cursor_key: head.to_bytes().unwrap(),
+                head,
+                version_id,
+            });
+            let version = BlobVersion::materialized(
+                [index as u8; 32],
+                aruna_core::structs::storage::blob::BackendRef::node_default(),
+                aruna_core::structs::storage::format::EncodingClass::Raw,
+                UNIX_EPOCH,
+                req.auth.user_id,
+                None,
+            );
+            versions.push(Some(version.to_bytes().unwrap().into()));
+        }
+        assert!(matches!(builder.start(heads), Ok(BuildTurn::Call(_))));
+        let Ok(BuildTurn::Call(IoCall::Read(reads))) = builder.answer(IoResult::Values(versions))
+        else {
+            panic!("expected deduplicated bucket read");
+        };
+        assert_eq!(
+            reads,
+            vec![
+                (S3_BUCKET_KEYSPACE.to_string(), Key::from("alpha")),
+                (S3_BUCKET_KEYSPACE.to_string(), Key::from("beta")),
+            ]
+        );
+        let Ok(BuildTurn::Call(_)) = builder.answer(IoResult::Values(vec![
+            Some(bucket_bytes(group_a)),
+            Some(bucket_bytes(group_b)),
+        ])) else {
+            panic!("expected location reads after bucket hydration");
+        };
+        let Ok(BuildTurn::Done(candidates)) = builder.answer(IoResult::Values(vec![None; 50]))
+        else {
+            panic!("expected hydrated candidates");
+        };
+        assert_eq!(candidates.len(), 50);
+        assert_eq!(candidates[0].hit.hit.group_id, group_a);
+        assert_eq!(candidates[1].hit.hit.group_id, group_b);
     }
 
     #[test]

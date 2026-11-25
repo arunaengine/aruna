@@ -9,7 +9,7 @@ pub mod here;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::compute::quota::QuotaDenied;
 use aruna_core::document::DocumentTarget;
-use aruna_core::effects::{Effect, JobRecordFrame, StorageEffect};
+use aruna_core::effects::{JobRecordFrame, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
@@ -44,6 +44,7 @@ use super::closure::closure_key;
 use super::{LifecycleError, stored_view};
 use crate::jobs::records::verify::{Evidence, FamilyView};
 use crate::jobs::records::{RECORD_PAGE_SIZE, RecordStoreError};
+use crate::jobs::store::store_call::OutsideRead;
 use aruna_core::job_request::workspace_of;
 
 /// The alias this node would mint, with the records it already signed for it.
@@ -86,6 +87,8 @@ pub struct AdmittedSubmission {
 pub struct AdmitSubmissionOperation {
     config: AdmitSubmissionConfig,
     view: Option<FamilyView>,
+    /// The realm config row the view came from, read again in the transaction as its fence.
+    config_row: Option<Value>,
     claims: Vec<(JobFamilyId, SubmissionClaim)>,
     quota_revision: u64,
     cache: Option<ProjectionCache>,
@@ -110,6 +113,7 @@ impl AdmitSubmissionOperation {
         Self {
             config,
             view: None,
+            config_row: None,
             claims: Vec::new(),
             quota_revision: 0,
             cache: None,
@@ -245,10 +249,15 @@ impl AdmitSubmissionOperation {
             return Err(StorageError::TransactionConflict.into());
         }
         self.state = AdmitState::ReadCache;
-        Ok(Next::Call(IoCall::Read(vec![(
+        let config = DocumentTarget::RealmConfig {
+            realm_id: self.config.realm_id,
+        };
+        let cache = (
             FAMILY_PROJECTION_KEYSPACE.to_string(),
             family_prefix(&self.family()),
-        )])))
+        );
+        let fence = (config.storage_keyspace().to_string(), config.storage_key());
+        Ok(Next::Call(IoCall::Read(vec![cache, fence])))
     }
 
     fn batch_writes(&self) -> Result<Vec<(String, Key, Value)>, LifecycleError> {
@@ -376,27 +385,29 @@ impl Operation for AdmitSubmissionOperation {
         let config = DocumentTarget::RealmConfig {
             realm_id: self.config.realm_id,
         };
-        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Storage(
-            StorageEffect::Read {
-                key_space: config.storage_keyspace().to_string(),
-                key: config.storage_key(),
-                txn_id: None,
-            },
-        )))))
+        Ok(Next::Call(OutsideRead::call(StorageEffect::Read {
+            key_space: config.storage_keyspace().to_string(),
+            key: config.storage_key(),
+            txn_id: None,
+        })))
     }
 
     fn next(&mut self, result: IoResult) -> Step {
         match (self.state, result) {
-            (AdmitState::ReadConfig, IoResult::Event(event)) => match *event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+            (AdmitState::ReadConfig, result) => match OutsideRead::answer(result)? {
+                StorageEvent::ReadResult { value, .. } => {
+                    self.config_row.clone_from(&value);
                     self.view = stored_view(value, self.config.realm_id, self.family())?;
                     if self.view.is_none() {
                         return Err(LifecycleError::NotHolder);
                     }
                     self.read_tombstone()
                 }
-                Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-                other => Err(self.unexpected("realm config read", other.label())),
+                StorageEvent::Error { error } => Err(error.into()),
+                other => {
+                    let got = Event::Storage(other).label();
+                    Err(self.unexpected("realm config read", got))
+                }
             },
             (AdmitState::ReadTombstone, result) => {
                 let [tombstone] = values::<1>(result)?;
@@ -416,7 +427,12 @@ impl Operation for AdmitSubmissionOperation {
             (AdmitState::ReadClosure, result) => self.closed(result),
             (AdmitState::ReadQuota, result) => self.read_cache(result),
             (AdmitState::ReadCache, result) => {
-                let [value] = values::<1>(result)?;
+                let [value, config] = values::<2>(result)?;
+                // A membership change since the view was read reruns the admission on the new
+                // one; a later change conflicts this transaction's read of the row.
+                if config != self.config_row {
+                    return Err(StorageError::TransactionConflict.into());
+                }
                 self.cache = value
                     .as_ref()
                     .and_then(|value| ProjectionCache::decode(value));
@@ -494,14 +510,73 @@ mod pure_tests {
             operation.transaction(),
             aruna_core::operation::TransactionMode::Write
         );
+        // A child reads the config, so the admission's transaction does not start with it.
         assert!(matches!(
             operation.first(),
-            Ok(Next::Call(IoCall::Effect(effect)))
-                if matches!(*effect, Effect::Storage(StorageEffect::Read { txn_id: None, .. }))
+            Ok(Next::Call(IoCall::Child(_)))
         ));
+        assert!(operation.next(IoResult::Done).is_err());
+    }
+
+    // A realm config that changed after the view was read conflicts the admission before it
+    // writes, so its rerun decides on the new membership.
+    #[test]
+    fn fences_realm_config() {
+        use crate::tests::records::actor;
+        use aruna_core::calls::{ChildOutcome, IoError};
+        use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+        let family = Family::new([2u8; 32]);
+        let spec = family.spec();
+        let claim = family.claim(&spec);
+        let sign = |record| {
+            JobRecordFrame::new(family.sign(&family.holder, record)).expect("bounded record")
+        };
+        let mut operation = AdmitSubmissionOperation::new(AdmitSubmissionConfig {
+            realm_id: REALM,
+            local_node_id: family.holder.public(),
+            submission_id: family.submission_id,
+            request_digest: family.request_digest,
+            candidate: Box::new(AdmissionCandidate {
+                job_id: spec.job_id,
+                spec: sign(JobFamilyRecord::Spec(Box::new(spec.clone()))),
+                claim: sign(JobFamilyRecord::Claim(claim)),
+            }),
+            now_ms: 3_000,
+            quota_refusal: None,
+            quota_revision: None,
+            admit_by: None,
+        });
+        let config = (family.config)
+            .to_bytes(&actor(family.holder.public()))
+            .expect("config encodes");
+        operation.first().expect("config read");
+        let read = StorageEvent::ReadResult {
+            key: Key::from([0u8].as_slice()),
+            value: Some(Value::from(config.as_slice())),
+        };
+        let mut turn = operation.next(IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(read))));
+        let changed = Some(Value::from([1u8].as_slice()));
+        let failed = loop {
+            let result = match turn {
+                Ok(Next::Call(IoCall::Read(reads))) => {
+                    let fence = |(space, _): &(String, Key)| {
+                        (space == REALM_CONFIG_KEYSPACE)
+                            .then(|| changed.clone())
+                            .flatten()
+                    };
+                    IoResult::Values(reads.iter().map(fence).collect())
+                }
+                Ok(Next::Call(IoCall::Page { .. })) => IoResult::Page {
+                    rows: Vec::new(),
+                    next: None,
+                },
+                other => break other,
+            };
+            turn = operation.next(result);
+        };
         assert!(matches!(
-            operation.next(IoResult::Done),
-            Err(LifecycleError::UnexpectedEvent { .. })
+            failed,
+            Err(LifecycleError::Storage(StorageError::TransactionConflict))
         ));
     }
 }

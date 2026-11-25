@@ -37,7 +37,7 @@ use aruna_ops_identity::auth::check_permissions::{
 use aruna_ops_identity::auth::enforcement::PolicyLoadOperation;
 use aruna_ops_identity::groups::routing::{BucketRules, SnapshotOperation};
 use aruna_ops_identity::placement::policy::gate::GateOperation;
-use aruna_runner::driver::{drive, node_routing};
+use aruna_runner::driver::{drive, drive_retry, node_routing};
 use s3s::dto::Error as S3DeleteError;
 use s3s::dto::{
     ChecksumType, CopyObjectInput, CopyObjectOutput, DeleteObjectInput, DeleteObjectOutput,
@@ -544,23 +544,27 @@ pub(super) async fn delete_object(
     let replication_key = req.input.key.clone();
     let replicate_latest_delete = version_id.is_none();
 
-    let operation =
-        DeleteObjectOperation::new(aruna_ops_data::s3::object::delete::DeleteObjectInput {
-            bucket: req.input.bucket,
-            key: req.input.key,
-            version_id,
-            group_id: user_access.group_id,
-            realm_id: adapter.realm_id,
-            node_id: adapter.node_id,
-            deleted_by: user_access.user_identity,
-        })
-        .with_restrictions(replication_auth.path_restrictions.clone());
-    let operation = match guards.is_empty() {
-        true => operation,
-        false => operation.with_fence(guards, Vec::new()),
+    let input = aruna_ops_data::s3::object::delete::DeleteObjectInput {
+        bucket: req.input.bucket,
+        key: req.input.key,
+        version_id,
+        group_id: user_access.group_id,
+        realm_id: adapter.realm_id,
+        node_id: adapter.node_id,
+        deleted_by: user_access.user_identity,
     };
-
-    let result = drive(operation, &adapter.state)
+    let restrictions = replication_auth.path_restrictions.clone();
+    let seed = input.key.clone().into_bytes();
+    // A lost commit conflict deletes again after a backoff; nothing moves before the commit.
+    let build = || {
+        let operation =
+            DeleteObjectOperation::new(input.clone()).with_restrictions(restrictions.clone());
+        match guards.is_empty() {
+            true => operation,
+            false => operation.with_fence(guards.clone(), Vec::new()),
+        }
+    };
+    let result = drive_retry(build, &adapter.state, &seed)
         .await
         .map_err(IntoS3Error::into_s3_error)?;
 

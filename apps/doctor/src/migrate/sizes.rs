@@ -19,11 +19,14 @@ pub(super) fn missing_sizes(
     let mut scanned = 0;
     let mut rows = Vec::new();
     for entry in read.iter(events) {
-        let (key, value) = entry.into_inner()?;
+        let key = entry.key()?;
         scanned += 1;
         if read.get(sizes, &key)?.is_some() {
             continue;
         }
+        let Some(value) = read.get(events, &key)? else {
+            continue;
+        };
         let event: MetadataEventRecord = postcard::from_bytes(&value)
             .map_err(|error| decode_error(EVENT_LOG_KEYSPACE, &key, error))?;
         let size = EventSize {
@@ -105,5 +108,34 @@ mod tests {
         assert_eq!(size.bytes, log.len() as u64);
         let again = migrate_output(database).expect("migration repeats");
         assert_eq!(again.event_sizes_written, 0);
+    }
+
+    #[test]
+    fn existing_skips_value() {
+        let key = b"already-sized-event".to_vec();
+        let existing = EventSize {
+            node_id: iroh::SecretKey::from_bytes(&[3; 32]).public(),
+            bytes: 42,
+        };
+        let encoded = postcard::to_allocvec(&existing).expect("size encodes");
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("db");
+        write(
+            &path,
+            EVENT_LOG_KEYSPACE,
+            vec![(&key, b"corrupt-unopened".to_vec())],
+        );
+        write(&path, EVENT_SIZE_KEYSPACE, vec![(&key, encoded)]);
+
+        let db = fjall::OptimisticTxDatabase::builder(&path).open().unwrap();
+        let events = db
+            .keyspace(EVENT_LOG_KEYSPACE, fjall::KeyspaceCreateOptions::default)
+            .unwrap();
+        let sizes = db
+            .keyspace(EVENT_SIZE_KEYSPACE, fjall::KeyspaceCreateOptions::default)
+            .unwrap();
+        let rewrites = super::missing_sizes(&db, &events, &sizes).unwrap();
+        assert_eq!(rewrites.scanned, 1);
+        assert!(rewrites.rows.is_empty());
     }
 }

@@ -13,20 +13,20 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     APPLIED_OPS_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     BROKEN_VERSION_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE, CONNECTOR_SECRET_KEYSPACE,
-    COPY_WAIT_KEYSPACE, DEADLINE_INDEX_KEYSPACE, DEDUP_INDEX_KEYSPACE, EVENT_JOURNAL_KEYSPACE,
-    EVENT_LOG_KEYSPACE, EVENT_SIZE_KEYSPACE, FAMILY_ALIAS_KEYSPACE, FAMILY_CONFLICT_KEYSPACE,
-    FAMILY_OUTBOX_KEYSPACE, FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE,
-    FAMILY_RECORD_KEYSPACE, GIT_RECORD_KEYSPACE, ID_MAPPING_KEYSPACE, INPUT_PAGE_KEYSPACE,
-    IRI_INDEX_KEYSPACE, JOB_KEYSPACE, JOB_RESERVATION_KEYSPACE, JOB_STATE_KEYSPACE,
-    LAUNCH_RECORD_KEYSPACE, NODE_INFO_KEYSPACE, NODE_STATE_KEY, NODE_STATE_KEYSPACE,
-    NODE_STATS_KEYSPACE, NODE_VAULT_KEYSPACE, ONBOARDING_KEYSPACE, PLAINTEXT_COPY_KEYSPACE,
-    PLAN_EXPLAIN_KEYSPACE, PLUGIN_OUTBOX_KEYSPACE, PLUGIN_RUNS_KEYSPACE, PLUGIN_WAITING_KEYSPACE,
-    QUARANTINE_USAGE_KEYSPACE, REALM_CONFIG_KEYSPACE, REFRESH_JOB_KEYSPACE,
-    REPLICATION_JOB_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE, ROOT_RECORD_KEYSPACE,
-    S3_BUCKET_KEYSPACE, S3_SESSION_KEYSPACE, SECONDARY_ID_KEYSPACE, SESSION_EXPIRY_KEYSPACE,
-    SESSION_OWNER_KEYSPACE, SOURCE_INDEX_KEYSPACE, STAGING_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
-    SYNC_QUARANTINE_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE, USAGE_STATS_KEYSPACE,
-    USER_SESSION_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
+    COPY_WAIT_KEYSPACE, DEADLINE_INDEX_KEYSPACE, DEDUP_INDEX_KEYSPACE, DOCUMENT_STATE_KEYSPACE,
+    EVENT_JOURNAL_KEYSPACE, EVENT_LOG_KEYSPACE, EVENT_SIZE_KEYSPACE, FAMILY_ALIAS_KEYSPACE,
+    FAMILY_CONFLICT_KEYSPACE, FAMILY_OUTBOX_KEYSPACE, FAMILY_PENDING_KEYSPACE,
+    FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE, GIT_RECORD_KEYSPACE, ID_MAPPING_KEYSPACE,
+    INPUT_PAGE_KEYSPACE, IRI_INDEX_KEYSPACE, JOB_KEYSPACE, JOB_RESERVATION_KEYSPACE,
+    JOB_STATE_KEYSPACE, LAUNCH_RECORD_KEYSPACE, NODE_INFO_KEYSPACE, NODE_STATE_KEY,
+    NODE_STATE_KEYSPACE, NODE_STATS_KEYSPACE, NODE_VAULT_KEYSPACE, ONBOARDING_KEYSPACE,
+    PLAINTEXT_COPY_KEYSPACE, PLAN_EXPLAIN_KEYSPACE, PLUGIN_OUTBOX_KEYSPACE, PLUGIN_RUNS_KEYSPACE,
+    PLUGIN_WAITING_KEYSPACE, QUARANTINE_USAGE_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    REFRESH_JOB_KEYSPACE, REPLICATION_JOB_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE,
+    ROOT_RECORD_KEYSPACE, S3_BUCKET_KEYSPACE, S3_SESSION_KEYSPACE, SECONDARY_ID_KEYSPACE,
+    SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE, SOURCE_INDEX_KEYSPACE, STAGING_STATE_KEYSPACE,
+    SYNC_OUTBOX_KEYSPACE, SYNC_QUARANTINE_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
+    USAGE_STATS_KEYSPACE, USER_SESSION_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
 };
 use aruna_core::node::vault::NodeVaultKey;
 use aruna_core::plugin_installs::PluginInstall;
@@ -79,6 +79,7 @@ pub(crate) mod cursor_repair;
 mod families;
 mod federation;
 mod git;
+mod history;
 mod info_topics;
 mod installs;
 mod jobs;
@@ -88,6 +89,7 @@ mod onboarding;
 mod pages;
 mod plugin_events;
 mod prune_index;
+mod quarantine;
 mod removals;
 mod session_refs;
 mod sessions;
@@ -127,6 +129,15 @@ pub struct MigrateOutput {
     pub projections_cleared: usize,
     pub realm_configs_scanned: usize,
     pub realm_configs_rewritten: usize,
+    /// Realm config reducer states, and those that gained the node history entries of nodes
+    /// added before the history was kept.
+    pub node_histories_scanned: usize,
+    pub node_histories_rewritten: usize,
+    /// Quarantined node info upserts this version reads: all leave the quarantine, and those
+    /// newer than the stored document are applied.
+    pub quarantined_infos_scanned: usize,
+    pub node_infos_recovered: usize,
+    pub quarantine_rows_cleared: usize,
     pub secrets_scanned: usize,
     pub secrets_sealed: usize,
     /// Secret rows left unchanged because they could not be read, as `keyspace/key: reason`.
@@ -268,7 +279,17 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
 
 /// Migrates the node database at `database_path` and its document sync store at `sync_path`.
 fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput, ExplorerError> {
-    let db = OptimisticTxDatabase::builder(Path::new(database_path)).open()?;
+    let db = OptimisticTxDatabase::builder(Path::new(database_path))
+        .cache_size(aruna_core::persistence::CACHE_BYTES)
+        .open()?;
+    let sync_storage = if sync_path.exists() {
+        let sync_db = OptimisticTxDatabase::builder(sync_path)
+            .cache_size(aruna_core::persistence::CACHE_BYTES)
+            .open()?;
+        Some(irokle::FjallStorage::from_database(sync_db)?)
+    } else {
+        None
+    };
     let record_rows = db.keyspace(FAMILY_RECORD_KEYSPACE, KeyspaceCreateOptions::default)?;
     let pending_rows = db.keyspace(FAMILY_PENDING_KEYSPACE, KeyspaceCreateOptions::default)?;
     let conflict_rows = db.keyspace(FAMILY_CONFLICT_KEYSPACE, KeyspaceCreateOptions::default)?;
@@ -329,8 +350,9 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     let mirror_rows = db.keyspace(trailing::MIRROR.0, KeyspaceCreateOptions::default)?;
     let timer_rows = db.keyspace(trailing::TIMERS.0, KeyspaceCreateOptions::default)?;
     let onboarding_rows = db.keyspace(ONBOARDING_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let document_rows = db.keyspace(DOCUMENT_STATE_KEYSPACE, KeyspaceCreateOptions::default)?;
 
-    sync_ops::unread_ops(&db, sync_path, &applied_rows)?;
+    sync_ops::unread_ops(&db, sync_storage.as_ref(), &applied_rows)?;
     // Old families are read before any write, so an unreadable one stops the run unchanged.
     let mut evidence = families::Evidence::default();
     let specs = [
@@ -394,6 +416,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     )?;
     let projections = keys(&db, &cache_rows)?;
     let configs = realm_configs(&db, &config_rows)?;
+    let histories = history::legacy_states(&db, &document_rows)?;
     let expiries = onboarding::expiry_rows(&db, &onboarding_rows, &mut unknown_rows)?;
     let mappings =
         rewrites::<PersistentIdMapping, LegacyMapping>(&db, &mapping_rows, ID_MAPPING_KEYSPACE)?;
@@ -430,7 +453,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     })?;
     let info = info_topics::info_cleanup(
         &db,
-        sync_path,
+        sync_storage.as_ref(),
         info_topics::InfoRows {
             applied: &applied_rows,
             quarantine: &quarantine_rows,
@@ -438,6 +461,8 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
             outbox: &outbox_rows,
         },
     )?;
+    // Release the sync store handle before any topic purge reopens it with its larger cache.
+    drop(sync_storage);
     let logins = rewrites::<UserSession, user_sessions::LegacySession>(
         &db,
         &login_rows,
@@ -556,7 +581,30 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
             layouts::rebuild_progress(&db, &stats_rows)?,
         ),
     ];
-    let keys = node_secret(&db)?.map(|secret| {
+    let relaid_infos = (relaid_rows.iter())
+        .find(|(_, space, _)| *space == NODE_INFO_KEYSPACE)
+        .map_or(&[][..], |(_, _, rows)| &rows[..]);
+    let old_infos = (stale_rows.iter())
+        .find(|(_, space, _)| *space == NODE_INFO_KEYSPACE)
+        .map_or(&[][..], |(_, _, keys)| &keys[..]);
+    let state = node_state(&db)?;
+    let infos = quarantine::recovered_infos(
+        &db,
+        state.as_ref().map(|state| state.realm_id),
+        quarantine::InfoStores {
+            quarantine: &quarantine_rows,
+            nodes: &node_rows,
+            usage: &usage_rows,
+        },
+        quarantine::InfoChanges {
+            cleared: &info.quarantine,
+            usage: info.usage.as_deref(),
+            relaid: relaid_infos,
+            deleted: old_infos,
+        },
+    )?;
+    let keys = state.map(|state| {
+        let secret = state.net_secret_key;
         (
             CredentialEncryptionKey::derive(&secret),
             NodeVaultKey::derive(&secret),
@@ -586,6 +634,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         (&pending_rows, &pending.rows),
         (&conflict_rows, &conflicts.rows),
         (&config_rows, &configs.rows),
+        (&document_rows, &histories.rows),
         (&onboarding_rows, &expiries.rows),
         (&mapping_rows, &mappings.rows),
         (&outbox_rows, &outbox.rows),
@@ -660,6 +709,16 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     if let Some(usage) = &info.usage {
         txn.insert(usage_rows.clone(), QUARANTINE_USAGE_KEY, usage.clone());
     }
+    // Last, so the recovered node info and usage win over the rewrites they were computed on.
+    for key in &infos.removed {
+        txn.remove(quarantine_rows.clone(), key.clone());
+    }
+    for (key, value) in &infos.documents {
+        txn.insert(node_rows.clone(), key.clone(), value.clone());
+    }
+    if let Some(usage) = &infos.usage {
+        txn.insert(usage_rows.clone(), QUARANTINE_USAGE_KEY, usage.clone());
+    }
     for (name, keys) in &removal.rows {
         let keyspace = db.keyspace(name, KeyspaceCreateOptions::default)?;
         for key in keys {
@@ -718,6 +777,11 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         projections_cleared: projections.len(),
         realm_configs_scanned: configs.scanned,
         realm_configs_rewritten: configs.rows.len(),
+        node_histories_scanned: histories.scanned,
+        node_histories_rewritten: histories.rows.len(),
+        quarantined_infos_scanned: infos.scanned,
+        node_infos_recovered: infos.documents.len(),
+        quarantine_rows_cleared: infos.removed.len(),
         secrets_scanned: secrets.iter().map(|(_, sealed)| sealed.scanned).sum(),
         secrets_sealed: secrets.iter().map(|(_, sealed)| sealed.rows.len()).sum(),
         secrets_skipped,
@@ -809,15 +873,15 @@ fn node_documents<'k>(
     Ok((keyspace, NODE_INFO_KEYSPACE, rows.rows))
 }
 
-/// The node secret the node derives its sealing keys from at startup.
-fn node_secret(db: &OptimisticTxDatabase) -> Result<Option<[u8; 32]>, ExplorerError> {
+/// The node state, with the realm and the secret the node derives its sealing keys from.
+fn node_state(db: &OptimisticTxDatabase) -> Result<Option<PersistedNodeState>, ExplorerError> {
     let rows = db.keyspace(NODE_STATE_KEYSPACE, KeyspaceCreateOptions::default)?;
     let Some(value) = db.read_tx().get(&rows, NODE_STATE_KEY)? else {
         return Ok(None);
     };
     let state = postcard::from_bytes::<PersistedNodeState>(&value)
         .map_err(|error| decode_error(NODE_STATE_KEYSPACE, NODE_STATE_KEY, error))?;
-    Ok(Some(state.net_secret_key))
+    Ok(Some(state))
 }
 
 /// Seals plain secret rows; rows that already open with the node key stay unchanged.

@@ -327,6 +327,7 @@ struct LocalPartOperation<O> {
     node: PageNode,
     group_id: Ulid,
     caller: Option<OwnedCaller>,
+    access: Option<Arc<BucketAccess>>,
     input: Option<ListBucketInput>,
     /// The sealed hidden position the page opens and resumes at.
     hidden: Option<Vec<u8>>,
@@ -346,12 +347,18 @@ impl<O: PageObject> LocalPartOperation<O> {
             node,
             group_id,
             caller,
+            access: None,
             input: Some(input),
             hidden,
             bounds,
             step: LocalStep::Listed,
             object: PhantomData,
         }
+    }
+
+    fn with_access(mut self, access: Option<Arc<BucketAccess>>) -> Self {
+        self.access = access;
+        self
     }
 
     fn input(&mut self) -> Result<ListBucketInput, IoError> {
@@ -368,12 +375,12 @@ impl<O: PageObject> LocalPartOperation<O> {
         Ok(Next::Call(IoCall::child(list)))
     }
 
-    fn list_visible(&mut self, access: BucketAccess) -> PageTurn<O> {
+    fn list_visible(&mut self, access: Arc<BucketAccess>) -> PageTurn<O> {
         let (auth, expiry) = self.caller.take().ok_or(IoError::Unfinished)?;
         let node = self.node;
         // The bearer's expiry bounds a delegated HEAD of a target on another node.
         let rule = LinkShows {
-            keys: AccessKeys(Arc::new(access)),
+            keys: AccessKeys(access),
             caller: LinkCaller {
                 auth,
                 credential: (String::new(), self.group_id, expiry),
@@ -404,6 +411,9 @@ impl<O: PageObject> Operation for LocalPartOperation<O> {
         let Some((auth, _)) = &self.caller else {
             return self.list_all();
         };
+        if let Some(access) = self.access.take() {
+            return self.list_visible(access);
+        }
         let node = self.node;
         let ids = (node.realm_id, self.group_id, node.node_id);
         let bucket = &self.input.as_ref().ok_or(IoError::Unfinished)?.bucket;
@@ -416,7 +426,7 @@ impl<O: PageObject> Operation for LocalPartOperation<O> {
         match self.step {
             LocalStep::Access => {
                 let access = result.child::<BucketAccess, AuthorizeError>()?;
-                self.list_visible(access.map_err(PageError::internal)?)
+                self.list_visible(Arc::new(access.map_err(PageError::internal)?))
             }
             LocalStep::Listed => {
                 let listed = result.child::<ListBucketResult, ListBucketError>()?;
@@ -751,6 +761,7 @@ struct MergedPageOperation<O> {
     info: BucketInfo,
     binding: DistributionBinding,
     caller: Option<OwnedCaller>,
+    bucket_access: Option<Arc<BucketAccess>>,
     request: ListRequest,
     checks: Option<Checks>,
     view: Option<DistributionView>,
@@ -783,6 +794,7 @@ impl<O: PageObject> MergedPageOperation<O> {
             info,
             binding,
             caller,
+            bucket_access: None,
             request,
             checks: None,
             view: None,
@@ -800,6 +812,11 @@ impl<O: PageObject> MergedPageOperation<O> {
             current: None,
             step: MergeStep::View,
         }
+    }
+
+    fn with_access(mut self, access: Option<Arc<BucketAccess>>) -> Self {
+        self.bucket_access = access;
+        self
     }
 
     fn read_view(&mut self) -> PageTurn<O> {
@@ -969,7 +986,8 @@ impl<O: PageObject> MergedPageOperation<O> {
         let bounds = Some((range.lower.clone(), range.upper.clone()));
         let input = list_input(&current.sub, self.info.group_id, token, None);
         let who = (self.info.group_id, self.caller.clone());
-        let part = LocalPartOperation::<O>::new(self.node, who, input, (hidden, bounds));
+        let part = LocalPartOperation::<O>::new(self.node, who, input, (hidden, bounds))
+            .with_access(self.bucket_access.clone());
         self.step = MergeStep::Local;
         Ok(Next::Call(IoCall::child(part)))
     }
@@ -1064,6 +1082,10 @@ impl<O: PageObject> Operation for MergedPageOperation<O> {
         let Some((auth, _)) = self.caller.as_ref().filter(|_| checked) else {
             return self.read_view();
         };
+        if let Some(access) = self.bucket_access.clone() {
+            self.checks = Some((access, self.info.group_id));
+            return self.read_view();
+        }
         let ids = (self.node.realm_id, self.info.group_id, self.node.node_id);
         let access = BucketAccessOperation::new(auth, ids, &self.request.bucket);
         self.step = MergeStep::Access;
@@ -1126,6 +1148,7 @@ pub struct ObjectPageOperation<O> {
     access: MemberAccess,
     info: BucketInfo,
     caller: Option<OwnedCaller>,
+    bucket_access: Option<Arc<BucketAccess>>,
     request: ListRequest,
     kind: PageKind,
     object: PhantomData<O>,
@@ -1144,10 +1167,17 @@ impl<O: PageObject> ObjectPageOperation<O> {
             access,
             info: info.clone(),
             caller: caller.map(|(auth, expiry)| (auth.clone(), expiry)),
+            bucket_access: None,
             request,
             kind: PageKind::Whole,
             object: PhantomData,
         }
+    }
+
+    /// Reuses an already-loaded caller bucket access instead of reading auth and policy rows again.
+    pub fn with_access(mut self, access: Arc<BucketAccess>) -> Self {
+        self.bucket_access = Some(access);
+        self
     }
 
     /// One page of the range `bounds` names, for a listing another member relays here.
@@ -1172,7 +1202,8 @@ impl<O: PageObject> ObjectPageOperation<O> {
         let group_id = self.info.group_id;
         let input = list_input(&self.request, group_id, token, start_after);
         let who = (group_id, self.caller.take());
-        let part = LocalPartOperation::<O>::new(self.node, who, input, (hidden, bounds));
+        let part = LocalPartOperation::<O>::new(self.node, who, input, (hidden, bounds))
+            .with_access(self.bucket_access.take());
         Ok(IoCall::child(part))
     }
 }
@@ -1199,7 +1230,8 @@ impl<O: PageObject> Operation for ObjectPageOperation<O> {
                     (self.info.clone(), binding),
                     self.caller.take(),
                     self.request.clone(),
-                );
+                )
+                .with_access(self.bucket_access.take());
                 IoCall::child(merged)
             }
         };

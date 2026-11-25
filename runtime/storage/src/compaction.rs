@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -16,6 +16,7 @@ use fjall::{
 use tracing::{debug, warn};
 
 pub(crate) const DELETE_THRESHOLD: u64 = 5_000;
+pub(crate) const MIN_SCAN_BYTES: u64 = 1024 * 1024;
 pub(crate) const MAX_KEYSPACE_BYTES: u64 = 256 * 1024 * 1024;
 /// Least time between two compactions of one keyspace. Each flushes its memtable while every
 /// commit waits, so a queue that deletes thousands of rows a second must not compact each time.
@@ -30,14 +31,103 @@ const SWEEP: &str = "journal sweep";
 pub(crate) struct CompactionJob {
     pub(crate) key_space: String,
     pub(crate) deletes: u64,
+    /// When true (slow-scan trigger), skip running if no committed deletes remain tracked for
+    /// the keyspace when the job starts.
+    pub(crate) require_deletes: bool,
     pub(crate) run: Box<dyn FnOnce() -> fjall::Result<()> + Send>,
 }
 
 pub(crate) struct Compactor {
     pub(crate) sender: Option<std::sync::mpsc::Sender<CompactionJob>>,
+    shared_sender: Arc<Mutex<Option<std::sync::mpsc::Sender<CompactionJob>>>>,
     thread: Option<thread::JoinHandle<()>>,
     pub(crate) active: Arc<Mutex<HashSet<String>>>,
+    /// Keyspaces that saw at least one committed delete since their last compaction started.
+    pub(crate) deleted: Arc<RwLock<HashSet<String>>>,
     pub(crate) stopping: Arc<AtomicBool>,
+}
+
+/// Cloneable handle read pool threads use to queue tombstone compactions.
+#[derive(Clone)]
+pub(crate) struct CompactorHandle {
+    sender: Arc<Mutex<Option<std::sync::mpsc::Sender<CompactionJob>>>>,
+    active: Arc<Mutex<HashSet<String>>>,
+    deleted: Arc<RwLock<HashSet<String>>>,
+}
+
+impl CompactorHandle {
+    pub(crate) fn has_deletes(&self, key_space: &str) -> bool {
+        self.deleted
+            .read()
+            .expect("storage compaction deleted lock poisoned")
+            .contains(key_space)
+    }
+
+    pub(crate) fn submit_scan(
+        &self,
+        key_space: &str,
+        db: OptimisticTxDatabase,
+        keyspace: OptimisticTxKeyspace,
+    ) {
+        self.submit_job(key_space, 1, true, db, keyspace);
+    }
+
+    pub(crate) fn submit(
+        &self,
+        key_space: &str,
+        deletes: u64,
+        db: OptimisticTxDatabase,
+        keyspace: OptimisticTxKeyspace,
+    ) {
+        self.submit_job(key_space, deletes, false, db, keyspace);
+    }
+
+    fn submit_job(
+        &self,
+        key_space: &str,
+        deletes: u64,
+        require_deletes: bool,
+        db: OptimisticTxDatabase,
+        keyspace: OptimisticTxKeyspace,
+    ) {
+        let sender = self
+            .sender
+            .lock()
+            .expect("storage compaction sender mutex poisoned")
+            .clone();
+        let Some(sender) = sender else {
+            return;
+        };
+        {
+            let mut active = self
+                .active
+                .lock()
+                .expect("storage compaction mutex poisoned");
+            if require_deletes && !self.has_deletes(key_space) {
+                return;
+            }
+            if !active.insert(key_space.to_string()) {
+                return;
+            }
+        }
+        let job = CompactionJob {
+            key_space: key_space.to_string(),
+            deletes,
+            require_deletes,
+            run: Box::new(move || {
+                let inner: &fjall::Keyspace = keyspace.as_ref();
+                inner.rotate_memtable_and_wait()?;
+                inner.major_compact()?;
+                checkpoint(&db, &keyspace)
+            }),
+        };
+        if sender.send(job).is_err() {
+            self.active
+                .lock()
+                .expect("storage compaction mutex poisoned")
+                .remove(key_space);
+        }
+    }
 }
 
 /// Keeps the compactions of one keyspace an interval apart, from the end of one to the start of
@@ -69,6 +159,7 @@ impl Spacing {
         }
         if let Some(waiting) = self.waiting.get_mut(&job.key_space) {
             waiting.deletes = waiting.deletes.saturating_add(job.deletes);
+            waiting.require_deletes &= job.require_deletes;
             return None;
         }
         if self.due_at(&job.key_space).is_some_and(|due| now < due) {
@@ -113,8 +204,10 @@ impl Compactor {
     pub(crate) fn spaced(interval: Duration) -> Self {
         let (sender, receiver) = std::sync::mpsc::channel::<CompactionJob>();
         let active = Arc::new(Mutex::new(HashSet::new()));
+        let deleted = Arc::new(RwLock::new(HashSet::new()));
         let stopping = Arc::new(AtomicBool::new(false));
         let running = active.clone();
+        let tracked = deleted.clone();
         let stop = stopping.clone();
         let thread = thread::spawn(move || {
             let mut spacing = Spacing::new(interval);
@@ -138,15 +231,19 @@ impl Compactor {
                         return;
                     }
                     let key_space = job.key_space.clone();
-                    run_job(job, &running);
-                    spacing.finished(&key_space, Instant::now());
+                    if run_job(job, &running, &tracked) {
+                        spacing.finished(&key_space, Instant::now());
+                    }
                 }
             }
         });
+        let shared_sender = Arc::new(Mutex::new(Some(sender.clone())));
         Self {
             sender: Some(sender),
+            shared_sender,
             thread: Some(thread),
             active,
+            deleted,
             stopping,
         }
     }
@@ -155,19 +252,47 @@ impl Compactor {
     pub(crate) fn idle() -> Self {
         Self {
             sender: None,
+            shared_sender: Arc::new(Mutex::new(None)),
             thread: None,
             active: Arc::new(Mutex::new(HashSet::new())),
+            deleted: Arc::new(RwLock::new(HashSet::new())),
             stopping: Arc::new(AtomicBool::new(false)),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn stub(sender: std::sync::mpsc::Sender<CompactionJob>) -> Self {
+        let shared_sender = Arc::new(Mutex::new(Some(sender.clone())));
         Self {
             sender: Some(sender),
+            shared_sender,
             thread: None,
             active: Arc::new(Mutex::new(HashSet::new())),
+            deleted: Arc::new(RwLock::new(HashSet::new())),
             stopping: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub(crate) fn note_deleted(&self, key_space: &str) {
+        if self
+            .deleted
+            .read()
+            .expect("storage compaction deleted lock poisoned")
+            .contains(key_space)
+        {
+            return;
+        }
+        self.deleted
+            .write()
+            .expect("storage compaction deleted lock poisoned")
+            .insert(key_space.to_string());
+    }
+
+    pub(crate) fn handle(&self) -> CompactorHandle {
+        CompactorHandle {
+            sender: self.shared_sender.clone(),
+            active: self.active.clone(),
+            deleted: self.deleted.clone(),
         }
     }
 
@@ -180,30 +305,7 @@ impl Compactor {
         db: OptimisticTxDatabase,
         keyspace: OptimisticTxKeyspace,
     ) {
-        let Some(sender) = self.sender.as_ref() else {
-            return;
-        };
-        if !self
-            .active
-            .lock()
-            .expect("storage compaction mutex poisoned")
-            .insert(key_space.to_string())
-        {
-            return;
-        }
-        let job = CompactionJob {
-            key_space: key_space.to_string(),
-            deletes,
-            run: Box::new(move || {
-                let inner: &fjall::Keyspace = keyspace.as_ref();
-                inner.rotate_memtable_and_wait()?;
-                inner.major_compact()?;
-                checkpoint(&db, &keyspace)
-            }),
-        };
-        if sender.send(job).is_err() {
-            self.release(key_space);
-        }
+        self.handle().submit(key_space, deletes, db, keyspace);
     }
 
     /// Checkpoints every keyspace without unflushed rows, since any of them may hold old journals.
@@ -222,6 +324,7 @@ impl Compactor {
         let job = CompactionJob {
             key_space: SWEEP.to_string(),
             deletes: 0,
+            require_deletes: false,
             run: Box::new(move || {
                 for name in db.list_keyspace_names() {
                     let keyspace = db.keyspace(&name, KeyspaceCreateOptions::default)?;
@@ -250,6 +353,10 @@ impl Compactor {
     pub(crate) fn shutdown(&mut self) {
         self.stopping.store(true, Ordering::Release);
         self.sender = None;
+        self.shared_sender
+            .lock()
+            .expect("storage compaction sender mutex poisoned")
+            .take();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -292,16 +399,37 @@ pub(crate) fn compactable(disk_space: u64) -> bool {
     disk_space <= MAX_KEYSPACE_BYTES
 }
 
-pub(crate) fn run_job(job: CompactionJob, active: &Arc<Mutex<HashSet<String>>>) {
+/// Whether a slow tombstone scan on a keyspace warrants major compaction: at least one flushed
+/// table and `MIN_SCAN_BYTES` on disk, bounded by `MAX_KEYSPACE_BYTES`.
+pub(crate) fn scan_compactable(disk_space: u64, tables: usize) -> bool {
+    tables > 0 && disk_space >= MIN_SCAN_BYTES && compactable(disk_space)
+}
+
+pub(crate) fn run_job(
+    job: CompactionJob,
+    active: &Arc<Mutex<HashSet<String>>>,
+    deleted: &Arc<RwLock<HashSet<String>>>,
+) -> bool {
     let CompactionJob {
         key_space,
         deletes,
+        require_deletes,
         run,
     } = job;
-    active
-        .lock()
-        .expect("storage compaction mutex poisoned")
-        .remove(&key_space);
+    let had_deletes = {
+        // Hold `active` across clearing `deleted` and `active` so a concurrent delete-threshold
+        // writer either contributes its `deleted` marker to this run or queues a successor.
+        let mut active_guard = active.lock().expect("storage compaction mutex poisoned");
+        let had_deletes = deleted
+            .write()
+            .expect("storage compaction deleted lock poisoned")
+            .remove(&key_space);
+        active_guard.remove(&key_space);
+        had_deletes
+    };
+    if require_deletes && !had_deletes {
+        return false;
+    }
     let started = Instant::now();
     match run() {
         Ok(()) => debug!(
@@ -311,14 +439,23 @@ pub(crate) fn run_job(job: CompactionJob, active: &Arc<Mutex<HashSet<String>>>) 
             elapsed_ms = duration_ms(started.elapsed()),
             "Compacted a delete-heavy keyspace"
         ),
-        Err(error) => warn!(
-            event = "storage.keyspace.compact_failed",
-            key_space = %key_space,
-            deletes,
-            error = %error,
-            "Keyspace compaction failed"
-        ),
+        Err(error) => {
+            if had_deletes {
+                deleted
+                    .write()
+                    .expect("storage compaction deleted lock poisoned")
+                    .insert(key_space.clone());
+            }
+            warn!(
+                event = "storage.keyspace.compact_failed",
+                key_space = %key_space,
+                deletes,
+                error = %error,
+                "Keyspace compaction failed"
+            );
+        }
     }
+    true
 }
 
 #[cfg(test)]
@@ -334,6 +471,16 @@ mod tests {
         CompactionJob {
             key_space: key_space.to_string(),
             deletes,
+            require_deletes: false,
+            run: Box::new(|| Ok(())),
+        }
+    }
+
+    fn scan_job(key_space: &str) -> CompactionJob {
+        CompactionJob {
+            key_space: key_space.to_string(),
+            deletes: 1,
+            require_deletes: true,
             run: Box::new(|| Ok(())),
         }
     }
@@ -395,6 +542,7 @@ mod tests {
             let job = CompactionJob {
                 key_space,
                 deletes,
+                require_deletes: false,
                 run,
             };
             sender.send(job).expect("job is queued");
@@ -413,6 +561,11 @@ mod tests {
         assert!(compactable(0));
         assert!(compactable(MAX_KEYSPACE_BYTES));
         assert!(!compactable(MAX_KEYSPACE_BYTES + 1));
+        assert!(!super::scan_compactable(0, 0));
+        assert!(!super::scan_compactable(super::MIN_SCAN_BYTES, 0));
+        assert!(!super::scan_compactable(super::MIN_SCAN_BYTES - 1, 2));
+        assert!(super::scan_compactable(super::MIN_SCAN_BYTES, 1));
+        assert!(!super::scan_compactable(MAX_KEYSPACE_BYTES + 1, 2));
     }
 
     #[test]
@@ -448,6 +601,7 @@ mod tests {
             .send(CompactionJob {
                 key_space: "failing".to_string(),
                 deletes: DELETE_THRESHOLD,
+                require_deletes: false,
                 run: Box::new(|| Err(fjall::Error::Poisoned)),
             })
             .expect("failing job is queued");
@@ -455,6 +609,7 @@ mod tests {
             .send(CompactionJob {
                 key_space: "next".to_string(),
                 deletes: 1,
+                require_deletes: false,
                 run: Box::new(move || {
                     done.send(()).expect("test receives signal");
                     Ok(())
@@ -485,6 +640,7 @@ mod tests {
             .send(CompactionJob {
                 key_space: "first".to_string(),
                 deletes: 1,
+                require_deletes: false,
                 run: Box::new(move || {
                     entered.send(()).expect("first job observed");
                     blocked.recv().expect("first job released");
@@ -496,6 +652,7 @@ mod tests {
             .send(CompactionJob {
                 key_space: "second".to_string(),
                 deletes: 1,
+                require_deletes: false,
                 run: Box::new(move || {
                     ran.send(()).expect("second job observed");
                     Ok(())
@@ -511,5 +668,120 @@ mod tests {
         release.send(()).expect("first job is released");
         compactor.shutdown();
         assert!(second.try_recv().is_err(), "backlog ran after shutdown");
+    }
+
+    // Two concurrent slow scans for one keyspace only compact once while no new delete lands.
+    #[test]
+    fn scan_skips_clean() {
+        use std::sync::atomic::AtomicUsize;
+
+        let mut compactor = Compactor::spaced(Duration::from_millis(1));
+        compactor.note_deleted("queue");
+        let runs = std::sync::Arc::new(AtomicUsize::new(0));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let sender = compactor.sender.clone().expect("compactor accepts jobs");
+
+        for _ in 0..2 {
+            let runs = runs.clone();
+            sender
+                .send(CompactionJob {
+                    key_space: "queue".to_string(),
+                    deletes: 1,
+                    require_deletes: true,
+                    run: Box::new(move || {
+                        runs.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }),
+                })
+                .expect("scan job queued");
+        }
+        // A threshold job (require_deletes: false) still runs as a fence and proves the
+        // redundant scan job already passed through the compactor thread.
+        sender
+            .send(CompactionJob {
+                key_space: "fence".to_string(),
+                deletes: DELETE_THRESHOLD,
+                require_deletes: false,
+                run: Box::new(move || {
+                    done_tx.send(()).expect("fence reached");
+                    Ok(())
+                }),
+            })
+            .expect("fence job queued");
+        drop(sender);
+
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("fence ran");
+        compactor.shutdown();
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    // Merging a delete-threshold job into a waiting slow-scan job clears `require_deletes`.
+    #[test]
+    fn merge_clears_gate() {
+        let start = Instant::now();
+        let at = |secs| start + Duration::from_secs(secs);
+        let mut spacing = Spacing::new(Duration::from_secs(60));
+        let first = spacing.offer(job("queue", 1), at(0));
+        spacing.finished(&first.expect("first runs").key_space, at(0));
+
+        assert!(spacing.offer(scan_job("queue"), at(10)).is_none());
+        assert!(spacing.offer(job("queue", 5_000), at(20)).is_none());
+        let due = spacing.due(at(60));
+        assert_eq!(due.len(), 1);
+        assert!(!due[0].require_deletes);
+        assert_eq!(due[0].deletes, 5_001);
+    }
+
+    // A stale scan clearing `deleted` and `active` under one lock cannot drop a concurrent
+    // delete-threshold submission: either the scan runs or the threshold submission queues.
+    #[test]
+    fn scan_keeps_threshold() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::{Arc, Barrier};
+
+        for _ in 0..64 {
+            let compactor = Compactor::idle();
+            compactor
+                .active
+                .lock()
+                .expect("compaction mutex")
+                .insert("queue".to_string());
+            let barrier = Arc::new(Barrier::new(2));
+            let ran = Arc::new(AtomicUsize::new(0));
+
+            let active = compactor.active.clone();
+            let deleted = compactor.deleted.clone();
+            let scan_barrier = barrier.clone();
+            let scan_ran = ran.clone();
+            let scan_thread = std::thread::spawn(move || {
+                let job = CompactionJob {
+                    key_space: "queue".to_string(),
+                    deletes: 1,
+                    require_deletes: true,
+                    run: Box::new(move || {
+                        scan_ran.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }),
+                };
+                scan_barrier.wait();
+                super::run_job(job, &active, &deleted)
+            });
+
+            barrier.wait();
+            compactor.note_deleted("queue");
+            let queued = compactor
+                .active
+                .lock()
+                .expect("compaction mutex")
+                .insert("queue".to_string());
+            let compacted = scan_thread.join().expect("scan thread joins");
+            assert!(
+                compacted || queued,
+                "concurrent delete-threshold submission must either compact or queue"
+            );
+            assert_eq!(ran.load(Ordering::SeqCst), usize::from(compacted));
+        }
     }
 }

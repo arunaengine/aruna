@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -11,7 +12,7 @@ use aruna_core::git::{CaptureMark, GitNode};
 use aruna_core::keyspaces::MATERIALIZATION_CAPTURE_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::types::Key;
+use aruna_core::types::{Key, Value};
 use byteview::ByteView;
 use tracing::warn;
 use ulid::Ulid;
@@ -22,6 +23,8 @@ use crate::metadata::record_reads::DocumentRecordOperation;
 
 /// When the drain runs again after a snapshot that failed; its mark stays for that run.
 pub const CAPTURE_RETRY_AFTER: Duration = Duration::from_secs(30);
+/// Capture marks loaded per scan page to avoid one scan per mark while preserving every revision.
+const CAPTURE_PAGE_LIMIT: usize = 64;
 
 type Turn = Result<Next<Option<Duration>>, IoError>;
 
@@ -33,17 +36,19 @@ enum CaptureStep {
     Delete,
 }
 
-/// One drain run over the queued capture marks in sequence order, so Git gets a document's graphs
-/// in finish order; a failed snapshot stops its document. It reads one mark at a time, so a
-/// backlog loads one graph at most, and answers when to run again after a failed snapshot.
+/// One drain run over the queued capture marks in sequence order, prefetching pages of marks and
+/// snapshotting each distinct revision in order before deleting its mark; a failed snapshot stops
+/// its document. Answers when to run again after a failed snapshot.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CaptureDrainOperation {
     node: GitNode,
-    /// The last key the drain read; the next mark comes after it.
+    /// The last key the drain read; the next page starts after it.
     after: Option<Key>,
+    /// Rows loaded by the current page waiting to be snapshotted one by one.
+    pending: VecDeque<(Key, Value)>,
     /// The document of the last mark and its record, `None` once it was deleted.
     known: Option<(Ulid, Option<MetadataRegistryRecord>)>,
-    /// The mark being snapshotted.
+    /// The single mark key and payload currently being snapshotted.
     current: Option<(Key, CaptureMark)>,
     failed: bool,
     step: CaptureStep,
@@ -72,6 +77,7 @@ impl CaptureDrainOperation {
         Self {
             node,
             after: None,
+            pending: VecDeque::new(),
             known: None,
             current: None,
             failed: false,
@@ -80,43 +86,54 @@ impl CaptureDrainOperation {
     }
 
     fn page(&mut self) -> Turn {
+        if !self.pending.is_empty() {
+            return self.take_next();
+        }
         self.step = CaptureStep::Page;
         Ok(Next::Call(IoCall::Page {
             space: MATERIALIZATION_CAPTURE_KEYSPACE.to_string(),
             prefix: ByteView::from(Vec::new()),
             after: self.after.clone(),
-            limit: 1,
+            limit: CAPTURE_PAGE_LIMIT,
         }))
     }
 
     fn take(&mut self, result: IoResult) -> Turn {
         let (rows, _) = result.page()?;
-        let Some((key, value)) = rows.into_iter().next() else {
+        if rows.is_empty() {
             return Ok(Next::Done(self.failed.then_some(CAPTURE_RETRY_AFTER)));
-        };
-        self.after = Some(key.clone());
-        if is_hold(&key) {
-            return self.page();
         }
-        let Some(document_id) = mark_document(&key) else {
-            return self.delete(key);
-        };
-        let mark = match CaptureMark::from_bytes(&value) {
-            Ok(mark) => mark,
-            Err(error) => {
-                warn!(%document_id, %error, "Deleting an unreadable Git capture mark");
-                return self.delete(key);
+        self.pending = rows.into();
+        self.take_next()
+    }
+
+    fn take_next(&mut self) -> Turn {
+        while let Some((key, value)) = self.pending.pop_front() {
+            self.after = Some(key.clone());
+            if is_hold(&key) {
+                continue;
             }
-        };
-        self.current = Some((key, mark));
-        let known = (self.known.as_ref()).is_some_and(|(known, _)| *known == document_id);
-        if known {
-            return self.snapshot();
+            let Some(document_id) = mark_document(&key) else {
+                return self.delete(key);
+            };
+            let mark = match CaptureMark::from_bytes(&value) {
+                Ok(mark) => mark,
+                Err(error) => {
+                    warn!(%document_id, %error, "Deleting an unreadable Git capture mark");
+                    return self.delete(key);
+                }
+            };
+            self.current = Some((key, mark));
+            let known = (self.known.as_ref()).is_some_and(|(known, _)| *known == document_id);
+            if known {
+                return self.snapshot();
+            }
+            self.known = None;
+            self.step = CaptureStep::Record;
+            let read = DocumentRecordOperation::new(document_id);
+            return Ok(Next::Call(IoCall::child(read)));
         }
-        self.known = None;
-        self.step = CaptureStep::Record;
-        let read = DocumentRecordOperation::new(document_id);
-        Ok(Next::Call(IoCall::child(read)))
+        self.page()
     }
 
     /// Snapshots the current mark's graph; a deleted document has no snapshot to take.
@@ -132,13 +149,14 @@ impl CaptureDrainOperation {
         Ok(Next::Call(IoCall::child(snapshot)))
     }
 
-    /// A failed step keeps the mark and leaves the rest of its document until the next run.
+    /// A failed step keeps its mark and leaves the rest of its document until the next run.
     fn kept(&mut self, error: impl std::fmt::Display) -> Turn {
         let (key, _) = self.current.take().ok_or(IoError::Unfinished)?;
         let document_id = mark_document(&key).unwrap_or_else(Ulid::nil);
         warn!(%document_id, %error, "The Git snapshot of a materialized document waits");
         self.failed = true;
         self.known = None;
+        self.pending.clear();
         self.after = Some(past_document(document_id));
         self.page()
     }
@@ -270,7 +288,7 @@ mod tests {
             space: MATERIALIZATION_CAPTURE_KEYSPACE.to_string(),
             prefix: ByteView::from(Vec::new()),
             after,
-            limit: 1,
+            limit: CAPTURE_PAGE_LIMIT,
         }))
     }
 
@@ -304,8 +322,7 @@ mod tests {
         assert_eq!(drain.next(page(Vec::new())), Ok(Next::Done(None)));
     }
 
-    // The drain reads one mark per page and loads the next only after the last one went, so a
-    // backlog never holds more than one graph; the document's record is read once.
+    // The drain reuses the document's record across consecutive marks.
     #[test]
     fn streams_one_mark() {
         let mut drain = snapshotting();
@@ -369,5 +386,36 @@ mod tests {
         drain.first().unwrap();
         let row = (capture_key(DOCUMENT, 0), Value::from(vec![0xff]));
         assert_eq!(drain.next(one(row)), deleted(0));
+    }
+
+    // A prefetched page snapshots each distinct revision in order and deletes only after each
+    // snapshot succeeds; a middle failure keeps the failed mark and every later mark of that doc.
+    #[test]
+    fn preserves_every_revision() {
+        let mut drain = CaptureDrainOperation::new(GitNode::default());
+        drain.first().unwrap();
+        let rows = vec![queued(1, "first"), queued(2, "second"), queued(3, "third")];
+        let record_read = IoCall::child(DocumentRecordOperation::new(DOCUMENT));
+        assert_eq!(drain.next(page(rows.clone())), Ok(Next::Call(record_read)));
+        assert_eq!(drain.next(found()), snapshot_of("first"));
+        assert_eq!(drain.next(done()), deleted(1));
+        assert_eq!(drain.next(IoResult::Done), snapshot_of("second"));
+        assert_eq!(drain.next(done()), deleted(2));
+        assert_eq!(drain.next(IoResult::Done), snapshot_of("third"));
+        assert_eq!(drain.next(done()), deleted(3));
+        assert_eq!(
+            drain.next(IoResult::Done),
+            paged(Some(capture_key(DOCUMENT, 3)))
+        );
+
+        // If revision 2 fails, revision 1 was deleted individually while 2 and 3 remain queued.
+        let mut partial = CaptureDrainOperation::new(GitNode::default());
+        partial.first().unwrap();
+        partial.next(page(rows)).unwrap();
+        assert_eq!(partial.next(found()), snapshot_of("first"));
+        assert_eq!(partial.next(done()), deleted(1));
+        assert_eq!(partial.next(IoResult::Done), snapshot_of("second"));
+        let failed = child(Err::<(), _>(GitError::Unavailable));
+        assert_eq!(partial.next(failed), paged(Some(past_document(DOCUMENT))));
     }
 }

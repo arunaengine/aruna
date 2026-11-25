@@ -159,8 +159,12 @@ impl CompleteUploadOperation {
     }
 
     /// Keyed by the location's own backend, so a rewrite of identical content only ever
-    /// replaces the copy on the backend the write resolved to.
+    /// replaces the copy on the backend the write resolved to. A row this transaction read
+    /// stays as it is: rewriting it would conflict identical uploads, and the read fences a reclaim.
     pub(super) fn write_blob_location(&mut self) -> Turn {
+        if !self.new_blob {
+            return self.read_object_lookup();
+        }
         let location = self.final_location.clone();
         let location = location.ok_or(CompleteUploadError::CompleteUploadFailed)?;
         let blake3_hash = location.get_blake3();
@@ -439,11 +443,16 @@ impl CompleteUploadOperation {
         self.call(CompleteUploadState::ReadUploadRecord, read)
     }
 
-    /// A concurrent delete of the record conflicts with this read, so a record is counted
-    /// closed once.
+    /// Publishes only while the record is still this attempt's completion: a purge that aborted
+    /// the upload or a takeover of the lease ends it here, and the reopen leaves their record be.
+    /// A concurrent delete of the record conflicts with this read, so it is counted closed once.
     pub(super) fn upload_record_read(&mut self, value: Option<Value>) -> Turn {
-        if value.is_none() {
-            return self.delete_records();
+        let value = value.ok_or(CompleteUploadError::NoSuchUpload)?;
+        let record = MultipartUpload::from_bytes(value.as_ref())?;
+        if record.status != MultipartUploadStatus::Completing
+            || record.completing_since_ms != Some(self.input.now_ms)
+        {
+            return Err(CompleteUploadError::UploadNotOpen);
         }
         let count = upload_count(&self.input.bucket, -1);
         self.call(CompleteUploadState::CountUpload, count)

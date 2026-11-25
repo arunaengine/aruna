@@ -7,8 +7,8 @@ use std::collections::{BTreeMap, VecDeque};
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::document::DocumentTarget;
-use aruna_core::effects::{Effect, JobRecordFrame, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::effects::JobRecordFrame;
+use aruna_core::errors::StorageError;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     FAMILY_ALIAS_KEYSPACE, FAMILY_CONFLICT_KEYSPACE, FAMILY_OUTBOX_KEYSPACE,
@@ -37,6 +37,8 @@ use super::admit::{
 };
 use super::verify::{EvidencePlan, FamilyView};
 use super::{MAX_EVIDENCE_ROWS, RECORD_PAGE_SIZE, RecordStoreError};
+use crate::jobs::store::mutation_error::JobMutationError;
+use crate::jobs::store::store_call::RowRead;
 
 type Step = Result<Next<AppendOutcome>, RecordStoreError>;
 
@@ -80,6 +82,8 @@ pub struct AppendOutcome {
 pub struct AppendRecordOperation {
     config: AppendRecordConfig,
     view: Option<FamilyView>,
+    /// The realm config row the view came from, read again in the transaction as its fence.
+    config_row: Option<Value>,
     stored: BTreeMap<JobRecordKey, JobRecordEnvelope>,
     retained: Vec<(JobRecordKey, PendingRecord)>,
     cache: Option<ProjectionCache>,
@@ -114,6 +118,7 @@ impl AppendRecordOperation {
         Self {
             config,
             view: None,
+            config_row: None,
             stored: BTreeMap::new(),
             retained: Vec::new(),
             cache: None,
@@ -162,23 +167,20 @@ impl AppendRecordOperation {
         self.envelope().family()
     }
 
-    /// The realm view is read outside the transaction: a config write is
-    /// unrelated to this family and must not conflict every append.
+    /// The realm view is read by a child without a transaction: a config write is unrelated
+    /// to this family and must not conflict every append. A storage call here would open it.
     fn read_config(&mut self) -> Step {
         self.state = AppendState::ReadConfig;
         let config = DocumentTarget::RealmConfig {
             realm_id: self.config.realm_id,
         };
-        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Storage(
-            StorageEffect::Read {
-                key_space: config.storage_keyspace().to_string(),
-                key: config.storage_key(),
-                txn_id: None,
-            },
-        )))))
+        let space = config.storage_keyspace();
+        let read = RowRead::new(space, config.storage_key(), |row: Option<Value>| Ok(row));
+        Ok(Next::Call(IoCall::child(read)))
     }
 
     fn keep_view(&mut self, value: Option<Value>) -> Result<(), RecordStoreError> {
+        self.config_row.clone_from(&value);
         let Some(value) = value else {
             return Err(RecordStoreError::RealmConfigMissing);
         };
@@ -207,12 +209,22 @@ impl AppendRecordOperation {
         if let Some(group_id) = self.spec_group() {
             reads.push(aruna_ops_identity::groups::fence::group_fence_key(group_id));
         }
+        let config = DocumentTarget::RealmConfig {
+            realm_id: self.config.realm_id,
+        };
+        reads.push((config.storage_keyspace().to_string(), config.storage_key()));
         Ok(Next::Call(IoCall::Read(reads)))
     }
 
     /// Keeps the candidate's own row, the projection cache and the family tombstone, and checks
-    /// that a spec's group still accepts writes.
-    fn keep_row(&mut self, values: Vec<Option<Value>>) -> Result<(), RecordStoreError> {
+    /// that a spec's group still accepts writes and the realm config is the one read first.
+    fn keep_row(&mut self, mut values: Vec<Option<Value>>) -> Result<(), RecordStoreError> {
+        // A membership change since the view was read reruns the append on the new one; a
+        // later change conflicts this transaction's read of the row.
+        let config = values.pop().ok_or(RecordStoreError::EvidenceIncomplete)?;
+        if config != self.config_row {
+            return Err(StorageError::TransactionConflict.into());
+        }
         let mut values = values.into_iter();
         let row = values
             .next()
@@ -484,7 +496,7 @@ impl AppendRecordOperation {
             kind = ?self.envelope().kind(),
             admission = ?admission,
             admitted,
-            "Job record admission decided"
+            "Job record admission planned; the transaction may still conflict"
         );
         AppendOutcome {
             key: self.envelope().key(),
@@ -498,10 +510,6 @@ impl AppendRecordOperation {
             admission,
             admitted,
         }
-    }
-
-    fn unexpected(&self, expected: &'static str, got: &'static str) -> RecordStoreError {
-        RecordStoreError::unexpected(&self.state, expected, got)
     }
 }
 
@@ -526,14 +534,12 @@ impl Operation for AppendRecordOperation {
 
     fn next(&mut self, result: IoResult) -> Step {
         match (self.state, result) {
-            (AppendState::ReadConfig, IoResult::Event(event)) => match *event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    self.keep_view(value)?;
-                    self.read_row()
-                }
-                Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-                other => Err(self.unexpected("realm config read", other.label())),
-            },
+            (AppendState::ReadConfig, result @ IoResult::Child(_)) => {
+                let value = result.child::<Option<Value>, JobMutationError>()?;
+                let value = value.map_err(|error| StorageError::ReadError(error.to_string()))?;
+                self.keep_view(value)?;
+                self.read_row()
+            }
             (AppendState::ReadRow, IoResult::Values(values)) => {
                 self.keep_row(values)?;
                 self.scan_pending()

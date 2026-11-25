@@ -11,12 +11,12 @@ use super::create::{CreateBatchOutcome, CreateBatchPlan, CreateEventPlan, Pendin
 use super::distribution::{DistributionPlan, ReplayForkPlan, RetryParkedPlan};
 use super::events::{ApplyEventPlan, ApplyOutcome, PolicyChangePlan, WatchChangePlan};
 use super::fixtures::{
-    actor, check_plan, config_target, config_topic, node, realm, signature, single_event,
-    snapshot_event,
+    actor, check_plan, config_target, config_topic, info_target, info_upsert, info_upsert_epoch,
+    node, realm, signature, single_event, snapshot_event,
 };
 use super::followups::{FollowUpNode, QueuedApply, followup_id, followup_row};
 use super::links::LinkPlan;
-use super::quarantine::CursorEvidencePlan;
+use super::quarantine::{CursorEvidencePlan, SupersededInfoPlan};
 use super::reads::{dependency_available, relay_allowed};
 use super::registry::{
     DeleteRegistryPlan, DocumentLifecyclePlan, GraphLifecyclePlan, PidMappingPlan,
@@ -56,8 +56,8 @@ use crate::structs::placement::policy::{PlacementPolicy, PlacementSelector, Veri
 use crate::structs::placement::record::{LabelMatch, METADATA_HANDLE, PlacementRef};
 use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
 use crate::structs::sync_quarantine::{
-    QUARANTINE_MAX_RECORDS, SyncQuarantineIdentity, SyncQuarantineUsage, SyncRejection,
-    quarantine_usage_entry,
+    QUARANTINE_MAX_RECORDS, SyncQuarantineIdentity, SyncQuarantineRecord, SyncQuarantineUsage,
+    SyncRejection, quarantine_row_entry, quarantine_usage_entry,
 };
 use crate::structured_id::{BucketId, MetaResourceId, PlacementHandle, StructuredId};
 use crate::types::{Key, KeySpace, Value};
@@ -876,6 +876,169 @@ fn full_holds_cursor() {
     let ran = run(plan, &stored);
     assert!(ran.unchanged());
     assert!(!ran.output());
+}
+
+#[test]
+fn superseded_info_cleared() {
+    // An applied node info upsert drops the earlier advertisements of its publisher for that node
+    // that were rejected only for their payload, and releases their usage. A later one, a policy
+    // refusal, a rejected delete and another node's row stay.
+    let decode = "invalid node info document: Found a bool that wasn't 0 or 1";
+    let row = |seq: u64, node_id, reason: &str| {
+        let (identity, event) = info_upsert(seq, node_id);
+        let rejection = SyncRejection::new(identity, event, reason);
+        let record = SyncQuarantineRecord::new(identity, rejection.evidence, reason, 1);
+        quarantine_row_entry(&record).unwrap()
+    };
+    let deleted = {
+        let (identity, _) = info_upsert(2, node());
+        let event = DocumentEvent::Delete {
+            event_id: Ulid::from_parts(2, 1),
+            target: info_target(node()),
+            change: change(DocumentChangeKind::Delete, PlacementRef::NIL),
+        };
+        let record = SyncQuarantineRecord::new(
+            identity,
+            SyncRejection::new(identity, event, decode).evidence,
+            decode,
+            1,
+        );
+        quarantine_row_entry(&record).unwrap()
+    };
+    let other = iroh::SecretKey::from_bytes(&[8; 32]).public();
+    let rows = [
+        row(3, node(), decode),
+        row(9, node(), decode),
+        row(
+            4,
+            node(),
+            "shard publisher is outside the current holder set",
+        ),
+        row(1, other, decode),
+        deleted,
+    ];
+    let total: u64 = rows.iter().map(|(_, _, value)| value.len() as u64).sum();
+    let usage = SyncQuarantineUsage {
+        records: rows.len() as u64,
+        bytes: total,
+    };
+    let mut stored = with_row(nothing(), quarantine_usage_entry(usage).unwrap());
+    for row in rows.clone() {
+        stored = with_row(stored, row);
+    }
+    let (applied, event) = info_upsert(5, node());
+    let DocumentEvent::Upsert { target, bytes, .. } = event else {
+        panic!("an upsert");
+    };
+    let plan = SupersededInfoPlan {
+        identity: applied,
+        target: target.clone(),
+        realm_id: realm(),
+        bytes: bytes.clone(),
+    };
+    assert_eq!(plan.transaction(), TransactionMode::Write);
+    // An equal or older advertisement left another document stored and clears nothing.
+    let (_, newer) = info_upsert(6, node());
+    let DocumentEvent::Upsert { bytes: newer, .. } = newer else {
+        panic!("an upsert");
+    };
+    let info = |bytes: Vec<u8>| {
+        (
+            target.storage_keyspace().to_string(),
+            target.storage_key(),
+            Value::from(bytes),
+        )
+    };
+    let stale = run(plan.clone(), &with_row(stored.clone(), info(newer)));
+    assert!(stale.unchanged());
+    assert!(!stale.output());
+
+    let ran = run(plan.clone(), &with_row(stored, info(bytes.clone())));
+    let (space, key, value) = &rows[0];
+    assert_eq!(ran.deletes, vec![(space.clone(), key.clone())]);
+    let released = SyncQuarantineUsage {
+        records: rows.len() as u64 - 1,
+        bytes: total - value.len() as u64,
+    };
+    assert_eq!(ran.writes, vec![quarantine_usage_entry(released).unwrap()]);
+    assert!(ran.output());
+    let alone = with_row(nothing(), info(bytes));
+    assert!(
+        run(plan, &alone).unchanged(),
+        "nothing quarantined changes nothing"
+    );
+}
+
+#[test]
+fn replay_keeps_newer() {
+    // A byte-identical replay at a higher sequence must keep a lower-sequence rejection whose
+    // epoch supersedes the stored document, and a shard target with nil placement never panics.
+    use crate::structs::storage::node_info::AdvertisementEpoch;
+    use crate::sync_checks::quarantined_node_info;
+    let decode = "invalid node info document: Found a bool that wasn't 0 or 1";
+    let epoch = |step| AdvertisementEpoch {
+        membership_generation: 1,
+        publisher_generation: step,
+        observed_at_ms: step,
+    };
+    let make = |seq: u64, step: u64| {
+        let (identity, event) = info_upsert_epoch(seq, node(), epoch(step));
+        let rejection = SyncRejection::new(identity, event, decode);
+        let record = SyncQuarantineRecord::new(identity, rejection.evidence, decode, 1);
+        quarantine_row_entry(&record).unwrap()
+    };
+    let older = make(2, 4);
+    let newer = make(3, 10);
+    let total = (older.2.len() + newer.2.len()) as u64;
+    let usage = SyncQuarantineUsage {
+        records: 2,
+        bytes: total,
+    };
+    let (mut replay_id, replay_event) = info_upsert_epoch(1, node(), epoch(5));
+    replay_id.actor_seq = 5;
+    let DocumentEvent::Upsert { target, bytes, .. } = replay_event else {
+        panic!("an upsert");
+    };
+    let info = (
+        target.storage_keyspace().to_string(),
+        target.storage_key(),
+        Value::from(bytes.clone()),
+    );
+    let stored = with_row(
+        with_row(
+            with_row(
+                with_row(nothing(), info),
+                quarantine_usage_entry(usage).unwrap(),
+            ),
+            older.clone(),
+        ),
+        newer,
+    );
+    let plan = SupersededInfoPlan {
+        identity: replay_id,
+        target,
+        realm_id: realm(),
+        bytes,
+    };
+    let ran = run(plan, &stored);
+    assert_eq!(ran.deletes, vec![(older.0, older.1)]);
+    assert!(ran.output());
+
+    let shard = DocumentEvent::Upsert {
+        event_id: Ulid::from_parts(7, 1),
+        target: DocumentTarget::Group {
+            group_id: Ulid::from_bytes([7; 16]),
+        },
+        bytes: Vec::new(),
+        change: change(DocumentChangeKind::Upsert, PlacementRef::NIL),
+    };
+    let record = SyncQuarantineRecord::new(
+        replay_id,
+        SyncRejection::new(replay_id, shard, decode).evidence,
+        decode,
+        1,
+    );
+    assert!(quarantined_node_info(&record, realm()).is_none());
 }
 
 #[test]

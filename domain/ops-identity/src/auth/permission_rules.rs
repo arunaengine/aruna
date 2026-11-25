@@ -2,7 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::errors::AuthorizationError;
@@ -57,13 +58,92 @@ impl PartialEq for CompiledRestriction {
     }
 }
 
+/// Compiled rules kept behind an `Arc` so cached evaluations clone in O(1).
+#[derive(Clone, Debug, Default, PartialEq)]
+struct CompiledRules {
+    rules: Vec<CompiledRule>,
+    restrictions: Option<Vec<CompiledRestriction>>,
+}
+
+/// Bounded content-addressed cache of compiled rules keyed by BLAKE3 of caller and auth rows.
+const RULE_CACHE_CAPACITY: usize = 1024;
+
+#[derive(Default)]
+struct RuleCache {
+    entries: HashMap<[u8; 32], Arc<CompiledRules>>,
+    order: VecDeque<[u8; 32]>,
+}
+
+impl RuleCache {
+    fn get(&self, key: &[u8; 32]) -> Option<Arc<CompiledRules>> {
+        self.entries.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: [u8; 32], rules: Arc<CompiledRules>) {
+        if let Some(existing) = self.entries.get_mut(&key) {
+            *existing = rules;
+            return;
+        }
+        if self.entries.len() >= RULE_CACHE_CAPACITY
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.entries.remove(&oldest);
+        }
+        self.entries.insert(key, rules);
+        self.order.push_back(key);
+    }
+}
+
+fn rule_cache() -> &'static Mutex<RuleCache> {
+    static CACHE: OnceLock<Mutex<RuleCache>> = OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+fn rules_cache_key(auth_context: &AuthContext, realm: &[u8], group: Option<&[u8]>) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"aruna-permission-rules-v1\0");
+    hasher.update(auth_context.user_id.realm_id.as_bytes());
+    hasher.update(&auth_context.user_id.user_ulid.to_bytes());
+    match auth_context.path_restrictions.as_deref() {
+        None => {
+            hasher.update(&[0u8]);
+        }
+        Some(restrictions) => {
+            hasher.update(&[1u8]);
+            hasher.update(&(restrictions.len() as u64).to_le_bytes());
+            for restriction in restrictions {
+                hasher.update(&(restriction.pattern.len() as u64).to_le_bytes());
+                hasher.update(restriction.pattern.as_bytes());
+                let perm = match restriction.permission {
+                    Permission::READ => 1u8,
+                    Permission::WRITE => 2u8,
+                    Permission::DENY => 3u8,
+                };
+                hasher.update(&[perm]);
+            }
+        }
+    }
+    hasher.update(&(realm.len() as u64).to_le_bytes());
+    hasher.update(realm);
+    match group {
+        None => {
+            hasher.update(&[0u8]);
+        }
+        Some(group) => {
+            hasher.update(&[1u8]);
+            hasher.update(&(group.len() as u64).to_le_bytes());
+            hasher.update(group);
+        }
+    }
+    *hasher.finalize().as_bytes()
+}
+
 /// The caller's effective permission rules for one realm or group scope.
 /// `allows` is the single authorization decision used by every read path, so a
 /// caller holding many paths can decide in memory after one collection.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PermissionRules {
-    rules: Vec<CompiledRule>,
-    restrictions: Option<Vec<CompiledRestriction>>,
+    inner: Arc<CompiledRules>,
 }
 
 impl PermissionRules {
@@ -108,8 +188,10 @@ impl PermissionRules {
             .transpose()?;
 
         Ok(Self {
-            rules,
-            restrictions,
+            inner: Arc::new(CompiledRules {
+                rules,
+                restrictions,
+            }),
         })
     }
 
@@ -117,7 +199,7 @@ impl PermissionRules {
     /// READ, and token path restrictions act as a whitelist on top.
     pub fn allows(&self, path: &str, required: &Permission) -> bool {
         let mut allowed = false;
-        for rule in &self.rules {
+        for rule in &self.inner.rules {
             if !rule.matcher.is_match(path) {
                 continue;
             }
@@ -143,7 +225,8 @@ impl PermissionRules {
     /// Patterns of the roles the caller holds directly, for callers that derive
     /// reachable subtrees instead of deciding one concrete path.
     pub fn direct_patterns(&self) -> Vec<(String, Permission)> {
-        self.rules
+        self.inner
+            .rules
             .iter()
             .filter(|rule| rule.direct)
             .map(|rule| {
@@ -175,14 +258,14 @@ impl PermissionRules {
     /// Whether every path that starts with `path` is readable: a role grant and, for a scoped
     /// token, a restriction cover all of them, and no deny of either could reach one.
     pub fn reads_below(&self, path: &str) -> bool {
-        let patterns: Vec<_> = (self.rules.iter())
+        let patterns: Vec<_> = (self.inner.rules.iter())
             .filter(|rule| rule.direct || rule.public && rule.permission == Permission::READ)
             .map(|rule| (rule.matcher.glob().glob(), &rule.permission))
             .collect();
         if !covers_below(&patterns, path) {
             return false;
         }
-        match &self.restrictions {
+        match &self.inner.restrictions {
             None => true,
             Some(rules) => covers_below(
                 &(rules.iter())
@@ -200,11 +283,11 @@ impl PermissionRules {
             return self.reads_below(path);
         }
         let held = |permission: &Permission| *permission != Permission::READ;
-        let patterns: Vec<_> = (self.rules.iter())
+        let patterns: Vec<_> = (self.inner.rules.iter())
             .filter(|rule| rule.direct && held(&rule.permission))
             .map(|rule| (rule.matcher.glob().glob(), &rule.permission))
             .collect();
-        let restrictions = self.restrictions.as_ref().map(|rules| {
+        let restrictions = self.inner.restrictions.as_ref().map(|rules| {
             (rules.iter())
                 .filter(|rule| held(&rule.permission))
                 .map(|rule| (rule.matcher.glob().glob(), &rule.permission))
@@ -215,7 +298,7 @@ impl PermissionRules {
     }
 
     fn restrictions_allow(&self, path: &str, required: &Permission) -> bool {
-        let Some(restrictions) = self.restrictions.as_ref() else {
+        let Some(restrictions) = self.inner.restrictions.as_ref() else {
             return true;
         };
         if let Some(root) = path.strip_suffix("/**") {
@@ -380,20 +463,40 @@ pub fn read_rules(
     values: Vec<Option<Value>>,
 ) -> Result<PermissionRules, AuthorizationError> {
     let mut values = values.into_iter();
-    let realm = values
+    let realm_bytes = values
         .next()
         .flatten()
         .ok_or(AuthorizationError::DocNotFound)?;
-    let realm = RealmAuthorizationDocument::from_bytes(&realm)?;
-    let group = values
+    let group_bytes = values
         .next()
+        .map(|group| group.ok_or(AuthorizationError::DocNotFound))
+        .transpose()?;
+    let key = rules_cache_key(
+        auth_context,
+        realm_bytes.as_ref(),
+        group_bytes.as_ref().map(AsRef::as_ref),
+    );
+    if let Some(inner) = rule_cache()
+        .lock()
+        .expect("permission rule cache poisoned")
+        .get(&key)
+    {
+        return Ok(PermissionRules { inner });
+    }
+    let realm = RealmAuthorizationDocument::from_bytes(&realm_bytes)?;
+    let group = group_bytes
+        .as_ref()
         .map(|group| {
-            let group = group.ok_or(AuthorizationError::DocNotFound)?;
-            GroupAuthorizationDocument::from_bytes(&group).map_err(AuthorizationError::from)
+            GroupAuthorizationDocument::from_bytes(group).map_err(AuthorizationError::from)
         })
         .transpose()?;
     let roles = collect_roles(auth_context, &realm, group.as_ref());
-    PermissionRules::from_roles(roles, auth_context.path_restrictions.as_deref())
+    let rules = PermissionRules::from_roles(roles, auth_context.path_restrictions.as_deref())?;
+    rule_cache()
+        .lock()
+        .expect("permission rule cache poisoned")
+        .insert(key, Arc::clone(&rules.inner));
+    Ok(rules)
 }
 
 fn collect_roles(
@@ -903,6 +1006,76 @@ mod pure_tests {
         assert!(matches!(
             failed.next(IoResult::Done),
             Err(AuthorizationError::UnexpectedEvent { .. })
+        ));
+    }
+
+    #[test]
+    fn caches_compiled_rules() {
+        use std::sync::Arc;
+        let realm_id = RealmId([42u8; 32]);
+        let group_id = Ulid::from(42u128);
+        let user_id = UserId::local(Ulid::from(99u128), realm_id);
+        let realm = RealmAuthorizationDocument::default_realm_doc(realm_id);
+        let group = GroupAuthorizationDocument::default_group_doc(user_id, realm_id, group_id);
+        let realm_bytes: aruna_core::types::Value = postcard::to_allocvec(&realm).unwrap().into();
+        let group_bytes: aruna_core::types::Value = postcard::to_allocvec(&group).unwrap().into();
+        let auth = AuthContext {
+            user_id,
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        let first = super::read_rules(
+            &auth,
+            vec![Some(realm_bytes.clone()), Some(group_bytes.clone())],
+        )
+        .expect("compiles");
+        let second = super::read_rules(
+            &auth,
+            vec![Some(realm_bytes.clone()), Some(group_bytes.clone())],
+        )
+        .expect("hits cache");
+        assert!(Arc::ptr_eq(&first.inner, &second.inner));
+
+        // Changing path restrictions or group bytes misses and compiles fresh rules.
+        let restricted = AuthContext {
+            path_restrictions: Some(vec![PathRestriction {
+                pattern: format!("/{realm_id}/g/{group_id}/meta/**"),
+                permission: Permission::READ,
+            }]),
+            ..auth.clone()
+        };
+        let third = super::read_rules(
+            &restricted,
+            vec![Some(realm_bytes.clone()), Some(group_bytes.clone())],
+        )
+        .expect("compiles restricted");
+        assert!(!Arc::ptr_eq(&first.inner, &third.inner));
+        assert!(third.allows(
+            &format!("/{realm_id}/g/{group_id}/meta/doc"),
+            &Permission::READ
+        ));
+        assert!(!third.allows(
+            &format!("/{realm_id}/g/{group_id}/data/doc"),
+            &Permission::READ
+        ));
+
+        let mut updated_group = group;
+        updated_group.roles.insert(
+            Ulid::from(77u128),
+            role(
+                HashMap::from([(format!("/{realm_id}/g/{group_id}/**"), Permission::DENY)]),
+                HashSet::from([user_id]),
+            ),
+        );
+        let updated_bytes: aruna_core::types::Value =
+            postcard::to_allocvec(&updated_group).unwrap().into();
+        let fourth = super::read_rules(&auth, vec![Some(realm_bytes), Some(updated_bytes)])
+            .expect("compiles updated group");
+        assert!(!Arc::ptr_eq(&first.inner, &fourth.inner));
+        assert!(!fourth.allows(
+            &format!("/{realm_id}/g/{group_id}/meta/doc"),
+            &Permission::READ
         ));
     }
 }

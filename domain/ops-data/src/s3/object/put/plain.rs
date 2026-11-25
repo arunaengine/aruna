@@ -1136,6 +1136,7 @@ mod tests {
             begin(&mut put).unwrap();
             let id = put.version_id.unwrap();
             put.output = Some(written_at("raw/x/one.csv".to_string(), id));
+            put.new_blob = true;
             // The version is read in the transaction before the head moves.
             let turn = put.write_current_lookup(None);
             assert_eq!(read_spaces(&turn), [BLOB_VERSIONS_KEYSPACE]);

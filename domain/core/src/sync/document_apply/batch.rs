@@ -14,6 +14,7 @@ use super::create::PendingCreateApply;
 use super::distribution::{DistributionPlan, Handled, RetryParkedPlan};
 use super::events::{ApplyEventPlan, ApplyOutcome, family_target};
 use super::followups::{FollowUpNode, QueuedApply};
+use super::quarantine::{SupersededInfoPlan, superseded_by};
 use super::reconcile::net_answer;
 use super::validate::{ConfigSnapshot, ValidateAdminPlan};
 use super::{ApplyError, plan_call};
@@ -31,7 +32,9 @@ use crate::operation::Operation;
 use crate::row_plan::RowPlan;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::record::PlacementRef;
-use crate::structs::sync_quarantine::{SyncQuarantineIdentity, SyncRejection};
+use crate::structs::sync_quarantine::{
+    SyncQuarantineIdentity, SyncQuarantineRecord, SyncRejection,
+};
 use crate::sync_checks::{EventScreen, screen_event};
 
 /// What applying one batch left for the reconcile pass.
@@ -89,7 +92,10 @@ enum Wait {
     /// The last run was flushed; the deferred admin events come next.
     FlushedLast,
     Checked(Box<AdminItem>),
-    Applied,
+    /// An event applies; a node info upsert then clears the quarantine rows it made obsolete.
+    Applied(Option<Box<SupersededInfoPlan>>),
+    /// The obsolete quarantine rows of an applied node info upsert are dropped.
+    Cleared(Box<SupersededInfoPlan>),
     /// The stored Git record of an applied event is being counted.
     GitNoted,
     AdminApplied(Box<AdminItem>),
@@ -258,6 +264,19 @@ impl ApplyBatchOperation {
                 self.call(Wait::Checked(Box::new(item)), check)
             }
             event => {
+                let cleanup = match &event {
+                    DocumentEvent::Upsert {
+                        target: target @ DocumentTarget::NodeInfo { .. },
+                        bytes,
+                        ..
+                    } => Some(Box::new(SupersededInfoPlan {
+                        identity,
+                        target: target.clone(),
+                        realm_id: self.realm_id,
+                        bytes: bytes.clone(),
+                    })),
+                    _ => None,
+                };
                 let plan = ApplyEventPlan {
                     topic_id: self.topic_id,
                     actor_id: actor,
@@ -266,7 +285,7 @@ impl ApplyBatchOperation {
                     event,
                 };
                 let call = self.apply_call(plan, identity);
-                self.call(Wait::Applied, call)
+                self.call(Wait::Applied(cleanup), call)
             }
         }
     }
@@ -507,6 +526,12 @@ impl ApplyBatchOperation {
 }
 
 /// Whether an event may join a buffered run of realm config events.
+/// A rejection of this batch as the quarantine row it would become.
+fn pending_record(rejection: &SyncRejection) -> SyncQuarantineRecord {
+    let evidence = rejection.evidence.clone();
+    SyncQuarantineRecord::new(rejection.identity, evidence, &rejection.reason, 0)
+}
+
 fn is_config_candidate(event: &DocumentEvent) -> bool {
     matches!(
         event,
@@ -548,12 +573,26 @@ impl Operation for ApplyBatchOperation {
                 let validation = self.checked(result)?;
                 self.on_checked(*item, validation)
             }
-            Wait::Applied => {
+            Wait::Applied(cleanup) => {
                 let outcome = result.child::<ApplyOutcome, ApplyError>()??;
+                let applied = matches!(outcome, ApplyOutcome::Applied { .. });
                 match self.on_event(outcome) {
                     Some(document_id) => self.note_git_record(document_id),
-                    None => self.advance(),
+                    None => match cleanup.filter(|_| applied) {
+                        Some(plan) => self.call(Wait::Cleared(plan.clone()), plan_call(*plan)),
+                        None => self.advance(),
+                    },
                 }
+            }
+            Wait::Cleared(plan) => {
+                // Earlier rejections of this batch are not stored yet, so they are dropped here.
+                if result.child::<bool, ApplyError>()?? {
+                    let rejections = std::mem::take(&mut self.outcome.rejections);
+                    self.outcome.rejections = (rejections.into_iter())
+                        .filter(|rejection| !superseded_by(&pending_record(rejection), &plan))
+                        .collect();
+                }
+                self.advance()
             }
             Wait::GitNoted => match net_answer(result, "DocumentNetEvent::GitRecordNoted")? {
                 DocumentNetEvent::GitRecordNoted => self.advance(),
