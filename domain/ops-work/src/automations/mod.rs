@@ -15,6 +15,8 @@ mod flow_tests;
 pub mod identity;
 pub mod lifecycle;
 pub mod limits;
+#[cfg(test)]
+mod match_tests;
 pub mod matcher;
 pub mod notify_stage;
 pub mod reads;
