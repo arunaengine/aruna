@@ -1,27 +1,27 @@
-//! Advances active automation firings through their DAG: polls child runs, fans out ready
-//! workflows, executes copy/dataset/notify/approval stages and finalizes async cancellation.
+//! Advances active automation firings through their pinned DAG with conditional updates,
+//! cross-firing workflow slot accounting, feature switches, child cancel retry and recovery.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::automation::firing::{Firing, FiringState, StageState};
-use aruna_core::automation::keys::{active_key, firing_key, record_key};
-use aruna_core::automation::record::{Automation, DEFAULT_APPROVAL_MS, Lifecycle, StageKind};
+use std::collections::BTreeSet;
+
+use aruna_core::automation::firing::Firing;
+use aruna_core::automation::record::Automation;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id::NodeId;
-use aruna_core::keyspaces::{
-    AUTOMATION_RUNS_KEYSPACE, AUTOMATIONS_KEYSPACE, WORKFLOW_RUN_KEYSPACE,
-};
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::workflow_run::{RunState, WorkflowRunRecord, run_key};
-use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::identity::features::Feature;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 use ulid::Ulid;
 
-use super::copy_stage::{CopyStageOp, StageOutcome};
-use super::dataset_stage::DatasetStageOp;
-use super::firing_reads::decode_ulid;
-use super::notify_stage::NotifyStageOp;
-use super::run_stage::{StartStageRun, render_text};
-use super::{AutoError, active_page, firing_row};
+use super::firing_tx::{FiringDelta, FiringTxResult};
+use super::schedule::{
+    DispatchPlan, NextAction, RunTrack, StepPhase, build_poll_deltas, build_stage_dispatch,
+    cancel_reply_delta, decode_pair, drop_active_call, firing_tx_call, in_flight_runs,
+    load_pair_call, poll_reads_call, stage_outcome_delta, start_run_delta,
+};
+use super::{AutoError, active_page};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StepReport {
@@ -30,28 +30,13 @@ pub struct StepReport {
     pub finished: usize,
 }
 
-#[derive(Debug, PartialEq)]
-enum StepPhase {
-    Active,
-    LoadPair(Ulid, Ulid),
-    PollRuns(Vec<(usize, Ulid)>),
-    StartRuns(usize, Vec<usize>),
-    RunCopy(usize),
-    RunDataset(usize),
-    RunNotify(usize),
-    Save,
-    DropActive(Ulid),
-}
-
 /// Drives every active automation firing one tick forward on `local`.
 #[derive(Debug, PartialEq)]
 pub struct StepFiringsOperation {
     local: (NodeId, RealmId),
-    now_ms: u64,
-    queue: Vec<(Ulid, Ulid)>,
+    track: RunTrack,
     auto: Option<Automation>,
     firing: Option<Firing>,
-    dirty: bool,
     report: StepReport,
     phase: StepPhase,
 }
@@ -60,207 +45,82 @@ impl StepFiringsOperation {
     pub fn new(local: (NodeId, RealmId)) -> Self {
         Self {
             local,
-            now_ms: 0,
-            queue: Vec::new(),
+            track: RunTrack::default(),
             auto: None,
             firing: None,
-            dirty: false,
             report: StepReport::default(),
-            phase: StepPhase::Active,
+            phase: StepPhase::Config,
         }
+    }
+
+    pub fn with_disabled_features(mut self, disabled: BTreeSet<Feature>) -> Self {
+        self.track.disabled_features = disabled;
+        self
+    }
+
+    fn tx_step(
+        &mut self,
+        delta: FiringDelta,
+        phase: StepPhase,
+    ) -> Result<Next<StepReport>, AutoError> {
+        let firing = self.firing.as_ref().ok_or(IoError::Unfinished)?;
+        self.phase = phase;
+        Ok(Next::Call(firing_tx_call(firing, delta)))
+    }
+
+    fn take_tx(&mut self, result: IoResult) -> Result<(bool, Vec<(usize, Ulid)>), AutoError> {
+        let tx = result.child::<FiringTxResult, AutoError>()??;
+        if tx.changed {
+            self.report.advanced += 1;
+        }
+        self.firing = Some(tx.firing);
+        Ok((tx.claimed, tx.child_runs))
+    }
+
+    fn count_batch(&mut self, offset: usize) -> Result<Next<StepReport>, AutoError> {
+        let Some((end, call)) = self.track.count_batch_call(offset) else {
+            return self.next_firing();
+        };
+        self.phase = StepPhase::CountRuns(end);
+        Ok(Next::Call(call))
     }
 
     fn next_firing(&mut self) -> Result<Next<StepReport>, AutoError> {
-        let Some((firing_id, auto_id)) = self.queue.pop() else {
+        let Some((firing_id, auto_id)) = self.track.queue.pop() else {
             return Ok(Next::Done(self.report));
         };
-        self.auto = None;
-        self.firing = None;
-        self.dirty = false;
+        (self.auto, self.firing) = (None, None);
         self.phase = StepPhase::LoadPair(firing_id, auto_id);
-        Ok(Next::Call(IoCall::Read(vec![
-            (AUTOMATIONS_KEYSPACE.to_string(), record_key(auto_id)),
-            (
-                AUTOMATION_RUNS_KEYSPACE.to_string(),
-                firing_key(auto_id, firing_id),
-            ),
-        ])))
+        Ok(Next::Call(load_pair_call(auto_id, firing_id)))
     }
 
-    fn save_current(&mut self) -> Result<Next<StepReport>, AutoError> {
+    fn evaluate_current(&mut self) -> Result<Next<StepReport>, AutoError> {
         let auto = self.auto.as_ref().ok_or(IoError::Unfinished)?;
-        let firing = self.firing.as_mut().ok_or(IoError::Unfinished)?;
-        let before = firing.state;
-        firing.evaluate(&auto.spec, self.now_ms);
-        if firing.state != before {
-            self.dirty = true;
-        }
-        let firing_id = firing.firing_id;
-        let terminal = firing.state.is_terminal();
-        if !self.dirty && !terminal {
-            return self.next_firing();
-        }
-        if self.dirty {
-            self.report.advanced += 1;
-        }
-        let row = firing_row(firing)?;
-        self.phase = StepPhase::Save;
-        let _ = firing_id;
-        Ok(Next::Call(IoCall::Write(vec![row])))
+        let firing = self.firing.as_ref().ok_or(IoError::Unfinished)?;
+        let delta = self.track.evaluate_delta(auto, firing);
+        self.tx_step(delta, StepPhase::Evaluate)
     }
 
-    fn dispatch_ready(&mut self) -> Result<Next<StepReport>, AutoError> {
-        let auto = self.auto.as_ref().ok_or(IoError::Unfinished)?.clone();
-        let firing = self.firing.as_mut().ok_or(IoError::Unfinished)?;
-        firing.evaluate(&auto.spec, self.now_ms);
-        if firing.state == FiringState::Cancelling {
-            // Stop any in-flight copy stage cleanly between files while keeping committed receipts.
-            for (i, stage) in firing.stages.iter_mut().enumerate() {
-                if stage.state == StageState::Cancelling
-                    && matches!(auto.spec.stages[i].kind, StageKind::Copy { .. })
-                {
-                    stage.state = StageState::Cancelled;
-                    stage.finished_at_ms = Some(self.now_ms);
-                    self.dirty = true;
-                }
+    fn apply_action(&mut self, action: NextAction) -> Result<Next<StepReport>, AutoError> {
+        match action {
+            NextAction::Finished => {
+                self.report.finished += 1;
+                self.next_firing()
             }
-            firing.finish_cancel(self.now_ms);
-            return self.save_current();
-        }
-        if firing.state != FiringState::Running || auto.lifecycle != Lifecycle::Active {
-            return self.save_current();
-        }
-        // Enter any Ready approval stages immediately (no side effects).
-        let snap = firing.clone();
-        for (i, stage) in firing.stages.iter_mut().enumerate() {
-            if stage.state == StageState::Ready
-                && let StageKind::Approval {
-                    message,
-                    timeout_ms,
-                } = &auto.spec.stages[i].kind
-            {
-                let preview = render_text(message, &snap);
-                stage.state = StageState::WaitingForApproval;
-                stage.started_at_ms = Some(self.now_ms);
-                stage.receipt.expires_at_ms = Some(
-                    self.now_ms
-                        .saturating_add(timeout_ms.unwrap_or(DEFAULT_APPROVAL_MS)),
-                );
-                stage.receipt.preview_json = Some(preview);
-                self.dirty = true;
+            NextAction::NextFiring => self.next_firing(),
+            NextAction::Call(phase, call) => {
+                self.phase = phase;
+                Ok(Next::Call(call))
             }
-        }
-        // 1. Launch ready `run` stages in parallel up to `max_concurrent_workflows`.
-        let mut ready_runs = firing.ready_runs(&auto.spec);
-        if let Some(first) = ready_runs.pop() {
-            let firing_snap = firing.clone();
-            return self.launch_run(auto, firing_snap, first, ready_runs);
-        }
-        // 2. Continue an in-flight copy stage or start one ready copy stage at a time.
-        let active_copy = firing.stages.iter().enumerate().find_map(|(i, s)| {
-            (s.state == StageState::Running
-                && matches!(auto.spec.stages[i].kind, StageKind::Copy { .. }))
-            .then_some(i)
-        });
-        if let Some(idx) = active_copy.or_else(|| firing.next_copy(&auto.spec)) {
-            if firing.stages[idx].started_at_ms.is_none() {
-                firing.stages[idx].started_at_ms = Some(self.now_ms);
-                firing.stages[idx].state = StageState::Running;
-                self.dirty = true;
-            }
-            let op = CopyStageOp::new(auto, firing.clone(), idx, self.local)?;
-            self.phase = StepPhase::RunCopy(idx);
-            return Ok(Next::Call(IoCall::child(op)));
-        }
-        // 3. Execute first ready `dataset` stage.
-        if let Some(idx) = firing.stages.iter().enumerate().find_map(|(i, s)| {
-            (s.state == StageState::Ready
-                && matches!(auto.spec.stages[i].kind, StageKind::Dataset { .. }))
-            .then_some(i)
-        }) {
-            firing.stages[idx].started_at_ms = Some(self.now_ms);
-            let op = DatasetStageOp::new(auto, firing.clone(), idx, self.local)?;
-            self.phase = StepPhase::RunDataset(idx);
-            return Ok(Next::Call(IoCall::child(op)));
-        }
-        // 4. Execute first ready `notify` stage.
-        if let Some(idx) = firing.stages.iter().enumerate().find_map(|(i, s)| {
-            (s.state == StageState::Ready
-                && matches!(auto.spec.stages[i].kind, StageKind::Notify { .. }))
-            .then_some(i)
-        }) {
-            firing.stages[idx].started_at_ms = Some(self.now_ms);
-            let op = NotifyStageOp::new(auto, firing, idx, self.local.1)?;
-            self.phase = StepPhase::RunNotify(idx);
-            return Ok(Next::Call(IoCall::child(op)));
-        }
-        self.save_current()
-    }
-
-    fn launch_run(
-        &mut self,
-        auto: Automation,
-        firing_snap: Firing,
-        idx: usize,
-        rest: Vec<usize>,
-    ) -> Result<Next<StepReport>, AutoError> {
-        match StartStageRun::new(auto, firing_snap, idx, self.local) {
-            Ok(op) => {
-                self.phase = StepPhase::StartRuns(idx, rest);
-                Ok(Next::Call(IoCall::child(op)))
-            }
-            Err(err) => {
-                let firing = self.firing.as_mut().ok_or(IoError::Unfinished)?;
-                let st = &mut firing.stages[idx];
-                st.state = StageState::Failed;
-                st.error = Some(err.to_string());
-                st.finished_at_ms = Some(self.now_ms);
-                self.dirty = true;
-                self.dispatch_ready()
-            }
+            NextAction::Tx(phase, delta) => self.tx_step(delta, phase),
         }
     }
 
-    fn apply_outcome(
-        &mut self,
-        idx: usize,
-        outcome: StageOutcome,
-    ) -> Result<Next<StepReport>, AutoError> {
-        let firing = self.firing.as_mut().ok_or(IoError::Unfinished)?;
-        let st = &mut firing.stages[idx];
-        self.dirty = true;
-        match outcome {
-            StageOutcome::Progress(copied) => {
-                st.receipt.copied.push(copied);
-                st.state = StageState::Running;
-                // Persist each committed file receipt before continuing so cancel stops cleanly.
-                return self.save_current();
-            }
-            StageOutcome::CopiedAll => {
-                st.state = StageState::Succeeded;
-                st.finished_at_ms = Some(self.now_ms);
-            }
-            StageOutcome::Dataset(doc_id) => {
-                st.receipt.dataset_id = Some(doc_id);
-                st.state = StageState::Succeeded;
-                st.finished_at_ms = Some(self.now_ms);
-            }
-            StageOutcome::Notified(count) => {
-                st.receipt.notified = Some(count);
-                st.state = StageState::Succeeded;
-                st.finished_at_ms = Some(self.now_ms);
-            }
-            StageOutcome::Failed(err) => {
-                st.state = StageState::Failed;
-                st.error = Some(err);
-                st.finished_at_ms = Some(self.now_ms);
-            }
-            StageOutcome::NeedsAttention(err) => {
-                st.state = StageState::NeedsAttention;
-                st.error = Some(err);
-            }
-        }
-        self.dispatch_ready()
+    fn dispatch_next(&mut self) -> Result<Next<StepReport>, AutoError> {
+        let auto = self.auto.as_ref().ok_or(IoError::Unfinished)?;
+        let firing = self.firing.as_ref().ok_or(IoError::Unfinished)?;
+        let action = self.track.plan_next(auto, firing, self.local);
+        self.apply_action(action)
     }
 }
 
@@ -268,143 +128,125 @@ impl Operation for StepFiringsOperation {
     type Output = StepReport;
     type Error = AutoError;
 
-    fn stamp(&mut self, now_ms: u64) {
-        self.now_ms = now_ms;
-    }
-
     fn first(&mut self) -> Result<Next<StepReport>, AutoError> {
-        Ok(Next::Call(active_page(None)))
+        Ok(Next::Call(IoCall::child(GetConfigOperation::new(
+            self.local.1,
+        ))))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<StepReport>, AutoError> {
         match std::mem::replace(&mut self.phase, StepPhase::Active) {
+            StepPhase::Config => {
+                self.track.config = result.child::<RealmConfigDocument, GetConfigError>()?.ok();
+                self.phase = StepPhase::Active;
+                Ok(Next::Call(active_page(None)))
+            }
             StepPhase::Active => {
                 let (rows, next) = result.page()?;
-                for (key, value) in rows {
-                    if let (Some(firing_id), Some(auto_id)) =
-                        (key.get(1..17).and_then(decode_ulid), decode_ulid(&value))
-                    {
-                        self.queue.push((firing_id, auto_id));
-                    }
-                }
+                self.track.collect_active(rows);
                 if let Some(after) = next {
                     self.phase = StepPhase::Active;
                     return Ok(Next::Call(active_page(Some(after))));
                 }
-                self.next_firing()
+                self.count_batch(0)
             }
-            StepPhase::LoadPair(firing_id, _auto_id) => {
-                let values = result.values()?;
-                let (Some(auto_bytes), Some(firing_bytes)) = (
-                    values.first().and_then(Option::as_ref),
-                    values.get(1).and_then(Option::as_ref),
-                ) else {
+            StepPhase::CountRuns(offset) => {
+                self.track.tally_active_runs(result.values()?);
+                self.count_batch(offset)
+            }
+            StepPhase::LoadPair(firing_id, _) => {
+                let Some((auto, firing)) = decode_pair(result.values()?)? else {
                     self.phase = StepPhase::DropActive(firing_id);
-                    return Ok(Next::Call(IoCall::Delete(vec![(
-                        AUTOMATION_RUNS_KEYSPACE.to_string(),
-                        active_key(firing_id),
-                    )])));
+                    return Ok(Next::Call(drop_active_call(firing_id)));
                 };
-                let auto = Automation::from_bytes(auto_bytes)?;
-                let firing = Firing::from_bytes(firing_bytes)?;
                 self.report.checked += 1;
-                let polling: Vec<(usize, Ulid)> = firing
-                    .stages
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, s)| {
-                        (s.state.is_in_flight()
-                            && matches!(auto.spec.stages[i].kind, StageKind::Run { .. }))
-                        .then_some(s.receipt.workflow_run_id.map(|id| (i, id)))
-                        .flatten()
-                    })
-                    .collect();
-                self.auto = Some(auto);
-                self.firing = Some(firing);
-                if !polling.is_empty() {
-                    let reads = polling
-                        .iter()
-                        .map(|(_, id)| (WORKFLOW_RUN_KEYSPACE.to_string(), run_key(*id)))
-                        .collect();
-                    self.phase = StepPhase::PollRuns(polling);
-                    return Ok(Next::Call(IoCall::Read(reads)));
+                let polling = in_flight_runs(&firing);
+                (self.auto, self.firing) = (Some(auto), Some(firing));
+                if polling.is_empty() {
+                    return self.evaluate_current();
                 }
-                self.dispatch_ready()
+                let call = poll_reads_call(&polling);
+                self.phase = StepPhase::PollRuns(polling);
+                Ok(Next::Call(call))
             }
             StepPhase::PollRuns(polling) => {
-                let values = result.values()?;
-                let firing = self.firing.as_mut().ok_or(IoError::Unfinished)?;
-                for ((idx, _), bytes) in polling.into_iter().zip(values) {
-                    let Some(bytes) = bytes else {
-                        continue;
-                    };
-                    let rec = WorkflowRunRecord::from_bytes(&bytes)?;
-                    if !rec.state.is_terminal() {
-                        continue;
-                    }
-                    let st = &mut firing.stages[idx];
-                    match rec.state {
-                        RunState::Succeeded => {
-                            st.state = StageState::Succeeded;
-                            st.receipt.outputs = rec.outputs;
-                        }
-                        RunState::Failed => {
-                            st.state = StageState::Failed;
-                            st.error = rec.error;
-                        }
-                        RunState::Cancelled => {
-                            st.state = StageState::Cancelled;
-                        }
-                        _ => {}
-                    }
-                    st.finished_at_ms = Some(self.now_ms);
-                    self.dirty = true;
+                let aid = self
+                    .firing
+                    .as_ref()
+                    .ok_or(IoError::Unfinished)?
+                    .automation_id;
+                let deltas =
+                    build_poll_deltas(polling, result.values()?, &mut self.track.active_runs, aid)?;
+                match deltas.is_empty() {
+                    true => self.evaluate_current(),
+                    false => self.tx_step(FiringDelta::Poll(deltas), StepPhase::CommitPoll),
                 }
-                self.dispatch_ready()
             }
-            StepPhase::StartRuns(idx, mut rest) => {
-                let firing = self.firing.as_mut().ok_or(IoError::Unfinished)?;
-                let st = &mut firing.stages[idx];
-                self.dirty = true;
-                match result.child::<Ulid, AutoError>()? {
-                    Ok(run_id) => {
-                        st.state = StageState::Running;
-                        st.started_at_ms = Some(self.now_ms);
-                        st.receipt.workflow_run_id = Some(run_id);
-                    }
-                    Err(err) => {
-                        st.state = StageState::Failed;
-                        st.error = Some(err.to_string());
-                        st.finished_at_ms = Some(self.now_ms);
-                    }
+            StepPhase::CommitPoll => {
+                self.take_tx(result)?;
+                self.evaluate_current()
+            }
+            StepPhase::Evaluate | StepPhase::CommitCancel | StepPhase::ReleaseRun => {
+                self.take_tx(result)?;
+                self.dispatch_next()
+            }
+            StepPhase::RetryCancel(idx, run_id) => {
+                let delta = cancel_reply_delta(idx, run_id, result)?;
+                self.tx_step(delta, StepPhase::CommitCancel)
+            }
+            StepPhase::Claim(work) => {
+                if !self.take_tx(result)?.0 {
+                    return self.dispatch_next();
                 }
-                if let Some(next_idx) = rest.pop() {
-                    let auto = self.auto.as_ref().ok_or(IoError::Unfinished)?.clone();
-                    let snap = self.firing.as_ref().ok_or(IoError::Unfinished)?.clone();
-                    return self.launch_run(auto, snap, next_idx, rest);
+                let auto = self.auto.as_ref().ok_or(IoError::Unfinished)?.clone();
+                let firing = self.firing.as_ref().ok_or(IoError::Unfinished)?.clone();
+                match build_stage_dispatch(work, auto, firing, self.local)? {
+                    DispatchPlan::StartRun(idx, call) => {
+                        self.phase = StepPhase::StartRun(idx);
+                        Ok(Next::Call(call))
+                    }
+                    DispatchPlan::RunStage(idx, call) => {
+                        self.phase = StepPhase::RunStage(idx);
+                        Ok(Next::Call(call))
+                    }
+                    DispatchPlan::Commit(delta) => self.tx_step(delta, StepPhase::CommitRun),
                 }
-                self.save_current()
             }
-            StepPhase::RunCopy(idx) | StepPhase::RunDataset(idx) | StepPhase::RunNotify(idx) => {
-                let outcome = match result.child::<StageOutcome, AutoError>()? {
-                    Ok(out) => out,
-                    Err(err) => StageOutcome::Failed(err.to_string()),
-                };
-                self.apply_outcome(idx, outcome)
+            StepPhase::StartRun(idx) => {
+                let aid = self
+                    .firing
+                    .as_ref()
+                    .ok_or(IoError::Unfinished)?
+                    .automation_id;
+                let (delta, next) = start_run_delta(idx, aid, result, &mut self.track)?;
+                self.tx_step(delta, next)
             }
-            StepPhase::Save => {
-                result.done()?;
-                let firing = self.firing.as_ref().ok_or(IoError::Unfinished)?;
-                if firing.state.is_terminal() {
+            StepPhase::CommitRun => match self.take_tx(result)?.1.into_iter().next() {
+                Some((idx, run_id)) => {
+                    let auto = self.auto.as_ref().ok_or(IoError::Unfinished)?;
+                    let firing = self.firing.as_ref().ok_or(IoError::Unfinished)?;
+                    let action = self
+                        .track
+                        .retry_cancel_action(auto, firing, self.local, idx, run_id);
+                    self.apply_action(action)
+                }
+                None => self.evaluate_current(),
+            },
+            StepPhase::RunStage(idx) => {
+                let (delta, stop) = stage_outcome_delta(idx, result)?;
+                self.tx_step(delta, StepPhase::CommitOutcome(stop))
+            }
+            StepPhase::CommitOutcome(stop_after) => {
+                self.take_tx(result)?;
+                if self.firing.as_ref().is_some_and(|f| f.state.is_terminal()) {
                     self.report.finished += 1;
-                    let id = firing.firing_id;
-                    self.phase = StepPhase::DropActive(id);
-                    return Ok(Next::Call(IoCall::Delete(vec![(
-                        AUTOMATION_RUNS_KEYSPACE.to_string(),
-                        active_key(id),
-                    )])));
+                    return self.next_firing();
                 }
-                self.next_firing()
+                if stop_after {
+                    self.next_firing()
+                } else {
+                    self.evaluate_current()
+                }
             }
             StepPhase::DropActive(_) => {
                 result.done()?;
