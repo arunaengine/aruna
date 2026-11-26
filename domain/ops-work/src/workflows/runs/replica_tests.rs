@@ -746,6 +746,52 @@ async fn chunks_large_replicas() {
         Err(CatalogError::Forbidden)
     );
 
+    // Duplicate completed chunks for the same target within an intermediate frame are rejected.
+    let dup_more = ReplicatedWorkflow {
+        chunks: vec![
+            ReplicatedChunk {
+                kind: ChunkKind::Source,
+                index: 0,
+                total: 1,
+                data: good_src.clone(),
+            },
+            ReplicatedChunk {
+                kind: ChunkKind::Source,
+                index: 0,
+                total: 1,
+                data: wrong_files.to_bytes().unwrap(),
+            },
+        ],
+        more: true,
+        transfer_id: 90,
+        ..ReplicatedWorkflow::default()
+    };
+    assert_eq!(
+        drive(
+            WriteReplicaOperation {
+                peer: gone,
+                local: here,
+                run: Box::new(remote.clone()),
+                first_page: 0,
+                pages: Vec::new(),
+                workflow: Some(dup_more),
+                now_ms: 0,
+                step: WriteStep::Read,
+                kept: 0,
+            },
+            context,
+        )
+        .await,
+        Err(CatalogError::Forbidden)
+    );
+
+    // LoadLogOperation reads head_key and numbered page keys directly without scanning manifests.
+    let mut loader = LoadLogOperation::new(remote.run_id);
+    assert!(matches!(
+        loader.first().unwrap(),
+        Next::Call(IoCall::Read(keys)) if keys.len() == 1 && keys[0].1 == head_key(remote.run_id)
+    ));
+
     // An expired staged transfer is reclaimed when a new transfer begins, and finalization
     // deletes all remaining staged rows for the peer.
     let expired_key = staged_key(remote.run_id, gone, 80, ChunkKind::Source);

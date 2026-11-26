@@ -1288,12 +1288,20 @@ impl Operation for WriteReplicaOperation {
                     ));
                 }
             }
+            let mut seen_chunks = BTreeSet::new();
+            let mut seen_done = BTreeSet::new();
             for chunk in &replicated.chunks {
                 if chunk.total == 0 || chunk.index >= chunk.total || chunk.total > MAX_CHUNKS {
                     return Err(CatalogError::Forbidden);
                 }
+                let target = chunk_target(&chunk.kind);
+                if !seen_chunks.insert((target, chunk.index)) {
+                    return Err(CatalogError::Forbidden);
+                }
                 if chunk.index + 1 == chunk.total {
-                    let target = chunk_target(&chunk.kind);
+                    if !seen_done.insert(target) {
+                        return Err(CatalogError::Forbidden);
+                    }
                     for prior in 0..chunk.index {
                         reads.push((
                             RUN_LOG_KEYSPACE.to_string(),
@@ -1561,6 +1569,12 @@ impl Operation for WriteReplicaOperation {
                         WorkflowFiles::from_bytes(&assembled)
                             .map_err(|_| CatalogError::Forbidden)?;
                         if more {
+                            if staged_src
+                                .as_deref()
+                                .is_some_and(|old| old != assembled.as_slice())
+                            {
+                                return Err(CatalogError::Forbidden);
+                            }
                             writes.push((
                                 space.clone(),
                                 staged_key(run_id, peer, transfer, ChunkKind::Source),
@@ -1582,6 +1596,12 @@ impl Operation for WriteReplicaOperation {
                             return Err(CatalogError::Forbidden);
                         }
                         if more {
+                            if staged_wf
+                                .as_deref()
+                                .is_some_and(|old| old != assembled.as_slice())
+                            {
+                                return Err(CatalogError::Forbidden);
+                            }
                             writes.push((
                                 space.clone(),
                                 staged_key(run_id, peer, transfer, ChunkKind::Workflow),
@@ -1603,6 +1623,12 @@ impl Operation for WriteReplicaOperation {
                             return Err(CatalogError::Forbidden);
                         }
                         if more {
+                            if staged_ver
+                                .as_deref()
+                                .is_some_and(|old| old != assembled.as_slice())
+                            {
+                                return Err(CatalogError::Forbidden);
+                            }
                             writes.push((
                                 space.clone(),
                                 staged_key(run_id, peer, transfer, ChunkKind::Version),

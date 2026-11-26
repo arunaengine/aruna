@@ -7,7 +7,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::RUN_LOG_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::execution::workflow_run::{
-    LogHead, decode_page, encode_page, head_key, page_key, run_prefix,
+    LogHead, decode_page, encode_page, head_key, page_key,
 };
 use aruna_core::types::Key;
 use aruna_workflow_contract::preflight::{RunLogEntry, RunLogPage};
@@ -143,11 +143,19 @@ impl Operation for AppendLogOperation {
     }
 }
 
-/// Every page of a run's log, in order.
+#[derive(Debug, PartialEq)]
+enum LoadStep {
+    Head,
+    Pages { total: u32, next: u32 },
+}
+
+/// Every page of a run's log, in order, read directly by head and page numbers so non-log rows
+/// under the run prefix (such as directory manifests or replica staging) are never scanned.
 #[derive(Debug, PartialEq)]
 pub struct LoadLogOperation {
     run_id: Ulid,
     pages: Vec<RunLogPage>,
+    step: LoadStep,
 }
 
 impl LoadLogOperation {
@@ -155,16 +163,18 @@ impl LoadLogOperation {
         Self {
             run_id,
             pages: Vec::new(),
+            step: LoadStep::Head,
         }
     }
 
-    fn page(&self, after: Option<Key>) -> Next<Vec<RunLogPage>> {
-        Next::Call(IoCall::Page {
-            space: RUN_LOG_KEYSPACE.to_string(),
-            prefix: run_prefix(self.run_id),
-            after,
-            limit: READ_ROWS,
-        })
+    fn read_batch(&mut self, total: u32, next: u32) -> Next<Vec<RunLogPage>> {
+        let end = total.min(next.saturating_add(READ_ROWS as u32));
+        let space = RUN_LOG_KEYSPACE.to_string();
+        let reads = (next..end)
+            .map(|page| (space.clone(), page_key(self.run_id, page)))
+            .collect();
+        self.step = LoadStep::Pages { total, next: end };
+        Next::Call(IoCall::Read(reads))
     }
 }
 
@@ -173,20 +183,35 @@ impl Operation for LoadLogOperation {
     type Error = CatalogError;
 
     fn first(&mut self) -> Result<Next<Vec<RunLogPage>>, CatalogError> {
-        Ok(self.page(None))
+        self.step = LoadStep::Head;
+        Ok(Next::Call(IoCall::Read(vec![(
+            RUN_LOG_KEYSPACE.to_string(),
+            head_key(self.run_id),
+        )])))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Vec<RunLogPage>>, CatalogError> {
-        let (rows, next) = result.page()?;
-        let head = head_key(self.run_id);
-        for (key, value) in rows {
-            if key != head && key.len() == 20 {
-                self.pages.push(decode_page(&value)?);
+        match self.step {
+            LoadStep::Head => {
+                let head = result
+                    .value()?
+                    .map(|value| LogHead::from_bytes(&value))
+                    .transpose()?;
+                let total = head.map_or(0, |head| head.pages);
+                if total == 0 {
+                    return Ok(Next::Done(Vec::new()));
+                }
+                Ok(self.read_batch(total, 0))
             }
-        }
-        match next {
-            Some(after) => Ok(self.page(Some(after))),
-            None => Ok(Next::Done(std::mem::take(&mut self.pages))),
+            LoadStep::Pages { total, next } => {
+                for value in result.values()?.into_iter().flatten() {
+                    self.pages.push(decode_page(&value)?);
+                }
+                if next < total {
+                    return Ok(self.read_batch(total, next));
+                }
+                Ok(Next::Done(std::mem::take(&mut self.pages)))
+            }
         }
     }
 }
