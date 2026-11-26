@@ -212,8 +212,15 @@ async fn deliver_outputs(
         }
     }
     let mut declared = Vec::new();
+    let mut missing_dirs = Vec::new();
     if let Some(value) = outputs.as_deref() {
-        collect_output_paths(value, root, &canonical_root, &mut declared);
+        collect_output_paths(
+            value,
+            root,
+            &canonical_root,
+            &mut declared,
+            &mut missing_dirs,
+        );
     }
     let raw: Vec<(String, Option<String>)> = match declared.is_empty() {
         false => declared
@@ -401,6 +408,21 @@ async fn deliver_outputs(
         receipts.insert(dir.raw_target, prefix.clone());
         receipts.insert(dir.canonical.to_string_lossy().into_owned(), prefix);
     }
+    for raw_dir in missing_dirs {
+        if let Ok(target_path) = relative_target(&raw_dir, root, &canonical_root)
+            && check_path(&target_path).is_ok()
+        {
+            let prefix = output_base
+                .map(|base| prefix_for(base, &target_path))
+                .or_else(|| {
+                    any_sample
+                        .as_ref()
+                        .and_then(|(rel, loc)| output_prefix(loc, rel, &target_path))
+                })
+                .unwrap_or_else(|| format!("{}/", target_path.trim_end_matches('/')));
+            receipts.insert(raw_dir, prefix);
+        }
+    }
     if let Some(value) = outputs {
         rewrite_locations(value, &receipts);
     }
@@ -449,11 +471,17 @@ fn local_location(loc: &str) -> Option<String> {
 }
 
 /// Collects file and directory output paths (including `secondaryFiles`) from `run.outputs`.
-fn collect_output_paths(value: &Value, root: &Path, canonical_root: &Path, out: &mut Vec<String>) {
+fn collect_output_paths(
+    value: &Value,
+    root: &Path,
+    canonical_root: &Path,
+    out: &mut Vec<String>,
+    missing_dirs: &mut Vec<String>,
+) {
     match value {
         Value::Array(items) => items
             .iter()
-            .for_each(|item| collect_output_paths(item, root, canonical_root, out)),
+            .for_each(|item| collect_output_paths(item, root, canonical_root, out, missing_dirs)),
         Value::Object(map) => {
             let class = map.get("class").and_then(Value::as_str);
             let is_entry = matches!(class, Some("File" | "Directory"));
@@ -476,13 +504,14 @@ fn collect_output_paths(value: &Value, root: &Path, canonical_root: &Path, out: 
                     .get("listing")
                     .and_then(Value::as_array)
                     .is_some_and(|items| !items.is_empty());
-            let push_entry = match (class, entry_path.as_deref()) {
-                (Some("Directory"), Some(_)) if !walked_dir && has_listing => false,
-                (_, Some(_)) => true,
-                _ => false,
-            };
-            if push_entry && let Some(path) = entry_path {
-                out.push(path);
+            match (class, entry_path) {
+                (Some("Directory"), Some(path)) if !walked_dir && has_listing => {
+                    if !served(&path) {
+                        missing_dirs.push(path);
+                    }
+                }
+                (_, Some(path)) => out.push(path),
+                _ => {}
             }
             for (key, item) in map {
                 if is_entry && matches!(key.as_str(), "location" | "path") {
@@ -491,7 +520,7 @@ fn collect_output_paths(value: &Value, root: &Path, canonical_root: &Path, out: 
                 if walked_dir && key == "listing" {
                     continue;
                 }
-                collect_output_paths(item, root, canonical_root, out);
+                collect_output_paths(item, root, canonical_root, out, missing_dirs);
             }
         }
         Value::String(text) => {
@@ -893,7 +922,9 @@ mod tests {
             }
         });
         let mut found = Vec::new();
-        collect_output_paths(&outputs, root, &canon, &mut found);
+        let mut missing_dirs = Vec::new();
+        collect_output_paths(&outputs, root, &canon, &mut found, &mut missing_dirs);
+        assert!(missing_dirs.is_empty());
         assert_eq!(
             found,
             vec![
@@ -1025,7 +1056,8 @@ mod tests {
             },
         });
         let mut found = Vec::new();
-        collect_output_paths(&outputs, root, &canon, &mut found);
+        let mut missing_dirs = Vec::new();
+        collect_output_paths(&outputs, root, &canon, &mut found, &mut missing_dirs);
         assert_eq!(
             found,
             vec![
@@ -1034,6 +1066,16 @@ mod tests {
                 extra.to_string_lossy().into_owned(),
                 extra.to_string_lossy().into_owned(),
             ]
+        );
+        let absent = out_dir.join("absent").to_string_lossy().into_owned();
+        assert_eq!(missing_dirs, vec![absent.clone()]);
+        let rel = relative_target(&absent, root, &canon).unwrap();
+        let mut rewritten = outputs;
+        let receipts = HashMap::from([(absent, prefix_for("aruna://results/run", &rel))]);
+        rewrite_locations(&mut rewritten, &receipts);
+        assert_eq!(
+            rewritten["missing_parent"]["location"],
+            "aruna://results/run/absent/"
         );
     }
 

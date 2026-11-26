@@ -3,10 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use aruna_workflow_contract::host::StorageEntry;
@@ -25,44 +23,11 @@ pub const SCHEMES: [&str; 2] = ["aruna://", "s3://"];
 
 pub struct CoordinatorStorage {
     rpc: RpcClient,
-    /// Maps unencoded child URIs synthesized by uwe back to the provider's encoded child URI.
-    tree_children: Mutex<HashMap<String, String>>,
 }
 
 impl CoordinatorStorage {
     pub fn new(rpc: RpcClient) -> CoordinatorStorage {
-        CoordinatorStorage {
-            rpc,
-            tree_children: Mutex::new(HashMap::new()),
-        }
-    }
-
-    fn resolve_address(&self, address: &str) -> String {
-        if let Some(encoded) = self
-            .tree_children
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(address)
-            .cloned()
-        {
-            return encoded;
-        }
-        normalize_address(address)
-    }
-
-    fn record_child(&self, raw_root: &str, norm_root: &str, path: &str, encoded: &str) {
-        let mut guard = self
-            .tree_children
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        guard.insert(
-            format!("{}/{path}", raw_root.trim_end_matches('/')),
-            encoded.to_owned(),
-        );
-        guard.insert(
-            format!("{}/{path}", norm_root.trim_end_matches('/')),
-            encoded.to_owned(),
-        );
+        CoordinatorStorage { rpc }
     }
 }
 
@@ -85,7 +50,7 @@ impl StorageProvider for CoordinatorStorage {
         address: &'a str,
     ) -> BoxFuture<'a, Result<Option<Details>, StorageError>> {
         Box::pin(async move {
-            let normalized = self.resolve_address(address);
+            let normalized = normalize_address(address);
             let request = HostRpcRequest::StorageStat {
                 address: normalized.clone(),
             };
@@ -165,7 +130,6 @@ impl StorageProvider for CoordinatorStorage {
                             address: storage::address::redacted(&child),
                             provider: self.name().to_owned(),
                         })?;
-                    self.record_child(address, &root, &path, &child);
                     manifest.files.push(TreeFile {
                         path,
                         size: found.metadata.size,
@@ -173,6 +137,31 @@ impl StorageProvider for CoordinatorStorage {
                         digest: found.verified().map(str::to_owned),
                         direct: found.direct,
                     });
+                }
+            }
+            // If any child name needs URI percent-encoding, verify missing SHA-256 digests using
+            // each file's provider URI so uwe stages the tree via DirectRef without re-joining raw
+            // filenames.
+            let has_encoded = manifest
+                .files
+                .iter()
+                .any(|file| aruna_workflow_contract::host::encode_key(&file.path) != file.path);
+            if has_encoded && !manifest.direct() {
+                for file in &mut manifest.files {
+                    if file.digest.as_deref().is_some_and(storage::sha256) {
+                        continue;
+                    }
+                    let Some(reference) = file.direct.as_mut() else {
+                        continue;
+                    };
+                    let done = hash_remote(&self.rpc, &reference.url)
+                        .await
+                        .map_err(|error| failed("read", &reference.url, error))?;
+                    file.size = done.size;
+                    file.digest = Some(hex_lower(&done.sha256));
+                    if let Some(ver) = done.version.as_deref() {
+                        reference.url = pin_version(&reference.url, ver);
+                    }
                 }
             }
             manifest
@@ -189,7 +178,7 @@ impl StorageProvider for CoordinatorStorage {
         target: &'a Path,
     ) -> BoxFuture<'a, Result<Option<String>, StorageError>> {
         Box::pin(async move {
-            let normalized = self.resolve_address(address);
+            let normalized = normalize_address(address);
             download_file(&self.rpc, &normalized, target)
                 .await
                 .map_err(|error| failed("read", &normalized, error))
@@ -367,10 +356,25 @@ pub async fn download_hashed(
     result
 }
 
-async fn download_chunks(
+/// Streams a remote file through SHA-256 without touching disk to supply a verified digest.
+async fn hash_remote(rpc: &RpcClient, address: &str) -> Result<Downloaded, ContractError> {
+    let mut sink = std::io::sink();
+    download_chunks(rpc, address, &mut sink).await
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+async fn download_chunks<W: Write>(
     rpc: &RpcClient,
     address: &str,
-    file: &mut std::fs::File,
+    file: &mut W,
 ) -> Result<Downloaded, ContractError> {
     let mut offset = 0u64;
     let mut pinned: Option<String> = None;

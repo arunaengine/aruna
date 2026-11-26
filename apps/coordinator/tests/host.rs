@@ -264,10 +264,10 @@ impl MockNode {
                         }),
                     },
                     None => {
-                        let (base, query) = decoded.split_once('?').unwrap_or((&decoded, ""));
+                        let (base, query) = split_query(&decoded);
                         let prefix = base.trim_end_matches('/').to_owned() + "/";
                         let is_dir = self.files.keys().any(|key| {
-                            let (kbase, kquery) = key.split_once('?').unwrap_or((key, ""));
+                            let (kbase, kquery) = split_query(key);
                             kquery == query && kbase.starts_with(&prefix)
                         });
                         let entry = is_dir.then(|| StorageEntry {
@@ -298,11 +298,11 @@ impl MockNode {
                         "malformed escape in {address}"
                     ))));
                 };
-                let (base, query) = decoded.split_once('?').unwrap_or((&decoded, ""));
+                let (base, query) = split_query(&decoded);
                 let prefix = base.trim_end_matches('/').to_owned() + "/";
                 let mut entries: BTreeMap<String, bool> = BTreeMap::new();
                 for key in self.files.keys() {
-                    let (kbase, kquery) = key.split_once('?').unwrap_or((key, ""));
+                    let (kbase, kquery) = split_query(key);
                     if kquery != query {
                         continue;
                     }
@@ -438,8 +438,22 @@ impl MockNode {
     }
 }
 
+fn split_query(address: &str) -> (&str, &str) {
+    match address.split_once('?') {
+        Some((path, query))
+            if !query.is_empty()
+                && query.split('&').all(|pair| {
+                    matches!(pair.split_once('='), Some(("version" | "node", v)) if !v.is_empty())
+                }) =>
+        {
+            (path, query)
+        }
+        _ => (address, ""),
+    }
+}
+
 fn decode_addr(address: &str) -> Option<String> {
-    let (path, query) = address.split_once('?').unwrap_or((address, ""));
+    let (path, query) = split_query(address);
     let decoded = aruna_workflow_contract::host::decode_key(path)?;
     Some(match query.is_empty() {
         true => decoded,

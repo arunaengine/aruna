@@ -477,7 +477,7 @@ outputs:
         s
     };
 
-    // Both `a%20b` (literal percent escape) and `a b` (space) coexist without confusion.
+    // Siblings `a%20b`, `a b`, `a?b`, and `a%3Fb` coexist without URI collision or redirection.
     let mut direct_node = MockNode::new(TaskMode::Succeed);
     direct_node
         .files
@@ -485,21 +485,44 @@ outputs:
     direct_node
         .files
         .insert("s3://results/folder/a b".into(), b"space".to_vec());
+    direct_node
+        .files
+        .insert("s3://results/folder/a?b".into(), b"question".to_vec());
+    direct_node
+        .files
+        .insert("s3://results/folder/a%3Fb".into(), b"escaped".to_vec());
     let direct_node = finished_run("run-pct-direct", start(), direct_node).await;
-    let addrs: Vec<&str> = direct_node.tasks[0]
+    let addrs: Vec<(&str, &str)> = direct_node.tasks[0]
         .direct_inputs
         .iter()
-        .map(|d| d.address.as_str())
+        .map(|d| (d.address.as_str(), d.digest.as_str()))
         .collect();
+    let q_digest = task_model::Digest::sha256(b"question").to_string();
+    let e_digest = task_model::Digest::sha256(b"escaped").to_string();
     assert!(
-        addrs.contains(&"s3://results/folder/a%2520b"),
+        addrs
+            .iter()
+            .any(|(a, _)| *a == "s3://results/folder/a%2520b"),
         "expected encoded percent child in direct inputs: {addrs:?}"
     );
     assert!(
-        addrs.contains(&"s3://results/folder/a b"),
+        addrs.iter().any(|(a, _)| *a == "s3://results/folder/a b"),
         "expected space child in direct inputs: {addrs:?}"
     );
+    assert!(
+        addrs
+            .iter()
+            .any(|(a, d)| *a == "s3://results/folder/a%3Fb" && *d == q_digest),
+        "expected distinct digest for a?b: {addrs:?}"
+    );
+    assert!(
+        addrs
+            .iter()
+            .any(|(a, d)| *a == "s3://results/folder/a%253Fb" && *d == e_digest),
+        "expected distinct digest for a%3Fb: {addrs:?}"
+    );
 
+    // Without stored SHA-256, provider hashes each encoded URI directly with zero shared aliases.
     let mut fetch_node = MockNode::new(TaskMode::Succeed);
     fetch_node.omit_sha256 = true;
     fetch_node
@@ -508,21 +531,52 @@ outputs:
     fetch_node
         .files
         .insert("s3://results/folder/a b".into(), b"space".to_vec());
+    fetch_node
+        .files
+        .insert("s3://results/folder/a?b".into(), b"question".to_vec());
+    fetch_node
+        .files
+        .insert("s3://results/folder/a%3Fb".into(), b"escaped".to_vec());
     let fetch_node = finished_run("run-pct-fetch", start(), fetch_node).await;
     assert!(
         fetch_node
             .downloads
             .iter()
             .any(|addr| addr == "s3://results/folder/a%2520b"),
-        "download fallback must request encoded percent child: {:?}",
+        "must hash encoded percent child: {:?}",
         fetch_node.downloads
     );
     assert!(
         fetch_node
             .downloads
             .iter()
-            .any(|addr| addr == "s3://results/folder/a b"),
-        "download fallback must request space child: {:?}",
+            .any(|addr| addr == "s3://results/folder/a%3Fb"),
+        "must hash encoded question child: {:?}",
         fetch_node.downloads
+    );
+    assert!(
+        fetch_node
+            .downloads
+            .iter()
+            .any(|addr| addr == "s3://results/folder/a%253Fb"),
+        "must hash double-encoded escaped child: {:?}",
+        fetch_node.downloads
+    );
+    let hashed: Vec<(&str, &str)> = fetch_node.tasks[0]
+        .direct_inputs
+        .iter()
+        .map(|d| (d.address.as_str(), d.digest.as_str()))
+        .collect();
+    assert!(
+        hashed
+            .iter()
+            .any(|(a, d)| a.starts_with("s3://results/folder/a%3Fb") && *d == q_digest),
+        "expected verified a?b digest: {hashed:?}"
+    );
+    assert!(
+        hashed
+            .iter()
+            .any(|(a, d)| a.starts_with("s3://results/folder/a%253Fb") && *d == e_digest),
+        "expected verified a%3Fb digest: {hashed:?}"
     );
 }
