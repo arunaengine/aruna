@@ -1323,3 +1323,312 @@ async fn round_trips_addresses() {
         );
     }
 }
+
+/// Seeds a local materialized object version so `HeadObjectOperation` resolves its head version.
+async fn seed_object(runs: &Runs, bucket: &str, key: &str, version_id: Ulid) {
+    use aruna_core::keyspaces::{
+        BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    };
+    use aruna_core::structs::checksum::HASH_BLAKE3;
+    use aruna_core::structs::storage::blob::{
+        BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
+        CurrentVersionPointer, VersionKey,
+    };
+    use aruna_core::structs::storage::format::{EncodingClass, StoredFormat};
+    use std::collections::HashMap;
+    use std::time::SystemTime;
+
+    let mut hashes = HashMap::new();
+    hashes.insert(HASH_BLAKE3.to_string(), vec![7; 32]);
+    let location = BackendLocation {
+        backend: BackendRef::node_default(),
+        storage_class: None,
+        root: "/tmp".to_string(),
+        storage_bucket: bucket.to_string(),
+        backend_path: key.to_string(),
+        ulid: version_id,
+        format: StoredFormat::default(),
+        created_at: SystemTime::now(),
+        created_by: Default::default(),
+        staging: false,
+        partial: false,
+        blob_size: 4,
+        hashes,
+    };
+    let head_key = BlobHeadKey::new(bucket, key).to_bytes().unwrap();
+    write(
+        &runs.fixture.context,
+        BLOB_HEAD_KEYSPACE,
+        head_key,
+        CurrentVersionPointer::new(version_id).to_bytes().unwrap(),
+    )
+    .await;
+    write(
+        &runs.fixture.context,
+        BLOB_VERSIONS_KEYSPACE,
+        VersionKey::new(bucket, key, version_id).to_bytes().unwrap(),
+        BlobVersion::materialized(
+            [7; 32],
+            BackendRef::node_default(),
+            EncodingClass::Raw,
+            location.created_at,
+            location.created_by,
+            None,
+        )
+        .to_bytes()
+        .unwrap(),
+    )
+    .await;
+    write(
+        &runs.fixture.context,
+        BLOB_LOCATIONS_KEYSPACE,
+        BlobLocationKey::from_blake3(&[7; 32], EncodingClass::Raw, BackendRef::node_default())
+            .unwrap()
+            .to_bytes(),
+        location.to_bytes().unwrap(),
+    )
+    .await;
+}
+
+// Cancelling a run on a replica holder refuses with Conflict without altering stored state.
+#[tokio::test]
+async fn rejects_replica_cancel() {
+    let runs = runs().await;
+    let record = runs.started().await;
+    let other_node = aruna_ops_identity::testing::node(9);
+    let err = drive(
+        CancelRunOperation::new(
+            &runs.fixture.alice,
+            record.run_id,
+            (other_node, runs.fixture.alice.realm_id),
+        ),
+        &runs.fixture.context,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, CatalogError::Conflict(_)), "{err:?}");
+    let after = drive(
+        RunSnapshotOperation::new(&runs.fixture.alice, record.run_id),
+        &runs.fixture.context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(after.record.state, RunState::Queued);
+}
+
+// Admission pins local unversioned file values without changing idempotency digests, and
+// cross-node resume attaches the original coordinator node to local file-valued parameters.
+#[tokio::test]
+async fn pins_value_versions() {
+    use super::control::{Follow, FollowRunOperation};
+    use aruna_core::keyspaces::WORKFLOW_RUN_KEYSPACE;
+
+    let runs = runs().await;
+    let version = Ulid::from_bytes([51; 16]);
+    seed_object(&runs, "results", "inputs/a.txt", version).await;
+    let req = runs.request(
+        Some("pin-key"),
+        json!({
+            "one": "s3://results/inputs/a.txt",
+            "many": ["aruna://results/inputs/a.txt"],
+            "plain": "hello",
+        }),
+    );
+    let first = runs.start(&runs.fixture.alice, req.clone()).await.unwrap();
+    assert!(first.created);
+    let values: Value = serde_json::from_str(&first.record.values_json).unwrap();
+    assert_eq!(
+        values["one"],
+        format!("s3://results/inputs/a.txt?version={version}")
+    );
+    assert_eq!(
+        values["many"][0],
+        format!("aruna://results/inputs/a.txt?version={version}")
+    );
+    assert_eq!(values["plain"], "hello");
+
+    // Retrying with the same unversioned request hits the idempotency key cleanly.
+    let retry = runs.start(&runs.fixture.alice, req).await.unwrap();
+    assert!(!retry.created);
+    assert_eq!(retry.record.run_id, first.record.run_id);
+
+    // Cross-node resume attaches `node=<origin>` to values held on the original coordinator node.
+    let origin = aruna_ops_identity::testing::node(9);
+    let peer = aruna_ops_identity::testing::node(10);
+    let mut copy = first.record.clone();
+    copy.run_id = Ulid::from_bytes([52; 16]);
+    copy.lineage = copy.run_id;
+    copy.node_id = origin;
+    copy.state = RunState::Running;
+    copy.values_json = json!({
+        "local": format!("s3://results/inputs/a.txt?version={version}"),
+        "already": format!("aruna://results/inputs/a.txt?version={version}&node={peer}"),
+        "nested": [{"f": format!("aruna://results/inputs/a.txt?version={version}")}],
+    })
+    .to_string();
+    write(
+        &runs.fixture.context,
+        WORKFLOW_RUN_KEYSPACE,
+        super::run_key(copy.run_id).to_vec(),
+        copy.to_bytes().unwrap(),
+    )
+    .await;
+    let mut rewritten = json!({
+        "local": format!("s3://results/inputs/a.txt?version={version}"),
+        "already": format!("aruna://results/inputs/a.txt?version={version}&node={peer}"),
+        "nested": [{"f": format!("aruna://results/inputs/a.txt?version={version}")}],
+    });
+    super::control::values_held_by(&mut rewritten, origin);
+    assert_eq!(
+        rewritten["local"],
+        format!("s3://results/inputs/a.txt?version={version}&node={origin}")
+    );
+    assert_eq!(
+        rewritten["already"],
+        format!("aruna://results/inputs/a.txt?version={version}&node={peer}")
+    );
+    assert_eq!(
+        rewritten["nested"][0]["f"],
+        format!("aruna://results/inputs/a.txt?version={version}&node={origin}")
+    );
+
+    // End-to-end: resuming `copy` on a different node rewrites local value addresses to `origin`,
+    // so admission enforces remote capture instead of silently reading locally.
+    let err = drive(
+        FollowRunOperation::new(
+            &runs.fixture.alice,
+            runs.serving(),
+            copy.run_id,
+            Follow::Resume,
+        ),
+        &runs.fixture.context,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, CatalogError::Invalid(_)), "{err:?}");
+}
+
+// Coordinator uploads targeting a remote node are rejected before UploadStarted or writing locally.
+#[tokio::test]
+async fn rejects_remote_upload() {
+    use super::data::{WriteBody, WriteObjectOperation, upload_target};
+    use super::run::OpenUploadOperation;
+
+    let runs = runs().await;
+    let record = runs.started().await;
+    let remote = aruna_ops_identity::testing::node(9);
+    let addr = format!("s3://results/hello/out.txt?node={remote}");
+    assert!(upload_target(&record, runs.fixture.node, &addr).is_err());
+
+    let opened = drive(
+        OpenUploadOperation::new(record.clone(), runs.fixture.node, 7, addr.clone()),
+        &runs.fixture.context,
+    )
+    .await
+    .unwrap();
+    assert!(opened.is_none());
+    assert!(runs.host.sent().iter().any(|msg| matches!(
+        msg,
+        HostToCoordinator::RpcResponse {
+            call_id: 7,
+            result: HostRpcResult::Failed(_),
+        }
+    )));
+
+    let target = resolve(&record, &addr).unwrap();
+    let result = drive(
+        WriteObjectOperation::new(
+            (record, runs.fixture.node),
+            NodeRouting::default(),
+            target,
+            WriteBody::Bytes(b"abc".to_vec()),
+        ),
+        &runs.fixture.context,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result, HostRpcResult::Failed(_)), "{result:?}");
+}
+
+// Explicitly staged empty directories are created by a launcher script while preserving wrapper $0.
+#[tokio::test]
+async fn stages_empty_directories() {
+    let runs = runs().await;
+    let record = runs.started().await;
+    let mut task = start_task();
+    task.staged_files.push(StagedFile {
+        path: "nested/dir with 'quotes'".into(),
+        address: None,
+        directory: true,
+        executable: false,
+        size: 0,
+    });
+    let spec = task_spec(&record, &task, "k").unwrap();
+    assert_eq!(
+        spec.entrypoint.as_deref(),
+        Some(&["/bin/sh".to_owned(), "/uwe/task.sh".to_owned()][..])
+    );
+    let inline = |path: &str| {
+        spec.inputs.iter().find_map(|file| match &file.source {
+            InputSource::Inline { bytes } if file.container_path.as_deref() == Some(path) => {
+                Some(bytes.as_slice())
+            }
+            _ => None,
+        })
+    };
+    let wrapper = inline("/uwe/wrapper.sh").expect("original wrapper stays at /uwe/wrapper.sh");
+    assert_eq!(wrapper, task.command_wrapper_bytes.as_slice());
+    let launcher = inline("/uwe/task.sh").expect("launcher script");
+    let text = String::from_utf8(launcher.to_vec()).unwrap();
+    assert!(
+        text.contains("mkdir -p -- '/uwe/work/nested/dir with '\\''quotes'\\'''"),
+        "{text}"
+    );
+    assert!(text.contains("exec /bin/sh '/uwe/wrapper.sh'"));
+
+    let mut bad_dir = start_task();
+    bad_dir.staged_files.push(StagedFile {
+        path: "../escape".into(),
+        address: None,
+        directory: true,
+        executable: false,
+        size: 0,
+    });
+    assert!(task_spec(&record, &bad_dir, "k").is_err());
+
+    let mut missing_addr = start_task();
+    missing_addr.staged_files.push(StagedFile {
+        path: "plain.txt".into(),
+        address: None,
+        directory: false,
+        executable: false,
+        size: 0,
+    });
+    assert!(task_spec(&record, &missing_addr, "k").is_err());
+}
+
+// Deleting a run lets the same idempotency key be reused for a fresh run instead of failing NotFound.
+#[tokio::test]
+async fn reuses_deleted_idempotency() {
+    let runs = runs().await;
+    let req = runs.request(Some("idem-del"), json!({"message": "first"}));
+    let first = runs.start(&runs.fixture.alice, req.clone()).await.unwrap();
+    drive(
+        CancelRunOperation::new(&runs.fixture.alice, first.record.run_id, runs.serving()),
+        &runs.fixture.context,
+    )
+    .await
+    .unwrap();
+    drive(
+        DeleteRunOperation::new(&runs.fixture.alice, first.record.run_id),
+        &runs.fixture.context,
+    )
+    .await
+    .unwrap();
+
+    // Retrying with the same key and even different values succeeds cleanly with a new run.
+    let req2 = runs.request(Some("idem-del"), json!({"message": "second"}));
+    let second = runs.start(&runs.fixture.alice, req2).await.unwrap();
+    assert!(second.created);
+    assert_ne!(second.record.run_id, first.record.run_id);
+}
