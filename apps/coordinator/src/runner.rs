@@ -150,6 +150,7 @@ async fn prepare_and_run(
             store.as_ref(),
             &run.id,
             &fetched,
+            payload.output_prefix.as_deref(),
             outputs.as_mut(),
         )
         .await?;
@@ -193,6 +194,7 @@ async fn deliver_outputs(
     store: &CoordinatorRunStore,
     run_id: &str,
     fetched: &FetchedFiles,
+    output_base: Option<&str>,
     outputs: Option<&mut Value>,
 ) -> Result<(), ContractError> {
     let canonical_root = std::fs::canonicalize(root)
@@ -251,7 +253,14 @@ async fn deliver_outputs(
         if meta.is_dir() {
             check_path(&target_path)?;
             let mut entries = Vec::new();
-            walk_output(&source, &target_path, &canonical_root, &mut entries)?;
+            let mut sub_dirs = Vec::new();
+            walk_output(
+                &source,
+                &target_path,
+                &canonical_root,
+                &mut entries,
+                &mut sub_dirs,
+            )?;
             let target_base = Path::new(&target);
             for (local, rel) in entries {
                 check_path(&rel)?;
@@ -272,6 +281,18 @@ async fn deliver_outputs(
                         remote_hint: None,
                     },
                 );
+            }
+            for (sub_canon, sub_rel) in sub_dirs {
+                check_path(&sub_rel)?;
+                let raw_sub = sub_canon
+                    .strip_prefix(&source)
+                    .map(|inner| target_base.join(inner).to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| sub_canon.to_string_lossy().into_owned());
+                dirs.push(OutputDir {
+                    raw_target: raw_sub,
+                    canonical: sub_canon,
+                    target_path: sub_rel,
+                });
             }
             dirs.push(OutputDir {
                 raw_target: target,
@@ -340,10 +361,14 @@ async fn deliver_outputs(
         }
     }
     for dir in dirs {
-        let prefix = dir_sample
-            .get(&dir.target_path)
-            .or(any_sample.as_ref())
-            .and_then(|(rel, loc)| output_prefix(loc, rel, &dir.target_path))
+        let prefix = output_base
+            .map(|base| prefix_for(base, &dir.target_path))
+            .or_else(|| {
+                dir_sample
+                    .get(&dir.target_path)
+                    .or(any_sample.as_ref())
+                    .and_then(|(rel, loc)| output_prefix(loc, rel, &dir.target_path))
+            })
             .unwrap_or_else(|| format!("{}/", dir.target_path.trim_end_matches('/')));
         receipts.insert(dir.raw_target, prefix.clone());
         receipts.insert(dir.canonical.to_string_lossy().into_owned(), prefix);
@@ -352,6 +377,16 @@ async fn deliver_outputs(
         rewrite_locations(value, &receipts);
     }
     Ok(())
+}
+
+/// Formats a delivered directory URI beneath the run's configured output base.
+fn prefix_for(base: &str, dir_path: &str) -> String {
+    let base = base.trim_end_matches('/');
+    let rel = aruna_workflow_contract::host::encode_key(dir_path.trim_end_matches('/'));
+    match rel.is_empty() {
+        true => format!("{base}/"),
+        false => format!("{base}/{rel}/"),
+    }
 }
 
 /// Derives the delivered output prefix for `dir_path` from one delivered file receipt.
@@ -387,19 +422,28 @@ fn collect_output_paths(value: &Value, root: &Path, canonical_root: &Path, out: 
         Value::Object(map) => {
             let class = map.get("class").and_then(Value::as_str);
             let is_entry = matches!(class, Some("File" | "Directory"));
-            if is_entry
-                && let Some(loc) = map.get("location").and_then(Value::as_str)
-                && !loc.is_empty()
-                && !loc.starts_with("_:")
-                && let Some(path) = local_location(loc)
-            {
+            let usable = |field: &str| {
+                map.get(field)
+                    .and_then(Value::as_str)
+                    .filter(|loc| !loc.is_empty() && !loc.starts_with("_:"))
+                    .and_then(local_location)
+            };
+            let entry_path = match is_entry {
+                true => usable("location").or_else(|| usable("path")),
+                false => None,
+            };
+            let walked_dir = class == Some("Directory")
+                && entry_path
+                    .as_deref()
+                    .is_some_and(|p| !served(p) && Path::new(p).is_dir());
+            if let Some(path) = entry_path {
                 out.push(path);
             }
             for (key, item) in map {
                 if is_entry && matches!(key.as_str(), "location" | "path") {
                     continue;
                 }
-                if class == Some("Directory") && key == "listing" {
+                if walked_dir && key == "listing" {
                     continue;
                 }
                 collect_output_paths(item, root, canonical_root, out);
@@ -511,7 +555,8 @@ fn walk_output(
     dir: &Path,
     prefix: &str,
     canonical_root: &Path,
-    out: &mut Vec<(PathBuf, String)>,
+    files: &mut Vec<(PathBuf, String)>,
+    dirs: &mut Vec<(PathBuf, String)>,
 ) -> Result<(), ContractError> {
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .map_err(|error| ContractError::internal(format!("read output dir: {error}")))?
@@ -532,9 +577,10 @@ fn walk_output(
             false => format!("{prefix}/{name}"),
         };
         if canonical.is_dir() {
-            walk_output(&canonical, &rel, canonical_root, out)?;
+            dirs.push((canonical.clone(), rel.clone()));
+            walk_output(&canonical, &rel, canonical_root, files, dirs)?;
         } else if canonical.is_file() {
-            out.push((canonical, rel));
+            files.push((canonical, rel));
         }
     }
     Ok(())
@@ -891,6 +937,81 @@ mod tests {
         assert_eq!(
             value["empty"]["location"],
             "aruna://results/prefix/empty_dir/"
+        );
+    }
+
+    #[test]
+    fn collects_path_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("outputs");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let main = out_dir.join("a.bam");
+        let idx = out_dir.join("a.bam.bai");
+        let extra = out_dir.join("extra.txt");
+        std::fs::write(&main, b"bam").unwrap();
+        std::fs::write(&idx, b"bai").unwrap();
+        std::fs::write(&extra, b"extra").unwrap();
+        let root = dir.path();
+        let canon = std::fs::canonicalize(root).unwrap();
+        let outputs = json!({
+            "aligned": {
+                "class": "File",
+                "location": format!("file://{}", main.display()),
+                "secondaryFiles": [{
+                    "class": "File",
+                    "path": idx.to_string_lossy(),
+                }],
+            },
+            "virtual_dir": {
+                "class": "Directory",
+                "location": "_:vdir",
+                "listing": [{
+                    "class": "File",
+                    "path": extra.to_string_lossy(),
+                }],
+            },
+        });
+        let mut found = Vec::new();
+        collect_output_paths(&outputs, root, &canon, &mut found);
+        assert_eq!(
+            found,
+            vec![
+                main.to_string_lossy().into_owned(),
+                idx.to_string_lossy().into_owned(),
+                extra.to_string_lossy().into_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rewrites_nested_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("outputs");
+        let bundle = out_dir.join("bundle");
+        let nested = bundle.join("nested");
+        let empty = bundle.join("empty_sub");
+        let only_empty = out_dir.join("only_empty");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::create_dir_all(&only_empty).unwrap();
+        let leaf = nested.join("leaf.txt");
+        std::fs::write(&leaf, b"hi").unwrap();
+        let canon_root = std::fs::canonicalize(dir.path()).unwrap();
+        let mut files = Vec::new();
+        let mut sub_dirs = Vec::new();
+        walk_output(&bundle, "bundle", &canon_root, &mut files, &mut sub_dirs).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(sub_dirs.len(), 2);
+        let rels: Vec<&str> = sub_dirs.iter().map(|(_, rel)| rel.as_str()).collect();
+        assert!(rels.contains(&"bundle/nested"), "{rels:?}");
+        assert!(rels.contains(&"bundle/empty_sub"), "{rels:?}");
+        assert_eq!(
+            prefix_for("aruna://results/run", "only_empty"),
+            "aruna://results/run/only_empty/"
+        );
+        assert_eq!(
+            prefix_for("aruna://results/run/", "bundle/nested"),
+            "aruna://results/run/bundle/nested/"
         );
     }
 }

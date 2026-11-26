@@ -250,6 +250,17 @@ impl PrepareRunOperation {
         let record = self.record()?;
         let inputs = run_inputs(record)?;
         let namespace = super::cache::namespaces(record, record.cache_scope).pop();
+        let output_prefix = record.output.as_ref().map(|output| {
+            let prefix = output.prefix.trim_end_matches('/');
+            match prefix.is_empty() {
+                true => format!("aruna://{}", output.bucket),
+                false => format!(
+                    "aruna://{}/{}",
+                    output.bucket,
+                    aruna_workflow_contract::host::encode_key(prefix)
+                ),
+            }
+        });
         Ok(RunStartPayload {
             source: start.source,
             entrypoint: start.entrypoint,
@@ -264,6 +275,7 @@ impl PrepareRunOperation {
             max_pending: Some(MAX_PENDING),
             prior_log_pages: pages,
             step_settings: start.step_settings,
+            output_prefix,
         })
     }
 }

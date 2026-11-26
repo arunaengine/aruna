@@ -104,6 +104,9 @@ pub struct RunStartPayload {
     pub prior_log_pages: Vec<RunLogPage>,
     /// The `aruna` settings of composed workflow steps, by step id.
     pub step_settings: BTreeMap<String, ArunaStepSettings>,
+    /// Base output URI (`aruna://<bucket>` or `aruna://<bucket>/<prefix>`) for directory outputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_prefix: Option<String>,
 }
 
 /// How a run ended.

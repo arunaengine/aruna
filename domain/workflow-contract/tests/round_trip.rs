@@ -459,6 +459,7 @@ fn host_messages_travel() {
             max_pending: Some(8),
             prior_log_pages: pages(),
             step_settings: BTreeMap::from([("upper".into(), settings())]),
+            output_prefix: Some("aruna://results/run".into()),
         }),
         HostToCoordinator::Cancel {
             reason: "the owner cancelled".into(),
