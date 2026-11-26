@@ -5,6 +5,7 @@
 
 pub mod change;
 pub mod check;
+pub mod copy_stage;
 pub mod diff;
 pub mod firing_reads;
 pub mod identity;
