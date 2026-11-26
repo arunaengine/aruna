@@ -62,7 +62,8 @@ bundles:
   builds omit the web portal unless the built
   [website](https://github.com/arunaengine/website) is staged in `.portal-embed` before building, or
   you configure `PORTAL_MODE=artifact` with `PORTAL_ARTIFACT_URL` and `PORTAL_ARTIFACT_SHA256` to
-  fetch a signed release archive at startup.
+  fetch a signed release archive at startup. `bash scripts/build_images.sh --portal <portal tag> aruna`
+  builds the image with a portal release of the website whose SHA-256 it checks first.
 
 ## Host sizing and preparation
 
