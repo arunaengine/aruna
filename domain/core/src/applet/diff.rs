@@ -33,8 +33,26 @@ pub struct ApprovalDiff {
     pub grants: (Grants, Grants),
     pub origins_added: Vec<String>,
     pub domains: Vec<String>,
+    /// Custom domains that share a registered domain with the portal, API, S3 or sign-in hosts.
+    #[serde(default)]
+    pub shared_domains: Vec<String>,
     /// The work the applet starts may run on a backend without a kernel sandbox.
     pub unsandboxed: bool,
+}
+
+impl ApprovalDiff {
+    /// Marks custom domains that share a registered domain with any protected host.
+    pub fn with_protected(mut self, protected: &[String]) -> Self {
+        self.shared_domains = (self.domains.iter())
+            .filter(|domain| {
+                protected
+                    .iter()
+                    .any(|host| super::hosts::same_site(domain, host))
+            })
+            .cloned()
+            .collect();
+        self
+    }
 }
 
 /// Compares `pending` and its manifest `next` with the live state and its manifest `live`.
@@ -94,6 +112,7 @@ pub fn approval_diff(
             .iter()
             .map(|domain| domain.host.clone())
             .collect(),
+        shared_domains: Vec::new(),
         unsandboxed,
     }
 }
@@ -161,5 +180,23 @@ mod tests {
         assert!(diff.unsandboxed);
         let first = approval_diff(&applet, &pending, None, &next, false);
         assert_eq!(first.files.added.len(), 2);
+    }
+
+    #[test]
+    fn flags_shared_domains() {
+        let mut applet = applet();
+        let entry = |host: &str| crate::applet::record::CustomDomain {
+            host: host.into(),
+            nonce: "n".into(),
+            state: crate::applet::record::DomainState::Active,
+            failures: 0,
+            checked_at_ms: 0,
+        };
+        applet.domains = vec![entry("bakta.lab.example.org"), entry("bakta.other.net")];
+        let pending = request(1);
+        let next = manifest(&[("index.html", "a")], &[]);
+        let protected = vec!["portal.example.org".to_string()];
+        let diff = approval_diff(&applet, &pending, None, &next, false).with_protected(&protected);
+        assert_eq!(diff.shared_domains, vec!["bakta.lab.example.org"]);
     }
 }

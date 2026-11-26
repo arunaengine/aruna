@@ -70,7 +70,7 @@ pub struct FilesBody {
         "limits": {}},
     "grants_after": {"read": [], "references": [], "start": null, "submissions": null,
         "limits": {}},
-    "origins_added": [], "domains": ["bakta.lab.org"], "unsandboxed": false
+    "origins_added": [], "domains": ["bakta.lab.org"], "shared_domains": [], "unsandboxed": false
 }))]
 pub struct DiffBody {
     pub version: u32,
@@ -89,6 +89,8 @@ pub struct DiffBody {
     pub grants_after: GrantsBody,
     pub origins_added: Vec<String>,
     pub domains: Vec<String>,
+    /// Custom domains that share a registered domain with the portal, API, S3 or sign-in hosts.
+    pub shared_domains: Vec<String>,
     /// Work the applet starts may run on a backend without a kernel sandbox.
     pub unsandboxed: bool,
 }
@@ -136,6 +138,7 @@ fn diff_body(
         grants_after: GrantsBody::from(&diff.grants.1),
         origins_added: diff.origins_added,
         domains: diff.domains,
+        shared_domains: diff.shared_domains,
         unsandboxed: diff.unsandboxed,
     }
 }
@@ -219,7 +222,9 @@ pub async fn version_diff(
         .map_err(applet_error)?;
     let open = backends.is_empty() || backends.iter().any(|backend| !backend.sandbox);
     let unsandboxed = pending.grants.start.is_some() && open;
-    let diff = approval_diff(&applet, &pending, before.as_ref(), &next, unsandboxed);
+    let protected = super::protected_hosts(&state).await;
+    let diff = approval_diff(&applet, &pending, before.as_ref(), &next, unsandboxed)
+        .with_protected(&protected);
     let catalogue = (state.applet_settings().building.as_ref())
         .map_or_else(default_catalogue, |building| building.catalogue.clone());
     Ok(Json(diff_body(diff, base, requested, &catalogue)))

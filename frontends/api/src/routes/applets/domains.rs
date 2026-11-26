@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use aruna_core::applet::hosts::custom_domain;
+use aruna_core::applet::hosts::{custom_domain, same_site};
 use aruna_core::applet::record::Applet;
 use aruna_ops_work::applets::change::{AppletChange, ChangeAppletOperation};
 use aruna_ops_work::applets::domains::VerifyDomainOperation;
@@ -95,7 +95,7 @@ on the applet's host node.
             example = json!({"host": "bakta.lab.example.org", "state": "pending",
             "txt_value": "aruna-applet=9f86d081884c7d659a2feaa0c55ad015",
             "checked_at": "2026-11-24T08:00:00+00:00"})),
-        (status = 400, description = "Not a subdomain outside the applet domain", body = ErrorResponse),
+        (status = 400, description = "Not an isolated subdomain outside the applet and node domains", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group's data", body = ErrorResponse),
         (status = 404, description = "No such applet", body = ErrorResponse),
         (status = 409, description = "Already added, custom domains or applets off, or hosted elsewhere", body = ErrorResponse),
@@ -117,6 +117,13 @@ pub async fn add_domain(
     }
     let host = custom_domain(&body.host, &settings.applet_domain)
         .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
+    let protected = super::protected_hosts(&state).await;
+    if protected.iter().any(|site| same_site(&host, site)) {
+        return Err(ServerError::BadRequestReason(
+            "a custom domain cannot share a registered domain with the portal, API, S3 or sign-in service"
+                .to_string(),
+        ));
+    }
     let read = AppletAccessOperation::new(&auth, applet_id(&id)?, Need::Write);
     let record = drive(read, &state.get_ctx()).await.map_err(applet_error)?;
     require_feature(&state, record.group_id).await?;

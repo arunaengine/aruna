@@ -112,6 +112,30 @@ pub(crate) async fn require_feature(state: &ServerState, group_id: GroupId) -> S
     crate::features::require(state, Feature::Applets, Some(group_id)).await
 }
 
+/// Normalized hosts of this node's portal, API, S3 and realm OIDC providers.
+pub(crate) async fn protected_hosts(state: &ServerState) -> Vec<String> {
+    let mut hosts = state
+        .applet_settings()
+        .hosting
+        .as_ref()
+        .map(|hosting| hosting.protected_hosts.clone())
+        .unwrap_or_default();
+    if let Ok(config) = realm_config(state).await {
+        for provider in &config.oidc_providers {
+            for raw in [&provider.issuer, &provider.discovery_url] {
+                let host = url::Url::parse(raw.trim())
+                    .ok()
+                    .and_then(|url| url.host_str().map(str::to_string))
+                    .and_then(|host| aruna_core::applet::hosts::normalize_host(&host).ok());
+                hosts.extend(host);
+            }
+        }
+    }
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
 /// What the edge serves for `applet` now, from the feature state and this node's hosting.
 pub(crate) async fn serving(state: &ServerState, applet: &Applet) -> ServerResult<Serving> {
     let feature = realm_feature(state, applet.group_id).await?;
