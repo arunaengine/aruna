@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::document::DocumentTarget;
@@ -26,7 +26,8 @@ use aruna_core::structs::execution::workflow::{
 };
 use aruna_core::structs::execution::workflow_run::{
     ChunkKind, LogHead, ReplicatedChunk, ReplicatedWorkflow, WorkflowRunAuth, WorkflowRunRecord,
-    chunk_key, decode_page, encode_page, head_key, page_key, run_key,
+    chunk_key, decode_page, encode_page, head_key, page_key, run_key, stage_prefix,
+    transfer_prefix,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{GroupId, Key};
@@ -45,6 +46,12 @@ use crate::workflows::{CatalogError, GraphView, ScanOperation, scan_answer};
 const BATCH_BYTES: usize = 8 << 20;
 /// Maximum chunk count allowed for one replicated source or tool blob.
 const MAX_CHUNKS: u32 = 64;
+/// Age after which an unfinished staged transfer from a peer is reclaimed.
+const STALE_STAGE_MS: u64 = 5 * 60 * 1000;
+/// Non-expired prior transfers retained per `(run_id, peer)` before evicting oldest.
+const MAX_PRIOR_TRANSFERS: usize = 1;
+/// Rows scanned per page when reclaiming staged replica rows.
+const CLEANUP_ROWS: usize = 256;
 
 /// What a replica of an active run shows on a node that is not its coordinator.
 pub const UNREACHABLE: &str = "coordinator node unreachable";
@@ -73,10 +80,8 @@ pub fn replica_note(record: &WorkflowRunRecord, local: NodeId) -> Option<&'stati
     (record.node_id != local && record.state.is_active()).then_some(UNREACHABLE)
 }
 
-fn chunk_target(peer: NodeId, transfer: u64, kind: &ChunkKind) -> [u8; 32] {
+fn chunk_target(kind: &ChunkKind) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(peer.as_bytes());
-    hasher.update(&transfer.to_be_bytes());
     match kind {
         ChunkKind::Source => {
             hasher.update(b"source");
@@ -104,16 +109,29 @@ fn chunk_target(peer: NodeId, transfer: u64, kind: &ChunkKind) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
+fn stage_meta_key(run_id: Ulid, peer: NodeId, transfer: u64) -> Key {
+    let mut key = transfer_prefix(run_id, peer, transfer).to_vec();
+    key.push(b'm');
+    Key::from(key)
+}
+
 fn staged_key(run_id: Ulid, peer: NodeId, transfer: u64, kind: ChunkKind) -> Key {
-    chunk_key(run_id, chunk_target(peer, transfer, &kind), u32::MAX)
+    chunk_key(run_id, peer, transfer, chunk_target(&kind), u32::MAX)
 }
 
 fn staged_tools_key(run_id: Ulid, peer: NodeId, transfer: u64) -> Key {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(peer.as_bytes());
-    hasher.update(&transfer.to_be_bytes());
-    hasher.update(b"tool-index");
-    chunk_key(run_id, *hasher.finalize().as_bytes(), u32::MAX)
+    let mut key = transfer_prefix(run_id, peer, transfer).to_vec();
+    key.push(b't');
+    Key::from(key)
+}
+
+fn parse_stage_key(run_id: Ulid, peer: NodeId, key: &[u8]) -> Option<(u64, u8)> {
+    let prefix = stage_prefix(run_id, peer);
+    if key.len() < 58 || !key.starts_with(prefix.as_ref()) {
+        return None;
+    }
+    let transfer = u64::from_be_bytes(key[49..57].try_into().ok()?);
+    Some((transfer, key[57]))
 }
 
 fn stub_run(run: &WorkflowRunRecord) -> WorkflowRunRecord {
@@ -986,6 +1004,7 @@ pub struct StoreReplicaOperation {
     first_page: u32,
     pages: Vec<Vec<u8>>,
     workflow: Option<ReplicatedWorkflow>,
+    now_ms: u64,
     step: StoreStep,
 }
 
@@ -1005,6 +1024,7 @@ impl StoreReplicaOperation {
             first_page,
             pages,
             workflow,
+            now_ms: 0,
             step: StoreStep::Config,
         }
     }
@@ -1013,6 +1033,10 @@ impl StoreReplicaOperation {
 impl Operation for StoreReplicaOperation {
     type Output = u32;
     type Error = MetadataReadError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn first(&mut self) -> Result<Next<u32>, MetadataReadError> {
         if self.run.node_id != self.peer || self.run.realm_id != self.local.1 || self.run.local_only
@@ -1043,6 +1067,7 @@ impl Operation for StoreReplicaOperation {
                     first_page: self.first_page,
                     pages: std::mem::take(&mut self.pages),
                     workflow: self.workflow.take(),
+                    now_ms: self.now_ms,
                     step: WriteStep::Read,
                     kept: 0,
                 };
@@ -1072,15 +1097,26 @@ impl Operation for StoreReplicaOperation {
 
 #[derive(Clone, Debug, PartialEq)]
 struct CommitState {
+    transfer: u64,
     tools: Vec<(String, String)>,
     writes: Vec<(String, Key, ByteView)>,
     deletes: Vec<(String, Key)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+struct StageScan {
+    transfer: u64,
+    clear_all: bool,
+    writes: Vec<(String, Key, ByteView)>,
+    deletes: Vec<(String, Key)>,
+    seen: Vec<(u64, u8, Key, Option<u64>)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 enum WriteStep {
     Read,
     ReadTools(Box<CommitState>),
+    ScanStage(Box<StageScan>),
     Write(Vec<(String, Key)>),
     Delete,
 }
@@ -1094,8 +1130,81 @@ pub struct WriteReplicaOperation {
     first_page: u32,
     pages: Vec<Vec<u8>>,
     workflow: Option<ReplicatedWorkflow>,
+    now_ms: u64,
     step: WriteStep,
     kept: u32,
+}
+
+impl WriteReplicaOperation {
+    fn scan_stage(
+        &mut self,
+        scan: StageScan,
+        after: Option<Key>,
+    ) -> Result<Next<u32>, CatalogError> {
+        let prefix = stage_prefix(self.run.run_id, self.peer);
+        self.step = WriteStep::ScanStage(Box::new(scan));
+        Ok(Next::Call(IoCall::Page {
+            space: RUN_LOG_KEYSPACE.to_string(),
+            prefix,
+            after,
+            limit: CLEANUP_ROWS,
+        }))
+    }
+
+    fn emit_writes(
+        &mut self,
+        writes: Vec<(String, Key, ByteView)>,
+        mut deletes: Vec<(String, Key)>,
+    ) -> Result<Next<u32>, CatalogError> {
+        deletes.sort();
+        deletes.dedup();
+        if writes.is_empty() {
+            if !deletes.is_empty() {
+                self.step = WriteStep::Delete;
+                return Ok(Next::Call(IoCall::Delete(deletes)));
+            }
+            return Ok(Next::Done(self.kept));
+        }
+        self.step = WriteStep::Write(deletes);
+        Ok(Next::Call(IoCall::Write(writes)))
+    }
+
+    fn finish_stage(&mut self, mut scan: StageScan) -> Result<Next<u32>, CatalogError> {
+        let space = RUN_LOG_KEYSPACE.to_string();
+        if !scan.clear_all {
+            let mut groups: BTreeMap<u64, (u64, Vec<Key>)> = BTreeMap::new();
+            for (transfer, tag, key, ts) in scan.seen {
+                let entry = groups.entry(transfer).or_insert_with(|| (0, Vec::new()));
+                if tag == b'm'
+                    && let Some(stamp) = ts
+                {
+                    entry.0 = stamp;
+                }
+                entry.1.push(key);
+            }
+            let mut active = Vec::new();
+            for (transfer, (stamp, keys)) in groups {
+                let expired = stamp == 0 || self.now_ms.saturating_sub(stamp) >= STALE_STAGE_MS;
+                if expired {
+                    for key in keys {
+                        scan.deletes.push((space.clone(), key));
+                    }
+                } else {
+                    active.push((stamp, transfer, keys));
+                }
+            }
+            if active.len() > MAX_PRIOR_TRANSFERS {
+                active.sort_by_key(|(stamp, transfer, _)| (*stamp, *transfer));
+                let drop_count = active.len() - MAX_PRIOR_TRANSFERS;
+                for (_, _, keys) in active.into_iter().take(drop_count) {
+                    for key in keys {
+                        scan.deletes.push((space.clone(), key));
+                    }
+                }
+            }
+        }
+        self.emit_writes(scan.writes, scan.deletes)
+    }
 }
 
 impl Operation for WriteReplicaOperation {
@@ -1106,6 +1215,10 @@ impl Operation for WriteReplicaOperation {
         TransactionMode::Write
     }
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
     fn first(&mut self) -> Result<Next<u32>, CatalogError> {
         let wf_key = workflow_key(self.run.workflow_id);
         let ver_key = version_key(self.run.workflow_id, self.run.version);
@@ -1114,7 +1227,7 @@ impl Operation for WriteReplicaOperation {
         if self
             .workflow
             .as_ref()
-            .is_some_and(|wf| wf.more && transfer == 0)
+            .is_some_and(|wf| transfer == 0 && (wf.more || !wf.chunks.is_empty()))
         {
             return Err(CatalogError::Forbidden);
         }
@@ -1141,6 +1254,10 @@ impl Operation for WriteReplicaOperation {
             reads.push((
                 RUN_LOG_KEYSPACE.to_string(),
                 staged_tools_key(run_id, self.peer, transfer),
+            ));
+            reads.push((
+                RUN_LOG_KEYSPACE.to_string(),
+                stage_meta_key(run_id, self.peer, transfer),
             ));
         }
         for index in 0..self.pages.len() {
@@ -1176,11 +1293,11 @@ impl Operation for WriteReplicaOperation {
                     return Err(CatalogError::Forbidden);
                 }
                 if chunk.index + 1 == chunk.total {
-                    let target = chunk_target(self.peer, transfer, &chunk.kind);
+                    let target = chunk_target(&chunk.kind);
                     for prior in 0..chunk.index {
                         reads.push((
                             RUN_LOG_KEYSPACE.to_string(),
-                            chunk_key(run_id, target, prior),
+                            chunk_key(run_id, self.peer, transfer, target, prior),
                         ));
                     }
                     match &chunk.kind {
@@ -1250,15 +1367,41 @@ impl Operation for WriteReplicaOperation {
                         }
                     }
                 }
-                if commit.writes.is_empty() {
-                    if !commit.deletes.is_empty() {
-                        self.step = WriteStep::Delete;
-                        return Ok(Next::Call(IoCall::Delete(commit.deletes)));
+                return self.scan_stage(
+                    StageScan {
+                        transfer: commit.transfer,
+                        clear_all: true,
+                        writes: commit.writes,
+                        deletes: commit.deletes,
+                        seen: Vec::new(),
+                    },
+                    None,
+                );
+            }
+            WriteStep::ScanStage(mut scan) => {
+                let (rows, next) = result.page()?;
+                let space = RUN_LOG_KEYSPACE.to_string();
+                for (key, value) in rows {
+                    if scan.clear_all {
+                        scan.deletes.push((space.clone(), key));
+                        continue;
                     }
-                    return Ok(Next::Done(self.kept));
+                    let Some((row_transfer, tag)) =
+                        parse_stage_key(self.run.run_id, self.peer, key.as_ref())
+                    else {
+                        continue;
+                    };
+                    if row_transfer == scan.transfer {
+                        continue;
+                    }
+                    let stamp = (tag == b'm' && value.len() == 8)
+                        .then(|| u64::from_be_bytes(value.as_ref().try_into().unwrap()));
+                    scan.seen.push((row_transfer, tag, key, stamp));
                 }
-                self.step = WriteStep::Write(commit.deletes);
-                return Ok(Next::Call(IoCall::Write(commit.writes)));
+                if let Some(after) = next {
+                    return self.scan_stage(*scan, Some(after));
+                }
+                return self.finish_stage(*scan);
             }
             WriteStep::Write(deletes) => {
                 result.done()?;
@@ -1289,14 +1432,15 @@ impl Operation for WriteReplicaOperation {
         let ver_row = values.next().flatten();
         let src_row = values.next().flatten();
         let transfer = self.workflow.as_ref().map_or(0, |wf| wf.transfer_id);
-        let (staged_wf, staged_ver, staged_src, staged_index_row) = match transfer != 0 {
+        let (staged_wf, staged_ver, staged_src, staged_index_row, meta_row) = match transfer != 0 {
             true => (
                 values.next().flatten(),
                 values.next().flatten(),
                 values.next().flatten(),
                 values.next().flatten(),
+                values.next().flatten(),
             ),
-            false => (None, None, None, None),
+            false => (None, None, None, None, None),
         };
         let mut staged_index: Vec<(String, String)> = staged_index_row
             .as_deref()
@@ -1357,6 +1501,13 @@ impl Operation for WriteReplicaOperation {
             Ok(())
         };
         if let Some(replicated) = self.workflow.take() {
+            if more
+                && (!replicated.workflow.is_empty()
+                    || !replicated.version.is_empty()
+                    || replicated.source.is_some())
+            {
+                return Err(CatalogError::Forbidden);
+            }
             for tool_bytes in replicated.tools {
                 let existing = values.next().flatten();
                 if let Some((key, value)) =
@@ -1386,11 +1537,11 @@ impl Operation for WriteReplicaOperation {
                 }
             }
             for chunk in replicated.chunks {
-                let target = chunk_target(peer, transfer, &chunk.kind);
+                let target = chunk_target(&chunk.kind);
                 if chunk.index + 1 < chunk.total {
                     writes.push((
                         space.clone(),
-                        chunk_key(run_id, target, chunk.index),
+                        chunk_key(run_id, peer, transfer, target, chunk.index),
                         ByteView::from(chunk.data),
                     ));
                     continue;
@@ -1399,7 +1550,10 @@ impl Operation for WriteReplicaOperation {
                 for prior in 0..chunk.index {
                     let part = values.next().flatten().ok_or(CatalogError::NotFound)?;
                     assembled.extend_from_slice(&part);
-                    deletes.push((space.clone(), chunk_key(run_id, target, prior)));
+                    deletes.push((
+                        space.clone(),
+                        chunk_key(run_id, peer, transfer, target, prior),
+                    ));
                 }
                 assembled.extend_from_slice(&chunk.data);
                 match chunk.kind {
@@ -1413,6 +1567,9 @@ impl Operation for WriteReplicaOperation {
                                 ByteView::from(assembled),
                             ));
                         } else {
+                            if pending_src.is_some() {
+                                return Err(CatalogError::Forbidden);
+                            }
                             pending_src = Some(assembled);
                         }
                     }
@@ -1431,6 +1588,9 @@ impl Operation for WriteReplicaOperation {
                                 ByteView::from(assembled),
                             ));
                         } else {
+                            if pending_wf.is_some() {
+                                return Err(CatalogError::Forbidden);
+                            }
                             pending_wf = Some(assembled);
                         }
                     }
@@ -1449,11 +1609,14 @@ impl Operation for WriteReplicaOperation {
                                 ByteView::from(assembled),
                             ));
                         } else {
+                            if pending_ver.is_some() {
+                                return Err(CatalogError::Forbidden);
+                            }
                             pending_ver = Some(assembled);
                         }
                     }
                     ChunkKind::Run => {
-                        if more {
+                        if more || assembled_run.is_some() {
                             return Err(CatalogError::Forbidden);
                         }
                         let full = WorkflowRunRecord::from_bytes(&assembled)
@@ -1539,53 +1702,75 @@ impl Operation for WriteReplicaOperation {
                 }
             }
             if !more {
-                if pending_wf.is_none() && !replicated.workflow.is_empty() {
+                if !replicated.workflow.is_empty() {
+                    if pending_wf.is_some() {
+                        return Err(CatalogError::Forbidden);
+                    }
                     pending_wf = Some(replicated.workflow);
                 }
-                if pending_ver.is_none() && !replicated.version.is_empty() {
+                if !replicated.version.is_empty() {
+                    if pending_ver.is_some() {
+                        return Err(CatalogError::Forbidden);
+                    }
                     pending_ver = Some(replicated.version);
                 }
-                if pending_src.is_none() {
-                    pending_src = replicated.source;
+                if let Some(source) = replicated.source {
+                    if pending_src.is_some() {
+                        return Err(CatalogError::Forbidden);
+                    }
+                    pending_src = Some(source);
                 }
             }
         }
-        if more && index_dirty {
-            let encoded = postcard::to_allocvec(&staged_index)
-                .map_err(|error| CatalogError::Storage(error.to_string()))?;
+        if more {
+            let stamp = self.now_ms.max(1);
             writes.push((
                 space.clone(),
-                staged_tools_key(run_id, peer, transfer),
-                ByteView::from(encoded),
+                stage_meta_key(run_id, peer, transfer),
+                ByteView::from(stamp.to_be_bytes().to_vec()),
             ));
+            if index_dirty {
+                let encoded = postcard::to_allocvec(&staged_index)
+                    .map_err(|error| CatalogError::Storage(error.to_string()))?;
+                writes.push((
+                    space.clone(),
+                    staged_tools_key(run_id, peer, transfer),
+                    ByteView::from(encoded),
+                ));
+            }
+            self.kept = head.pages;
+            if meta_row.is_none() {
+                return self.scan_stage(
+                    StageScan {
+                        transfer,
+                        clear_all: false,
+                        writes,
+                        deletes,
+                        seen: Vec::new(),
+                    },
+                    None,
+                );
+            }
+            return self.emit_writes(writes, deletes);
         }
         if !more {
             if let Some(bytes) = staged_wf {
-                deletes.push((
-                    space.clone(),
-                    staged_key(run_id, peer, transfer, ChunkKind::Workflow),
-                ));
-                if pending_wf.is_none() {
-                    pending_wf = Some(bytes.to_vec());
+                if pending_wf.is_some() {
+                    return Err(CatalogError::Forbidden);
                 }
+                pending_wf = Some(bytes.to_vec());
             }
             if let Some(bytes) = staged_ver {
-                deletes.push((
-                    space.clone(),
-                    staged_key(run_id, peer, transfer, ChunkKind::Version),
-                ));
-                if pending_ver.is_none() {
-                    pending_ver = Some(bytes.to_vec());
+                if pending_ver.is_some() {
+                    return Err(CatalogError::Forbidden);
                 }
+                pending_ver = Some(bytes.to_vec());
             }
             if let Some(bytes) = staged_src {
-                deletes.push((
-                    space.clone(),
-                    staged_key(run_id, peer, transfer, ChunkKind::Source),
-                ));
-                if pending_src.is_none() {
-                    pending_src = Some(bytes.to_vec());
+                if pending_src.is_some() {
+                    return Err(CatalogError::Forbidden);
                 }
+                pending_src = Some(bytes.to_vec());
             }
             // Publish catalog rows and the run together only when every required row is available.
             if (wf_row.is_none() && pending_wf.is_none())
@@ -1686,9 +1871,7 @@ impl Operation for WriteReplicaOperation {
                 head_key(run_id),
                 ByteView::from(head.to_bytes()?),
             ));
-            if staged_index_row.is_some() {
-                deletes.push((space.clone(), staged_tools_key(run_id, peer, transfer)));
-            }
+            self.kept = head.pages;
             if !staged_index.is_empty() {
                 let mut tool_reads = Vec::with_capacity(staged_index.len() * 2);
                 for (id, version) in &staged_index {
@@ -1698,15 +1881,14 @@ impl Operation for WriteReplicaOperation {
                         transfer,
                         ChunkKind::Tool(id.clone(), version.clone()),
                     );
-                    deletes.push((space.clone(), key.clone()));
                     tool_reads.push((space.clone(), key));
                     tool_reads.push((
                         WORKFLOW_TOOL_KEYSPACE.to_string(),
                         tool_key(id, version, self.run.group_id),
                     ));
                 }
-                self.kept = head.pages;
                 self.step = WriteStep::ReadTools(Box::new(CommitState {
+                    transfer,
                     tools: staged_index,
                     writes,
                     deletes,
@@ -1714,16 +1896,16 @@ impl Operation for WriteReplicaOperation {
                 return Ok(Next::Call(IoCall::Read(tool_reads)));
             }
         }
-        self.kept = head.pages;
-        if writes.is_empty() {
-            if !deletes.is_empty() {
-                self.step = WriteStep::Delete;
-                return Ok(Next::Call(IoCall::Delete(deletes)));
-            }
-            return Ok(Next::Done(self.kept));
-        }
-        self.step = WriteStep::Write(deletes);
-        Ok(Next::Call(IoCall::Write(writes)))
+        self.scan_stage(
+            StageScan {
+                transfer,
+                clear_all: true,
+                writes,
+                deletes,
+                seen: Vec::new(),
+            },
+            None,
+        )
     }
 }
 

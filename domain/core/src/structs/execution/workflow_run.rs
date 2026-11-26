@@ -487,13 +487,47 @@ pub fn page_key(run_id: Ulid, page: u32) -> Key {
     numbered(run_id, &page.to_be_bytes())
 }
 
-/// Temporary row staging one chunk of a replicated source or tool under `run_prefix(run_id)`.
-pub fn chunk_key(run_id: Ulid, target: [u8; 32], index: u32) -> Key {
-    let mut key = Vec::with_capacity(53);
+/// Prefix covering all replica staging rows of `run_id` written by `peer`.
+pub fn stage_prefix(run_id: Ulid, peer: NodeId) -> Key {
+    let mut key = Vec::with_capacity(49);
     key.extend_from_slice(&run_id.to_bytes());
+    key.push(b's');
+    key.extend_from_slice(peer.as_bytes());
+    Key::from(key)
+}
+
+/// Prefix covering all replica staging rows of one `(run_id, peer, transfer)` transfer.
+pub fn transfer_prefix(run_id: Ulid, peer: NodeId, transfer: u64) -> Key {
+    let mut key = Vec::with_capacity(57);
+    key.extend_from_slice(&run_id.to_bytes());
+    key.push(b's');
+    key.extend_from_slice(peer.as_bytes());
+    key.extend_from_slice(&transfer.to_be_bytes());
+    Key::from(key)
+}
+
+/// Temporary row staging one chunk under `transfer_prefix(run_id, peer, transfer)`.
+pub fn chunk_key(run_id: Ulid, peer: NodeId, transfer: u64, target: [u8; 32], index: u32) -> Key {
+    let mut key = Vec::with_capacity(94);
+    key.extend_from_slice(&run_id.to_bytes());
+    key.push(b's');
+    key.extend_from_slice(peer.as_bytes());
+    key.extend_from_slice(&transfer.to_be_bytes());
     key.push(b'c');
     key.extend_from_slice(&target);
     key.extend_from_slice(&index.to_be_bytes());
+    Key::from(key)
+}
+
+/// One page of exact-version child files stored for a remote directory output under `run_prefix`.
+pub fn dir_page_key(run_id: Ulid, task_id: u64, attempt: u32, output_index: u32, page: u32) -> Key {
+    let mut key = Vec::with_capacity(37);
+    key.extend_from_slice(&run_id.to_bytes());
+    key.push(b'd');
+    key.extend_from_slice(&task_id.to_be_bytes());
+    key.extend_from_slice(&attempt.to_be_bytes());
+    key.extend_from_slice(&output_index.to_be_bytes());
+    key.extend_from_slice(&page.to_be_bytes());
     Key::from(key)
 }
 

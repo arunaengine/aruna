@@ -121,6 +121,7 @@ async fn resumes_copied_run() {
             first_page,
             pages,
             workflow: None,
+            now_ms: 0,
             step: WriteStep::Read,
             kept: 0,
         };
@@ -231,6 +232,7 @@ async fn guards_replica_gaps() {
             first_page,
             pages,
             workflow: None,
+            now_ms: 0,
             step: WriteStep::Read,
             kept: 0,
         };
@@ -459,6 +461,7 @@ async fn chunks_large_replicas() {
                 first_page,
                 pages,
                 workflow,
+                now_ms: 0,
                 step: WriteStep::Read,
                 kept: 0,
             },
@@ -526,7 +529,7 @@ async fn chunks_large_replicas() {
     .unwrap();
     assert_eq!(stored_ver.workflow.description, wf.description);
     assert_eq!(stored_ver.version.message, ver.message);
-    assert_eq!(stored_ver.files, Some(source_files));
+    assert_eq!(stored_ver.files.as_ref(), Some(&source_files));
     assert_eq!(
         drive(LoadLogOperation::new(remote.run_id), context)
             .await
@@ -669,6 +672,7 @@ async fn chunks_large_replicas() {
                 first_page: 0,
                 pages: Vec::new(),
                 workflow: Some(bad_bundle),
+                now_ms: 0,
                 step: WriteStep::Read,
                 kept: 0,
             },
@@ -677,6 +681,93 @@ async fn chunks_large_replicas() {
         .await;
         assert_eq!(rejected, Err(CatalogError::Forbidden));
     }
+
+    // Zero-ID frames carrying chunks are rejected even when `more` is false.
+    let zero_chunk = ReplicatedWorkflow {
+        chunks: vec![ReplicatedChunk {
+            kind: ChunkKind::Source,
+            index: 0,
+            total: 2,
+            data: b"part".to_vec(),
+        }],
+        more: false,
+        transfer_id: 0,
+        ..ReplicatedWorkflow::default()
+    };
+    assert_eq!(
+        drive(
+            WriteReplicaOperation {
+                peer: gone,
+                local: here,
+                run: Box::new(remote.clone()),
+                first_page: 0,
+                pages: Vec::new(),
+                workflow: Some(zero_chunk),
+                now_ms: 0,
+                step: WriteStep::Read,
+                kept: 0,
+            },
+            context,
+        )
+        .await,
+        Err(CatalogError::Forbidden)
+    );
+
+    // Duplicate source representations (assembled chunk plus inline source) are rejected.
+    let good_src = source_files.to_bytes().unwrap();
+    let dup_source = ReplicatedWorkflow {
+        source: Some(b"tampered".to_vec()),
+        chunks: vec![ReplicatedChunk {
+            kind: ChunkKind::Source,
+            index: 0,
+            total: 1,
+            data: good_src.clone(),
+        }],
+        more: false,
+        transfer_id: 90,
+        ..ReplicatedWorkflow::default()
+    };
+    assert_eq!(
+        drive(
+            WriteReplicaOperation {
+                peer: gone,
+                local: here,
+                run: Box::new(remote.clone()),
+                first_page: 0,
+                pages: Vec::new(),
+                workflow: Some(dup_source),
+                now_ms: 0,
+                step: WriteStep::Read,
+                kept: 0,
+            },
+            context,
+        )
+        .await,
+        Err(CatalogError::Forbidden)
+    );
+
+    // An expired staged transfer is reclaimed when a new transfer begins, and finalization
+    // deletes all remaining staged rows for the peer.
+    let expired_key = staged_key(remote.run_id, gone, 80, ChunkKind::Source);
+    let expired_meta = stage_meta_key(remote.run_id, gone, 80);
+    context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: RUN_LOG_KEYSPACE.to_string(),
+            key: expired_key.clone(),
+            value: good_src.clone().into(),
+            txn_id: None,
+        })
+        .await;
+    context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: RUN_LOG_KEYSPACE.to_string(),
+            key: expired_meta.clone(),
+            value: 1u64.to_be_bytes().to_vec().into(),
+            txn_id: None,
+        })
+        .await;
 
     // An abandoned intermediate transfer's staged tool must never publish on a later transfer.
     let mut abandoned = tool_v2.clone();
@@ -696,6 +787,7 @@ async fn chunks_large_replicas() {
             first_page: 0,
             pages: Vec::new(),
             workflow: Some(stage_old),
+            now_ms: 0,
             step: WriteStep::Read,
             kept: 0,
         },
@@ -703,6 +795,22 @@ async fn chunks_large_replicas() {
     )
     .await
     .unwrap();
+    // Transfer 91 starting must have reclaimed expired transfer 80.
+    let gone_old = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: RUN_LOG_KEYSPACE.to_string(),
+            key: expired_key,
+            txn_id: None,
+        })
+        .await;
+    assert!(matches!(
+        gone_old,
+        aruna_core::events::Event::Storage(aruna_core::events::StorageEvent::ReadResult {
+            value: None,
+            ..
+        })
+    ));
     let retry_commit = ReplicatedWorkflow {
         more: false,
         transfer_id: 92,
@@ -716,6 +824,7 @@ async fn chunks_large_replicas() {
             first_page: 0,
             pages: Vec::new(),
             workflow: Some(retry_commit),
+            now_ms: 0,
             step: WriteStep::Read,
             kept: 0,
         },
@@ -733,6 +842,24 @@ async fn chunks_large_replicas() {
         after_retry.iter().all(|(_, t)| t.tool_id != "abandoned"),
         "abandoned tool from transfer 91 must not publish under transfer 92"
     );
+    // Transfer 92 committing must also delete abandoned transfer 91's durable staged rows.
+    let staged_left = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: RUN_LOG_KEYSPACE.to_string(),
+            prefix: Some(stage_prefix(remote.run_id, gone)),
+            start: None,
+            limit: 16,
+            txn_id: None,
+        })
+        .await;
+    assert!(matches!(
+        staged_left,
+        aruna_core::events::Event::Storage(aruna_core::events::StorageEvent::IterResult {
+            values,
+            ..
+        }) if values.is_empty()
+    ));
 
     // Missing source row on a replacement holder triggers NotFound so sender backfills from 0.
     context
@@ -751,6 +878,7 @@ async fn chunks_large_replicas() {
             first_page: 0,
             pages: Vec::new(),
             workflow: None,
+            now_ms: 0,
             step: WriteStep::Read,
             kept: 0,
         },
@@ -773,6 +901,7 @@ async fn chunks_large_replicas() {
                 first_page: 0,
                 pages: Vec::new(),
                 workflow: Some(bad_bundle),
+                now_ms: 0,
                 step: WriteStep::Read,
                 kept: 0,
             },
