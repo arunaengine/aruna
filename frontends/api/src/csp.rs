@@ -133,7 +133,7 @@ impl PortalSecurity {
             )
             .await
             .ok()
-            .is_none_or(|config| hosting.provider_conflict(&config.oidc_providers).is_none());
+            .is_some_and(|config| hosting.provider_conflict(&config.oidc_providers).is_none());
             if safe {
                 frame.insert(format!("https://*.{}", hosting.applet_domain));
             }

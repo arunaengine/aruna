@@ -39,6 +39,14 @@ else
 fi
 export ARUNA_PREVIEW_SOURCE_MAP=1
 node node_modules/vite/bin/vite.js build --configLoader runner --outDir "$WORK/dist" --emptyOutDir
+if [ "$OUT" = "/" ]; then
+    echo "aruna-build: refusing to write output to /" >&2
+    exit 2
+fi
 mkdir -p "$OUT"
+for entry in "$OUT"/* "$OUT"/.[!.]* "$OUT"/..?*; do
+    [ -e "$entry" ] || [ -L "$entry" ] || continue
+    rm -rf -- "$entry"
+done
 cp -R "$WORK/dist"/. "$OUT"/
 cp "$WORK/package-lock.json" "$OUT/package-lock.json"

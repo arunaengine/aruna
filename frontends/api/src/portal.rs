@@ -1029,18 +1029,57 @@ mod tests {
             }),
         );
         enable_portal(&state, &portal_dir).await;
-        let router = super::router(
-            state,
-            PortalConfig {
-                api_public_url: TEST_API_URL.to_string(),
-                csp: PortalCspConfig::new(Vec::new()),
-                registry_url: None,
-                login: None,
-                landing: true,
-                legal: Vec::new(),
-            },
+        let make_router = || {
+            super::router(
+                state.clone(),
+                PortalConfig {
+                    api_public_url: TEST_API_URL.to_string(),
+                    csp: PortalCspConfig::new(Vec::new()),
+                    registry_url: None,
+                    login: None,
+                    landing: true,
+                    legal: Vec::new(),
+                },
+            )
+        };
+        // Without a readable realm config, applet wildcard framing fails closed.
+        let uninit = make_router()
+            .oneshot(request(Method::GET, "/"))
+            .await
+            .unwrap();
+        let uninit_csp = uninit
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            !uninit_csp.contains("apps.example.net"),
+            "missing realm config must fail closed: {uninit_csp}"
         );
-        let response = router.oneshot(request(Method::GET, "/")).await.unwrap();
+
+        // With a clean realm config, applet wildcard framing is emitted.
+        let realm_id = state.get_realm_id();
+        let actor = aruna_core::structs::identity::auth::Actor {
+            node_id: state.get_node_id(),
+            user_id: aruna_core::user::id::UserId::nil(realm_id),
+            realm_id,
+        };
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        state
+            .get_ctx()
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                key: realm_id.as_bytes().to_vec().into(),
+                value: config.to_bytes(&actor).unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        let response = make_router()
+            .oneshot(request(Method::GET, "/"))
+            .await
+            .unwrap();
         let policy = response
             .headers()
             .get(header::CONTENT_SECURITY_POLICY)
@@ -1051,6 +1090,37 @@ mod tests {
             policy.contains("frame-src blob: https://*.apps.example.net;"),
             "{policy}"
         );
+
+        // With a conflicting OIDC provider on the same site, framing is omitted again.
+        config
+            .oidc_providers
+            .push(aruna_core::structs::identity::realm::OidcProviderConfig {
+                id: "idp".into(),
+                issuer: "https://auth.example.net/realms/main".into(),
+                audience: "client".into(),
+                discovery_url: "https://auth.example.net/.well-known/openid-configuration".into(),
+            });
+        state
+            .get_ctx()
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                key: realm_id.as_bytes().to_vec().into(),
+                value: config.to_bytes(&actor).unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        let blocked = make_router()
+            .oneshot(request(Method::GET, "/"))
+            .await
+            .unwrap();
+        let blocked_csp = blocked
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(!blocked_csp.contains("apps.example.net"), "{blocked_csp}");
     }
 
     #[tokio::test]

@@ -619,7 +619,7 @@ pub(crate) async fn run_node_info(state: &ServerState, auth: Option<AuthContext>
         )
         .await
         .ok()
-        .is_none_or(|config| hosting.provider_conflict(&config.oidc_providers).is_none()),
+        .is_some_and(|config| hosting.provider_conflict(&config.oidc_providers).is_none()),
         None => false,
     };
     response.applets = Some(aruna_wire::info::AppletCapabilities {

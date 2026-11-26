@@ -297,19 +297,31 @@ async fn bind_all(
         }
         false => None,
     };
-    if let Some(hosting) = config.applets.hosting.as_ref()
-        && let Ok(realm) = aruna_runner::driver::drive(
+    if let Some(hosting) = config.applets.hosting.as_ref() {
+        match aruna_runner::driver::drive(
             aruna_ops_identity::document_repository::GetConfigOperation::new(config.realm_id),
             &driver_ctx,
         )
         .await
-        && let Some(host) = hosting.provider_conflict(&realm.oidc_providers)
-    {
-        return Err(format!(
-            "APPLETS_DOMAIN {} must use its own registered domain separate from realm OIDC provider ({host})",
-            hosting.applet_domain
-        )
-        .into());
+        {
+            Ok(realm) => {
+                if let Some(host) = hosting.provider_conflict(&realm.oidc_providers) {
+                    return Err(format!(
+                        "APPLETS_DOMAIN {} must use its own registered domain separate from realm OIDC provider ({host})",
+                        hosting.applet_domain
+                    )
+                    .into());
+                }
+            }
+            Err(aruna_ops_identity::document_repository::GetConfigError::DocumentNotFound) => {}
+            Err(error) => {
+                return Err(format!(
+                    "cannot verify APPLETS_DOMAIN {} against realm OIDC providers: {error}",
+                    hosting.applet_domain
+                )
+                .into());
+            }
+        }
     }
     let mut state = ServerState::new(
         driver_ctx.clone(),
@@ -1036,9 +1048,25 @@ mod tests {
             })
             .await;
 
-        let error = bind_error(&config, storage).await;
+        let error = bind_error(&config, storage.clone()).await;
         assert!(error.contains("APPLETS_DOMAIN"), "{error}");
         assert!(error.contains("auth.example.net"), "{error}");
+        std::net::TcpListener::bind(rest).expect("no REST listener was started");
+
+        // A corrupt realm config row also refuses startup instead of silently bypassing the check.
+        storage
+            .send_storage_effect(aruna_core::effects::StorageEffect::Write {
+                key_space: aruna_core::keyspaces::REALM_CONFIG_KEYSPACE.to_string(),
+                key: config.realm_id.as_bytes().to_vec().into(),
+                value: b"corrupt-realm-config".to_vec().into(),
+                txn_id: None,
+            })
+            .await;
+        let corrupt = bind_error(&config, storage).await;
+        assert!(
+            corrupt.contains("cannot verify APPLETS_DOMAIN"),
+            "{corrupt}"
+        );
         std::net::TcpListener::bind(rest).expect("no REST listener was started");
     }
 }
