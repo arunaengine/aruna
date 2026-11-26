@@ -308,3 +308,219 @@ async fn stages_and_edges() {
     .unwrap();
     assert!(upkeep.pruned_kept >= 1);
 }
+
+#[tokio::test]
+async fn pinned_spec_cancel() {
+    use super::change::AutoChange;
+    use super::control::{FiringDelta, FiringTxOp};
+    use super::copy_stage::StageOutcome;
+    use super::lifecycle::ChangeAutoOperation;
+    use aruna_core::automation::firing::CopiedFile;
+
+    let env = Env::new().await;
+    let spec_v1 = Spec {
+        triggers: vec![Trigger::Manual { form_json: None }],
+        stages: vec![
+            Stage {
+                name: "gate".into(),
+                needs: Some(vec![]),
+                when: When::Passed,
+                kind: StageKind::Approval {
+                    message: "approve".into(),
+                    timeout_ms: Some(100),
+                },
+            },
+            Stage {
+                name: "alert".into(),
+                needs: Some(vec!["gate".into()]),
+                when: When::Passed,
+                kind: StageKind::Notify {
+                    audience: Audience::GroupAdmins,
+                    message: "done".into(),
+                },
+            },
+        ],
+        scope: Scope {
+            audiences: vec![Audience::GroupAdmins],
+            ..Scope::default()
+        },
+    };
+    let auto = env.create_active(spec_v1.clone()).await;
+    let started = drive(
+        StartManualOperation::new(&env.owner, auto.automation_id, env.node, "{}".into()),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    drive(StepFiringsOperation::new((env.node, env.realm)), &env.ctx)
+        .await
+        .unwrap();
+
+    // Mutate parent automation to a reordered 3-stage spec and approve it.
+    let mut spec_v2 = spec_v1.clone();
+    spec_v2.stages.reverse();
+    spec_v2.stages.push(Stage {
+        name: "extra".into(),
+        needs: Some(vec![]),
+        when: When::Passed,
+        kind: StageKind::Notify {
+            audience: Audience::GroupAdmins,
+            message: "extra".into(),
+        },
+    });
+    let staged = drive(
+        ChangeAutoOperation::new(
+            &env.owner,
+            (auto.automation_id, Some(auto.revision)),
+            AutoChange::Update {
+                name: None,
+                description: None,
+                spec: Some(spec_v2),
+            },
+            env.node,
+        ),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    drive(
+        ChangeAutoOperation::new(
+            &env.owner,
+            (auto.automation_id, Some(staged.revision)),
+            AutoChange::Approve,
+            env.node,
+        ),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+
+    // Expired approval is refused inside DecideStageOperation even before worker ticks.
+    let mut expired = Firing::new(
+        Ulid::from_bytes([101; 16]),
+        auto.automation_id,
+        auto.group_id,
+        auto.revision,
+        &spec_v1,
+        TriggerPayload::Manual {
+            values_json: "{}".into(),
+            actor: env.owner.user_id,
+        },
+        1,
+    );
+    expired.stages[0].state = StageState::WaitingForApproval;
+    expired.stages[0].receipt.expires_at_ms = Some(1);
+    expired.state = FiringState::WaitingForApproval;
+    for (ks, k, v) in new_firing_rows(&expired).unwrap() {
+        env.write_row(&ks, k, v).await;
+    }
+    let late = drive(
+        DecideStageOperation::new(
+            &env.owner,
+            expired.firing_id,
+            "gate".into(),
+            true,
+            None,
+            env.node,
+        ),
+        &env.ctx,
+    )
+    .await;
+    assert!(matches!(late, Err(AutoError::Conflict(_))), "{late:?}");
+
+    // Existing firing still finishes cleanly against its pinned 2-stage spec.
+    drive(
+        DecideStageOperation::new(
+            &env.owner,
+            started.firing_id,
+            "gate".into(),
+            true,
+            None,
+            env.node,
+        ),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    drive(StepFiringsOperation::new((env.node, env.realm)), &env.ctx)
+        .await
+        .unwrap();
+    let (done, _) = drive(
+        GetFiringOperation::new(&env.owner, started.firing_id, env.node),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(done.state, FiringState::Succeeded);
+    assert_eq!(done.stages.len(), 2);
+
+    // Concurrent cancel during copy preserves committed file receipt and ends Cancelled.
+    let copy_spec = Spec {
+        triggers: vec![Trigger::Manual { form_json: None }],
+        stages: vec![Stage {
+            name: "copy".into(),
+            needs: Some(vec![]),
+            when: When::Passed,
+            kind: StageKind::Copy {
+                from_stage: "run".into(),
+                file: None,
+                dest_bucket: "out".into(),
+                dest_template: "d/{filename}".into(),
+                allow_downgrade: false,
+            },
+        }],
+        scope: Scope::default(),
+    };
+    let mut cf = Firing::new(
+        Ulid::from_bytes([102; 16]),
+        auto.automation_id,
+        auto.group_id,
+        auto.revision,
+        &copy_spec,
+        TriggerPayload::Manual {
+            values_json: "{}".into(),
+            actor: env.owner.user_id,
+        },
+        10,
+    );
+    let file = |k: &str, v: u64| CopiedFile {
+        source_key: k.into(),
+        source_version: Ulid::from_parts(v, 1),
+        dest_bucket: "out".into(),
+        dest_key: format!("d/{k}"),
+        dest_version: Ulid::from_parts(v, 2),
+        bytes: 16,
+    };
+    cf.stages[0].state = StageState::Running;
+    cf.stages[0].receipt.copied.push(file("a.dat", 1));
+    for (ks, k, v) in new_firing_rows(&cf).unwrap() {
+        env.write_row(&ks, k, v).await;
+    }
+    drive(
+        CancelFiringOperation::new(&env.owner, cf.firing_id, (env.node, env.realm)),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    let after = drive(
+        FiringTxOp::new(
+            auto.automation_id,
+            cf.firing_id,
+            FiringDelta::StageOutcome {
+                idx: 0,
+                outcome: StageOutcome::Progress(file("b.dat", 2)),
+            },
+        ),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(after.firing.state, FiringState::Cancelled);
+    assert_eq!(after.firing.stages[0].state, StageState::Cancelled);
+    assert_eq!(after.firing.stages[0].receipt.copied.len(), 2);
+    assert!(
+        env.read_row(AUTOMATION_RUNS_KEYSPACE, &active_key(cf.firing_id))
+            .await
+            .is_none()
+    );
+}
