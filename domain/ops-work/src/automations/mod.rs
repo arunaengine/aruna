@@ -2,15 +2,21 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+pub mod admit;
 pub mod change;
 pub mod check;
 pub mod control;
 pub mod copy_stage;
+#[cfg(test)]
+mod copy_tests;
 pub mod dataset_stage;
 pub mod diff;
 pub mod firing_reads;
+pub mod firing_tx;
 #[cfg(test)]
 mod flow_tests;
+#[cfg(test)]
+mod guard_tests;
 pub mod identity;
 pub mod lifecycle;
 pub mod limits;
@@ -23,12 +29,13 @@ pub mod run_stage;
 pub mod runner;
 #[cfg(test)]
 mod runner_tests;
+mod schedule;
 pub mod start;
 pub mod upkeep;
 
 use aruna_core::automation::firing::Firing;
 use aruna_core::automation::keys::{active_prefix, firing_key, record_key, record_prefix};
-use aruna_core::automation::record::{Automation, Lifecycle};
+use aruna_core::automation::record::{Automation, Lifecycle, Spec};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::ConversionError;
 use aruna_core::id::NodeId;
@@ -55,6 +62,8 @@ pub enum AutoError {
     Invalid(String),
     #[error("{0}")]
     Conflict(String),
+    #[error("{0}")]
+    Capacity(String),
     #[error("{0}")]
     Limited(String),
     #[error("storage failed: {0}")]
@@ -154,9 +163,18 @@ pub(crate) fn firing_row(firing: &Firing) -> Result<(KeySpace, Key, Value), Auto
 
 /// Auth context for an automation's service account restricted strictly to its role paths.
 pub fn automation_auth(auto: &Automation, realm_id: RealmId) -> Option<AuthContext> {
+    automation_auth_for(auto, &auto.spec, realm_id)
+}
+
+/// Auth context for an automation's service account bounded to a pinned execution `spec`.
+pub fn automation_auth_for(
+    auto: &Automation,
+    spec: &Spec,
+    realm_id: RealmId,
+) -> Option<AuthContext> {
     let account = auto.account.filter(|_| auto.role_id.is_some())?;
     let restrictions = auto
-        .role_paths(realm_id, auto.host_node)
+        .role_paths_for(spec, realm_id, auto.host_node)
         .into_iter()
         .map(|(pattern, permission)| PathRestriction {
             pattern,

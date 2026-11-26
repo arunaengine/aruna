@@ -2,8 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::automation::firing::{Firing, FiringState, StageState};
-use aruna_core::automation::keys::active_key;
+use aruna_core::automation::firing::{CopiedFile, Firing, StageState};
+use aruna_core::automation::keys::copy_plan_key;
 use aruna_core::automation::record::{Automation, StageKind};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::AuthorizationError;
@@ -12,39 +12,42 @@ use aruna_core::keyspaces::{AUTOMATION_INTENTS_KEYSPACE, AUTOMATION_RUNS_KEYSPAC
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::types::{Key, KeySpace};
+use aruna_ops_data::s3::object::head::{
+    HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
+};
 use aruna_ops_identity::groups::admin_check::AdminCheckOperation;
-use byteview::ByteView;
 use ulid::Ulid;
 
-use super::copy_stage::stage_intent_id;
+use super::copy_stage::{source_count, source_length, stage_intent_id};
 use super::firing_reads::GetFiringOperation;
-use super::{AutoAccessOperation, AutoError, Need, automation_auth, firing_row};
-use crate::plugins::intents::{intent_scan_in, resolved_rows_in, undone_keys_in};
-use crate::plugins::rows::{Rows, StoreError, delete_call, scan_rows};
+pub(crate) use super::firing_tx::{FiringDelta, FiringTxOp, FiringTxResult};
+use super::{AutoAccessOperation, AutoError, Need, automation_auth_for};
+use crate::plugins::intents::{
+    IntentRecord, IntentState, intent_scan_in, resolved_rows_in, undone_keys_in,
+};
+use crate::plugins::rows::{Row, Rows, StoreError, decode, delete_call, encode, row, scan_rows};
 use crate::workflows::CatalogError;
 use crate::workflows::runs::cancel::{CancelRunOperation, CancelledRun};
 
 #[derive(Debug, PartialEq)]
 enum CancelStep {
     Load,
-    Access(Box<Firing>),
-    Write,
-    DropActive,
-    ChildRun,
+    Access,
+    Mark,
+    ChildRun(usize, Ulid),
+    RecordReply,
 }
 
-/// Moves a firing into `Cancelling`, cancels pending/waiting stages, persists the firing, and
-/// propagates cancellation to every active child `WorkflowRunRecord`.
+/// Moves a firing into `Cancelling`, persists it atomically, and propagates cancellation to every
+/// active child `WorkflowRunRecord`, recording acknowledgement or retryable failure on the stage.
 #[derive(Debug, PartialEq)]
 pub struct CancelFiringOperation {
     auth: AuthContext,
     firing_id: Ulid,
     local: (NodeId, RealmId),
-    now_ms: u64,
     auto: Option<Automation>,
     firing: Option<Firing>,
-    child_runs: Vec<Ulid>,
+    child_runs: Vec<(usize, Ulid)>,
     step: CancelStep,
 }
 
@@ -54,7 +57,6 @@ impl CancelFiringOperation {
             auth: auth.clone(),
             firing_id,
             local,
-            now_ms: 0,
             auto: None,
             firing: None,
             child_runs: Vec::new(),
@@ -63,12 +65,14 @@ impl CancelFiringOperation {
     }
 
     fn next_child(&mut self) -> Result<Next<Firing>, AutoError> {
-        let Some(run_id) = self.child_runs.pop() else {
+        let Some((idx, run_id)) = self.child_runs.pop() else {
             return Ok(Next::Done(self.firing.take().ok_or(IoError::Unfinished)?));
         };
         let auto = self.auto.as_ref().ok_or(IoError::Unfinished)?;
-        let caller = automation_auth(auto, self.local.1).unwrap_or_else(|| self.auth.clone());
-        self.step = CancelStep::ChildRun;
+        let firing = self.firing.as_ref().ok_or(IoError::Unfinished)?;
+        let caller = automation_auth_for(auto, &firing.spec, self.local.1)
+            .unwrap_or_else(|| self.auth.clone());
+        self.step = CancelStep::ChildRun(idx, run_id);
         Ok(Next::Call(IoCall::child(CancelRunOperation::new(
             &caller, run_id, self.local,
         ))))
@@ -79,10 +83,6 @@ impl Operation for CancelFiringOperation {
     type Output = Firing;
     type Error = AutoError;
 
-    fn stamp(&mut self, now_ms: u64) {
-        self.now_ms = now_ms;
-    }
-
     fn first(&mut self) -> Result<Next<Firing>, AutoError> {
         let get = GetFiringOperation::new(&self.auth, self.firing_id, self.local.0);
         Ok(Next::Call(IoCall::child(get)))
@@ -91,38 +91,49 @@ impl Operation for CancelFiringOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<Firing>, AutoError> {
         match std::mem::replace(&mut self.step, CancelStep::Load) {
             CancelStep::Load => {
-                let (firing, auto) = result.child::<(Firing, Automation), AutoError>()??;
-                self.step = CancelStep::Access(Box::new(firing));
+                let (_, auto) = result.child::<(Firing, Automation), AutoError>()??;
+                self.step = CancelStep::Access;
                 Ok(Next::Call(write_access(
                     &self.auth,
                     auto.automation_id,
                     self.local.0,
                 )))
             }
-            CancelStep::Access(mut firing) => {
+            CancelStep::Access => {
                 let auto = result.child::<Automation, AutoError>()??;
-                self.child_runs = firing.begin_cancel(&auto.spec, self.now_ms);
-                let row = firing_row(&firing)?;
+                let tx =
+                    FiringTxOp::new(auto.automation_id, self.firing_id, FiringDelta::BeginCancel);
                 self.auto = Some(auto);
-                self.firing = Some(*firing);
-                self.step = CancelStep::Write;
-                Ok(Next::Call(IoCall::Write(vec![row])))
+                self.step = CancelStep::Mark;
+                Ok(Next::Call(IoCall::retry(tx, &self.firing_id.to_bytes())))
             }
-            CancelStep::Write => {
-                result.done()?;
-                let firing = self.firing.as_ref().ok_or(IoError::Unfinished)?;
-                if firing.state == FiringState::Cancelled {
-                    self.step = CancelStep::DropActive;
-                    return Ok(Next::Call(drop_active(active_key(firing.firing_id))));
-                }
+            CancelStep::Mark => {
+                let tx = result.child::<FiringTxResult, AutoError>()??;
+                self.firing = Some(tx.firing);
+                self.child_runs = tx.child_runs;
                 self.next_child()
             }
-            CancelStep::DropActive => {
-                result.done()?;
-                self.next_child()
+            CancelStep::ChildRun(idx, run_id) => {
+                let err = match result.child::<CancelledRun, CatalogError>()? {
+                    Ok(_) | Err(CatalogError::NotFound) => None,
+                    Err(e) => Some(format!("child cancel pending: {e}")),
+                };
+                let auto_id = self.auto.as_ref().ok_or(IoError::Unfinished)?.automation_id;
+                let tx = FiringTxOp::new(
+                    auto_id,
+                    self.firing_id,
+                    FiringDelta::CancelReply {
+                        idx,
+                        run_id,
+                        error: err,
+                    },
+                );
+                self.step = CancelStep::RecordReply;
+                Ok(Next::Call(IoCall::retry(tx, &self.firing_id.to_bytes())))
             }
-            CancelStep::ChildRun => {
-                let _ = result.child::<CancelledRun, CatalogError>()?;
+            CancelStep::RecordReply => {
+                let tx = result.child::<FiringTxResult, AutoError>()??;
+                self.firing = Some(tx.firing);
                 self.next_child()
             }
         }
@@ -136,16 +147,17 @@ impl Operation for CancelFiringOperation {
 #[derive(Debug, PartialEq)]
 enum ResolveStep {
     Load,
-    Access(Box<Firing>),
+    Access,
     ScanIntents,
-    WriteIntents(Rows),
-    DropUndone,
-    WriteFiring,
-    SyncActive,
+    LoadPlan(Rows, Option<(Vec<u8>, IntentRecord, u32)>),
+    HeadDest(Rows, Option<(Vec<u8>, IntentRecord, u32)>, Box<CopiedFile>),
+    WriteIntents(Rows, Vec<(&'static str, Vec<u8>)>),
+    DropKeys,
+    Commit,
 }
 
-/// Records an audited human decision (`done: true | false`) for a `NeedsAttention` stage and
-/// settles its intent rows in `AUTOMATION_INTENTS_KEYSPACE`.
+/// Records an audited human decision (`done: true | false`) for a `NeedsAttention` stage, settling
+/// its intent row and continuing multi-file `copy` stages from the next uncommitted file.
 #[derive(Debug, PartialEq)]
 pub struct ResolveStageOperation {
     auth: AuthContext,
@@ -154,8 +166,10 @@ pub struct ResolveStageOperation {
     done: bool,
     note: Option<String>,
     local: NodeId,
-    now_ms: u64,
-    firing: Option<Firing>,
+    auto_id: Option<Ulid>,
+    stage_id: Option<Ulid>,
+    copy_total: Option<usize>,
+    planned: Option<CopiedFile>,
     step: ResolveStep,
 }
 
@@ -175,27 +189,75 @@ impl ResolveStageOperation {
             done,
             note,
             local,
-            now_ms: 0,
-            firing: None,
+            auto_id: None,
+            stage_id: None,
+            copy_total: None,
+            planned: None,
             step: ResolveStep::Load,
         }
     }
 
-    fn write_firing(&mut self) -> Result<Next<Firing>, AutoError> {
-        let firing = self.firing.as_ref().ok_or(IoError::Unfinished)?;
-        let row = firing_row(firing)?;
-        self.step = ResolveStep::WriteFiring;
-        Ok(Next::Call(IoCall::Write(vec![row])))
+    fn commit(&mut self) -> Result<Next<Firing>, AutoError> {
+        let auto_id = self.auto_id.ok_or(IoError::Unfinished)?;
+        let copy_progress = self.copy_total.map(|total| (self.planned.clone(), total));
+        let tx = FiringTxOp::new(
+            auto_id,
+            self.firing_id,
+            FiringDelta::Resolve {
+                stage: self.stage.clone(),
+                done: self.done,
+                copy_progress,
+                actor: self.auth.user_id,
+                note: self.note.clone(),
+            },
+        );
+        self.step = ResolveStep::Commit;
+        Ok(Next::Call(IoCall::retry(tx, &self.firing_id.to_bytes())))
     }
+
+    fn finish_copy_done(
+        &mut self,
+        open: Option<(Vec<u8>, IntentRecord, u32)>,
+    ) -> Result<Next<Firing>, AutoError> {
+        let stage_id = self.stage_id.ok_or(IoError::Unfinished)?;
+        let mut writes: Vec<Row> = Vec::new();
+        let mut drops = Vec::new();
+        if let Some((key, mut record, ordinal)) = open {
+            record.state = match &self.planned {
+                Some(file) => IntentState::Settled {
+                    reply: serde_json::to_string(file)
+                        .map_err(|e| AutoError::Storage(e.to_string()))?,
+                },
+                None => IntentState::Resolved { done: true },
+            };
+            let encoded = encode(&record).map_err(|e| AutoError::Storage(e.detail()))?;
+            writes.push(row(AUTOMATION_INTENTS_KEYSPACE, key, encoded));
+            drops.push((
+                AUTOMATION_RUNS_KEYSPACE,
+                copy_plan_key(stage_id, ordinal).to_vec(),
+            ));
+        }
+        if !writes.is_empty() {
+            self.step = ResolveStep::WriteIntents(Vec::new(), drops);
+            return Ok(Next::Call(IoCall::Write(writes)));
+        }
+        if !drops.is_empty() {
+            self.step = ResolveStep::DropKeys;
+            return Ok(Next::Call(delete_call(drops)));
+        }
+        self.commit()
+    }
+}
+
+fn intent_ordinal(key: &[u8]) -> Option<u32> {
+    key.get(16..20)
+        .and_then(|s| <[u8; 4]>::try_from(s).ok())
+        .map(u32::from_be_bytes)
 }
 
 impl Operation for ResolveStageOperation {
     type Output = Firing;
     type Error = AutoError;
-
-    fn stamp(&mut self, now_ms: u64) {
-        self.now_ms = now_ms;
-    }
 
     fn first(&mut self) -> Result<Next<Firing>, AutoError> {
         let get = GetFiringOperation::new(&self.auth, self.firing_id, self.local);
@@ -206,27 +268,34 @@ impl Operation for ResolveStageOperation {
         match std::mem::replace(&mut self.step, ResolveStep::Load) {
             ResolveStep::Load => {
                 let (firing, auto) = result.child::<(Firing, Automation), AutoError>()??;
-                self.step = ResolveStep::Access(Box::new(firing));
+                let idx = firing.stage_index(&self.stage).ok_or_else(|| {
+                    AutoError::Conflict(format!("unknown stage `{}`", self.stage))
+                })?;
+                if firing.stages[idx].state != StageState::NeedsAttention {
+                    return Err(AutoError::Conflict(format!(
+                        "stage `{}` is not in needs_attention",
+                        self.stage
+                    )));
+                }
+                if let StageKind::Copy {
+                    from_stage, file, ..
+                } = &firing.spec.stages[idx].kind
+                {
+                    self.copy_total = Some(source_count(&firing, from_stage, file.as_deref()));
+                    self.planned = firing.stages[idx].receipt.pending_copy.clone();
+                }
+                self.auto_id = Some(auto.automation_id);
+                self.stage_id = Some(stage_intent_id(firing.firing_id, &self.stage));
+                self.step = ResolveStep::Access;
                 Ok(Next::Call(write_access(
                     &self.auth,
                     auto.automation_id,
                     self.local,
                 )))
             }
-            ResolveStep::Access(mut firing) => {
-                let auto = result.child::<Automation, AutoError>()??;
-                firing
-                    .resolve(
-                        &auto.spec,
-                        &self.stage,
-                        self.done,
-                        self.auth.user_id,
-                        self.note.clone(),
-                        self.now_ms,
-                    )
-                    .map_err(AutoError::Conflict)?;
-                let stage_id = stage_intent_id(firing.firing_id, &self.stage);
-                self.firing = Some(*firing);
+            ResolveStep::Access => {
+                let _ = result.child::<Automation, AutoError>()??;
+                let stage_id = self.stage_id.ok_or(IoError::Unfinished)?;
                 self.step = ResolveStep::ScanIntents;
                 Ok(Next::Call(IoCall::child(scan_rows(intent_scan_in(
                     AUTOMATION_INTENTS_KEYSPACE,
@@ -237,43 +306,111 @@ impl Operation for ResolveStageOperation {
                 let rows = result
                     .child::<Rows, StoreError>()?
                     .map_err(|e| AutoError::Storage(e.detail()))?;
+                let stage_id = self.stage_id.ok_or(IoError::Unfinished)?;
+                if self.copy_total.is_some() {
+                    let mut open_rows = Vec::new();
+                    for (key, value) in &rows {
+                        let rec = decode::<IntentRecord>(value)
+                            .map_err(|e| AutoError::Storage(e.detail()))?;
+                        if matches!(
+                            rec.state,
+                            IntentState::Pending | IntentState::Unknown { .. }
+                        ) && let Some(ord) = intent_ordinal(key)
+                        {
+                            open_rows.push((key.clone(), rec, ord));
+                        }
+                    }
+                    if !self.done {
+                        let mut drops = Vec::new();
+                        for (key, _, ord) in open_rows {
+                            drops.push((AUTOMATION_INTENTS_KEYSPACE, key));
+                            drops.push((
+                                AUTOMATION_RUNS_KEYSPACE,
+                                copy_plan_key(stage_id, ord).to_vec(),
+                            ));
+                        }
+                        if !drops.is_empty() {
+                            self.step = ResolveStep::DropKeys;
+                            return Ok(Next::Call(delete_call(drops)));
+                        }
+                        return self.commit();
+                    }
+                    let open = open_rows.into_iter().next();
+                    if self.planned.is_none()
+                        && let Some((_, _, ord)) = open.as_ref()
+                    {
+                        let ord = *ord;
+                        self.step = ResolveStep::LoadPlan(rows, open);
+                        return Ok(Next::Call(IoCall::Read(vec![(
+                            AUTOMATION_RUNS_KEYSPACE.to_string(),
+                            copy_plan_key(stage_id, ord),
+                        )])));
+                    }
+                    if let Some(planned) = self.planned.clone() {
+                        let head = HeadObjectOperation::new(HeadObjectInput {
+                            bucket: planned.dest_bucket.clone(),
+                            key: planned.dest_key.clone(),
+                            version_id: Some(planned.dest_version),
+                        });
+                        self.step = ResolveStep::HeadDest(rows, open, Box::new(planned));
+                        return Ok(Next::Call(IoCall::child(head)));
+                    }
+                    return self.finish_copy_done(open);
+                }
                 let updates =
                     resolved_rows_in(AUTOMATION_INTENTS_KEYSPACE, rows.clone(), self.done)
                         .map_err(|e| AutoError::Storage(e.detail()))?;
                 if updates.is_empty() {
-                    return self.write_firing();
+                    return self.commit();
                 }
-                self.step = ResolveStep::WriteIntents(rows);
+                self.step = ResolveStep::WriteIntents(rows, Vec::new());
                 Ok(Next::Call(IoCall::Write(updates)))
             }
-            ResolveStep::WriteIntents(rows) => {
+            ResolveStep::LoadPlan(rows, open) => {
+                if let Some(bytes) = result.value()? {
+                    self.planned = postcard::from_bytes::<CopiedFile>(&bytes).ok();
+                }
+                if let Some(planned) = self.planned.clone() {
+                    let head = HeadObjectOperation::new(HeadObjectInput {
+                        bucket: planned.dest_bucket.clone(),
+                        key: planned.dest_key.clone(),
+                        version_id: Some(planned.dest_version),
+                    });
+                    self.step = ResolveStep::HeadDest(rows, open, Box::new(planned));
+                    return Ok(Next::Call(IoCall::child(head)));
+                }
+                self.finish_copy_done(open)
+            }
+            ResolveStep::HeadDest(_rows, open, mut planned) => {
+                if let Ok(head) = result.child::<HeadObjectResult, HeadObjectError>()?
+                    && let Some(bytes) = source_length(&head)
+                {
+                    planned.bytes = planned.bytes.max(bytes);
+                }
+                self.planned = Some(*planned);
+                self.finish_copy_done(open)
+            }
+            ResolveStep::WriteIntents(rows, extra_drops) => {
                 result.done()?;
-                if !self.done {
+                let mut drops = extra_drops;
+                if !self.done && !rows.is_empty() {
                     let keys = undone_keys_in(AUTOMATION_INTENTS_KEYSPACE, rows)
                         .map_err(|e| AutoError::Storage(e.detail()))?;
-                    if !keys.is_empty() {
-                        self.step = ResolveStep::DropUndone;
-                        return Ok(Next::Call(delete_call(keys)));
-                    }
+                    drops.extend(keys);
                 }
-                self.write_firing()
-            }
-            ResolveStep::DropUndone => {
-                result.done()?;
-                self.write_firing()
-            }
-            ResolveStep::WriteFiring => {
-                result.done()?;
-                let firing = self.firing.as_ref().ok_or(IoError::Unfinished)?;
-                self.step = ResolveStep::SyncActive;
-                if firing.state.is_terminal() {
-                    return Ok(Next::Call(drop_active(active_key(firing.firing_id))));
+                if !drops.is_empty() {
+                    self.step = ResolveStep::DropKeys;
+                    return Ok(Next::Call(delete_call(drops)));
                 }
-                Ok(Next::Call(IoCall::Write(vec![active_row(firing)])))
+                self.commit()
             }
-            ResolveStep::SyncActive => {
+            ResolveStep::DropKeys => {
                 result.done()?;
-                Ok(Next::Done(self.firing.take().ok_or(IoError::Unfinished)?))
+                self.commit()
+            }
+            ResolveStep::Commit => {
+                let tx = result.child::<FiringTxResult, AutoError>()??;
+                Ok(Next::Done(tx.firing))
             }
         }
     }
@@ -286,8 +423,8 @@ impl Operation for ResolveStageOperation {
 #[derive(Debug, PartialEq)]
 enum ResumeStep {
     Load,
-    Access(Box<Firing>),
-    Write(Box<Firing>),
+    Access,
+    Commit,
 }
 
 /// Resumes a `Failed` firing, refusing unresolved `NeedsAttention` stages and preserving every
@@ -297,7 +434,6 @@ pub struct ResumeFiringOperation {
     auth: AuthContext,
     firing_id: Ulid,
     local: NodeId,
-    now_ms: u64,
     step: ResumeStep,
 }
 
@@ -307,7 +443,6 @@ impl ResumeFiringOperation {
             auth: auth.clone(),
             firing_id,
             local,
-            now_ms: 0,
             step: ResumeStep::Load,
         }
     }
@@ -317,10 +452,6 @@ impl Operation for ResumeFiringOperation {
     type Output = Firing;
     type Error = AutoError;
 
-    fn stamp(&mut self, now_ms: u64) {
-        self.now_ms = now_ms;
-    }
-
     fn first(&mut self) -> Result<Next<Firing>, AutoError> {
         let get = GetFiringOperation::new(&self.auth, self.firing_id, self.local);
         Ok(Next::Call(IoCall::child(get)))
@@ -329,26 +460,23 @@ impl Operation for ResumeFiringOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<Firing>, AutoError> {
         match std::mem::replace(&mut self.step, ResumeStep::Load) {
             ResumeStep::Load => {
-                let (firing, auto) = result.child::<(Firing, Automation), AutoError>()??;
-                self.step = ResumeStep::Access(Box::new(firing));
+                let (_, auto) = result.child::<(Firing, Automation), AutoError>()??;
+                self.step = ResumeStep::Access;
                 Ok(Next::Call(write_access(
                     &self.auth,
                     auto.automation_id,
                     self.local,
                 )))
             }
-            ResumeStep::Access(mut firing) => {
+            ResumeStep::Access => {
                 let auto = result.child::<Automation, AutoError>()??;
-                firing
-                    .prepare_resume(&auto.spec, self.now_ms)
-                    .map_err(AutoError::Conflict)?;
-                let writes = vec![firing_row(&firing)?, active_row(&firing)];
-                self.step = ResumeStep::Write(firing);
-                Ok(Next::Call(IoCall::Write(writes)))
+                let tx = FiringTxOp::new(auto.automation_id, self.firing_id, FiringDelta::Resume);
+                self.step = ResumeStep::Commit;
+                Ok(Next::Call(IoCall::retry(tx, &self.firing_id.to_bytes())))
             }
-            ResumeStep::Write(firing) => {
-                result.done()?;
-                Ok(Next::Done(*firing))
+            ResumeStep::Commit => {
+                let tx = result.child::<FiringTxResult, AutoError>()??;
+                Ok(Next::Done(tx.firing))
             }
         }
     }
@@ -361,12 +489,12 @@ impl Operation for ResumeFiringOperation {
 #[derive(Debug, PartialEq)]
 enum DecideStep {
     Load,
-    Admin(Box<(Firing, Automation)>),
-    Write(Box<Firing>),
-    DropActive(Box<Firing>),
+    Admin(Ulid),
+    Commit,
 }
 
-/// Human group admin approval or rejection of a `WaitingForApproval` stage.
+/// Human group admin approval or rejection of a `WaitingForApproval` stage, verifying expiry inside
+/// the same transaction that commits the decision.
 #[derive(Debug, PartialEq)]
 pub struct DecideStageOperation {
     auth: AuthContext,
@@ -375,7 +503,6 @@ pub struct DecideStageOperation {
     approve: bool,
     note: Option<String>,
     local: NodeId,
-    now_ms: u64,
     step: DecideStep,
 }
 
@@ -395,7 +522,6 @@ impl DecideStageOperation {
             approve,
             note,
             local,
-            now_ms: 0,
             step: DecideStep::Load,
         }
     }
@@ -405,10 +531,6 @@ impl Operation for DecideStageOperation {
     type Output = Firing;
     type Error = AutoError;
 
-    fn stamp(&mut self, now_ms: u64) {
-        self.now_ms = now_ms;
-    }
-
     fn first(&mut self) -> Result<Next<Firing>, AutoError> {
         let get = GetFiringOperation::new(&self.auth, self.firing_id, self.local);
         Ok(Next::Call(IoCall::child(get)))
@@ -417,58 +539,34 @@ impl Operation for DecideStageOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<Firing>, AutoError> {
         match std::mem::replace(&mut self.step, DecideStep::Load) {
             DecideStep::Load => {
-                let (firing, auto) = result.child::<(Firing, Automation), AutoError>()??;
+                let (_, auto) = result.child::<(Firing, Automation), AutoError>()??;
                 let check = AdminCheckOperation::new(self.auth.clone(), auto.group_id);
-                self.step = DecideStep::Admin(Box::new((firing, auto)));
+                self.step = DecideStep::Admin(auto.automation_id);
                 Ok(Next::Call(IoCall::child(check)))
             }
-            DecideStep::Admin(boxed) => {
+            DecideStep::Admin(auto_id) => {
                 let is_admin = result
                     .child::<bool, AuthorizationError>()?
                     .map_err(|e| AutoError::Storage(e.to_string()))?;
                 if !is_admin {
                     return Err(AutoError::Forbidden);
                 }
-                let (mut firing, auto) = *boxed;
-                let idx = firing.stage_index(&self.stage).ok_or(AutoError::NotFound)?;
-                if !matches!(auto.spec.stages[idx].kind, StageKind::Approval { .. })
-                    || firing.stages[idx].state != StageState::WaitingForApproval
-                {
-                    return Err(AutoError::Conflict(
-                        "stage is not waiting for approval".into(),
-                    ));
-                }
-                let st = &mut firing.stages[idx];
-                if self.approve {
-                    st.state = StageState::Succeeded;
-                    st.receipt.approved_by = Some(self.auth.user_id);
-                } else {
-                    st.state = StageState::Failed;
-                    st.receipt.rejected_by = Some(self.auth.user_id);
-                    st.error = Some(
-                        self.note
-                            .clone()
-                            .unwrap_or_else(|| "rejected by approver".into()),
-                    );
-                }
-                st.finished_at_ms = Some(self.now_ms);
-                firing.evaluate(&auto.spec, self.now_ms);
-                let row = firing_row(&firing)?;
-                self.step = DecideStep::Write(Box::new(firing));
-                Ok(Next::Call(IoCall::Write(vec![row])))
+                let tx = FiringTxOp::new(
+                    auto_id,
+                    self.firing_id,
+                    FiringDelta::Decide {
+                        stage: self.stage.clone(),
+                        approve: self.approve,
+                        actor: self.auth.user_id,
+                        note: self.note.clone(),
+                    },
+                );
+                self.step = DecideStep::Commit;
+                Ok(Next::Call(IoCall::retry(tx, &self.firing_id.to_bytes())))
             }
-            DecideStep::Write(firing) => {
-                result.done()?;
-                if firing.state.is_terminal() {
-                    let key = active_key(firing.firing_id);
-                    self.step = DecideStep::DropActive(firing);
-                    return Ok(Next::Call(drop_active(key)));
-                }
-                Ok(Next::Done(*firing))
-            }
-            DecideStep::DropActive(firing) => {
-                result.done()?;
-                Ok(Next::Done(*firing))
+            DecideStep::Commit => {
+                let tx = result.child::<FiringTxResult, AutoError>()??;
+                Ok(Next::Done(tx.firing))
             }
         }
     }
@@ -480,16 +578,4 @@ impl Operation for DecideStageOperation {
 
 fn write_access(auth: &AuthContext, auto_id: Ulid, local: NodeId) -> IoCall {
     IoCall::child(AutoAccessOperation::new(auth, auto_id, local, Need::Write))
-}
-
-fn drop_active(key: Key) -> IoCall {
-    IoCall::Delete(vec![(AUTOMATION_RUNS_KEYSPACE.to_string(), key)])
-}
-
-fn active_row(firing: &Firing) -> (KeySpace, Key, ByteView) {
-    (
-        AUTOMATION_RUNS_KEYSPACE.to_string(),
-        active_key(firing.firing_id),
-        ByteView::from(firing.automation_id.to_bytes().to_vec()),
-    )
 }
