@@ -471,7 +471,9 @@ impl Operation for Unreadable {
             SourceKind::DataUploaded
             | SourceKind::SyncCompleted
             | SourceKind::SyncFailed
-            | SourceKind::JobFinished => return Ok(Next::Done(false)),
+            | SourceKind::JobFinished
+            | SourceKind::AppletSubmission
+            | SourceKind::RunFinished => return Ok(Next::Done(false)),
             SourceKind::DatasetCreated => false,
             SourceKind::DatasetUpdated => true,
         };

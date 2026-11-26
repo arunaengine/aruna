@@ -35,6 +35,8 @@ pub struct RunFilter {
     pub group_id: Option<GroupId>,
     pub state: Option<RunState>,
     pub workflow_id: Option<Ulid>,
+    pub automation_id: Option<Ulid>,
+    pub firing_id: Option<Ulid>,
 }
 
 impl RunFilter {
@@ -44,6 +46,18 @@ impl RunFilter {
             && self
                 .workflow_id
                 .is_none_or(|workflow| workflow == record.workflow_id)
+            && self.automation_id.is_none_or(|id| {
+                record
+                    .automation
+                    .as_ref()
+                    .is_some_and(|origin| origin.automation_id == id)
+            })
+            && self.firing_id.is_none_or(|id| {
+                record
+                    .automation
+                    .as_ref()
+                    .is_some_and(|origin| origin.firing_id == id)
+            })
     }
 }
 

@@ -167,6 +167,7 @@ fn node_features(
     };
     let named = [
         ("workflows", Feature::Workflows),
+        ("automations", Feature::Automations),
         ("applets", Feature::Applets),
         ("builder", Feature::Applets),
         ("runs", Feature::Runs),
@@ -660,8 +661,8 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&features).unwrap(),
             serde_json::json!({
-                "workflows": false, "applets": false, "builder": false, "runs": false,
-                "compute": false, "jobs": false, "tes": false
+                "workflows": false, "automations": false, "applets": false, "builder": false,
+                "runs": false, "compute": false, "jobs": false, "tes": false
             })
         );
     }

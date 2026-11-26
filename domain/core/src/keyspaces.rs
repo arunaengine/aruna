@@ -2,6 +2,15 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+/// Node-local automation definitions, cursor, counters, kept events and dedup rows.
+pub const AUTOMATIONS_KEYSPACE: &str = "automations";
+/// Node-local automation firings and active firing index.
+pub const AUTOMATION_RUNS_KEYSPACE: &str = "automation_runs";
+/// Intent rows written before mutating automation stage effects (copy, dataset, notify).
+pub const AUTOMATION_INTENTS_KEYSPACE: &str = "automation_intents";
+/// Keyed metadata document create rows for automation dataset stages.
+pub const AUTOMATION_CREATES_KEYSPACE: &str = "automation_creates";
+
 pub const AUTH_KEYSPACE: &str = "auth";
 pub const GROUP_KEYSPACE: &str = "groups";
 pub const GROUP_DELETE_KEYSPACE: &str = "group_deletions";
@@ -972,6 +981,10 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     WORKFLOW_CACHE_KEYSPACE,
     WORKFLOW_CRATE_KEYSPACE,
     NFS_STATE_KEYSPACE,
+    AUTOMATIONS_KEYSPACE,
+    AUTOMATION_RUNS_KEYSPACE,
+    AUTOMATION_INTENTS_KEYSPACE,
+    AUTOMATION_CREATES_KEYSPACE,
 ];
 
 /// Smallest key strictly greater than every key starting with `prefix`,

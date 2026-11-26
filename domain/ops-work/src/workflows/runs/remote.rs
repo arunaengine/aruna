@@ -972,6 +972,7 @@ mod tests {
             directory_roots: Vec::new(),
             used_tools: Vec::new(),
             limits: None,
+            automation: None,
         };
         let link_target = Target {
             bucket: "data".into(),

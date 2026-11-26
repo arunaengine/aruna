@@ -27,6 +27,7 @@ pub enum Feature {
     S3Keys,
     Watches,
     Federation,
+    Automations,
 }
 
 /// How the realm sets one feature. Off never deletes data; it refuses new starts and writes.
@@ -73,7 +74,7 @@ pub struct Resolved {
 }
 
 impl Feature {
-    pub const ALL: [Feature; 15] = [
+    pub const ALL: [Feature; 16] = [
         Feature::Runs,
         Feature::Workflows,
         Feature::Notebooks,
@@ -89,6 +90,7 @@ impl Feature {
         Feature::S3Keys,
         Feature::Watches,
         Feature::Federation,
+        Feature::Automations,
     ];
 
     /// The key used in configuration, API bodies and errors.
@@ -109,6 +111,7 @@ impl Feature {
             Feature::S3Keys => "s3-keys",
             Feature::Watches => "watches",
             Feature::Federation => "federation",
+            Feature::Automations => "automations",
         }
     }
 
@@ -120,13 +123,14 @@ impl Feature {
     pub fn parent(self) -> Option<Feature> {
         match self {
             Feature::Workflows | Feature::Notebooks => Some(Feature::Runs),
+            Feature::Automations => Some(Feature::Workflows),
             _ => None,
         }
     }
 
     /// The state when neither the node nor the realm sets the feature.
     pub fn built_in(self) -> bool {
-        !matches!(self, Feature::Applets)
+        !matches!(self, Feature::Applets | Feature::Automations)
     }
 }
 
@@ -251,6 +255,8 @@ mod tests {
         assert_eq!(vault, state(true, Scope::Default));
         let applets = resolve(&empty, &none, Feature::Applets, None);
         assert_eq!(applets, state(false, Scope::Default));
+        let automations = resolve(&empty, &none, Feature::Automations, None);
+        assert_eq!(automations, state(false, Scope::Default));
 
         let mut legacy = config(&[]);
         legacy.portal_features.insert("compute".to_string(), false);
@@ -282,5 +288,19 @@ mod tests {
         let both = config(&[(Feature::Workflows, FeatureMode::ForcedOff)]);
         let workflows = resolve(&both, &node_off, Feature::Workflows, None);
         assert_eq!(workflows, state(false, Scope::Realm));
+        // Automations depend on Workflows (and transitively on Runs).
+        let auto_on = config(&[
+            (Feature::Automations, scoped(true, &[])),
+            (Feature::Workflows, scoped(true, &[(group, false)])),
+        ]);
+        assert_eq!(
+            resolve(&auto_on, &none, Feature::Automations, Some(&group)),
+            Resolved {
+                on: false,
+                scope: Scope::Dependency,
+                dependency: Some(Feature::Workflows),
+            }
+        );
+        assert!(resolve(&auto_on, &none, Feature::Automations, None).on);
     }
 }

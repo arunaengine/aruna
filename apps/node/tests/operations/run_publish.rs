@@ -598,6 +598,7 @@ async fn publishes_local_workflow() -> TestResult<()> {
         directory_roots: Vec::new(),
         used_tools: Vec::new(),
         limits: None,
+        automation: None,
     };
     device
         .context

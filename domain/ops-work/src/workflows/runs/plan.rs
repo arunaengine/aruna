@@ -233,6 +233,7 @@ impl PlanRunOperation {
             directory_roots: Vec::new(),
             used_tools: Vec::new(),
             limits: None,
+            automation: None,
         }
     }
 

@@ -829,7 +829,7 @@ pub fn event_run(
     event: &SourceEvent,
     (run_id, now_ms): (Ulid, u64),
 ) -> Option<PluginRun> {
-    let kind = event_trigger(event.kind);
+    let kind = event_trigger(event.kind)?;
     declared_trigger(config, install, kind)?;
     let trigger = RunTrigger::Event(event.clone());
     let handler = kind.as_str().to_string();

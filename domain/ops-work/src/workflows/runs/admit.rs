@@ -22,9 +22,9 @@ use aruna_core::structs::execution::job::input::{
 };
 use aruna_core::structs::execution::job::local::{WorkspaceMode, user_dedup_key};
 use aruna_core::structs::execution::workflow_run::{
-    CacheScope, DirectoryPin, DirectoryRoot, PrecapturedInput, RunKeyRecord, RunLimits, RunOutput,
-    RunState, WorkflowRunRecord, WorkflowRunSpec, WorkflowSecretBinding, WorkflowSecretScope,
-    run_key, run_key_row,
+    AutomationOrigin, CacheScope, DirectoryPin, DirectoryRoot, PrecapturedInput, RunKeyRecord,
+    RunLimits, RunOutput, RunState, WorkflowRunRecord, WorkflowRunSpec, WorkflowSecretBinding,
+    WorkflowSecretScope, run_key, run_key_row,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -261,6 +261,7 @@ pub struct StartRunOperation {
     request: RunRequest,
     lineage: Lineage,
     limits: Option<RunLimits>,
+    automation: Option<AutomationOrigin>,
     bad_address: Option<String>,
     pending: Vec<PinnedInput>,
     value_heads: Vec<(String, String)>,
@@ -323,6 +324,7 @@ impl StartRunOperation {
             request,
             lineage: Lineage::default(),
             limits: None,
+            automation: None,
             bad_address,
             remote: BTreeMap::new(),
             asked: Vec::new(),
@@ -396,6 +398,12 @@ impl StartRunOperation {
     /// Bounds compute resources and concurrent active runs for this run.
     pub fn with_limits(mut self, limits: RunLimits) -> Self {
         self.limits = (!limits.is_empty()).then_some(limits);
+        self
+    }
+
+    /// Marks this run as started by an automation firing and stage.
+    pub fn with_automation(mut self, origin: AutomationOrigin) -> Self {
+        self.automation = Some(origin);
         self
     }
 
@@ -654,6 +662,7 @@ impl StartRunOperation {
             directory_roots: std::mem::take(&mut self.directory_roots),
             used_tools: self.lineage.used_tools.clone(),
             limits: self.limits,
+            automation: self.automation.clone(),
         };
         let key = request.idempotency_key.as_ref().map(|key| {
             let row = self.key_row(key);

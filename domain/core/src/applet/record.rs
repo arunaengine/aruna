@@ -105,6 +105,50 @@ pub enum StartGrant {
     Workflow { workflow_id: Ulid, version: u32 },
 }
 
+/// One verified visitor upload attached to an applet form submission.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmissionFile {
+    pub name: String,
+    pub bucket: String,
+    pub key: String,
+    pub version_id: Ulid,
+}
+
+/// Stored receipt of a visitor's form submission and its verified upload pins.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmissionReceipt {
+    pub applet_id: Ulid,
+    pub version_id: Ulid,
+    pub pseudonym: String,
+    pub guest: bool,
+    pub bucket: String,
+    pub key: String,
+    pub files: Vec<SubmissionFile>,
+    pub created_at_ms: u64,
+}
+
+impl SubmissionReceipt {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+/// Row prefix of stored applet submission receipts in `APPLETS_KEYSPACE`.
+pub const SUBMISSION_ROW: u8 = 4;
+
+/// Key of one applet submission receipt in `APPLETS_KEYSPACE`.
+pub fn submission_key(applet_id: Ulid, version_id: Ulid) -> Key {
+    let mut row = Vec::with_capacity(33);
+    row.push(SUBMISSION_ROW);
+    row.extend_from_slice(&applet_id.to_bytes());
+    row.extend_from_slice(&version_id.to_bytes());
+    Key::from(row)
+}
+
 /// A folder of the group: a bucket and a key prefix.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Folder {

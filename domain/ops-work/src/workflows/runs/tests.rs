@@ -697,6 +697,7 @@ pub(super) fn sample_run() -> WorkflowRunRecord {
         directory_roots: Vec::new(),
         used_tools: Vec::new(),
         limits: None,
+        automation: None,
     }
 }
 

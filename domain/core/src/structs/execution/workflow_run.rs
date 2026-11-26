@@ -339,6 +339,18 @@ impl RunLimits {
     }
 }
 
+/// Automation firing and stage that started a workflow run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutomationOrigin {
+    pub automation_id: Ulid,
+    pub firing_id: Ulid,
+    pub stage: String,
+    #[serde(default)]
+    pub applet_id: Option<Ulid>,
+    #[serde(default)]
+    pub depth: u8,
+}
+
 /// One workflow run of a group on this node.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowRunRecord {
@@ -412,6 +424,9 @@ pub struct WorkflowRunRecord {
     /// Compute and concurrency caps captured at admission from an applet or automation.
     #[serde(default)]
     pub limits: Option<RunLimits>,
+    /// Automation firing that started this workflow run, when triggered automatically.
+    #[serde(default)]
+    pub automation: Option<AutomationOrigin>,
 }
 
 /// One task of a run, with the state of its newest attempt.

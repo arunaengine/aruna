@@ -39,27 +39,31 @@ impl Target {
     /// Whether the install's trigger of the event's kind covers the event's path, and the
     /// event is not a dataset or object write of the install itself.
     pub fn matches(&self, event: &SourceEvent) -> bool {
+        let Some(trigger) = event_trigger(event.kind) else {
+            return false;
+        };
         let own = matches!(
             event.kind,
             SourceKind::DatasetCreated | SourceKind::DatasetUpdated | SourceKind::DataUploaded
         );
         self.group_id == event.group_id
             && !(own && event.actor == Some(self.account))
-            && (self.coverage.get(&event_trigger(event.kind)))
+            && (self.coverage.get(&trigger))
                 .is_some_and(|patterns| patterns.iter().any(|pattern| covers(pattern, &event.path)))
     }
 }
 
-/// The manifest trigger a journaled event kind starts.
-pub(crate) fn event_trigger(kind: SourceKind) -> TriggerKind {
-    match kind {
+/// The manifest trigger a journaled event kind starts, when plugins subscribe to it.
+pub(crate) fn event_trigger(kind: SourceKind) -> Option<TriggerKind> {
+    Some(match kind {
         SourceKind::DatasetCreated => TriggerKind::DatasetCreated,
         SourceKind::DataUploaded => TriggerKind::DataUploaded,
         SourceKind::DatasetUpdated => TriggerKind::DatasetUpdated,
         SourceKind::SyncCompleted => TriggerKind::SyncCompleted,
         SourceKind::SyncFailed => TriggerKind::SyncFailed,
         SourceKind::JobFinished => TriggerKind::JobFinished,
-    }
+        SourceKind::AppletSubmission | SourceKind::RunFinished => return None,
+    })
 }
 
 /// The pending rows `keys` in one transaction, each queued for the installs it matches with at

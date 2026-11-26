@@ -375,6 +375,23 @@ pub(crate) fn validate_inbound_kind(
             }
             validate_kind_user("actor_user_id", actor_user_id, recipient_realm)?;
         }
+        NotificationKind::AutomationNotice {
+            group_id,
+            automation_id,
+            firing_id,
+            stage,
+            message,
+            ..
+        } => {
+            if group_id.is_nil()
+                || automation_id.is_nil()
+                || firing_id.is_nil()
+                || stage.trim().is_empty()
+                || message.trim().is_empty()
+            {
+                return Err("automation notice has missing identifiers or text".to_string());
+            }
+        }
     }
     Ok(())
 }

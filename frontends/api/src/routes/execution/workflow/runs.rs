@@ -330,6 +330,12 @@ pub async fn list_runs(
             workflow_id: (query.workflow_id.as_deref())
                 .map(|workflow| ulid(workflow, "workflow_id"))
                 .transpose()?,
+            automation_id: (query.automation_id.as_deref())
+                .map(|id| ulid(id, "automation_id"))
+                .transpose()?,
+            firing_id: (query.firing_id.as_deref())
+                .map(|id| ulid(id, "firing_id"))
+                .transpose()?,
         };
     let after = (query.cursor.as_deref())
         .map(|cursor| ulid(cursor, "cursor"))

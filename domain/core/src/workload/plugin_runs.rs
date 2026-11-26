@@ -252,6 +252,10 @@ pub enum SourceKind {
     SyncFailed,
     /// A job of the install ended; made on the receiver, never journaled.
     JobFinished,
+    /// A visitor or guest submitted an applet form with optional verified uploads.
+    AppletSubmission,
+    /// A workflow run reached a terminal `succeeded` or `failed` state on this node.
+    RunFinished,
 }
 
 impl SourceKind {
@@ -264,6 +268,8 @@ impl SourceKind {
             Self::SyncCompleted => "sync_completed",
             Self::SyncFailed => "sync_failed",
             Self::JobFinished => "job_finished",
+            Self::AppletSubmission => "applet_submission",
+            Self::RunFinished => "run_finished",
         }
     }
 }
@@ -347,6 +353,48 @@ impl SourceEvent {
             anchor_ms: now_ms,
             journaled_ms: now_ms,
             actor,
+        }
+    }
+
+    /// A visitor or guest submission stored by an applet on this node.
+    pub fn applet_submission(
+        group_id: GroupId,
+        path: String,
+        (applet_id, version_id): (Ulid, Ulid),
+        actor: Option<UserId>,
+        now_ms: u64,
+    ) -> Self {
+        Self {
+            kind: SourceKind::AppletSubmission,
+            group_id,
+            path,
+            resource: applet_id.to_string(),
+            revision: version_id.to_string(),
+            source: format!("applet_submission/{applet_id}/{version_id}"),
+            anchor_ms: now_ms,
+            journaled_ms: now_ms,
+            actor,
+        }
+    }
+
+    /// A workflow run finishing as `succeeded` or `failed` on this node.
+    pub fn run_finished(
+        (group_id, path): (GroupId, String),
+        (workflow_id, run_id): (Ulid, Ulid),
+        state: &str,
+        actor: UserId,
+        now_ms: u64,
+    ) -> Self {
+        Self {
+            kind: SourceKind::RunFinished,
+            group_id,
+            path,
+            resource: workflow_id.to_string(),
+            revision: run_id.to_string(),
+            source: format!("run_finished/{run_id}/{state}"),
+            anchor_ms: now_ms,
+            journaled_ms: now_ms,
+            actor: Some(actor),
         }
     }
 
@@ -674,6 +722,9 @@ mod tests {
         assert_eq!(index(SourceKind::DatasetUpdated), [2]);
         assert_eq!(index(SourceKind::SyncCompleted), [3]);
         assert_eq!(index(SourceKind::SyncFailed), [4]);
+        assert_eq!(index(SourceKind::JobFinished), [5]);
+        assert_eq!(index(SourceKind::AppletSubmission), [6]);
+        assert_eq!(index(SourceKind::RunFinished), [7]);
         assert_eq!(
             gap_key(Ulid::nil(), SourceKind::DataUploaded, GapReason::Full)[17],
             1
