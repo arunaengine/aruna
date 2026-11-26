@@ -86,20 +86,47 @@ pub fn resolve_precaptured(run: &WorkflowRunRecord, target: Target, local: NodeI
     target
 }
 
-/// Immediate directory entries captured for `(holder, bucket, key)` from admitted directory pins,
-/// keeping directory membership fixed across local and cross-node resumes.
-pub(super) fn captured_entries(
+/// Whether `(holder, bucket, key)` lies under an admitted directory root or has captured pins.
+pub(super) fn has_captured_dir(
     run: &WorkflowRunRecord,
     local: NodeId,
     holder: NodeId,
     bucket: &str,
     key: &str,
-) -> Vec<ListEntry> {
+) -> bool {
     let prefix = match key.is_empty() || key.ends_with('/') {
         true => key.to_owned(),
         false => format!("{key}/"),
     };
-    let mut entries: BTreeMap<String, bool> = BTreeMap::new();
+    let under_root = run.directory_roots.iter().any(|root| {
+        root.source_node_id.unwrap_or(local) == holder
+            && root.bucket == bucket
+            && (root.prefix == prefix || root.prefix.starts_with(&prefix))
+    });
+    if under_root {
+        return true;
+    }
+    run.directory_pins.iter().any(|pin| {
+        pin.source_node_id.unwrap_or(local) == holder
+            && pin.bucket == bucket
+            && pin.key.strip_prefix(&prefix).is_some_and(|r| !r.is_empty())
+    })
+}
+
+/// Captures `(object_key, immediate_entry)` pairs for per-entry READ authorization of local
+/// captured listings, including nested empty directory roots.
+pub(super) fn captured_pins(
+    run: &WorkflowRunRecord,
+    local: NodeId,
+    holder: NodeId,
+    bucket: &str,
+    key: &str,
+) -> Vec<(String, ListEntry)> {
+    let prefix = match key.is_empty() || key.ends_with('/') {
+        true => key.to_owned(),
+        false => format!("{key}/"),
+    };
+    let mut out = Vec::new();
     for pin in &run.directory_pins {
         if pin.source_node_id.unwrap_or(local) != holder || pin.bucket != bucket {
             continue;
@@ -110,15 +137,59 @@ pub(super) fn captured_entries(
         if rest.is_empty() {
             continue;
         }
-        match rest.split_once('/') {
-            Some((dir, _)) if !dir.is_empty() => {
-                entries.insert(dir.to_owned(), true);
-            }
-            None => {
-                entries.entry(rest.to_owned()).or_insert(false);
-            }
-            _ => {}
+        let entry = match rest.split_once('/') {
+            Some((dir, _)) if !dir.is_empty() => ListEntry {
+                name: dir.to_owned(),
+                directory: true,
+            },
+            None => ListEntry {
+                name: rest.to_owned(),
+                directory: false,
+            },
+            _ => continue,
+        };
+        out.push((pin.key.clone(), entry));
+    }
+    for root in &run.directory_roots {
+        if root.source_node_id.unwrap_or(local) != holder || root.bucket != bucket {
+            continue;
         }
+        let Some(rest) = root.prefix.strip_prefix(&prefix) else {
+            continue;
+        };
+        let rest = rest.trim_end_matches('/');
+        if rest.is_empty() {
+            continue;
+        }
+        let dir = rest.split('/').next().unwrap_or_default();
+        if !dir.is_empty() {
+            out.push((
+                root.prefix.clone(),
+                ListEntry {
+                    name: dir.to_owned(),
+                    directory: true,
+                },
+            ));
+        }
+    }
+    out
+}
+
+/// Immediate directory entries captured for `(holder, bucket, key)` from admitted directory pins
+/// and nested empty directory roots.
+pub(super) fn captured_entries(
+    run: &WorkflowRunRecord,
+    local: NodeId,
+    holder: NodeId,
+    bucket: &str,
+    key: &str,
+) -> Vec<ListEntry> {
+    let mut entries: BTreeMap<String, bool> = BTreeMap::new();
+    for (_, entry) in captured_pins(run, local, holder, bucket, key) {
+        entries
+            .entry(entry.name)
+            .and_modify(|is_dir| *is_dir |= entry.directory)
+            .or_insert(entry.directory);
     }
     entries
         .into_iter()
@@ -178,6 +249,8 @@ enum RemoteStep {
 pub struct RemoteReadOperation {
     run: WorkflowRunRecord,
     target: Target,
+    /// Admitted version of the requested address (preserves link version across multi-chunk reads).
+    reported_version: Option<Ulid>,
     node: NodeId,
     call: DataCall,
     size: u64,
@@ -188,11 +261,14 @@ type RemoteNext = Result<Next<HostRpcResult>, CatalogError>;
 
 impl RemoteReadOperation {
     pub fn new(run: WorkflowRunRecord, target: Target, node: NodeId, call: DataCall) -> Self {
-        let target = resolve_precaptured(&run, target, node);
+        let pinned = pin_directory_child(&run, target, run.node_id);
+        let reported_version = pinned.version;
+        let target = resolve_precaptured(&run, pinned, run.node_id);
         let node = target.node.unwrap_or(node);
         Self {
             run,
             target,
+            reported_version,
             node,
             call,
             size: 0,
@@ -205,7 +281,9 @@ impl RemoteReadOperation {
     }
 
     fn version(&self) -> Option<String> {
-        self.target.version.map(|version| version.to_string())
+        self.reported_version
+            .or(self.target.version)
+            .map(|version| version.to_string())
     }
 
     fn headed(
@@ -257,14 +335,20 @@ impl Operation for RemoteReadOperation {
 
     fn first(&mut self) -> RemoteNext {
         if matches!(self.call, DataCall::List { .. }) {
-            let entries = captured_entries(
+            if has_captured_dir(
                 &self.run,
                 self.run.node_id,
                 self.node,
                 &self.target.bucket,
                 &self.target.key,
-            );
-            if !entries.is_empty() {
+            ) {
+                let entries = captured_entries(
+                    &self.run,
+                    self.run.node_id,
+                    self.node,
+                    &self.target.bucket,
+                    &self.target.key,
+                );
                 return Ok(Next::Done(HostRpcResult::StorageList { entries }));
             }
             return Self::failed(ContractError::unsupported(format!(
@@ -272,27 +356,27 @@ impl Operation for RemoteReadOperation {
                 self.node
             )));
         }
-        if matches!(self.call, DataCall::Stat { .. }) && self.target.version.is_none() {
-            let entries = captured_entries(
+        if matches!(self.call, DataCall::Stat { .. })
+            && self.target.version.is_none()
+            && has_captured_dir(
                 &self.run,
                 self.run.node_id,
                 self.node,
                 &self.target.bucket,
                 &self.target.key,
-            );
-            if !entries.is_empty() {
-                return Ok(Next::Done(HostRpcResult::StorageStat {
-                    entry: Some(StorageEntry {
-                        directory: true,
-                        size: 0,
-                        modified_ms: None,
-                        version: None,
-                        sha256: None,
-                        aruna_id: None,
-                        endpoints: Vec::new(),
-                    }),
-                }));
-            }
+            )
+        {
+            return Ok(Next::Done(HostRpcResult::StorageStat {
+                entry: Some(StorageEntry {
+                    directory: true,
+                    size: 0,
+                    modified_ms: None,
+                    version: None,
+                    sha256: None,
+                    aruna_id: None,
+                    endpoints: Vec::new(),
+                }),
+            }));
         }
         let Some(head) = read_call(&self.run, &self.target, self.node, (true, None)) else {
             return Self::failed(ContractError::invalid(
@@ -419,6 +503,7 @@ mod tests {
                 captured: cap,
             }],
             directory_pins: Vec::new(),
+            directory_roots: Vec::new(),
             used_tools: Vec::new(),
         };
         let link_target = Target {
@@ -551,6 +636,7 @@ mod tests {
                 version_id: new_ver,
                 source_node_id: Some(node(2)),
             }],
+            directory_roots: Vec::new(),
             used_tools: Vec::new(),
         };
         let child = Target {
@@ -578,5 +664,47 @@ mod tests {
         let explicit_res = resolve_precaptured(&run, explicit, node(1));
         assert_eq!(explicit_res.key, "dir/a.txt");
         assert_eq!(explicit_res.version, Some(old_ver));
+
+        // RemoteReadOperation reports the admitted link version (`new_ver`) so chunk 2 pins the
+        // link key with `new_ver` and still resolves to `dir/real.txt@target_ver`.
+        let child_target = Target {
+            bucket: "data".into(),
+            key: "dir/a.txt".into(),
+            version: None,
+            owned: false,
+            node: Some(node(2)),
+        };
+        let op1 = RemoteReadOperation::new(
+            run.clone(),
+            child_target,
+            node(2),
+            DataCall::Download {
+                address: "s3://data/dir/a.txt".into(),
+                offset: 0,
+            },
+        );
+        assert_eq!(op1.version().as_deref(), Some(new_ver.to_string().as_str()));
+        assert_eq!(op1.target.key, "dir/real.txt");
+        assert_eq!(op1.target.version, Some(target_ver));
+
+        let chunk2_target = Target {
+            bucket: "data".into(),
+            key: "dir/a.txt".into(),
+            version: Some(new_ver),
+            owned: false,
+            node: Some(node(2)),
+        };
+        let op2 = RemoteReadOperation::new(
+            run,
+            chunk2_target,
+            node(2),
+            DataCall::Download {
+                address: format!("s3://data/dir/a.txt?version={new_ver}"),
+                offset: 1024,
+            },
+        );
+        assert_eq!(op2.version().as_deref(), Some(new_ver.to_string().as_str()));
+        assert_eq!(op2.target.key, "dir/real.txt");
+        assert_eq!(op2.target.version, Some(target_ver));
     }
 }

@@ -185,8 +185,18 @@ impl FollowRunOperation {
             }
             directory_pins.push(pin);
         }
-        if !directory_pins.is_empty() {
-            start = start.with_directories(directory_pins);
+        let mut directory_roots = Vec::new();
+        for mut root in source.directory_roots.clone() {
+            if source.node_id != self.node.0 {
+                root.source_node_id.get_or_insert(source.node_id);
+            }
+            if root.source_node_id == Some(self.node.0) {
+                root.source_node_id = None;
+            }
+            directory_roots.push(root);
+        }
+        if !directory_pins.is_empty() || !directory_roots.is_empty() {
+            start = start.with_directories(directory_pins, directory_roots);
         }
         if source.created_by == self.auth.user_id && self.auth.path_restrictions.is_none() {
             start = start.with_captured(source.captured_remote.clone());

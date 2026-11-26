@@ -250,6 +250,15 @@ pub struct DirectoryPin {
     pub source_node_id: Option<NodeId>,
 }
 
+/// One admitted directory prefix whose membership was captured at run start, including empty
+/// directories so resume never rescans newly added files.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryRoot {
+    pub bucket: String,
+    pub prefix: String,
+    pub source_node_id: Option<NodeId>,
+}
+
 /// How many tasks of one step are in each state, kept with the run so a read needs no scan.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepRecord {
@@ -374,6 +383,9 @@ pub struct WorkflowRunRecord {
     /// Versioned file entries captured from directory-valued parameters for cross-node resume.
     #[serde(default)]
     pub directory_pins: Vec<DirectoryPin>,
+    /// Admitted directory prefixes (including empty directories) captured at run start.
+    #[serde(default)]
+    pub directory_roots: Vec<DirectoryRoot>,
     /// Resolved `(tool_id, version)` pairs a composed workflow lowered against for this run.
     #[serde(default)]
     pub used_tools: Vec<(String, String)>,

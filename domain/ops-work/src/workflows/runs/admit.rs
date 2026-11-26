@@ -22,7 +22,7 @@ use aruna_core::structs::execution::job::input::{
 };
 use aruna_core::structs::execution::job::local::{WorkspaceMode, user_dedup_key};
 use aruna_core::structs::execution::workflow_run::{
-    CacheScope, DirectoryPin, PrecapturedInput, RunKeyRecord, RunOutput, RunState,
+    CacheScope, DirectoryPin, DirectoryRoot, PrecapturedInput, RunKeyRecord, RunOutput, RunState,
     WorkflowRunRecord, WorkflowRunSpec, WorkflowSecretBinding, WorkflowSecretScope, run_key,
     run_key_row,
 };
@@ -267,6 +267,7 @@ pub struct StartRunOperation {
     value_versions: BTreeMap<(String, String), Ulid>,
     retained_pins: Vec<(String, String, Ulid)>,
     directory_pins: Vec<DirectoryPin>,
+    directory_roots: Vec<DirectoryRoot>,
     dir_limit: usize,
     resolved_values: Value,
     pub(super) remote: BTreeMap<NodeId, Vec<(PinnedInput, InputSelection)>>,
@@ -315,6 +316,7 @@ impl StartRunOperation {
             value_versions: BTreeMap::new(),
             retained_pins: Vec::new(),
             directory_pins: Vec::new(),
+            directory_roots: Vec::new(),
             dir_limit: MAX_DIR_PINS,
             resolved_values,
             request,
@@ -335,9 +337,9 @@ impl StartRunOperation {
         self
     }
 
-    /// Carries versioned directory entries from an earlier run in the lineage, rechecking access
-    /// and exact-version existence for any entries held on this node.
-    pub fn with_directories(mut self, pins: Vec<DirectoryPin>) -> Self {
+    /// Carries versioned directory entries and admitted directory roots from an earlier run in
+    /// the lineage, rechecking access and exact-version existence for any entries held here.
+    pub fn with_directories(mut self, pins: Vec<DirectoryPin>, roots: Vec<DirectoryRoot>) -> Self {
         for pin in &pins {
             if pin.source_node_id.is_none() {
                 self.pending.push(PinnedInput {
@@ -351,7 +353,19 @@ impl StartRunOperation {
                     .push((pin.bucket.clone(), pin.key.clone(), pin.version_id));
             }
         }
+        for root in &roots {
+            if root.source_node_id.is_none() {
+                self.pending.push(PinnedInput {
+                    name: String::new(),
+                    bucket: root.bucket.clone(),
+                    key: root.prefix.trim_end_matches('/').to_owned(),
+                    version_id: Ulid::nil(),
+                    source_node_id: None,
+                });
+            }
+        }
         self.directory_pins = pins;
+        self.directory_roots = roots;
         self
     }
 
@@ -455,11 +469,13 @@ impl StartRunOperation {
                 false => format!("{key}/"),
             };
             let retained = keep
-                && self.directory_pins.iter().any(|pin| {
+                && (self.directory_roots.iter().any(|root| {
+                    root.source_node_id.is_none() && root.bucket == bucket && root.prefix == prefix
+                }) || self.directory_pins.iter().any(|pin| {
                     pin.source_node_id.is_none()
                         && pin.bucket == bucket
                         && pin.key.starts_with(&prefix)
-                });
+                }));
             if retained {
                 continue;
             }
@@ -623,6 +639,7 @@ impl StartRunOperation {
             path_restrictions: self.auth.path_restrictions.clone(),
             captured_remote: std::mem::take(&mut self.captured),
             directory_pins: std::mem::take(&mut self.directory_pins),
+            directory_roots: std::mem::take(&mut self.directory_roots),
             used_tools: self.lineage.used_tools.clone(),
         };
         let key = request.idempotency_key.as_ref().map(|key| {
@@ -693,6 +710,17 @@ impl StartRunOperation {
                     .as_ref()
                     .is_none_or(|g| g.grant.expires_at > now_secs)
             });
+        }
+        for root in &self.directory_roots {
+            if let Some(node) = root.source_node_id.filter(|n| *n != local)
+                && !cfg
+                    .node_kind(&node)
+                    .is_some_and(|kind| kind.is_sync_eligible())
+            {
+                return Err(CatalogError::Invalid(format!(
+                    "input node {node} is not an eligible realm server"
+                )));
+            }
         }
         for pin in pins {
             let Some(node) = pin.source_node_id.filter(|n| *n != local) else {
@@ -940,6 +968,17 @@ impl Operation for StartRunOperation {
                         true => key,
                         false => format!("{key}/"),
                     };
+                    if !self.directory_roots.iter().any(|root| {
+                        root.source_node_id.is_none()
+                            && root.bucket == bucket
+                            && root.prefix == prefix
+                    }) {
+                        self.directory_roots.push(DirectoryRoot {
+                            bucket: bucket.clone(),
+                            prefix: prefix.clone(),
+                            source_node_id: None,
+                        });
+                    }
                     let scan = DirScan {
                         bucket,
                         group_id: info.group_id,
@@ -969,25 +1008,43 @@ impl Operation for StartRunOperation {
                 let checking = scan.checking.take();
                 match result.child::<(), AuthorizeError>()? {
                     Ok(()) => {
-                        if let Some((key, version_id)) = checking
-                            && !self.directory_pins.iter().any(|pin| {
+                        if let Some((key, version_id)) = checking {
+                            if key.ends_with('/') {
+                                if !self.directory_roots.iter().any(|root| {
+                                    root.source_node_id.is_none()
+                                        && root.bucket == scan.bucket
+                                        && root.prefix == key
+                                }) {
+                                    if self.directory_roots.len() >= self.dir_limit {
+                                        return Err(CatalogError::Invalid(format!(
+                                            "directory inputs exceed the maximum of {} captured directories",
+                                            self.dir_limit
+                                        )));
+                                    }
+                                    self.directory_roots.push(DirectoryRoot {
+                                        bucket: scan.bucket.clone(),
+                                        prefix: key,
+                                        source_node_id: None,
+                                    });
+                                }
+                            } else if !self.directory_pins.iter().any(|pin| {
                                 pin.source_node_id.is_none()
                                     && pin.bucket == scan.bucket
                                     && pin.key == key
-                            })
-                        {
-                            if self.directory_pins.len() >= self.dir_limit {
-                                return Err(CatalogError::Invalid(format!(
-                                    "directory inputs exceed the maximum of {} captured files",
-                                    self.dir_limit
-                                )));
+                            }) {
+                                if self.directory_pins.len() >= self.dir_limit {
+                                    return Err(CatalogError::Invalid(format!(
+                                        "directory inputs exceed the maximum of {} captured files",
+                                        self.dir_limit
+                                    )));
+                                }
+                                self.directory_pins.push(DirectoryPin {
+                                    bucket: scan.bucket.clone(),
+                                    key,
+                                    version_id,
+                                    source_node_id: None,
+                                });
                             }
-                            self.directory_pins.push(DirectoryPin {
-                                bucket: scan.bucket.clone(),
-                                key,
-                                version_id,
-                                source_node_id: None,
-                            });
                         }
                     }
                     Err(

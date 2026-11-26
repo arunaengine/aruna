@@ -173,6 +173,7 @@ fn stub_run(run: &WorkflowRunRecord) -> WorkflowRunRecord {
         path_restrictions: None,
         captured_remote: Vec::new(),
         directory_pins: Vec::new(),
+        directory_roots: Vec::new(),
         used_tools: Vec::new(),
     }
 }
