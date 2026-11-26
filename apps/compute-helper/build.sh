@@ -6,6 +6,7 @@
 set -eu
 
 repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
-image=${ARUNA_COMPUTE_HELPER_IMAGE:-aruna-compute-helper:local}
+version=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$repo_root/Cargo.toml" | head -n 1)
+image=${ARUNA_COMPUTE_HELPER_IMAGE:-ghcr.io/arunaengine/aruna-compute-helper:v$version}
 
 docker build -f "$repo_root/apps/compute-helper/Dockerfile" -t "$image" "$repo_root"

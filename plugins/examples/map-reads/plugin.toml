@@ -12,7 +12,7 @@ access = "write"
 results = "Bucket path for results"
 
 [tasks.map]
-image = "harbor.computational.bio.uni-giessen.de/aruna/map-reads@sha256:4f2a8c1d9e7b6a5f3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b"
+image = "ghcr.io/arunaengine/map-reads@sha256:4f2a8c1d9e7b6a5f3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b"
 command = ["/opt/map.sh", "{reference}"]
 network = "open"                                # map.sh fetches the reference from NCBI
 cpu = 8

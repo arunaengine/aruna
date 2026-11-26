@@ -30,10 +30,10 @@ see [`.env.example`](../.env.example).
 ## Releases and image tags
 
 Aruna v3 is currently in public alpha (`v3.0.0-alpha.*`). Pre-built Linux (`linux/amd64`) container
-images are published on Harbor:
+images are published on the GitHub Container Registry:
 
 ```text
-harbor.computational.bio.uni-giessen.de/aruna/aruna-v3:<tag>
+ghcr.io/arunaengine/aruna:<tag>
 ```
 
 Each published image uses a distroless Debian 13 runtime (no shell inside the container) and
@@ -43,18 +43,31 @@ bundles:
 - `/run/aruna-doctor`: offline and live maintenance CLI (backups, restores, migrations, admin
   recovery and diagnostics),
 - `/run/iroh-doctor`: peer-to-peer QUIC and relay diagnostics,
-- `/run/portal`: the pre-built web portal single-page application (`PORTAL_DIR=/run/portal` is set
-  in the image; setting `PORTAL_MODE=artifact` serves this embedded copy without downloading).
+- `/run/portal`: the pre-built web portal single-page application when the release embeds a portal
+  (marked by a `v<version>-portal.<portal-tag>` tag in the release's `release-images.json`).
+  `PORTAL_DIR=/run/portal` is set in the image; setting `PORTAL_MODE=artifact` serves this embedded
+  copy without downloading. Headless releases omit `/run/portal` and require `PORTAL_ARTIFACT_URL`
+  and `PORTAL_ARTIFACT_SHA256` to serve the portal.
 
 ### Which tag to deploy
 
-- **Persistent pre-production and production (recommended):** pin an explicit release tag, such as
-  `v3.0.0-alpha.208` (or the latest tagged release listed on the
-  [GitHub releases page](https://github.com/arunaengine/aruna/releases)). Pinning prevents a
-  container recreation from silently pulling a newer release before you have taken a backup and run
-  `aruna-doctor migrate`.
-- **Short-lived evaluation only:** the floating `v3` tag tracks the newest v3 build. Do not use it
-  for persistent installations where you want controlled upgrades.
+- **Persistent pre-production and production (recommended):** pin an explicit release tag, starting
+  at `v3.0.0-alpha.210` on GHCR (or the latest tagged release listed on the
+  [GitHub releases page](https://github.com/arunaengine/aruna/releases)). When serving the embedded
+  portal with `PORTAL_MODE=artifact` and no `PORTAL_ARTIFACT_URL`, select the portal-qualified tag
+  (`v<version>-portal.<portal-tag>`) or pinned digest `reference` from the release's
+  `release-images.json`:
+
+  ```bash
+  curl -fsSL https://github.com/arunaengine/aruna/releases/download/v3.0.0-alpha.210/release-images.json \
+    | jq -er '.images[] | select(.name == "aruna" and any(.tags[]; contains("-portal."))) | (.tags[] | select(contains("-portal."))), .reference'
+  ```
+
+  Pinning prevents a container recreation from silently pulling a newer release before you have
+  taken a backup and run `aruna-doctor migrate`.
+- **Short-lived evaluation only:** the floating `v3` tag tracks the newest v3 release (and is
+  headless when that release was built without a portal tag). Do not use it for persistent
+  installations where you want controlled upgrades.
 - **Client version alignment:** match [Aruna Desktop](https://github.com/arunaengine/aruna-desktop/releases)
   and `aruna-cli` versions to the release your realm runs.
 - **Building from source:** run `docker build -t aruna:local .` from a tagged commit checkout if
@@ -62,7 +75,8 @@ bundles:
   builds omit the web portal unless the built
   [website](https://github.com/arunaengine/website) is staged in `.portal-embed` before building, or
   you configure `PORTAL_MODE=artifact` with `PORTAL_ARTIFACT_URL` and `PORTAL_ARTIFACT_SHA256` to
-  fetch a signed release archive at startup.
+  fetch a signed release archive at startup. `bash scripts/build_images.sh --portal <portal tag> aruna`
+  builds the image with a portal release of the website whose SHA-256 it checks first.
 
 ## Host sizing and preparation
 
@@ -194,7 +208,8 @@ S3_HOST=s3.rdm.example.org
 PORTAL_PUBLIC_URL=https://rdm.example.org
 CORS_ALLOWED_ORIGINS=https://rdm.example.org
 
-# Web portal (uses embedded /run/portal from the published Harbor image)
+# Web portal (uses embedded /run/portal from a portal-qualified image; add PORTAL_ARTIFACT_URL and
+# PORTAL_ARTIFACT_SHA256 when deploying a headless image)
 PORTAL_MODE=artifact
 PORTAL_LANDING=enabled
 
@@ -222,7 +237,9 @@ Create `/srv/aruna/compose.yaml`:
 ```yaml
 services:
   aruna:
-    image: harbor.computational.bio.uni-giessen.de/aruna/aruna-v3:v3.0.0-alpha.208
+    # Copy the portal-qualified tag or pinned digest reference from the release's release-images.json
+    # (or use ghcr.io/arunaengine/aruna:v3.0.0-alpha.210 for headless or PORTAL_ARTIFACT_URL setups).
+    image: ghcr.io/arunaengine/aruna:v3.0.0-alpha.210-portal.<portal-tag>
     container_name: aruna
     restart: unless-stopped
     stop_grace_period: 30s
@@ -591,7 +608,7 @@ docker compose start aruna
    ```bash
    docker run --rm \
      -v /srv/aruna:/srv/aruna \
-     harbor.computational.bio.uni-giessen.de/aruna/aruna-v3:v3.0.0-alpha.208 \
+     ghcr.io/arunaengine/aruna:v3.0.0-alpha.210 \
      /run/aruna-doctor restore /srv/aruna/backups/aruna-<timestamp>.bak /srv/aruna/data-restored
    ```
 
@@ -617,7 +634,7 @@ Always follow this sequence when moving from one pinned tag to another:
 3. **Pull the new pinned image** and update the tag in `/srv/aruna/compose.yaml`:
 
    ```bash
-   NEW_IMAGE=harbor.computational.bio.uni-giessen.de/aruna/aruna-v3:<new-tag>
+   NEW_IMAGE=ghcr.io/arunaengine/aruna:<new-tag>
    docker pull "$NEW_IMAGE"
    ```
 
@@ -687,7 +704,7 @@ a realm administrator in the portal (or API):
 
 Before opening a new deployment to users, verify each item:
 
-- [ ] Pinned Harbor image tag set in `compose.yaml` (not floating `v3`).
+- [ ] Pinned image tag set in `compose.yaml` (not floating `v3`).
 - [ ] Host clock synchronized with NTP.
 - [ ] `ARUNA_FJALL_PERSIST_MODE=sync_all` and an appropriate `ARUNA_FJALL_CACHE_MIB` configured.
 - [ ] DNS records and valid TLS certificates in place for Portal, API and S3 (plus `*.s3.*` if

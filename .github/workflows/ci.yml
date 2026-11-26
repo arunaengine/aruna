@@ -627,7 +627,8 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           shellcheck scripts/*.sh scripts/tests/*.sh
-          shellcheck --shell=sh apps/compute-helper/build.sh scripts/dev/rustc_coverage.sh \
+          shellcheck --shell=sh apps/compute-helper/build.sh apps/registry/build.sh \
+            scripts/dev/rustc_coverage.sh \
             scripts/session-deno/build.sh scripts/session-python/build.sh \
             scripts/session-helper/session-start
 
@@ -665,6 +666,10 @@ jobs:
       - name: Run recipe contract tests
         if: ${{ !cancelled() }}
         run: bash scripts/tests/just_recipes.sh
+
+      - name: Run image script contract tests
+        if: ${{ !cancelled() }}
+        run: bash scripts/tests/build_images.sh
 
   clippy:
     runs-on: ubuntu-latest

@@ -8,7 +8,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT_DIR/Cargo.toml" | head -n 1)"
-IMAGE="${ARUNA_ALPHA_IMAGE:-harbor.computational.bio.uni-giessen.de/aruna/aruna-v3:v$VERSION}"
+IMAGE="${ARUNA_ALPHA_IMAGE:-ghcr.io/arunaengine/aruna:v$VERSION}"
 WORK_DIR=""
 KEEP=0
 READY_TIMEOUT_SECS="${ARUNA_ALPHA_READY_TIMEOUT_SECS:-180}"
