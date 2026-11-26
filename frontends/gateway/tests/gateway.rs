@@ -175,8 +175,24 @@ async fn public_files_served() {
     let check = |domain: &str| format!("/_edge/tls-check?domain={domain}");
     let known = visit(&base, "any.test", &check("pub.apps.test"), &[]).await;
     assert_eq!(known.status(), StatusCode::OK);
+    let browser = visit(
+        &base,
+        "pub.apps.test",
+        &check("pub.apps.test"),
+        &[("sec-fetch-site", "same-origin")],
+    )
+    .await;
+    assert_eq!(browser.status(), StatusCode::NOT_FOUND);
     let missing = visit(&base, "any.test", &check("nobody.apps.test"), &[]).await;
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    let dup = client()
+        .get(format!("{base}/"))
+        .header("host", "pub.apps.test")
+        .header("host", "private.apps.test")
+        .send()
+        .await
+        .expect("gateway answers");
+    assert_eq!(dup.status(), StatusCode::BAD_REQUEST);
 }
 
 /// Signs in on the private host with `code` and returns the session cookie.
@@ -370,10 +386,22 @@ async fn embedded_popup_signin() {
     let popup_start = format!("/_aruna/auth/start?popup=1&state={state}&return=/runs");
     let redirect = visit(&base, "private.apps.test", &popup_start, &[]).await;
     assert_eq!(redirect.status(), StatusCode::FOUND);
+    assert_eq!(header(&redirect, "referrer-policy"), "no-referrer");
     assert_eq!(
         header(&redirect, "cross-origin-opener-policy"),
         "unsafe-none"
     );
+    let short = visit(
+        &base,
+        "private.apps.test",
+        "/_aruna/auth/start?popup=1&state=short&return=/_aruna/auth/logout",
+        &[],
+    )
+    .await;
+    let short_url = url::Url::parse(&header(&short, LOCATION)).expect("short portal URL");
+    let short_params: HashMap<_, _> = short_url.query_pairs().into_owned().collect();
+    assert_ne!(short_params["state"], "short");
+    assert_eq!(short_params["return"], "/");
     let portal = url::Url::parse(&header(&redirect, LOCATION)).expect("portal URL");
     let params: HashMap<_, _> = portal.query_pairs().into_owned().collect();
     assert_eq!(params["state"], state);
@@ -390,6 +418,8 @@ async fn embedded_popup_signin() {
     )
     .await;
     assert_eq!(handoff.status(), StatusCode::OK);
+    assert_eq!(header(&handoff, "referrer-policy"), "no-referrer");
+    assert_eq!(header(&handoff, "x-frame-options"), "DENY");
     assert_eq!(
         header(&handoff, "cross-origin-opener-policy"),
         "unsafe-none"

@@ -22,14 +22,14 @@ use std::time::Instant;
 use axum::Router;
 use axum::extract::{Query, Request, State};
 use axum::http::StatusCode;
-use axum::http::header::HOST;
-use axum::response::Response;
+use axum::http::header::{CACHE_CONTROL, HOST, HeaderMap, HeaderValue, ORIGIN};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use serde::Deserialize;
 use tracing::{info, warn};
 
 use crate::hosts::{HostCache, normalize};
-use crate::pages::{page, unavailable};
+use crate::pages::{bare, page, unavailable};
 use crate::policy::Frame;
 use crate::session::Sealer;
 use crate::settings::Settings;
@@ -71,7 +71,7 @@ pub async fn run(settings: Settings) -> Result<(), GatewayError> {
 
 pub fn router(gateway: Arc<Gateway>) -> Router {
     Router::new()
-        .route("/_edge/health", get(|| async { "ok" }))
+        .route("/_edge/health", get(health))
         .route("/_edge/tls-check", get(tls_check))
         .fallback(entry)
         .with_state(gateway)
@@ -99,13 +99,30 @@ impl Gateway {
     }
 }
 
+/// One unambiguous normalized host from `Host` and the URI authority; conflicting values fail.
+fn request_host(request: &Request) -> Option<String> {
+    let mut headers = request.headers().get_all(HOST).iter();
+    let header_host = match (headers.next(), headers.next()) {
+        (Some(_), Some(_)) => return None,
+        (Some(value), None) => Some(normalize(value.to_str().ok()?)?),
+        (None, _) => None,
+    };
+    let uri_host = match request.uri().host() {
+        Some(raw) => Some(normalize(raw)?),
+        None => None,
+    };
+    match (header_host, uri_host) {
+        (Some(left), Some(right)) if left == right => Some(left),
+        (Some(_), Some(_)) => None,
+        (Some(host), None) | (None, Some(host)) => Some(host),
+        (None, None) => None,
+    }
+}
+
 /// Every applet request: find the host's decision, then serve `/_aruna/` or a pinned file.
 async fn entry(State(gateway): State<Arc<Gateway>>, request: Request) -> Response {
     let none = Frame::Embed(&[]);
-    let named = (request.headers().get(HOST))
-        .and_then(|host| host.to_str().ok())
-        .or(request.uri().host());
-    let Some(host) = named.and_then(normalize) else {
+    let Some(host) = request_host(&request) else {
         let message = "The request names no valid host.";
         return page(StatusCode::BAD_REQUEST, "Unknown address", message, none);
     };
@@ -135,16 +152,40 @@ struct TlsQuery {
     domain: String,
 }
 
+async fn health() -> Response {
+    let mut response = (StatusCode::OK, "ok").into_response();
+    let headers = response.headers_mut();
+    policy::secure(headers, Frame::Embed(&[]));
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+fn browser_request(headers: &HeaderMap) -> bool {
+    headers.contains_key(ORIGIN)
+        || headers.contains_key("sec-fetch-site")
+        || headers.contains_key("sec-fetch-mode")
+        || headers.contains_key("sec-fetch-dest")
+}
+
 /// Lets the TLS proxy issue a certificate on demand only for hosts an applet serves.
-async fn tls_check(State(gateway): State<Arc<Gateway>>, query: Query<TlsQuery>) -> StatusCode {
+async fn tls_check(
+    State(gateway): State<Arc<Gateway>>,
+    headers: HeaderMap,
+    query: Query<TlsQuery>,
+) -> Response {
+    let none = Frame::Embed(&[]);
+    if browser_request(&headers) {
+        return bare(StatusCode::NOT_FOUND, none);
+    }
     let Some(host) = normalize(&query.domain) else {
-        return StatusCode::NOT_FOUND;
+        return bare(StatusCode::NOT_FOUND, none);
     };
-    match gateway.decide(&host).await {
+    let status = match gateway.decide(&host).await {
         Ok(Some(_)) => StatusCode::OK,
         Ok(None) => StatusCode::NOT_FOUND,
         Err(_) => StatusCode::BAD_GATEWAY,
-    }
+    };
+    bare(status, none)
 }
 
 async fn stopped() {

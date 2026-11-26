@@ -300,6 +300,9 @@ pub async fn signin_code(
     if applet.host_node != state.get_node_id() {
         return Err(applet_error(AppletError::Elsewhere(applet.host_node)));
     }
+    if !body.preview && !can_confirm(&state, &auth, &applet).await {
+        return Err(ServerError::NotFound);
+    }
     if normalize_host(&body.host).ok().as_deref() != Some(applet.host.as_str()) {
         return Err(ServerError::BadRequestReason(
             "not the applet's own host".to_string(),

@@ -24,6 +24,8 @@ use crate::visit::{Visit, plain_id, query_params};
 
 /// How long a started sign-in may take before its state cookie is gone.
 const STATE_SECONDS: u64 = 600;
+/// Shortest pop-up state accepted from the query string; matches a 24-byte base64url token.
+const MIN_POPUP_STATE: usize = 32;
 /// Marks a top-level pop-up state cookie so callback hands the code back to the framing applet.
 const POPUP_PREFIX: &str = "popup:";
 const PREVIEW_FRAME_JS: &str = include_str!("preview_frame.js");
@@ -49,6 +51,7 @@ fn html_page(body: String, frame: Frame<'_>, opener: bool) -> Response {
     let mut response = (StatusCode::OK, Html(body)).into_response();
     let headers = response.headers_mut();
     policy::secure(headers, frame);
+    policy::no_referrer(headers);
     if opener {
         policy::allow_opener(headers);
     }
@@ -184,7 +187,7 @@ pub fn start(visit: &Visit, headers: &HeaderMap, query: Option<&str>) -> Respons
     let state = match popup {
         true => params
             .get("state")
-            .filter(|value| plain_id(value))
+            .filter(|value| value.len() >= MIN_POPUP_STATE && plain_id(value))
             .cloned()
             .unwrap_or_else(|| URL_SAFE_NO_PAD.encode(rand::random::<[u8; 24]>())),
         false => URL_SAFE_NO_PAD.encode(rand::random::<[u8; 24]>()),
@@ -203,6 +206,7 @@ pub fn start(visit: &Visit, headers: &HeaderMap, query: Option<&str>) -> Respons
         (false, false) => (state, Site::Lax),
     };
     let mut response = redirect(StatusCode::FOUND, target.as_str(), frame);
+    policy::no_referrer(response.headers_mut());
     if popup {
         policy::allow_opener(response.headers_mut());
     }
@@ -212,7 +216,7 @@ pub fn start(visit: &Visit, headers: &HeaderMap, query: Option<&str>) -> Respons
     response
 }
 
-fn popup_handoff(frame: Frame<'_>, code: &str, state: &str) -> Response {
+fn popup_handoff(code: &str, state: &str) -> Response {
     let body = format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Signed in</title>\
          <script src=\"/_aruna/auth/popup-done.js\" data-code=\"{}\" data-state=\"{}\" defer>\
@@ -220,7 +224,7 @@ fn popup_handoff(frame: Frame<'_>, code: &str, state: &str) -> Response {
         escape_attr(code),
         escape_attr(state),
     );
-    let mut response = html_page(body, frame, true);
+    let mut response = html_page(body, Frame::Embed(&[]), true);
     clear_state(response.headers_mut());
     response
 }
@@ -236,14 +240,16 @@ pub async fn callback(
     let params = query_params(query);
     let expired = || {
         let message = "Start the sign-in again from the applet.";
-        page(StatusCode::BAD_REQUEST, "Sign-in expired", message, frame)
+        let mut response = page(StatusCode::BAD_REQUEST, "Sign-in expired", message, frame);
+        policy::no_referrer(response.headers_mut());
+        response
     };
     let (Some(code), Some(state)) = (params.get("code"), params.get("state")) else {
         return expired();
     };
     let popup_cookie = format!("{POPUP_PREFIX}{state}");
     if cookies(headers, STATE).any(|cookie| same_secret(cookie, &popup_cookie)) {
-        return popup_handoff(frame, code, state);
+        return popup_handoff(code, state);
     }
     if !cookies(headers, STATE).any(|cookie| same_secret(cookie, state)) {
         return expired();
@@ -300,6 +306,7 @@ pub async fn callback(
     let back = return_path(params.get("return").map(String::as_str));
     let mut response = redirect(StatusCode::SEE_OTHER, &back, frame);
     let out = response.headers_mut();
+    policy::no_referrer(out);
     out.append(SET_COOKIE, cookie);
     clear_state(out);
     response
@@ -309,6 +316,7 @@ pub async fn callback(
 pub fn logout(visit: &Visit) -> Response {
     let mut response = redirect(StatusCode::SEE_OTHER, "/", visit.frame());
     let out = response.headers_mut();
+    policy::no_referrer(out);
     for (name, site) in [
         (VISITOR, Site::Lax),
         (VISITOR, Site::Framed),

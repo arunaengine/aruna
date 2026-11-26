@@ -10,5 +10,6 @@
     { type: "aruna:auth", code, state },
     window.location.origin,
   );
+  window.history.replaceState(null, "", window.location.pathname);
   window.close();
 })();

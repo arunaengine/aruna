@@ -65,6 +65,14 @@ pub fn allow_opener(headers: &mut HeaderMap) {
     );
 }
 
+/// Drops the `Referer` header on auth and preview redirects carrying codes or state tokens.
+pub fn no_referrer(headers: &mut HeaderMap) {
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+}
+
 /// `text` when it is exactly a web origin, so it cannot widen or break the policy.
 pub fn origin(text: &str) -> Option<&str> {
     let parsed = url::Url::parse(text).ok()?;

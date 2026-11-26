@@ -83,7 +83,7 @@ impl HostCache {
 /// The host of a `Host` header in lowercase without its port, or `None` when it is no DNS name.
 pub fn normalize(raw: &str) -> Option<String> {
     let host = match raw.rsplit_once(':') {
-        Some((name, port)) if port.bytes().all(|b| b.is_ascii_digit()) => name,
+        Some((name, port)) if !port.is_empty() && port.parse::<u16>().is_ok() => name,
         _ => raw,
     };
     let host = host.trim_end_matches('.').to_ascii_lowercase();
@@ -177,6 +177,8 @@ mod tests {
             Some("bakta.apps.test")
         );
         assert!(normalize("").is_none());
+        assert!(normalize("bakta.apps.test:").is_none());
+        assert!(normalize("bakta.apps.test:99999").is_none());
         assert!(normalize("bad host").is_none());
         assert!(normalize("a..b").is_none());
         assert!(normalize("evil/../x").is_none());

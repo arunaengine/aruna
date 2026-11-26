@@ -119,6 +119,7 @@ pub fn select(gateway: &Gateway, visit: &Visit, query: Option<&str>) -> Response
         return bare(StatusCode::INTERNAL_SERVER_ERROR, frame);
     };
     let mut response = redirect(StatusCode::SEE_OTHER, "/", frame);
+    policy::no_referrer(response.headers_mut());
     response.headers_mut().append(SET_COOKIE, cookie);
     response
 }

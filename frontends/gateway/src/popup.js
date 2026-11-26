@@ -8,8 +8,9 @@
   const button = document.getElementById("aruna-signin");
   if (!popupUrl || !state || !button) return;
   const back = returnPath || "/";
+  let popup = null;
   window.addEventListener("message", (event) => {
-    if (event.origin !== window.location.origin) return;
+    if (event.origin !== window.location.origin || event.source !== popup) return;
     const data = event.data;
     if (!data || data.type !== "aruna:auth") return;
     if (data.state !== state || typeof data.code !== "string") return;
@@ -17,6 +18,6 @@
     window.location.replace(`/_aruna/auth/callback?${query.toString()}`);
   });
   button.addEventListener("click", () => {
-    window.open(popupUrl, "aruna-signin", "width=520,height=680");
+    popup = window.open(popupUrl, "aruna-signin", "width=520,height=680");
   });
 })();

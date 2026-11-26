@@ -181,12 +181,14 @@ pub fn framed(headers: &HeaderMap) -> bool {
         .is_some_and(|dest| dest == "iframe")
 }
 
-/// `raw` when it is a path on this host, else the applet root; it never leaves the host.
+/// `raw` when it is a path on this host, else the applet root; it never leaves the host or
+/// re-enters gateway auth, preview or edge routes.
 pub fn return_path(raw: Option<&str>) -> String {
     match raw {
         Some(path)
             if path.starts_with('/')
                 && !path.starts_with("//")
+                && !reserved_path(path)
                 && path.len() <= 2048
                 && path.bytes().all(|b| b.is_ascii_graphic() && b != b'\\') =>
         {
@@ -194,6 +196,14 @@ pub fn return_path(raw: Option<&str>) -> String {
         }
         _ => "/".to_string(),
     }
+}
+
+fn reserved_path(path: &str) -> bool {
+    let base = path.split(['?', '#']).next().unwrap_or(path);
+    base == "/_aruna"
+        || base.starts_with("/_aruna/")
+        || base == "/_edge"
+        || base.starts_with("/_edge/")
 }
 
 /// Compares two secrets without stopping at the first difference.
@@ -285,6 +295,9 @@ mod tests {
             "https://evil.test",
             "runs",
             "/a b",
+            "/_aruna/auth/logout",
+            "/_aruna/preview/select?version=1",
+            "/_edge/tls-check?domain=x",
             "",
         ] {
             assert_eq!(
