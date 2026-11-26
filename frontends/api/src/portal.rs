@@ -957,6 +957,7 @@ mod tests {
                 policy.contains("script-src 'self' 'wasm-unsafe-eval'"),
                 "{path}: {policy}"
             );
+            assert!(policy.contains("frame-src blob:;"), "{path}: {policy}");
             assert!(
                 policy.contains("frame-ancestors 'none'"),
                 "{path}: {policy}"
@@ -973,6 +974,7 @@ mod tests {
             );
         }
         let response = router
+            .clone()
             .oneshot(request(Method::GET, "/federation/login"))
             .await
             .unwrap();
@@ -982,6 +984,72 @@ mod tests {
                 .get("cross-origin-opener-policy")
                 .unwrap(),
             "unsafe-none"
+        );
+        let signin = router
+            .oneshot(request(Method::GET, "/applets/signin"))
+            .await
+            .unwrap();
+        assert_eq!(
+            signin.headers().get("cross-origin-opener-policy").unwrap(),
+            "unsafe-none"
+        );
+    }
+
+    #[tokio::test]
+    async fn portal_applet_headers() {
+        let tempdir = tempdir().unwrap();
+        let portal_dir = tempdir.path().join("portal");
+        std::fs::create_dir_all(&portal_dir).unwrap();
+        std::fs::write(portal_dir.join("index.html"), "<html>portal</html>").unwrap();
+        let (base, _state_dir) = setup_state().await;
+        let hosting = aruna_core::applet::settings::HostingSettings {
+            applet_domain: "apps.example.net".into(),
+            edge_key_sha256: [1; 32],
+            custom_domains: true,
+            guests: false,
+            embedding: false,
+            max_origins: 8,
+            portal_origin: Some("https://portal.example.org".into()),
+            protected_hosts: Vec::new(),
+        };
+        let state = Arc::new(
+            ServerState::new(
+                base.get_ctx(),
+                base.get_realm_id(),
+                base.get_node_id(),
+                NodeCapabilities::user_node(base.get_realm_id()).unwrap(),
+                false,
+                None,
+                aruna_runner::jobs::runtime::JobsRuntime::new(),
+            )
+            .await
+            .with_applets(aruna_core::applet::settings::AppletSettings {
+                hosting: Some(hosting),
+                building: None,
+            }),
+        );
+        enable_portal(&state, &portal_dir).await;
+        let router = super::router(
+            state,
+            PortalConfig {
+                api_public_url: TEST_API_URL.to_string(),
+                csp: PortalCspConfig::new(Vec::new()),
+                registry_url: None,
+                login: None,
+                landing: true,
+                legal: Vec::new(),
+            },
+        );
+        let response = router.oneshot(request(Method::GET, "/")).await.unwrap();
+        let policy = response
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            policy.contains("frame-src blob: https://*.apps.example.net;"),
+            "{policy}"
         );
     }
 

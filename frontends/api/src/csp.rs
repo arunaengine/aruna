@@ -37,6 +37,8 @@ const OIDC_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const ORIGIN_OPENER_POLICY: HeaderName = HeaderName::from_static("cross-origin-opener-policy");
 /// Portal paths of the federation popup pages a realm portal opens at the home realm.
 pub(crate) const FEDERATION_POPUP_PREFIX: &str = "/federation/";
+/// Portal sign-in confirmation route opened in a pop-up by embedded applets.
+pub(crate) const APPLET_SIGNIN_PATH: &str = "/applets/signin";
 
 /// Extra origins the portal document may connect to, on top of this node's own
 /// REST origin, its S3 interface and the realm's OIDC providers. Needed when a
@@ -74,6 +76,7 @@ impl PortalCspConfig {
 struct ResolvedOrigins {
     connect: BTreeSet<String>,
     img: BTreeSet<String>,
+    frame: BTreeSet<String>,
 }
 
 #[derive(Default)]
@@ -122,9 +125,14 @@ impl PortalSecurity {
         connect.extend(api.iter().cloned());
         connect.extend(self.oidc_origins().await);
         connect.extend(self.config.extra_connect_origins.iter().cloned());
+        let mut frame = BTreeSet::new();
+        if let Some(hosting) = self.state.applet_settings().hosting.as_ref() {
+            frame.insert(format!("https://*.{}", hosting.applet_domain));
+        }
         ResolvedOrigins {
             connect,
             img: s3.into_iter().chain(api).collect(),
+            frame,
         }
     }
 
@@ -237,8 +245,9 @@ pub(crate) async fn portal_security_headers(
         }
     };
 
-    // Portal pages keep the link to federation popups they open; the popup pages keep their opener.
-    let opener_policy = if request.uri().path().starts_with(FEDERATION_POPUP_PREFIX) {
+    // Portal pages keep links to popups they open; federation and applet sign-in popups keep theirs.
+    let path = request.uri().path();
+    let opener_policy = if path.starts_with(FEDERATION_POPUP_PREFIX) || path == APPLET_SIGNIN_PATH {
         "unsafe-none"
     } else {
         "same-origin-allow-popups"
@@ -286,14 +295,14 @@ fn content_security_policy(origins: &ResolvedOrigins) -> String {
         &origins.connect,
     );
     let img_src = directive("img-src 'self' data: blob:", &origins.img);
+    let frame_src = directive("frame-src blob:", &origins.frame);
 
     [
         "default-src 'self'",
         "base-uri 'self'",
         "object-src 'none'",
-        // blob: frames are page-created (inline PDF viewing); external frames
-        // stay blocked.
-        "frame-src blob:",
+        // blob: frames for inline PDF viewing plus this node's applet preview domain when hosted.
+        &frame_src,
         "frame-ancestors 'none'",
         "form-action 'self'",
         "script-src 'self' 'wasm-unsafe-eval'",
@@ -365,11 +374,13 @@ mod tests {
         LOCAL_MODEL_ORIGINS, NPM_ORIGIN, PYPI_ORIGIN, PortalCspConfig, ResolvedOrigins,
         content_security_policy, normalize_origin,
     };
+    use std::collections::BTreeSet;
 
     fn origins(connect: &[&str], img: &[&str]) -> ResolvedOrigins {
         ResolvedOrigins {
             connect: connect.iter().map(|s| s.to_string()).collect(),
             img: img.iter().map(|s| s.to_string()).collect(),
+            frame: BTreeSet::new(),
         }
     }
 
@@ -477,5 +488,17 @@ mod tests {
         let policy = content_security_policy(&origins(&["https://s3.test"], &["https://s3.test"]));
 
         assert!(policy.contains("img-src 'self' data: blob: https://s3.test"));
+    }
+
+    #[test]
+    fn allows_applet_frames() {
+        let default = content_security_policy(&ResolvedOrigins::default());
+        assert!(default.contains("frame-src blob:;"));
+        let mut hosted = ResolvedOrigins::default();
+        hosted
+            .frame
+            .insert("https://*.apps.example.net".to_string());
+        let policy = content_security_policy(&hosted);
+        assert!(policy.contains("frame-src blob: https://*.apps.example.net;"));
     }
 }
