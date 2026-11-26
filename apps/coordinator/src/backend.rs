@@ -3,7 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use aruna_workflow_contract::host::{
     DirectInput, DirectoryFile, ExpectedOutput, SecretPlaceholder, StagedFile, StartTask,
@@ -30,6 +32,9 @@ pub const HOME_FOLDER: &str = "/uwe/home";
 /// The scheme of the addresses that inputs only the coordinator held are uploaded to.
 pub const STAGING_SCHEME: &str = "aruna-staging://";
 
+/// Downloaded task output files keyed by `(size, sha256)` for zero-upload delivery.
+pub type FetchedFiles = Arc<Mutex<HashMap<(u64, [u8; 32]), String>>>;
+
 pub struct CoordinatorBackend {
     rpc: RpcClient,
     run: String,
@@ -37,6 +42,7 @@ pub struct CoordinatorBackend {
     scratch: PathBuf,
     steps: Vec<StepMatch>,
     secrets: Vec<SecretPlaceholder>,
+    fetched: FetchedFiles,
 }
 
 /// The parts of an attempt name, `<run>-<step>-<task>-<attempt>`.
@@ -61,7 +67,18 @@ impl CoordinatorBackend {
             scratch,
             steps,
             secrets,
+            fetched: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Shared map of downloaded task output content hashes to their remote addresses.
+    pub fn fetched_files(&self) -> FetchedFiles {
+        Arc::clone(&self.fetched)
+    }
+
+    fn note_fetched(&self, done: &storage::Downloaded, address: &str) {
+        let mut guard = self.fetched.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.insert((done.size, done.sha256), address.to_owned());
     }
 
     async fn run_attempt(
@@ -316,11 +333,12 @@ impl CoordinatorBackend {
         if let Some(parent) = local.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        storage::download_file(&self.rpc, &output.address, &local)
+        let done = storage::download_hashed(&self.rpc, &output.address, &local)
             .await
             .map_err(|error| {
                 engine_error(format!("cannot read output {}: {error}", output.path))
             })?;
+        self.note_fetched(&done, &output.address);
         Ok(())
     }
 
@@ -344,11 +362,12 @@ impl CoordinatorBackend {
             if let Some(parent) = child.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            storage::download_file(&self.rpc, &entry.address, &child)
+            let done = storage::download_hashed(&self.rpc, &entry.address, &child)
                 .await
                 .map_err(|error| {
                     engine_error(format!("cannot read output {}: {error}", entry.path))
                 })?;
+            self.note_fetched(&done, &entry.address);
         }
         Ok(())
     }
@@ -375,9 +394,10 @@ impl CoordinatorBackend {
                 if entry.directory {
                     pending.push((child, path));
                 } else {
-                    storage::download_file(&self.rpc, &child, &path)
+                    let done = storage::download_hashed(&self.rpc, &child, &path)
                         .await
                         .map_err(|error| engine_error(error.to_string()))?;
+                    self.note_fetched(&done, &child);
                 }
             }
         }

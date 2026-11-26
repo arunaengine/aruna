@@ -169,6 +169,8 @@ pub struct MockNode {
     pub cancelled: Vec<String>,
     pub stopped_runs: Vec<String>,
     pub pinned: Vec<String>,
+    pub delivered: Vec<(String, String)>,
+    pub fail_delivery: Option<String>,
     pub events: Vec<LiveWorkflowEvent>,
     pub event_seqs: Vec<u64>,
 }
@@ -184,6 +186,8 @@ impl MockNode {
             cancelled: Vec::new(),
             stopped_runs: Vec::new(),
             pinned: Vec::new(),
+            delivered: Vec::new(),
+            fail_delivery: None,
             events: Vec::new(),
             event_seqs: Vec::new(),
         }
@@ -304,9 +308,20 @@ impl MockNode {
                     message: "no paged remote directory in mock host".into(),
                 })
             }
-            HostRpcRequest::DeliverOutput { target_path, .. } => HostRpcResult::Delivered {
-                location: target_path,
-            },
+            HostRpcRequest::DeliverOutput {
+                source_ref,
+                target_path,
+            } => {
+                if let Some(reason) = &self.fail_delivery {
+                    return Some(HostRpcResult::Failed(ContractError::Denied {
+                        message: reason.clone(),
+                    }));
+                }
+                self.delivered.push((source_ref, target_path.clone()));
+                HostRpcResult::Delivered {
+                    location: format!("aruna://delivered/{target_path}"),
+                }
+            }
             HostRpcRequest::RunLogBegin { run_start_json } => {
                 self.log.push(RunLogEntry::Begin { run_start_json });
                 HostRpcResult::RunLogAck { seq: 0 }

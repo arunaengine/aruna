@@ -270,4 +270,37 @@ async fn isolates_step_network() {
         "isolated run keeps default steps offline"
     );
     assert!(second.network_allowed, "step opting into network gets it");
+    let targets: Vec<&str> = node
+        .delivered
+        .iter()
+        .map(|(_, path)| path.as_str())
+        .collect();
+    assert!(
+        targets.iter().any(|path| path.ends_with("shouted.txt")),
+        "declared workflow outputs are delivered through host: {targets:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delivers_declared_outputs() {
+    let node = finished_run("run-deliver", composed_start(COMPOSED), input_node()).await;
+    assert_eq!(node.delivered.len(), 1, "{:?}", node.delivered);
+    assert_eq!(node.delivered[0].1, "shouted.txt");
+    assert!(
+        node.delivered[0].0.starts_with("aruna://object/"),
+        "task output is delivered by reference: {:?}",
+        node.delivered
+    );
+
+    let (mut host, _) = FakeHost::greeted(CoordinatorMode::Run, "run-deliver-fail").await;
+    let mut failing = input_node();
+    failing.fail_delivery = Some("output bucket denied".into());
+    host.send(&HostToCoordinator::RunStart(composed_start(COMPOSED)))
+        .await;
+    let finished = drive_run(&mut host, &mut failing, None).await;
+    assert!(!finished.success, "delivery refusal fails the run");
+    let error = finished.error.unwrap_or_default();
+    assert!(error.contains("output bucket denied"), "{error}");
+    assert!(host.receive().await.is_none());
+    host.finished().await.expect("a clean end");
 }
