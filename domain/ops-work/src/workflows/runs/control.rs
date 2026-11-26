@@ -180,9 +180,10 @@ impl FollowRunOperation {
             if source.node_id != self.node.0 {
                 pin.source_node_id.get_or_insert(source.node_id);
             }
-            if pin.source_node_id.is_some_and(|node| node != self.node.0) {
-                directory_pins.push(pin);
+            if pin.source_node_id == Some(self.node.0) {
+                pin.source_node_id = None;
             }
+            directory_pins.push(pin);
         }
         if !directory_pins.is_empty() {
             start = start.with_directories(directory_pins);

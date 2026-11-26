@@ -392,7 +392,21 @@ impl ReadDataOperation {
                 self.step = Some(ReadStep::Head(target, Box::new(info)));
                 Ok(Next::Call(IoCall::child(head)))
             }
-            DataCall::List { .. } => self.list(target, info, None),
+            DataCall::List { .. } => {
+                if !target.owned {
+                    let captured = remote::captured_entries(
+                        &self.run,
+                        self.node_id,
+                        self.node_id,
+                        &target.bucket,
+                        &target.key,
+                    );
+                    if !captured.is_empty() {
+                        return Ok(Next::Done(HostRpcResult::StorageList { entries: captured }));
+                    }
+                }
+                self.list(target, info, None)
+            }
             DataCall::Download { offset, .. } => {
                 let get = GetObjectOperation::new(GetObjectInput {
                     bucket: target.bucket.clone(),
@@ -465,7 +479,23 @@ impl ReadDataOperation {
                 HeadObjectError::NoSuchKey
                 | HeadObjectError::NoSuchVersion
                 | HeadObjectError::DeleteMarker,
-            ) if target.version.is_none() => self.list(target, info, None),
+            ) if target.version.is_none() => {
+                if !target.owned
+                    && !remote::captured_entries(
+                        &self.run,
+                        self.node_id,
+                        self.node_id,
+                        &target.bucket,
+                        &target.key,
+                    )
+                    .is_empty()
+                {
+                    return Ok(Next::Done(HostRpcResult::StorageStat {
+                        entry: Some(Self::folder_entry()),
+                    }));
+                }
+                self.list(target, info, None)
+            }
             Err(
                 HeadObjectError::NoSuchKey
                 | HeadObjectError::NoSuchVersion

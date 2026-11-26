@@ -238,6 +238,7 @@ enum AdmitStep {
     Existing(Box<VersionView>, [u8; 32]),
     Inputs(Box<VersionView>),
     Head(Box<VersionView>, String, String),
+    DirVersion(Box<VersionView>, String, String, Ulid),
     DirBucket(Box<VersionView>, String, String),
     DirList(Box<(VersionView, DirScan)>),
     DirAuth(Box<(VersionView, DirScan)>),
@@ -264,7 +265,9 @@ pub struct StartRunOperation {
     value_heads: Vec<(String, String)>,
     value_dirs: Vec<(String, String)>,
     value_versions: BTreeMap<(String, String), Ulid>,
+    retained_pins: Vec<(String, String, Ulid)>,
     directory_pins: Vec<DirectoryPin>,
+    dir_limit: usize,
     resolved_values: Value,
     pub(super) remote: BTreeMap<NodeId, Vec<(PinnedInput, InputSelection)>>,
     asked: Vec<PinnedInput>,
@@ -310,7 +313,9 @@ impl StartRunOperation {
             value_heads,
             value_dirs,
             value_versions: BTreeMap::new(),
+            retained_pins: Vec::new(),
             directory_pins: Vec::new(),
+            dir_limit: MAX_DIR_PINS,
             resolved_values,
             request,
             lineage: Lineage::default(),
@@ -330,9 +335,29 @@ impl StartRunOperation {
         self
     }
 
-    /// Carries versioned directory entries from an earlier run in the lineage for cross-node resume.
+    /// Carries versioned directory entries from an earlier run in the lineage, rechecking access
+    /// and exact-version existence for any entries held on this node.
     pub fn with_directories(mut self, pins: Vec<DirectoryPin>) -> Self {
+        for pin in &pins {
+            if pin.source_node_id.is_none() {
+                self.pending.push(PinnedInput {
+                    name: String::new(),
+                    bucket: pin.bucket.clone(),
+                    key: pin.key.clone(),
+                    version_id: pin.version_id,
+                    source_node_id: None,
+                });
+                self.retained_pins
+                    .push((pin.bucket.clone(), pin.key.clone(), pin.version_id));
+            }
+        }
         self.directory_pins = pins;
+        self
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_dir_limit(mut self, limit: usize) -> Self {
+        self.dir_limit = limit;
         self
     }
 
@@ -404,14 +429,40 @@ impl StartRunOperation {
         if !self.value_versions.is_empty() {
             pin_versions(&mut self.resolved_values, self.node.0, &self.value_versions);
         }
+        self.next_retained(view)
+    }
+
+    /// Verifies each retained local directory pin still exists at its exact version.
+    fn next_retained(&mut self, view: VersionView) -> AdmitNext {
+        if let Some((bucket, key, version_id)) = self.retained_pins.pop() {
+            let head = HeadObjectOperation::new(HeadObjectInput {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: Some(version_id),
+            });
+            self.step = AdmitStep::DirVersion(Box::new(view), bucket, key, version_id);
+            return Ok(Next::Call(IoCall::child(head)));
+        }
         self.next_dir(view)
     }
 
     /// Captures authorized versioned file entries below each local directory-valued parameter.
     fn next_dir(&mut self, view: VersionView) -> AdmitNext {
-        if self.directory_pins.len() < MAX_DIR_PINS
-            && let Some((bucket, key)) = self.value_dirs.pop()
-        {
+        let keep = self.lineage.resumes.is_some() || self.lineage.repeats.is_some();
+        while let Some((bucket, key)) = self.value_dirs.pop() {
+            let prefix = match key.is_empty() || key.ends_with('/') {
+                true => key.clone(),
+                false => format!("{key}/"),
+            };
+            let retained = keep
+                && self.directory_pins.iter().any(|pin| {
+                    pin.source_node_id.is_none()
+                        && pin.bucket == bucket
+                        && pin.key.starts_with(&prefix)
+                });
+            if retained {
+                continue;
+            }
             let access = ObjectAccessOperation::new(
                 &self.auth,
                 self.node.0,
@@ -451,9 +502,7 @@ impl StartRunOperation {
     }
 
     fn next_dir_auth(&mut self, view: VersionView, mut scan: DirScan) -> AdmitNext {
-        if self.directory_pins.len() < MAX_DIR_PINS
-            && let Some((key, version_id)) = scan.pending.pop_front()
-        {
+        if let Some((key, version_id)) = scan.pending.pop_front() {
             let path = object_permission_path(
                 self.auth.realm_id,
                 scan.group_id,
@@ -472,7 +521,7 @@ impl StartRunOperation {
             self.step = AdmitStep::DirAuth(Box::new((view, scan)));
             return Ok(Next::Call(IoCall::child(check)));
         }
-        if self.directory_pins.len() < MAX_DIR_PINS && scan.next_token.is_some() {
+        if scan.next_token.is_some() {
             return self.list_dir(view, scan);
         }
         self.next_dir(view)
@@ -872,6 +921,19 @@ impl Operation for StartRunOperation {
                 }
                 self.next_head(*view)
             }
+            AdmitStep::DirVersion(view, bucket, key, version_id) => {
+                match result.child::<HeadObjectResult, HeadObjectError>()? {
+                    Ok(_) => self.next_retained(*view),
+                    Err(
+                        HeadObjectError::NoSuchKey
+                        | HeadObjectError::NoSuchVersion
+                        | HeadObjectError::DeleteMarker,
+                    ) => Err(CatalogError::Invalid(format!(
+                        "pinned directory object {bucket}/{key} version {version_id} is unavailable"
+                    ))),
+                    Err(error) => Err(CatalogError::Storage(error.to_string())),
+                }
+            }
             AdmitStep::DirBucket(view, bucket, key) => match super::data::bucket_answer(result) {
                 Ok(info) => {
                     let prefix = match key.is_empty() || key.ends_with('/') {
@@ -914,6 +976,12 @@ impl Operation for StartRunOperation {
                                     && pin.key == key
                             })
                         {
+                            if self.directory_pins.len() >= self.dir_limit {
+                                return Err(CatalogError::Invalid(format!(
+                                    "directory inputs exceed the maximum of {} captured files",
+                                    self.dir_limit
+                                )));
+                            }
                             self.directory_pins.push(DirectoryPin {
                                 bucket: scan.bucket.clone(),
                                 key,

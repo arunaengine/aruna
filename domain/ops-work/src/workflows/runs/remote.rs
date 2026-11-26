@@ -27,25 +27,35 @@ use super::creator_auth;
 use super::data::{DataCall, Target};
 use crate::workflows::CatalogError;
 
-/// Rewrites a precaptured link or captured directory child to its resolved versioned object so
-/// coordinator reads and task staging work both remotely and after cross-node resume.
-pub fn resolve_precaptured(run: &WorkflowRunRecord, mut target: Target, local: NodeId) -> Target {
-    let holder = target.node.unwrap_or(local);
+/// Attaches the admitted version for an unversioned directory child while keeping the original
+/// pin identity so child grant lookup still matches precaptured links.
+pub fn pin_directory_child(run: &WorkflowRunRecord, mut target: Target, local: NodeId) -> Target {
     if target.version.is_none() {
-        if let Some(entry) = run.captured_remote.iter().find(|entry| {
-            entry.pin_node_id == holder
-                && entry.pin_bucket == target.bucket
-                && entry.pin_key == target.key
-        }) {
-            target.version = Some(entry.pin_version_id);
-        } else if let Some(pin) = run.directory_pins.iter().find(|pin| {
+        let holder = target.node.unwrap_or(local);
+        if let Some(pin) = run.directory_pins.iter().find(|pin| {
             pin.source_node_id.unwrap_or(local) == holder
                 && pin.bucket == target.bucket
                 && pin.key == target.key
         }) {
             target.version = Some(pin.version_id);
-            return target;
         }
+    }
+    target
+}
+
+/// Rewrites a precaptured link or captured directory child to its resolved versioned object so
+/// coordinator reads work both locally and after cross-node resume.
+pub fn resolve_precaptured(run: &WorkflowRunRecord, target: Target, local: NodeId) -> Target {
+    let mut target = pin_directory_child(run, target, local);
+    let holder = target.node.unwrap_or(local);
+    if target.version.is_none()
+        && let Some(entry) = run.captured_remote.iter().find(|entry| {
+            entry.pin_node_id == holder
+                && entry.pin_bucket == target.bucket
+                && entry.pin_key == target.key
+        })
+    {
+        target.version = Some(entry.pin_version_id);
     }
     let Some(version) = target.version else {
         return target;
@@ -76,11 +86,12 @@ pub fn resolve_precaptured(run: &WorkflowRunRecord, mut target: Target, local: N
     target
 }
 
-/// Immediate directory entries captured for `(node, bucket, prefix)` from precaptured inputs or
-/// admitted directory pins, enabling cross-node resume of directory-valued parameters.
-fn captured_entries(
+/// Immediate directory entries captured for `(holder, bucket, key)` from admitted directory pins,
+/// keeping directory membership fixed across local and cross-node resumes.
+pub(super) fn captured_entries(
     run: &WorkflowRunRecord,
-    node: NodeId,
+    local: NodeId,
+    holder: NodeId,
     bucket: &str,
     key: &str,
 ) -> Vec<ListEntry> {
@@ -89,12 +100,15 @@ fn captured_entries(
         false => format!("{key}/"),
     };
     let mut entries: BTreeMap<String, bool> = BTreeMap::new();
-    let mut note = |full_key: &str| {
-        let Some(rest) = full_key.strip_prefix(&prefix) else {
-            return;
+    for pin in &run.directory_pins {
+        if pin.source_node_id.unwrap_or(local) != holder || pin.bucket != bucket {
+            continue;
+        }
+        let Some(rest) = pin.key.strip_prefix(&prefix) else {
+            continue;
         };
         if rest.is_empty() {
-            return;
+            continue;
         }
         match rest.split_once('/') {
             Some((dir, _)) if !dir.is_empty() => {
@@ -104,16 +118,6 @@ fn captured_entries(
                 entries.entry(rest.to_owned()).or_insert(false);
             }
             _ => {}
-        }
-    };
-    for entry in &run.captured_remote {
-        if entry.pin_node_id == node && entry.pin_bucket == bucket {
-            note(&entry.pin_key);
-        }
-    }
-    for pin in &run.directory_pins {
-        if pin.source_node_id == Some(node) && pin.bucket == bucket {
-            note(&pin.key);
         }
     }
     entries
@@ -253,8 +257,13 @@ impl Operation for RemoteReadOperation {
 
     fn first(&mut self) -> RemoteNext {
         if matches!(self.call, DataCall::List { .. }) {
-            let entries =
-                captured_entries(&self.run, self.node, &self.target.bucket, &self.target.key);
+            let entries = captured_entries(
+                &self.run,
+                self.run.node_id,
+                self.node,
+                &self.target.bucket,
+                &self.target.key,
+            );
             if !entries.is_empty() {
                 return Ok(Next::Done(HostRpcResult::StorageList { entries }));
             }
@@ -264,8 +273,13 @@ impl Operation for RemoteReadOperation {
             )));
         }
         if matches!(self.call, DataCall::Stat { .. }) && self.target.version.is_none() {
-            let entries =
-                captured_entries(&self.run, self.node, &self.target.bucket, &self.target.key);
+            let entries = captured_entries(
+                &self.run,
+                self.run.node_id,
+                self.node,
+                &self.target.bucket,
+                &self.target.key,
+            );
             if !entries.is_empty() {
                 return Ok(Next::Done(HostRpcResult::StorageStat {
                     entry: Some(StorageEntry {
@@ -438,5 +452,131 @@ mod tests {
         assert_eq!(resolved_local.key, "real.dat");
         assert_eq!(resolved_local.version, Some(target_ver));
         assert!(!resolved_local.owned);
+    }
+
+    // An unversioned directory child resolves via `directory_pins` before an earlier explicit pin.
+    #[test]
+    fn prefers_directory_pin() {
+        use aruna_core::structs::execution::workflow_run::DirectoryPin;
+        let old_ver = Ulid::from_parts(2, 1);
+        let new_ver = Ulid::from_parts(4, 1);
+        let target_ver = Ulid::from_parts(5, 1);
+        let old_sel = InputSelection {
+            source: InputSource::S3 {
+                bucket: "data".into(),
+                key: "dir/a.txt".into(),
+                version_id: Some(old_ver.to_string()),
+            },
+            source_node_id: Some(node(2)),
+            dest_key: "data/dir/a.txt".into(),
+            mode: InputMode::Snapshot,
+            container_path: None,
+            name: None,
+            description: None,
+        };
+        let new_sel = InputSelection {
+            source: InputSource::S3 {
+                bucket: "data".into(),
+                key: "dir/real.txt".into(),
+                version_id: Some(target_ver.to_string()),
+            },
+            source_node_id: Some(node(2)),
+            dest_key: "data/dir/a.txt".into(),
+            mode: InputMode::Snapshot,
+            container_path: None,
+            name: None,
+            description: None,
+        };
+        let mut old_cap = captured_input(&old_sel, node(2));
+        old_cap.version_id = old_ver;
+        let mut new_cap = captured_input(&new_sel, node(2));
+        new_cap.version_id = target_ver;
+        let run = WorkflowRunRecord {
+            run_id: Ulid::from_parts(1, 1),
+            lineage: Ulid::from_parts(1, 1),
+            group_id: aruna_core::types::GroupId::from_bytes([1; 16]),
+            workflow_id: Ulid::from_parts(1, 2),
+            workflow_name: "demo".into(),
+            version: 1,
+            realm_id: REALM,
+            node_id: node(1),
+            local_only: false,
+            last_event_seq: 0,
+            state: RunState::Running,
+            created_by: user(),
+            created_at_ms: 1,
+            started_at_ms: None,
+            finished_at_ms: None,
+            error: None,
+            values_json: "{}".into(),
+            inputs_json: None,
+            output: None,
+            provenance_crate: false,
+            provenance_status: None,
+            provenance_document_id: None,
+            outputs: Vec::new(),
+            origin: None,
+            parent_job_id: None,
+            claim_token_digest: None,
+            attempts: 1,
+            steps: Vec::new(),
+            resumes_run_id: None,
+            repeats_run_id: None,
+            cache_scope: CacheScope::Group,
+            placement_site: None,
+            protected: false,
+            secrets: Default::default(),
+            path_restrictions: None,
+            captured_remote: vec![
+                PrecapturedInput {
+                    pin_node_id: node(2),
+                    pin_bucket: "data".into(),
+                    pin_key: "dir/a.txt".into(),
+                    pin_version_id: old_ver,
+                    resolved: old_sel,
+                    captured: old_cap,
+                },
+                PrecapturedInput {
+                    pin_node_id: node(2),
+                    pin_bucket: "data".into(),
+                    pin_key: "dir/a.txt".into(),
+                    pin_version_id: new_ver,
+                    resolved: new_sel,
+                    captured: new_cap,
+                },
+            ],
+            directory_pins: vec![DirectoryPin {
+                bucket: "data".into(),
+                key: "dir/a.txt".into(),
+                version_id: new_ver,
+                source_node_id: Some(node(2)),
+            }],
+            used_tools: Vec::new(),
+        };
+        let child = Target {
+            bucket: "data".into(),
+            key: "dir/a.txt".into(),
+            version: None,
+            owned: false,
+            node: Some(node(2)),
+        };
+        let pinned = pin_directory_child(&run, child.clone(), node(1));
+        assert_eq!(pinned.key, "dir/a.txt");
+        assert_eq!(pinned.version, Some(new_ver));
+
+        let resolved = resolve_precaptured(&run, child, node(1));
+        assert_eq!(resolved.key, "dir/real.txt");
+        assert_eq!(resolved.version, Some(target_ver));
+
+        let explicit = Target {
+            bucket: "data".into(),
+            key: "dir/a.txt".into(),
+            version: Some(old_ver),
+            owned: false,
+            node: Some(node(2)),
+        };
+        let explicit_res = resolve_precaptured(&run, explicit, node(1));
+        assert_eq!(explicit_res.key, "dir/a.txt");
+        assert_eq!(explicit_res.version, Some(old_ver));
     }
 }
