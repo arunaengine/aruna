@@ -10,6 +10,7 @@ use std::time::{Duration, SystemTime};
 use aruna_workflow_contract::host::StorageEntry;
 use aruna_workflow_contract::{ContractError, DATA_CHUNK_BYTES, HostRpcRequest, HostRpcResult};
 use executor::BoxFuture;
+use sha2::{Digest as _, Sha256};
 use storage::{Details, DirectRef, Entry, Metadata, StorageError, StorageProvider, UploadReceipt};
 
 use crate::protocol::RpcClient;
@@ -147,17 +148,70 @@ fn details(address: &str, entry: StorageEntry) -> Details {
     }
 }
 
+/// Pins an unversioned `aruna://` or `s3://` address to `version` for later chunks.
+fn pin_version(address: &str, version: &str) -> String {
+    if !served(address) || version.is_empty() || version.contains(['&', '?', '#']) {
+        return address.to_owned();
+    }
+    let Some((_, query)) = address.split_once('?') else {
+        return format!("{address}?version={version}");
+    };
+    let pinned = query.split('&').any(|pair| {
+        pair.split_once('=')
+            .is_some_and(|(key, _)| key == "version")
+    });
+    match pinned {
+        true => address.to_owned(),
+        false if query.is_empty() => format!("{address}version={version}"),
+        false => format!("{address}&version={version}"),
+    }
+}
+
+/// Metadata collected while streaming a file down from the host.
+pub struct Downloaded {
+    pub version: Option<String>,
+    pub size: u64,
+    pub sha256: [u8; 32],
+}
+
 /// Reads a file of the host into `target` chunk by chunk, and gives its version.
 pub async fn download_file(
     rpc: &RpcClient,
     address: &str,
     target: &Path,
 ) -> Result<Option<String>, ContractError> {
+    download_hashed(rpc, address, target)
+        .await
+        .map(|done| done.version)
+}
+
+/// Reads a file of the host into `target` chunk by chunk, returning its version, size and SHA-256.
+pub async fn download_hashed(
+    rpc: &RpcClient,
+    address: &str,
+    target: &Path,
+) -> Result<Downloaded, ContractError> {
     let mut file = std::fs::File::create(target).map_err(local_error)?;
+    let result = download_chunks(rpc, address, &mut file).await;
+    if result.is_err() {
+        drop(file);
+        let _ = std::fs::remove_file(target);
+    }
+    result
+}
+
+async fn download_chunks(
+    rpc: &RpcClient,
+    address: &str,
+    file: &mut std::fs::File,
+) -> Result<Downloaded, ContractError> {
     let mut offset = 0u64;
+    let mut pinned: Option<String> = None;
+    let mut current = address.to_owned();
+    let mut hasher = Sha256::new();
     loop {
         let request = HostRpcRequest::StorageDownload {
-            address: address.to_owned(),
+            address: current.clone(),
             offset,
         };
         let (bytes, eof, version) = match rpc.call(request).await? {
@@ -178,11 +232,26 @@ pub async fn download_file(
                 bytes.len()
             )));
         }
+        if offset == 0 {
+            if let Some(ref ver) = version {
+                pinned = Some(ver.clone());
+                current = pin_version(address, ver);
+            }
+        } else if pinned.is_some() && version != pinned {
+            return Err(ContractError::invalid(format!(
+                "object version of {address} changed during download"
+            )));
+        }
+        hasher.update(&bytes);
         file.write_all(&bytes).map_err(local_error)?;
         offset += bytes.len() as u64;
         if eof {
             file.flush().map_err(local_error)?;
-            return Ok(version);
+            return Ok(Downloaded {
+                version: pinned.or(version),
+                size: offset,
+                sha256: hasher.finalize().into(),
+            });
         }
     }
 }
@@ -279,5 +348,154 @@ fn failed(action: &'static str, address: &str, error: ContractError) -> StorageE
             retryable: matches!(error, ContractError::Internal { .. }),
             message: error.to_string(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_workflow_contract::{
+        CoordinatorToHost, HostToCoordinator, decode_frame_len, decode_message, encode_message,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn pins_unversioned_addresses() {
+        assert_eq!(pin_version("s3://b/k", "v1"), "s3://b/k?version=v1");
+        assert_eq!(
+            pin_version("aruna://b/k?node=n1", "v1"),
+            "aruna://b/k?node=n1&version=v1"
+        );
+        assert_eq!(
+            pin_version("aruna://b/k?version=v0", "v1"),
+            "aruna://b/k?version=v0"
+        );
+        assert_eq!(
+            pin_version("aruna-staging://x/0", "v1"),
+            "aruna-staging://x/0"
+        );
+    }
+
+    async fn read_rpc(
+        reader: &mut tokio::io::ReadHalf<tokio::io::DuplexStream>,
+    ) -> (u64, HostRpcRequest) {
+        let mut prefix = [0u8; 4];
+        reader.read_exact(&mut prefix).await.unwrap();
+        let len = decode_frame_len(prefix).unwrap();
+        let mut body = vec![0u8; len];
+        reader.read_exact(&mut body).await.unwrap();
+        match decode_message(&body).unwrap() {
+            CoordinatorToHost::RpcRequest { call_id, request } => (call_id, request),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    async fn send_rpc(
+        writer: &mut tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        call_id: u64,
+        result: HostRpcResult,
+    ) {
+        let frame = encode_message(&HostToCoordinator::RpcResponse { call_id, result }).unwrap();
+        writer.write_all(&frame).await.unwrap();
+        writer.flush().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pins_multichunk_version() {
+        let (host, coord) = tokio::io::duplex(1 << 20);
+        let (coord_r, coord_w) = tokio::io::split(coord);
+        let (mut host_r, mut host_w) = tokio::io::split(host);
+        let (rpc, writer, mut inbound) = crate::protocol::start(coord_r, coord_w);
+        let pump = tokio::spawn({
+            let rpc = rpc.clone();
+            async move {
+                while let Some(crate::protocol::Inbound::Message(msg)) = inbound.recv().await {
+                    if let HostToCoordinator::RpcResponse { call_id, result } = *msg {
+                        rpc.answer(call_id, result);
+                    }
+                }
+            }
+        });
+        let server = tokio::spawn(async move {
+            let (id1, req1) = read_rpc(&mut host_r).await;
+            assert_eq!(
+                req1,
+                HostRpcRequest::StorageDownload {
+                    address: "s3://data/big.bin".into(),
+                    offset: 0,
+                }
+            );
+            send_rpc(
+                &mut host_w,
+                id1,
+                HostRpcResult::StorageChunk {
+                    bytes: b"hello ".to_vec(),
+                    eof: false,
+                    version: Some("v1".into()),
+                },
+            )
+            .await;
+            let (id2, req2) = read_rpc(&mut host_r).await;
+            assert_eq!(
+                req2,
+                HostRpcRequest::StorageDownload {
+                    address: "s3://data/big.bin?version=v1".into(),
+                    offset: 6,
+                }
+            );
+            send_rpc(
+                &mut host_w,
+                id2,
+                HostRpcResult::StorageChunk {
+                    bytes: b"world".to_vec(),
+                    eof: true,
+                    version: Some("v1".into()),
+                },
+            )
+            .await;
+            // Second download: host returns mismatched version on chunk 2.
+            let (id3, _) = read_rpc(&mut host_r).await;
+            send_rpc(
+                &mut host_w,
+                id3,
+                HostRpcResult::StorageChunk {
+                    bytes: b"part1".to_vec(),
+                    eof: false,
+                    version: Some("v1".into()),
+                },
+            )
+            .await;
+            let (id4, _) = read_rpc(&mut host_r).await;
+            send_rpc(
+                &mut host_w,
+                id4,
+                HostRpcResult::StorageChunk {
+                    bytes: b"part2".to_vec(),
+                    eof: true,
+                    version: Some("v2".into()),
+                },
+            )
+            .await;
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let ok_path = dir.path().join("ok.bin");
+        let version = download_file(&rpc, "s3://data/big.bin", &ok_path)
+            .await
+            .unwrap();
+        assert_eq!(version.as_deref(), Some("v1"));
+        assert_eq!(std::fs::read(&ok_path).unwrap(), b"hello world");
+
+        let bad_path = dir.path().join("bad.bin");
+        let err = download_file(&rpc, "s3://data/big.bin", &bad_path)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ContractError::Invalid { .. }), "{err:?}");
+        assert!(!bad_path.exists());
+
+        server.await.unwrap();
+        rpc.close_calls("done");
+        writer.close().await.unwrap();
+        pump.abort();
     }
 }

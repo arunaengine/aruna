@@ -31,6 +31,7 @@ wir = { git = "https://github.com/arunaengine/uwe-rs", rev = "a278b311c1bbc367d4
 workflow-graph = { git = "https://github.com/arunaengine/uwe-rs", rev = "a278b311c1bbc367d4b10381f95b025acf901764" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
+sha2 = "0.11.1"
 tempfile = "3.27.0"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
