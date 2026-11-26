@@ -55,18 +55,25 @@ pub fn intent_key(run_id: Ulid, ordinal: u32) -> Vec<u8> {
     key
 }
 
-/// Looks up the call's intent and writes it as pending when it is new. A pending intent found
-/// here belongs to an earlier attempt, so it becomes unknown.
-pub fn begin(run_id: Ulid, intent: CallIntent) -> BeginIntent {
+/// Looks up the call's intent in `space` and writes it as pending when it is new. A pending intent
+/// found here belongs to an earlier attempt, so it becomes unknown.
+pub fn begin_in(space: &'static str, run_id: Ulid, intent: CallIntent) -> BeginIntent {
     BeginIntent {
+        space,
         run_id,
         intent,
         begun: None,
     }
 }
 
+/// Looks up a plugin call's intent in `PLUGIN_INTENTS_KEYSPACE`.
+pub fn begin(run_id: Ulid, intent: CallIntent) -> BeginIntent {
+    begin_in(PLUGIN_INTENTS_KEYSPACE, run_id, intent)
+}
+
 #[derive(Debug, PartialEq)]
 pub struct BeginIntent {
+    space: &'static str,
     run_id: Ulid,
     intent: CallIntent,
     /// The outcome once its intent row is sent.
@@ -83,7 +90,7 @@ impl Operation for BeginIntent {
 
     fn first(&mut self) -> Result<Next<Begun>, StoreError> {
         let key = intent_key(self.run_id, self.intent.ordinal);
-        Ok(Next::Call(read_call(vec![(PLUGIN_INTENTS_KEYSPACE, key)])))
+        Ok(Next::Call(read_call(vec![(self.space, key)])))
     }
 
     fn next(&mut self, answer: IoResult) -> Result<Next<Begun>, StoreError> {
@@ -121,25 +128,30 @@ impl Operation for BeginIntent {
             },
         };
         self.begun = Some(begun);
-        let row = intent_row(self.run_id, &self.intent, state)?;
+        let row = intent_row(self.space, self.run_id, &self.intent, state)?;
         Ok(Next::Call(IoCall::Write(vec![row])))
     }
 }
 
+/// Whether an earlier attempt already wrote this call's intent in `space`.
+pub fn written_in(space: &'static str, run_id: Ulid, intent: &CallIntent) -> IntentWritten {
+    IntentWritten(space, intent_key(run_id, intent.ordinal))
+}
+
 /// Whether an earlier attempt of the run already wrote this call's intent.
 pub fn written(run_id: Ulid, intent: &CallIntent) -> IntentWritten {
-    IntentWritten(intent_key(run_id, intent.ordinal))
+    written_in(PLUGIN_INTENTS_KEYSPACE, run_id, intent)
 }
 
 #[derive(Debug, PartialEq)]
-pub struct IntentWritten(Vec<u8>);
+pub struct IntentWritten(&'static str, Vec<u8>);
 
 impl Operation for IntentWritten {
     type Output = bool;
     type Error = StoreError;
 
     fn first(&mut self) -> Result<Next<bool>, StoreError> {
-        let read = vec![(PLUGIN_INTENTS_KEYSPACE, self.0.clone())];
+        let read = vec![(self.0, self.1.clone())];
         Ok(Next::Call(read_call(read)))
     }
 
@@ -149,46 +161,89 @@ impl Operation for IntentWritten {
     }
 }
 
+/// The intent row in `space` recording the call's settled reply.
+pub fn settled_row_in(
+    space: &'static str,
+    run_id: Ulid,
+    intent: &CallIntent,
+    reply: String,
+) -> Result<Row, StoreError> {
+    intent_row(space, run_id, intent, IntentState::Settled { reply })
+}
+
 /// The intent row that records the call's reply, written with the call's effect where it has one.
 pub(crate) fn settled_row(
     run_id: Ulid,
     intent: &CallIntent,
     reply: String,
 ) -> Result<Row, StoreError> {
-    intent_row(run_id, intent, IntentState::Settled { reply })
+    settled_row_in(PLUGIN_INTENTS_KEYSPACE, run_id, intent, reply)
+}
+
+/// The intent row in `space` for a call whose effect may have happened without a recorded reply.
+pub fn unknown_row_in(
+    space: &'static str,
+    run_id: Ulid,
+    intent: &CallIntent,
+    reason: &str,
+) -> Result<Row, StoreError> {
+    let reason = reason.to_string();
+    intent_row(space, run_id, intent, IntentState::Unknown { reason })
 }
 
 /// The intent row of a call whose effect may have happened without a recorded reply.
 pub fn unknown_row(run_id: Ulid, intent: &CallIntent, reason: &str) -> Result<Row, StoreError> {
-    let reason = reason.to_string();
-    intent_row(run_id, intent, IntentState::Unknown { reason })
+    unknown_row_in(PLUGIN_INTENTS_KEYSPACE, run_id, intent, reason)
+}
+
+/// The key of a call's intent in `space`, removed when the call ended without an effect.
+pub fn row_key_in(
+    space: &'static str,
+    run_id: Ulid,
+    intent: &CallIntent,
+) -> (&'static str, Vec<u8>) {
+    (space, intent_key(run_id, intent.ordinal))
 }
 
 /// The key of a call's intent, removed when the call ended without an effect so it may be made
 /// again.
 pub(crate) fn intent_row_key(run_id: Ulid, intent: &CallIntent) -> (&'static str, Vec<u8>) {
-    let key = intent_key(run_id, intent.ordinal);
-    (PLUGIN_INTENTS_KEYSPACE, key)
+    row_key_in(PLUGIN_INTENTS_KEYSPACE, run_id, intent)
 }
 
-fn intent_row(run_id: Ulid, intent: &CallIntent, state: IntentState) -> Result<Row, StoreError> {
+fn intent_row(
+    space: &'static str,
+    run_id: Ulid,
+    intent: &CallIntent,
+    state: IntentState,
+) -> Result<Row, StoreError> {
     let record = IntentRecord {
         digest: intent.digest,
         state,
     };
     let key = intent_key(run_id, intent.ordinal);
-    Ok(row(PLUGIN_INTENTS_KEYSPACE, key, encode(&record)?))
+    Ok(row(space, key, encode(&record)?))
+}
+
+/// Reads every intent of a run in `space`.
+pub(crate) fn intent_scan_in(space: &'static str, run_id: Ulid) -> Scan {
+    Scan::new(space, run_id.to_bytes().to_vec())
 }
 
 /// Reads every intent of a run.
 pub(crate) fn intent_scan(run_id: Ulid) -> Scan {
-    Scan::new(PLUGIN_INTENTS_KEYSPACE, run_id.to_bytes().to_vec())
+    intent_scan_in(PLUGIN_INTENTS_KEYSPACE, run_id)
+}
+
+/// The first pending or unknown intent of `run_id` in `space`.
+pub fn open_intent_in(space: &'static str, run_id: Ulid) -> OpenIntent {
+    OpenIntent(intent_scan_in(space, run_id))
 }
 
 /// The first intent of the run that is pending or unknown, as the reason the run needs
 /// attention; every intent is inspected before a run ends.
 pub fn open_intent(run_id: Ulid) -> OpenIntent {
-    OpenIntent(intent_scan(run_id))
+    open_intent_in(PLUGIN_INTENTS_KEYSPACE, run_id)
 }
 
 #[derive(Debug, PartialEq)]
@@ -231,8 +286,12 @@ pub(crate) fn first_open(rows: &Rows) -> Result<Option<String>, StoreError> {
     Ok(None)
 }
 
-/// A person's decision on every pending or unknown intent among a run's `rows`.
-pub(crate) fn resolved_rows(rows: Rows, done: bool) -> Result<Vec<Row>, StoreError> {
+/// A person's decision on every pending or unknown intent among a run's `rows` in `space`.
+pub(crate) fn resolved_rows_in(
+    space: &'static str,
+    rows: Rows,
+    done: bool,
+) -> Result<Vec<Row>, StoreError> {
     let mut resolved = Vec::new();
     for (key, value) in rows {
         let mut record = decode::<IntentRecord>(&value)?;
@@ -241,31 +300,46 @@ pub(crate) fn resolved_rows(rows: Rows, done: bool) -> Result<Vec<Row>, StoreErr
             IntentState::Pending | IntentState::Unknown { .. }
         ) {
             record.state = IntentState::Resolved { done };
-            resolved.push(row(PLUGIN_INTENTS_KEYSPACE, key, encode(&record)?));
+            resolved.push(row(space, key, encode(&record)?));
         }
     }
     Ok(resolved)
 }
 
-/// The intents among a run's `rows` a person resolved as not done, removed so a retry makes
-/// those calls again; the other intents, settled replies among them, stay.
-pub(crate) fn undone_keys(rows: Rows) -> Result<Vec<(&'static str, Vec<u8>)>, StoreError> {
+/// A person's decision on every pending or unknown intent among a run's `rows`.
+pub(crate) fn resolved_rows(rows: Rows, done: bool) -> Result<Vec<Row>, StoreError> {
+    resolved_rows_in(PLUGIN_INTENTS_KEYSPACE, rows, done)
+}
+
+/// Intents resolved as not done in `space`, removed so a retry makes those calls again.
+pub(crate) fn undone_keys_in(
+    space: &'static str,
+    rows: Rows,
+) -> Result<Vec<(&'static str, Vec<u8>)>, StoreError> {
     let mut undone = Vec::new();
     for (key, value) in rows {
         let record = decode::<IntentRecord>(&value)?;
         if record.state == (IntentState::Resolved { done: false }) {
-            undone.push((PLUGIN_INTENTS_KEYSPACE, key));
+            undone.push((space, key));
         }
     }
     Ok(undone)
 }
 
+/// The intents among a run's `rows` a person resolved as not done, removed so a retry makes
+/// those calls again; the other intents, settled replies among them, stay.
+pub(crate) fn undone_keys(rows: Rows) -> Result<Vec<(&'static str, Vec<u8>)>, StoreError> {
+    undone_keys_in(PLUGIN_INTENTS_KEYSPACE, rows)
+}
+
+/// The keys of every intent among a run's `rows` in `space`.
+pub(crate) fn intent_keys_in(space: &'static str, rows: Rows) -> Vec<(&'static str, Vec<u8>)> {
+    rows.into_iter().map(|(key, _)| (space, key)).collect()
+}
+
 /// The keys of every intent among a run's `rows`.
 pub(crate) fn intent_keys(rows: Rows) -> Vec<(&'static str, Vec<u8>)> {
-    let keys = rows
-        .into_iter()
-        .map(|(key, _)| (PLUGIN_INTENTS_KEYSPACE, key));
-    keys.collect()
+    intent_keys_in(PLUGIN_INTENTS_KEYSPACE, rows)
 }
 
 #[cfg(test)]
@@ -326,6 +400,7 @@ mod tests {
             values_result(vec![Some(encode(&record).unwrap())])
         };
         let mut plan = BeginIntent {
+            space: PLUGIN_INTENTS_KEYSPACE,
             run_id: run,
             intent: intent.clone(),
             begun: None,
@@ -333,7 +408,8 @@ mod tests {
         let key = intent_key(run, 0);
         let read = read_call(vec![(PLUGIN_INTENTS_KEYSPACE, key)]);
         assert_eq!(plan.first().unwrap(), Next::Call(read));
-        let pending = intent_row(run, &intent, IntentState::Pending).unwrap();
+        let pending =
+            intent_row(PLUGIN_INTENTS_KEYSPACE, run, &intent, IntentState::Pending).unwrap();
         assert_eq!(
             plan.next(values_result(vec![None])).unwrap(),
             Next::Call(IoCall::Write(vec![pending]))
@@ -359,8 +435,13 @@ mod tests {
     fn resolutions() {
         let run = Ulid::from_parts(5, 1);
         let row = |ordinal, state| {
-            let (_, key, value) =
-                intent_row(run, &call_intent(&Intent::new(ordinal, &[])), state).unwrap();
+            let (_, key, value) = intent_row(
+                PLUGIN_INTENTS_KEYSPACE,
+                run,
+                &call_intent(&Intent::new(ordinal, &[])),
+                state,
+            )
+            .unwrap();
             (key.to_vec(), value.to_vec())
         };
         let rows = vec![

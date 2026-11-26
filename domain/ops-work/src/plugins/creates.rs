@@ -95,19 +95,34 @@ fn create_key(install_id: Ulid, key: &str) -> Vec<u8> {
     [&install_id.to_bytes()[..], key.as_bytes()].concat()
 }
 
-/// Opens an attempt of `key` in one transaction, so concurrent calls adopt one document. A new key
-/// (or a former install's) stores `minted`; a refused one with no open attempt takes its arguments.
-pub fn claim_key((install, key): (&PluginInstall, &str), minted: PinnedCreate) -> ClaimKey {
+/// Opens an attempt of `key` in `space` in one transaction, so concurrent calls adopt one document.
+pub fn claim_key_in(
+    space: &'static str,
+    (owner_id, account, key): (Ulid, UserId, &str),
+    minted: PinnedCreate,
+) -> ClaimKey {
     ClaimKey {
-        row: create_key(install.install_id, key),
-        account: install.account,
+        space,
+        row: create_key(owner_id, key),
+        account,
         minted: Box::new(minted),
         claimed: None,
     }
 }
 
+/// Opens an attempt of `key` in one transaction, so concurrent calls adopt one document. A new key
+/// (or a former install's) stores `minted`; a refused one with no open attempt takes its arguments.
+pub fn claim_key((install, key): (&PluginInstall, &str), minted: PinnedCreate) -> ClaimKey {
+    claim_key_in(
+        PLUGIN_CREATES_KEYSPACE,
+        (install.install_id, install.account, key),
+        minted,
+    )
+}
+
 #[derive(Debug, PartialEq)]
 pub struct ClaimKey {
+    space: &'static str,
     row: Vec<u8>,
     account: UserId,
     minted: Box<PinnedCreate>,
@@ -123,10 +138,7 @@ impl Operation for ClaimKey {
     }
 
     fn first(&mut self) -> Result<Next<Self::Output>, StoreError> {
-        Ok(Next::Call(read_call(vec![(
-            PLUGIN_CREATES_KEYSPACE,
-            self.row.clone(),
-        )])))
+        Ok(Next::Call(read_call(vec![(self.space, self.row.clone())])))
     }
 
     fn next(&mut self, answer: IoResult) -> Result<Next<Self::Output>, StoreError> {
@@ -158,24 +170,39 @@ impl Operation for ClaimKey {
             rejected: false,
         };
         self.claimed = Some((Box::new(create), claim));
-        let write = row(PLUGIN_CREATES_KEYSPACE, self.row.clone(), encode(&value)?);
+        let write = row(self.space, self.row.clone(), encode(&value)?);
         Ok(Next::Call(IoCall::Write(vec![write])))
+    }
+}
+
+/// Closes one attempt of `key` in `space` whose outcome is known.
+pub fn settle_key_in(
+    space: &'static str,
+    (owner_id, account, key): (Ulid, UserId, &str),
+    rejected: bool,
+) -> SettleKey {
+    SettleKey {
+        space,
+        row: create_key(owner_id, key),
+        account,
+        rejected,
+        written: false,
     }
 }
 
 /// Closes one attempt of `key` whose outcome is known: it committed, or it was refused without
 /// an effect, `rejected` when the refusal concerns its arguments.
 pub(crate) fn settle_key((install, key): (&PluginInstall, &str), rejected: bool) -> SettleKey {
-    SettleKey {
-        row: create_key(install.install_id, key),
-        account: install.account,
+    settle_key_in(
+        PLUGIN_CREATES_KEYSPACE,
+        (install.install_id, install.account, key),
         rejected,
-        written: false,
-    }
+    )
 }
 
 #[derive(Debug, PartialEq)]
 pub struct SettleKey {
+    space: &'static str,
     row: Vec<u8>,
     account: UserId,
     rejected: bool,
@@ -191,10 +218,7 @@ impl Operation for SettleKey {
     }
 
     fn first(&mut self) -> Result<Next<()>, StoreError> {
-        Ok(Next::Call(read_call(vec![(
-            PLUGIN_CREATES_KEYSPACE,
-            self.row.clone(),
-        )])))
+        Ok(Next::Call(read_call(vec![(self.space, self.row.clone())])))
     }
 
     fn next(&mut self, answer: IoResult) -> Result<Next<()>, StoreError> {
@@ -213,7 +237,7 @@ impl Operation for SettleKey {
         stored.open = stored.open.saturating_sub(1);
         stored.rejected = self.rejected;
         self.written = true;
-        let write = row(PLUGIN_CREATES_KEYSPACE, self.row.clone(), encode(&stored)?);
+        let write = row(self.space, self.row.clone(), encode(&stored)?);
         Ok(Next::Call(IoCall::Write(vec![write])))
     }
 }
