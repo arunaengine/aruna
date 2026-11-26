@@ -235,6 +235,7 @@ pub const JOURNAL_RETENTION_MS: u64 = 7 * 24 * 3600 * 1000;
 /// source-id rows that keep each source id from being journaled twice on a node.
 pub const JOURNAL_ROW: u8 = b'j';
 pub const PENDING_ROW: u8 = b'u';
+pub const AUTO_PENDING_ROW: u8 = b'a';
 pub const SOURCE_ROW: u8 = b'i';
 
 /// Key of the source-id row of `source`; its value is the event's anchor.
@@ -476,6 +477,13 @@ pub fn journal_entries(
             )
         })
         .collect();
+    if matches!(
+        event.kind,
+        SourceKind::DataUploaded | SourceKind::AppletSubmission | SourceKind::RunFinished
+    ) {
+        let key = journal_key(AUTO_PENDING_ROW, event.journaled_ms, unique);
+        entries.push((EVENT_JOURNAL_KEYSPACE.to_string(), key.into(), value));
+    }
     entries.push((
         EVENT_JOURNAL_KEYSPACE.to_string(),
         source_key(&event.source).into(),
@@ -808,14 +816,21 @@ mod tests {
             actor: None,
         };
         let entries = journal_entries(&event).unwrap();
-        assert_eq!(entries.len(), 3);
+        assert_eq!(entries.len(), 4);
         assert_eq!(entries[0].1[0], JOURNAL_ROW);
         assert_eq!(entries[1].1[0], PENDING_ROW);
-        assert_eq!(entries[2].1.to_vec(), source_key(&event.source));
-        assert_eq!(entries[2].2.to_vec(), 2u64.to_be_bytes());
+        assert_eq!(entries[2].1[0], AUTO_PENDING_ROW);
+        assert_eq!(entries[3].1.to_vec(), source_key(&event.source));
+        assert_eq!(entries[3].2.to_vec(), 2u64.to_be_bytes());
         assert_eq!(entries[0].1[1..], entries[1].1[1..]);
+        assert_eq!(entries[0].1[1..], entries[2].1[1..]);
         assert_eq!(SourceEvent::from_bytes(&entries[0].2).unwrap(), event);
         let early = journal_key(JOURNAL_ROW, 4, Ulid::from_parts(9, 9));
         assert!(early < entries[0].1.to_vec());
+        let dataset = SourceEvent {
+            kind: SourceKind::DatasetCreated,
+            ..event
+        };
+        assert_eq!(journal_entries(&dataset).unwrap().len(), 3);
     }
 }

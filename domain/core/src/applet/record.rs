@@ -121,6 +121,8 @@ pub struct SubmissionReceipt {
     pub version_id: Ulid,
     pub pseudonym: String,
     pub guest: bool,
+    /// Whether this submission came from an outside or guest-accessible applet.
+    pub outside_input: bool,
     pub bucket: String,
     pub key: String,
     pub files: Vec<SubmissionFile>,

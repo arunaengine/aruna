@@ -81,20 +81,20 @@ fn enforces_dag_edges() {
     );
     // Edge case 1: NeedsAttention is non-terminal; resume refused until resolved.
     firing.stages[0].state = StageState::NeedsAttention;
-    firing.evaluate(&spec, 110);
+    firing.evaluate(110);
     assert_eq!(firing.state, FiringState::NeedsAttention);
     assert_eq!(firing.stages[1].state, StageState::Pending);
     assert_eq!(firing.stages[2].state, StageState::Pending);
-    assert!(firing.prepare_resume(&spec, 120).is_err());
+    assert!(firing.prepare_resume(120).is_err());
 
     // Resolve as failed -> quarantine becomes Ready while deliver is Skipped.
     firing
-        .resolve(&spec, "a", false, actor, Some("retry".into()), 130)
+        .resolve("a", false, actor, Some("retry".into()), 130)
         .unwrap();
     assert_eq!(firing.resolutions.len(), 1);
     assert_eq!(firing.stages[1].state, StageState::Ready);
     assert_eq!(firing.stages[2].state, StageState::Skipped);
-    assert_eq!(firing.next_copy(&spec), Some(1));
+    assert_eq!(firing.next_copy(), Some(1));
 
     // Quarantine commits a receipt and succeeds; firing ends Failed (since `a` failed).
     firing.stages[1].receipt.copied.push(CopiedFile {
@@ -106,11 +106,11 @@ fn enforces_dag_edges() {
         bytes: 10,
     });
     firing.stages[1].state = StageState::Succeeded;
-    firing.evaluate(&spec, 140);
+    firing.evaluate(140);
     assert_eq!(firing.state, FiringState::Failed);
 
     // Edge case 2: Resume preserves attempt-1 quarantine receipt and finishes Succeeded.
-    firing.prepare_resume(&spec, 150).unwrap();
+    firing.prepare_resume(150).unwrap();
     assert_eq!(firing.attempt, 2);
     assert_eq!(firing.stages[0].state, StageState::Ready);
     assert_eq!(firing.stages[1].state, StageState::Succeeded);
@@ -118,12 +118,12 @@ fn enforces_dag_edges() {
     assert_eq!(firing.stages[2].state, StageState::Pending);
 
     firing.stages[0].state = StageState::Succeeded;
-    firing.evaluate(&spec, 160);
+    firing.evaluate(160);
     assert_eq!(firing.stages[2].state, StageState::Ready);
     firing.stages[2].state = StageState::Succeeded;
-    firing.evaluate(&spec, 170);
+    firing.evaluate(170);
     firing.stages[3].state = StageState::Succeeded;
-    firing.evaluate(&spec, 180);
+    firing.evaluate(180);
     assert_eq!(firing.state, FiringState::Succeeded);
     assert_eq!(firing.stages[1].receipt.copied.len(), 1);
 }
@@ -155,24 +155,84 @@ fn enforces_caps_cancel() {
         manual_trigger(),
         100,
     );
-    // Edge case 3: ready_runs caps fan-out at max_concurrent_workflows (2 of 3).
-    assert_eq!(firing.ready_runs(&spec), vec![0, 1]);
+    // Edge case 3: ready_runs caps fan-out at max_concurrent_workflows and available slots.
+    assert_eq!(firing.ready_runs(2), vec![0, 1]);
+    assert_eq!(firing.ready_runs(1), vec![0]);
     let child_id = Ulid::from_parts(7, 1);
     firing.stages[0].state = StageState::Running;
     firing.stages[0].receipt.workflow_run_id = Some(child_id);
-    assert_eq!(firing.ready_runs(&spec), vec![1]);
+    assert_eq!(firing.ready_runs(2), vec![1]);
 
     // Edge case 4: async Cancelling stops pending/ready stages and waits for active child.
-    let cancel_ids = firing.begin_cancel(&spec, 200);
-    assert_eq!(cancel_ids, vec![child_id]);
+    let cancel_ids = firing.begin_cancel(200);
+    assert_eq!(cancel_ids, vec![(0, child_id)]);
     assert_eq!(firing.state, FiringState::Cancelling);
     assert_eq!(firing.stages[0].state, StageState::Cancelling);
+    assert!(!firing.stages[0].receipt.cancel_sent);
     assert_eq!(firing.stages[1].state, StageState::Cancelled);
     assert_eq!(firing.stages[2].state, StageState::Cancelled);
     assert_eq!(firing.stages[3].state, StageState::Cancelled);
 
     firing.stages[0].state = StageState::Cancelled;
-    firing.evaluate(&spec, 250);
+    firing.evaluate(250);
     assert_eq!(firing.state, FiringState::Cancelled);
     assert_eq!(firing.finished_at_ms, Some(250));
+}
+
+#[test]
+fn resolves_copy_item() {
+    let actor = UserId::new(Ulid::from_parts(1, 9), RealmId([1; 32]));
+    let mut spec = Spec::default();
+    spec.triggers.push(Trigger::Manual { form_json: None });
+    spec.stages.push(run_stage("a", vec![], When::Passed));
+    spec.stages.push(copy_stage("deliver", "a", When::Passed));
+    let mut firing = Firing::new(
+        Ulid::from_parts(8, 1),
+        Ulid::from_parts(8, 2),
+        Ulid::from_parts(8, 3),
+        1,
+        &spec,
+        manual_trigger(),
+        100,
+    );
+    firing.stages[0].state = StageState::Succeeded;
+    firing.evaluate(110);
+    let file = |k: &str, v: u64| CopiedFile {
+        source_key: k.into(),
+        source_version: Ulid::from_parts(v, 1),
+        dest_bucket: "out".into(),
+        dest_key: format!("d/{k}"),
+        dest_version: Ulid::from_parts(v, 2),
+        bytes: 42,
+    };
+    firing.stages[1].receipt.copied.push(file("f1", 1));
+    firing.stages[1].receipt.pending_copy = Some(file("f2", 2));
+    firing.stages[1].state = StageState::NeedsAttention;
+    firing.evaluate(120);
+    assert_eq!(firing.state, FiringState::NeedsAttention);
+
+    // Resolving file 2 of 3 as done records file 2 and keeps the stage Running for file 3.
+    firing
+        .resolve_item("deliver", true, Some((None, 3)), actor, None, 130)
+        .unwrap();
+    assert_eq!(firing.stages[1].state, StageState::Running);
+    assert_eq!(firing.state, FiringState::Running);
+    assert_eq!(firing.stages[1].receipt.copied.len(), 2);
+    assert_eq!(firing.stages[1].receipt.copied[1].source_key, "f2");
+
+    // Resolving file 3 of 3 as done completes the stage.
+    firing.stages[1].state = StageState::NeedsAttention;
+    firing
+        .resolve_item(
+            "deliver",
+            true,
+            Some((Some(file("f3", 3)), 3)),
+            actor,
+            None,
+            140,
+        )
+        .unwrap();
+    assert_eq!(firing.stages[1].state, StageState::Succeeded);
+    assert_eq!(firing.state, FiringState::Succeeded);
+    assert_eq!(firing.stages[1].receipt.copied.len(), 3);
 }

@@ -232,15 +232,25 @@ impl Automation {
 
     /// Permission paths granted to the automation's service account role.
     pub fn role_paths(&self, realm_id: RealmId, node: NodeId) -> Vec<(String, Permission)> {
+        self.role_paths_for(&self.spec, realm_id, node)
+    }
+
+    /// Permission paths derived from a pinned `spec` (e.g. a firing's execution spec).
+    pub fn role_paths_for(
+        &self,
+        spec: &Spec,
+        realm_id: RealmId,
+        node: NodeId,
+    ) -> Vec<(String, Permission)> {
         let mut paths = Vec::new();
-        for pattern in &self.spec.scope.read {
+        for pattern in &spec.scope.read {
             paths.push((pattern.clone(), Permission::READ));
         }
-        for pattern in &self.spec.scope.write {
+        for pattern in &spec.scope.write {
             paths.push((pattern.clone(), Permission::WRITE));
         }
         let meta_root = format!("/{realm_id}/g/{}/meta", self.group_id);
-        for prefix in &self.spec.scope.metadata {
+        for prefix in &spec.scope.metadata {
             let trimmed = prefix.trim_matches('/');
             let full = match trimmed.is_empty() {
                 true => meta_root.clone(),
@@ -248,7 +258,7 @@ impl Automation {
             };
             paths.push((format!("{full}/**"), Permission::WRITE));
         }
-        if !self.spec.scope.workflows.is_empty() || self.spec.has_runs() {
+        if !spec.scope.workflows.is_empty() || spec.has_runs() {
             paths.push((
                 workflow_permission_path(realm_id, self.group_id),
                 Permission::WRITE,

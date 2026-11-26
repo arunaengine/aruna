@@ -106,6 +106,10 @@ pub struct StageReceipt {
     pub workflow_run_id: Option<Ulid>,
     pub outputs: Vec<RunFile>,
     pub copied: Vec<CopiedFile>,
+    /// Unsettled copy target awaiting human resolution on a `NeedsAttention` copy stage.
+    pub pending_copy: Option<CopiedFile>,
+    /// Whether cancellation has been acknowledged by the child workflow run.
+    pub cancel_sent: bool,
     pub dataset_id: Option<Ulid>,
     pub notified: Option<u32>,
     pub approved_by: Option<UserId>,
@@ -166,6 +170,7 @@ pub enum TriggerPayload {
         status: RunStatus,
         outputs: Vec<RunFile>,
         applet_id: Option<Ulid>,
+        outside_input: bool,
         depth: u8,
     },
     AppletSubmission {
@@ -173,6 +178,7 @@ pub enum TriggerPayload {
         version_id: Ulid,
         pseudonym: String,
         guest: bool,
+        outside_input: bool,
         bucket: String,
         key: String,
         files: Vec<SubmissionFile>,
@@ -187,6 +193,19 @@ impl TriggerPayload {
             0
         }
     }
+
+    pub fn outside_input(&self) -> bool {
+        match self {
+            Self::AppletSubmission {
+                guest,
+                outside_input,
+                ..
+            } => *guest || *outside_input,
+            Self::RunFinished { outside_input, .. } => *outside_input,
+            _ => false,
+        }
+    }
+
     pub fn kind_name(&self) -> &'static str {
         match self {
             Self::Manual { .. } => "manual",
@@ -197,7 +216,7 @@ impl TriggerPayload {
     }
 }
 
-/// One execution of an automation DAG.
+/// One execution of an automation DAG, pinned to the approved `spec` at start time.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Firing {
     pub firing_id: Ulid,
@@ -206,6 +225,7 @@ pub struct Firing {
     pub revision: u64,
     pub attempt: u32,
     pub state: FiringState,
+    pub spec: Spec,
     pub trigger: TriggerPayload,
     pub stages: Vec<StageRun>,
     pub resolutions: Vec<Resolution>,
@@ -237,6 +257,7 @@ impl Firing {
             revision,
             attempt: 1,
             state: FiringState::Running,
+            spec: spec.clone(),
             trigger,
             stages,
             resolutions: Vec::new(),
@@ -245,7 +266,7 @@ impl Firing {
             finished_at_ms: None,
             error: None,
         };
-        firing.evaluate(spec, now_ms);
+        firing.evaluate(now_ms);
         firing
     }
 
@@ -254,7 +275,7 @@ impl Firing {
     }
 
     /// Evaluates stage readiness in topological order and recomputes firing state.
-    pub fn evaluate(&mut self, spec: &Spec, now_ms: u64) {
+    pub fn evaluate(&mut self, now_ms: u64) {
         for stage in &mut self.stages {
             if stage.state == StageState::WaitingForApproval
                 && stage.receipt.expires_at_ms.is_some_and(|exp| now_ms >= exp)
@@ -268,7 +289,7 @@ impl Firing {
             self.finish_cancel(now_ms);
             return;
         }
-        let Ok(plan) = validate_spec(spec) else {
+        let Ok(plan) = validate_spec(&self.spec) else {
             return;
         };
         for &index in &plan.order {
@@ -285,7 +306,7 @@ impl Firing {
             let ready = if upstreams.is_empty() {
                 true
             } else {
-                match spec.stages[index].when {
+                match self.spec.stages[index].when {
                     When::Passed => upstreams.iter().all(|&s| s == StageState::Succeeded),
                     When::Failed => upstreams.contains(&StageState::Failed),
                     When::Always => upstreams
@@ -336,9 +357,22 @@ impl Firing {
     /// Audited human resolution of a `NeedsAttention` stage (`done=true` -> Succeeded, `false` -> Failed).
     pub fn resolve(
         &mut self,
-        spec: &Spec,
         stage_name: &str,
         done: bool,
+        actor: UserId,
+        note: Option<String>,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        self.resolve_item(stage_name, done, None, actor, note, now_ms)
+    }
+
+    /// Resolves a `NeedsAttention` stage, recovering a single uncertain copy file into `copied` and
+    /// keeping multi-file copy stages `Running` when remaining files still need to be copied.
+    pub fn resolve_item(
+        &mut self,
+        stage_name: &str,
+        done: bool,
+        copy_progress: Option<(Option<CopiedFile>, usize)>,
         actor: UserId,
         note: Option<String>,
         now_ms: u64,
@@ -357,22 +391,32 @@ impl Firing {
             at_ms: now_ms,
         });
         let stage = &mut self.stages[index];
-        stage.state = if done {
-            StageState::Succeeded
-        } else {
-            StageState::Failed
-        };
+        let planned = stage.receipt.pending_copy.take();
         if done {
             stage.error = None;
+            if let Some((recovered, total_files)) = copy_progress {
+                if let Some(file) = recovered.or(planned) {
+                    stage.receipt.copied.push(file);
+                }
+                if stage.receipt.copied.len() < total_files {
+                    stage.state = StageState::Running;
+                    stage.finished_at_ms = None;
+                    self.evaluate(now_ms);
+                    return Ok(());
+                }
+            }
+            stage.state = StageState::Succeeded;
+        } else {
+            stage.state = StageState::Failed;
         }
         stage.finished_at_ms = Some(now_ms);
-        self.evaluate(spec, now_ms);
+        self.evaluate(now_ms);
         Ok(())
     }
 
     /// Resumes a failed firing while refusing unresolved `NeedsAttention` stages and preserving
     /// every already-`Succeeded` stage receipt (including attempt-1 `when: failed` branches).
-    pub fn prepare_resume(&mut self, spec: &Spec, now_ms: u64) -> Result<(), String> {
+    pub fn prepare_resume(&mut self, now_ms: u64) -> Result<(), String> {
         if self
             .stages
             .iter()
@@ -383,7 +427,7 @@ impl Firing {
         if self.state != FiringState::Failed {
             return Err("only failed firings can be resumed".into());
         }
-        let plan = validate_spec(spec)?;
+        let plan = validate_spec(&self.spec)?;
         let mut reset = BTreeSet::new();
         for &index in &plan.order {
             let state = self.stages[index].state;
@@ -406,35 +450,38 @@ impl Firing {
             let r = &mut stage.receipt;
             (
                 r.workflow_run_id,
+                r.pending_copy,
+                r.cancel_sent,
                 r.approved_by,
                 r.rejected_by,
                 r.expires_at_ms,
-            ) = (None, None, None, None);
+            ) = (None, None, false, None, None, None);
         }
-        self.evaluate(spec, now_ms);
+        self.evaluate(now_ms);
         Ok(())
     }
 
-    pub fn active_runs(&self, spec: &Spec) -> usize {
+    pub fn active_runs(&self) -> usize {
         self.stages
             .iter()
             .enumerate()
             .filter(|(i, s)| {
-                s.state.is_in_flight() && matches!(spec.stages[*i].kind, StageKind::Run { .. })
+                s.state.is_in_flight() && matches!(self.spec.stages[*i].kind, StageKind::Run { .. })
             })
             .count()
     }
 
-    /// Ready `run` stage indices bounded by `max_concurrent_workflows`.
-    pub fn ready_runs(&self, spec: &Spec) -> Vec<usize> {
-        let slots = (spec.scope.limits.max_concurrent_workflows as usize)
-            .saturating_sub(self.active_runs(spec));
+    /// Ready `run` stage indices bounded by the remaining `available` workflow slots.
+    pub fn ready_runs(&self, available: usize) -> Vec<usize> {
+        let slots = (self.spec.scope.limits.max_concurrent_workflows as usize)
+            .saturating_sub(self.active_runs())
+            .min(available);
         self.stages
             .iter()
             .enumerate()
             .filter(|(i, s)| {
                 s.state == StageState::Ready
-                    && matches!(spec.stages[*i].kind, StageKind::Run { .. })
+                    && matches!(self.spec.stages[*i].kind, StageKind::Run { .. })
             })
             .map(|(i, _)| i)
             .take(slots)
@@ -442,20 +489,21 @@ impl Firing {
     }
 
     /// Next ready `copy` stage if no other `copy` stage is currently in flight in this firing.
-    pub fn next_copy(&self, spec: &Spec) -> Option<usize> {
+    pub fn next_copy(&self) -> Option<usize> {
         if self.stages.iter().enumerate().any(|(i, s)| {
-            s.state.is_in_flight() && matches!(spec.stages[i].kind, StageKind::Copy { .. })
+            s.state.is_in_flight() && matches!(self.spec.stages[i].kind, StageKind::Copy { .. })
         }) {
             return None;
         }
         self.stages.iter().enumerate().find_map(|(i, s)| {
-            (s.state == StageState::Ready && matches!(spec.stages[i].kind, StageKind::Copy { .. }))
-                .then_some(i)
+            (s.state == StageState::Ready
+                && matches!(self.spec.stages[i].kind, StageKind::Copy { .. }))
+            .then_some(i)
         })
     }
 
-    /// Moves firing to `Cancelling`, cancels pending/waiting stages and returns active child run ids.
-    pub fn begin_cancel(&mut self, spec: &Spec, now_ms: u64) -> Vec<Ulid> {
+    /// Moves firing to `Cancelling`, cancels pending/waiting stages and returns active child runs.
+    pub fn begin_cancel(&mut self, now_ms: u64) -> Vec<(usize, Ulid)> {
         if self.state.is_terminal() {
             return Vec::new();
         }
@@ -470,10 +518,11 @@ impl Firing {
                 }
                 StageState::Running | StageState::Cancelling => {
                     stage.state = StageState::Cancelling;
-                    if matches!(spec.stages[index].kind, StageKind::Run { .. })
+                    if matches!(self.spec.stages[index].kind, StageKind::Run { .. })
                         && let Some(run_id) = stage.receipt.workflow_run_id
                     {
-                        child_runs.push(run_id);
+                        stage.receipt.cancel_sent = false;
+                        child_runs.push((index, run_id));
                     }
                 }
                 _ => {}
