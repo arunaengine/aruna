@@ -563,7 +563,7 @@ jobs:
           done
           args+=("ghcr.io/arunaengine/aruna@${NODE_DIGEST}")
           docker "${args[@]}"
-          pushed="$(jq -r '."containerimage.digest" // empty' "$meta")"
+          pushed="$(jq -er '."containerimage.descriptor".digest' "$meta")"
           if [ "$pushed" != "$NODE_DIGEST" ]; then
             echo "promoted digest $pushed does not match attested digest $NODE_DIGEST" >&2
             exit 1
