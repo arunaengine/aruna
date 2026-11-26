@@ -351,13 +351,20 @@ async fn chunks_large_replicas() {
         created_at_ms: 1,
         updated_at_ms: 1,
     };
+    let source_files = WorkflowFiles {
+        files: vec![StoredFile {
+            path: "workflow.uwe.yaml".into(),
+            content: vec![b'x'; 2500],
+            executable: false,
+        }],
+    };
     let ver = WorkflowVersionRecord {
         workflow_id: wf_id,
         version: 1,
         language: StoredWorkflowLanguage::Uwe,
         entrypoint: "workflow.uwe.yaml".into(),
         files: vec!["workflow.uwe.yaml".into()],
-        digest: "blake3:chunk".into(),
+        digest: aruna_core::workflow::source_digest(&source_files.source()),
         commit: None,
         message: Some("v".repeat(2300)),
         uwe_yaml: Some("steps:\n  a:\n    tool: bigtool\n".into()),
@@ -365,13 +372,6 @@ async fn chunks_large_replicas() {
         inspection: Default::default(),
         created_by: remote.created_by,
         created_at_ms: 1,
-    };
-    let source_files = WorkflowFiles {
-        files: vec![StoredFile {
-            path: "workflow.uwe.yaml".into(),
-            content: vec![b'x'; 2500],
-            executable: false,
-        }],
     };
     let tool_v1 = ToolRecord {
         tool_id: "bigtool".into(),
@@ -485,6 +485,20 @@ async fn chunks_large_replicas() {
                 )
                 .await;
                 assert_eq!(hidden_ver, Err(CatalogError::NotFound));
+                let live_tools = drive(
+                    crate::workflows::ScanOperation::<ToolRecord>::of_groups(Some(
+                        [remote.group_id].into(),
+                    )),
+                    context,
+                )
+                .await
+                .unwrap();
+                let live = live_tools
+                    .into_iter()
+                    .find(|(_, t)| t.tool_id == "bigtool")
+                    .unwrap()
+                    .1;
+                assert_eq!(live.definition, tool_v1.definition);
             }
         } else {
             committed = true;
@@ -642,7 +656,7 @@ async fn chunks_large_replicas() {
     let missing_src = drive(
         WriteReplicaOperation {
             local: here,
-            run: Box::new(remote),
+            run: Box::new(remote.clone()),
             first_page: 0,
             pages: Vec::new(),
             workflow: None,
@@ -653,4 +667,33 @@ async fn chunks_large_replicas() {
     )
     .await;
     assert_eq!(missing_src, Err(CatalogError::NotFound));
+
+    // Malformed source bytes or a digest mismatch with the stored version are rejected.
+    let wrong_files = WorkflowFiles {
+        files: vec![StoredFile {
+            path: "workflow.uwe.yaml".into(),
+            content: b"tampered".to_vec(),
+            executable: false,
+        }],
+    };
+    for bad_source in [b"not-postcard".to_vec(), wrong_files.to_bytes().unwrap()] {
+        let bad_bundle = ReplicatedWorkflow {
+            source: Some(bad_source),
+            ..ReplicatedWorkflow::default()
+        };
+        let rejected = drive(
+            WriteReplicaOperation {
+                local: here,
+                run: Box::new(remote.clone()),
+                first_page: 0,
+                pages: Vec::new(),
+                workflow: Some(bad_bundle),
+                step: WriteStep::Read,
+                kept: 0,
+            },
+            context,
+        )
+        .await;
+        assert_eq!(rejected, Err(CatalogError::Forbidden));
+    }
 }

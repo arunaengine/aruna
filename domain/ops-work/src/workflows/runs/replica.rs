@@ -21,8 +21,8 @@ use aruna_core::placement::plan_target_placement;
 use aruna_core::placement::resolver::PlacementResolutionContext;
 use aruna_core::structs::execution::job::input::TaskSecretBinding;
 use aruna_core::structs::execution::workflow::{
-    StoredWorkflowLanguage, ToolRecord, WorkflowRecord, WorkflowVersionRecord, tool_key,
-    version_key, workflow_key,
+    StoredWorkflowLanguage, ToolRecord, WorkflowFiles, WorkflowRecord, WorkflowVersionRecord,
+    tool_key, version_key, workflow_key,
 };
 use aruna_core::structs::execution::workflow_run::{
     ChunkKind, LogHead, ReplicatedChunk, ReplicatedWorkflow, WorkflowRunAuth, WorkflowRunRecord,
@@ -30,6 +30,7 @@ use aruna_core::structs::execution::workflow_run::{
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{GroupId, Key};
+use aruna_core::workflow::source_digest;
 use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 use aruna_workflow_contract::preflight::{NodeKind, RunLogEntry, RunLogPage};
 use byteview::ByteView;
@@ -103,6 +104,11 @@ fn chunk_target(kind: &ChunkKind) -> [u8; 32] {
 
 fn staged_key(run_id: Ulid, kind: ChunkKind) -> Key {
     chunk_key(run_id, chunk_target(&kind), u32::MAX)
+}
+
+fn staged_tools_key(run_id: Ulid) -> Key {
+    let target = *blake3::hash(b"tool-index").as_bytes();
+    chunk_key(run_id, target, u32::MAX)
 }
 
 fn stub_run(run: &WorkflowRunRecord) -> WorkflowRunRecord {
@@ -1035,8 +1041,16 @@ impl Operation for StoreReplicaOperation {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+struct CommitState {
+    tools: Vec<(String, String)>,
+    writes: Vec<(String, Key, ByteView)>,
+    deletes: Vec<(String, Key)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 enum WriteStep {
     Read,
+    ReadTools(Box<CommitState>),
     Write(Vec<(String, Key)>),
     Delete,
 }
@@ -1083,6 +1097,7 @@ impl Operation for WriteReplicaOperation {
                 RUN_LOG_KEYSPACE.to_string(),
                 staged_key(run_id, ChunkKind::Source),
             ),
+            (RUN_LOG_KEYSPACE.to_string(), staged_tools_key(run_id)),
         ];
         for index in 0..self.pages.len() {
             let number = self.first_page + index as u32;
@@ -1095,10 +1110,17 @@ impl Operation for WriteReplicaOperation {
                 if tool.group_id != self.run.group_id {
                     return Err(CatalogError::Forbidden);
                 }
-                reads.push((
-                    WORKFLOW_TOOL_KEYSPACE.to_string(),
-                    tool_key(&tool.tool_id, &tool.version, tool.group_id),
-                ));
+                if replicated.more {
+                    reads.push((
+                        RUN_LOG_KEYSPACE.to_string(),
+                        staged_key(run_id, ChunkKind::Tool(tool.tool_id, tool.version)),
+                    ));
+                } else {
+                    reads.push((
+                        WORKFLOW_TOOL_KEYSPACE.to_string(),
+                        tool_key(&tool.tool_id, &tool.version, tool.group_id),
+                    ));
+                }
             }
             for chunk in &replicated.chunks {
                 if chunk.total == 0 || chunk.index >= chunk.total || chunk.total > MAX_CHUNKS {
@@ -1114,10 +1136,20 @@ impl Operation for WriteReplicaOperation {
                     }
                     match &chunk.kind {
                         ChunkKind::Tool(id, version) => {
-                            reads.push((
-                                WORKFLOW_TOOL_KEYSPACE.to_string(),
-                                tool_key(id, version, self.run.group_id),
-                            ));
+                            if replicated.more {
+                                reads.push((
+                                    RUN_LOG_KEYSPACE.to_string(),
+                                    staged_key(
+                                        run_id,
+                                        ChunkKind::Tool(id.clone(), version.clone()),
+                                    ),
+                                ));
+                            } else {
+                                reads.push((
+                                    WORKFLOW_TOOL_KEYSPACE.to_string(),
+                                    tool_key(id, version, self.run.group_id),
+                                ));
+                            }
                         }
                         ChunkKind::Page(number) => {
                             reads.push((RUN_LOG_KEYSPACE.to_string(), page_key(run_id, *number)));
@@ -1135,6 +1167,48 @@ impl Operation for WriteReplicaOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<u32>, CatalogError> {
         match std::mem::replace(&mut self.step, WriteStep::Delete) {
+            WriteStep::ReadTools(mut commit) => {
+                let mut values = result.values()?.into_iter();
+                for (id, version) in commit.tools {
+                    let staged = values.next().flatten();
+                    let existing = values.next().flatten();
+                    let Some(bytes) = staged else {
+                        continue;
+                    };
+                    let expected = tool_key(&id, &version, self.run.group_id);
+                    let prior = commit
+                        .writes
+                        .iter()
+                        .position(|(ks, k, _)| ks == WORKFLOW_TOOL_KEYSPACE && *k == expected);
+                    let base = prior
+                        .map(|idx| commit.writes[idx].2.as_ref())
+                        .or(existing.as_deref());
+                    if let Some((key, value)) = tool_update(base, &bytes, self.run.group_id)? {
+                        if key != expected {
+                            return Err(CatalogError::Forbidden);
+                        }
+                        match prior {
+                            Some(idx) => commit.writes[idx].2 = value,
+                            None => {
+                                commit.writes.push((
+                                    WORKFLOW_TOOL_KEYSPACE.to_string(),
+                                    key,
+                                    value,
+                                ));
+                            }
+                        }
+                    }
+                }
+                if commit.writes.is_empty() {
+                    if !commit.deletes.is_empty() {
+                        self.step = WriteStep::Delete;
+                        return Ok(Next::Call(IoCall::Delete(commit.deletes)));
+                    }
+                    return Ok(Next::Done(self.kept));
+                }
+                self.step = WriteStep::Write(commit.deletes);
+                return Ok(Next::Call(IoCall::Write(commit.writes)));
+            }
             WriteStep::Write(deletes) => {
                 result.done()?;
                 if !deletes.is_empty() {
@@ -1166,6 +1240,12 @@ impl Operation for WriteReplicaOperation {
         let staged_wf = values.next().flatten();
         let staged_ver = values.next().flatten();
         let staged_src = values.next().flatten();
+        let staged_index_row = values.next().flatten();
+        let mut staged_index: Vec<(String, String)> = staged_index_row
+            .as_deref()
+            .and_then(|bytes| postcard::from_bytes(bytes).ok())
+            .unwrap_or_default();
+        let mut index_dirty = false;
         let mut page_rows = Vec::with_capacity(self.pages.len());
         for _ in 0..self.pages.len() {
             page_rows.push(values.next().flatten());
@@ -1224,7 +1304,22 @@ impl Operation for WriteReplicaOperation {
                 if let Some((key, value)) =
                     tool_update(existing.as_deref(), &tool_bytes, self.run.group_id)?
                 {
-                    writes.push((WORKFLOW_TOOL_KEYSPACE.to_string(), key, value));
+                    if more {
+                        let tool = ToolRecord::from_bytes(&tool_bytes)
+                            .map_err(|_| CatalogError::Forbidden)?;
+                        let pair = (tool.tool_id, tool.version);
+                        writes.push((
+                            space.clone(),
+                            staged_key(run_id, ChunkKind::Tool(pair.0.clone(), pair.1.clone())),
+                            value,
+                        ));
+                        if !staged_index.contains(&pair) {
+                            staged_index.push(pair);
+                            index_dirty = true;
+                        }
+                    } else {
+                        writes.push((WORKFLOW_TOOL_KEYSPACE.to_string(), key, value));
+                    }
                 }
             }
             for chunk in replicated.chunks {
@@ -1246,6 +1341,8 @@ impl Operation for WriteReplicaOperation {
                 assembled.extend_from_slice(&chunk.data);
                 match chunk.kind {
                     ChunkKind::Source => {
+                        WorkflowFiles::from_bytes(&assembled)
+                            .map_err(|_| CatalogError::Forbidden)?;
                         if more {
                             writes.push((
                                 space.clone(),
@@ -1319,7 +1416,23 @@ impl Operation for WriteReplicaOperation {
                             if key != expected {
                                 return Err(CatalogError::Forbidden);
                             }
-                            writes.push((WORKFLOW_TOOL_KEYSPACE.to_string(), key, value));
+                            if more {
+                                let pair = (id, version);
+                                writes.push((
+                                    space.clone(),
+                                    staged_key(
+                                        run_id,
+                                        ChunkKind::Tool(pair.0.clone(), pair.1.clone()),
+                                    ),
+                                    value,
+                                ));
+                                if !staged_index.contains(&pair) {
+                                    staged_index.push(pair);
+                                    index_dirty = true;
+                                }
+                            } else {
+                                writes.push((WORKFLOW_TOOL_KEYSPACE.to_string(), key, value));
+                            }
                         }
                     }
                     ChunkKind::Page(number) => {
@@ -1372,6 +1485,15 @@ impl Operation for WriteReplicaOperation {
                 }
             }
         }
+        if more && index_dirty {
+            let encoded = postcard::to_allocvec(&staged_index)
+                .map_err(|error| CatalogError::Storage(error.to_string()))?;
+            writes.push((
+                space.clone(),
+                staged_tools_key(run_id),
+                ByteView::from(encoded),
+            ));
+        }
         if !more {
             if let Some(bytes) = staged_wf {
                 deletes.push((space.clone(), staged_key(run_id, ChunkKind::Workflow)));
@@ -1398,6 +1520,18 @@ impl Operation for WriteReplicaOperation {
             {
                 return Err(CatalogError::NotFound);
             }
+            let effective_ver = match ver_row.as_deref() {
+                Some(bytes) => WorkflowVersionRecord::from_bytes(bytes)?,
+                None => {
+                    let bytes = pending_ver.as_deref().ok_or(CatalogError::NotFound)?;
+                    let ver = WorkflowVersionRecord::from_bytes(bytes)
+                        .map_err(|_| CatalogError::Forbidden)?;
+                    if ver.workflow_id != self.run.workflow_id || ver.version != self.run.version {
+                        return Err(CatalogError::Forbidden);
+                    }
+                    ver
+                }
+            };
             if let Some(bytes) = pending_wf {
                 store_workflow(&bytes, wf_row.as_deref(), &self.run, &mut writes)?;
             }
@@ -1418,6 +1552,11 @@ impl Operation for WriteReplicaOperation {
             if let Some(bytes) = pending_src
                 && src_row.is_none()
             {
+                let files =
+                    WorkflowFiles::from_bytes(&bytes).map_err(|_| CatalogError::Forbidden)?;
+                if source_digest(&files.source()) != effective_ver.digest {
+                    return Err(CatalogError::Forbidden);
+                }
                 writes.push((
                     WORKFLOW_SOURCE_KEYSPACE.to_string(),
                     ver_key,
@@ -1468,7 +1607,33 @@ impl Operation for WriteReplicaOperation {
                     ByteView::from(bytes.clone()),
                 ));
             }
-            writes.push((space, head_key(run_id), ByteView::from(head.to_bytes()?)));
+            writes.push((
+                space.clone(),
+                head_key(run_id),
+                ByteView::from(head.to_bytes()?),
+            ));
+            if staged_index_row.is_some() {
+                deletes.push((space.clone(), staged_tools_key(run_id)));
+            }
+            if !staged_index.is_empty() {
+                let mut tool_reads = Vec::with_capacity(staged_index.len() * 2);
+                for (id, version) in &staged_index {
+                    let key = staged_key(run_id, ChunkKind::Tool(id.clone(), version.clone()));
+                    deletes.push((space.clone(), key.clone()));
+                    tool_reads.push((space.clone(), key));
+                    tool_reads.push((
+                        WORKFLOW_TOOL_KEYSPACE.to_string(),
+                        tool_key(id, version, self.run.group_id),
+                    ));
+                }
+                self.kept = head.pages;
+                self.step = WriteStep::ReadTools(Box::new(CommitState {
+                    tools: staged_index,
+                    writes,
+                    deletes,
+                }));
+                return Ok(Next::Call(IoCall::Read(tool_reads)));
+            }
         }
         self.kept = head.pages;
         if writes.is_empty() {
