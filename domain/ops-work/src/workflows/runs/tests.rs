@@ -1727,7 +1727,24 @@ async fn resumes_directory_values() {
             .all(|p| p.source_node_id == Some(origin))
     );
 
-    // RemoteReadOperation serves stat and list for the captured remote folder via authority form.
+    // RemoteReadOperation live-authorizes captured entries on the holder before serving stat/list.
+    use aruna_core::replication_protocol::BaoReadRefusal;
+    use aruna_ops_data::replication::bao_read::{BaoReadError, BaoReadOutput};
+    let ok_meta = || {
+        IoResult::Child(ChildOutcome::new(Ok::<BaoReadOutput, BaoReadError>(
+            BaoReadOutput::Metadata {
+                size: 4,
+                blake3: [7; 32],
+                etag: None,
+                hashes: Default::default(),
+            },
+        )))
+    };
+    let denied_meta = || {
+        IoResult::Child(ChildOutcome::new(Err::<BaoReadOutput, BaoReadError>(
+            BaoReadError::Refused(BaoReadRefusal::ReadDenied),
+        )))
+    };
     let remote_dir = format!("s3://{origin}@results/folder/");
     let dir_target = resolve(&resumed, &remote_dir).unwrap();
     assert_eq!(dir_target.node, Some(origin));
@@ -1741,7 +1758,11 @@ async fn resumes_directory_values() {
             address: remote_dir.clone(),
         },
     );
-    match stat_op.first().unwrap() {
+    assert!(matches!(
+        stat_op.first().unwrap(),
+        Next::Call(IoCall::Child(_))
+    ));
+    match stat_op.next(ok_meta()).unwrap() {
         Next::Done(HostRpcResult::StorageStat { entry: Some(entry) }) => {
             assert!(entry.directory);
         }
@@ -1749,13 +1770,21 @@ async fn resumes_directory_values() {
     }
     let mut list_op = RemoteReadOperation::new(
         resumed.clone(),
-        dir_target,
+        dir_target.clone(),
         origin,
         DataCall::List {
-            address: remote_dir,
+            address: remote_dir.clone(),
         },
     );
-    match list_op.first().unwrap() {
+    assert!(matches!(
+        list_op.first().unwrap(),
+        Next::Call(IoCall::Child(_))
+    ));
+    assert!(matches!(
+        list_op.next(ok_meta()).unwrap(),
+        Next::Call(IoCall::Child(_))
+    ));
+    match list_op.next(ok_meta()).unwrap() {
         Next::Done(HostRpcResult::StorageList { entries }) => {
             assert_eq!(entries.len(), 2, "{entries:?}");
             assert!(entries.iter().any(|e| e.name == "a.txt" && !e.directory));
@@ -1763,6 +1792,75 @@ async fn resumes_directory_values() {
         }
         other => panic!("expected directory listing, got {other:?}"),
     }
+
+    // Revoked READ on a remote empty directory marker hides it from both Stat and List.
+    let marker_ver = Ulid::from_bytes([66; 16]);
+    let mut with_empty = resumed.clone();
+    with_empty.directory_roots.push(
+        aruna_core::structs::execution::workflow_run::DirectoryRoot {
+            bucket: "results".into(),
+            prefix: "empty_remote/".into(),
+            version_id: Some(marker_ver),
+            source_node_id: Some(origin),
+        },
+    );
+    with_empty.directory_roots.push(
+        aruna_core::structs::execution::workflow_run::DirectoryRoot {
+            bucket: "results".into(),
+            prefix: "unversioned_empty/".into(),
+            version_id: None,
+            source_node_id: Some(origin),
+        },
+    );
+    let empty_addr = format!("s3://{origin}@results/empty_remote/");
+    let empty_target = resolve(&with_empty, &empty_addr).unwrap();
+    let mut denied_stat = RemoteReadOperation::new(
+        with_empty.clone(),
+        empty_target.clone(),
+        origin,
+        DataCall::Stat {
+            address: empty_addr.clone(),
+        },
+    );
+    assert!(matches!(
+        denied_stat.first().unwrap(),
+        Next::Call(IoCall::Child(_))
+    ));
+    assert_eq!(
+        denied_stat.next(denied_meta()).unwrap(),
+        Next::Done(HostRpcResult::StorageStat { entry: None })
+    );
+    let mut denied_list = RemoteReadOperation::new(
+        with_empty.clone(),
+        empty_target,
+        origin,
+        DataCall::List {
+            address: empty_addr,
+        },
+    );
+    assert!(matches!(
+        denied_list.first().unwrap(),
+        Next::Call(IoCall::Child(_))
+    ));
+    assert!(matches!(
+        denied_list.next(denied_meta()).unwrap(),
+        Next::Done(HostRpcResult::Failed(
+            aruna_workflow_contract::ContractError::Denied { .. }
+        ))
+    ));
+    // Unversioned remote empty roots are never exposed without holder authorization.
+    let unv_addr = format!("s3://{origin}@results/unversioned_empty/");
+    let unv_target = resolve(&with_empty, &unv_addr).unwrap();
+    let mut unv_list = RemoteReadOperation::new(
+        with_empty,
+        unv_target,
+        origin,
+        DataCall::List { address: unv_addr },
+    );
+    assert!(matches!(
+        unv_list.first().unwrap(),
+        Next::Done(HostRpcResult::Failed(_))
+    ));
 
     // Unversioned child reads and task DirectInputs resolve to the captured exact version.
     let child_addr = format!("s3://results/folder/a.txt?node={origin}");
@@ -1838,6 +1936,146 @@ async fn resumes_directory_values() {
                 && key == "folder/alias.link"
                 && version_id.as_deref() == Some(&link_ver.to_string())
     )));
+
+    // Two-chunk ReadDataOperation on an unversioned directory child link keeps `link_ver` across
+    // chunk 1 and chunk 2 while reading bytes from `folder/real.txt@real_ver`.
+    use aruna_core::events::Event;
+    use aruna_core::jobs::JobEvent;
+    use aruna_core::stream::BackendStream;
+    use aruna_workflow_contract::DATA_CHUNK_BYTES;
+    linked
+        .directory_pins
+        .push(aruna_core::structs::execution::workflow_run::DirectoryPin {
+            bucket: "results".into(),
+            key: "folder/alias.link".into(),
+            version_id: link_ver,
+            source_node_id: Some(origin),
+        });
+    let chunk1_addr = format!("s3://{origin}@results/folder/alias.link");
+    let read1 = super::data::ReadDataOperation::new(
+        linked.clone(),
+        runs.fixture.node,
+        DataCall::Download {
+            address: chunk1_addr.clone(),
+            offset: 0,
+        },
+    );
+    let (req1, target1) = read1.prepare_read().unwrap();
+    assert_eq!(req1.key, "folder/alias.link");
+    assert_eq!(req1.version, Some(link_ver));
+    assert_eq!(target1.key, "folder/real.txt");
+    assert_eq!(target1.version, Some(real_ver));
+    let mut rem1 = RemoteReadOperation::new(
+        linked.clone(),
+        req1,
+        target1.remote(runs.fixture.node).unwrap(),
+        DataCall::Download {
+            address: chunk1_addr,
+            offset: 0,
+        },
+    );
+    assert!(matches!(
+        rem1.first().unwrap(),
+        Next::Call(IoCall::Child(_))
+    ));
+    let total_size = (DATA_CHUNK_BYTES + 4) as u64;
+    let meta_large = IoResult::Child(ChildOutcome::new(Ok::<BaoReadOutput, BaoReadError>(
+        BaoReadOutput::Metadata {
+            size: total_size,
+            blake3: [7; 32],
+            etag: None,
+            hashes: Default::default(),
+        },
+    )));
+    assert!(matches!(
+        rem1.next(meta_large).unwrap(),
+        Next::Call(IoCall::Child(_))
+    ));
+    let stream_ok = || {
+        IoResult::Child(ChildOutcome::new(Ok::<BaoReadOutput, BaoReadError>(
+            BaoReadOutput::Stream {
+                blob: BackendStream::empty(),
+                size: total_size,
+                blake3: [7; 32],
+                etag: None,
+                hashes: Default::default(),
+            },
+        )))
+    };
+    assert!(matches!(
+        rem1.next(stream_ok()).unwrap(),
+        Next::Call(IoCall::Effect(_))
+    ));
+    let chunk1_ver = match rem1
+        .next(IoResult::Event(Box::new(Event::Job(
+            JobEvent::CollectedUpTo(Ok(Some(vec![1; DATA_CHUNK_BYTES]))),
+        ))))
+        .unwrap()
+    {
+        Next::Done(HostRpcResult::StorageChunk {
+            eof: false,
+            version: Some(ver),
+            ..
+        }) => ver,
+        other => panic!("expected chunk 1 with link version, got {other:?}"),
+    };
+    assert_eq!(chunk1_ver, link_ver.to_string());
+
+    // Chunk 2 pins the original link URI with chunk 1's reported version and resolves cleanly.
+    let chunk2_addr = format!("s3://{origin}@results/folder/alias.link?version={chunk1_ver}");
+    let read2 = super::data::ReadDataOperation::new(
+        linked.clone(),
+        runs.fixture.node,
+        DataCall::Download {
+            address: chunk2_addr.clone(),
+            offset: DATA_CHUNK_BYTES as u64,
+        },
+    );
+    let (req2, target2) = read2.prepare_read().unwrap();
+    assert_eq!(req2.key, "folder/alias.link");
+    assert_eq!(req2.version, Some(link_ver));
+    assert_eq!(target2.key, "folder/real.txt");
+    assert_eq!(target2.version, Some(real_ver));
+    let mut rem2 = RemoteReadOperation::new(
+        linked,
+        req2,
+        target2.remote(runs.fixture.node).unwrap(),
+        DataCall::Download {
+            address: chunk2_addr,
+            offset: DATA_CHUNK_BYTES as u64,
+        },
+    );
+    assert!(matches!(
+        rem2.first().unwrap(),
+        Next::Call(IoCall::Child(_))
+    ));
+    let meta_large2 = IoResult::Child(ChildOutcome::new(Ok::<BaoReadOutput, BaoReadError>(
+        BaoReadOutput::Metadata {
+            size: total_size,
+            blake3: [7; 32],
+            etag: None,
+            hashes: Default::default(),
+        },
+    )));
+    assert!(matches!(
+        rem2.next(meta_large2).unwrap(),
+        Next::Call(IoCall::Child(_))
+    ));
+    assert!(matches!(
+        rem2.next(stream_ok()).unwrap(),
+        Next::Call(IoCall::Effect(_))
+    ));
+    assert_eq!(
+        rem2.next(IoResult::Event(Box::new(Event::Job(
+            JobEvent::CollectedUpTo(Ok(Some(vec![2; 4]))),
+        ))))
+        .unwrap(),
+        Next::Done(HostRpcResult::StorageChunk {
+            bytes: vec![2; 4],
+            eof: true,
+            version: Some(link_ver.to_string()),
+        })
+    );
 
     // An uncaptured remote directory prefix is still refused.
     let other_target = resolve(&resumed, &format!("s3://results/other/?node={origin}")).unwrap();
@@ -2107,6 +2345,42 @@ async fn retains_local_pins() {
     .await
     .unwrap();
     assert_eq!(hidden_stat, HostRpcResult::StorageStat { entry: None });
+
+    // Same-name file and directory merge into a single directory entry in local captured list.
+    seed_object(&runs, "results", "clash/sample", Ulid::from_bytes([85; 16])).await;
+    seed_object(
+        &runs,
+        "results",
+        "clash/sample/result.txt",
+        Ulid::from_bytes([86; 16]),
+    )
+    .await;
+    let clash_req = runs.request(None, json!({ "dir": "s3://results/clash/" }));
+    let clash_run = runs
+        .start(&runs.fixture.alice, clash_req)
+        .await
+        .unwrap()
+        .record;
+    let clash_list = drive(
+        ReadDataOperation::new(
+            clash_run,
+            runs.fixture.node,
+            DataCall::List {
+                address: "s3://results/clash/".into(),
+            },
+        ),
+        &runs.fixture.context,
+    )
+    .await
+    .unwrap();
+    match clash_list {
+        HostRpcResult::StorageList { entries } => {
+            assert_eq!(entries.len(), 1, "{entries:?}");
+            assert_eq!(entries[0].name, "sample");
+            assert!(entries[0].directory);
+        }
+        other => panic!("expected merged directory entry, got {other:?}"),
+    }
 }
 
 // Delivering an empty output directory persists a folder marker visible to stat and list.
