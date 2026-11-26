@@ -257,6 +257,67 @@ fn device_serves_file() {
 }
 
 #[test]
+fn probes_authorized_link() {
+    use aruna_core::structs::execution::source_access::SourceMetadata;
+    use aruna_core::structs::storage::link::LinkTarget;
+    use aruna_core::structs::storage::replication::VersionedObjectArn;
+
+    let realm = test_realm();
+    let local = node_from_seed(1);
+    let peer = node_from_seed(2);
+    let target = LinkTarget {
+        arn: VersionedObjectArn::new(realm, peer, "other", "real.txt", Ulid::from(9u128)).unwrap(),
+        group_id: Ulid::from(3u128),
+    };
+    let meta = SourceMetadata {
+        content_length: 12,
+        content_type: None,
+        etag: Some("v-link".to_string()),
+        last_modified: None,
+        source_version: None,
+        digests: Default::default(),
+    };
+    let version = BlobVersion::reference(
+        target.binding(),
+        meta,
+        SystemTime::UNIX_EPOCH,
+        UserId::nil(realm),
+        SystemTime::UNIX_EPOCH,
+    );
+    let value: byteview::ByteView = version.to_bytes().unwrap().into();
+
+    let mut req = read_request(local, [0u8; 32]);
+    req.expected_blake3 = None;
+    req.metadata_only = true;
+    req.disallow_encrypted = true;
+    let mut allowed = IncomingBaoOperation::new(peer, local, realm, Ulid::from(8u128), req.clone());
+    allowed.policy_allowed = true;
+    let turn = allowed.handle_exact_version(Some(value.clone()));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
+    let accepted = allowed.next(row(None));
+    let Some(BlobEffect::SendMessage { payload, .. }) = asked(&accepted).as_blob() else {
+        panic!("expected accepted probe frame");
+    };
+    assert!(matches!(
+        VersionReplicationMessage::from_bytes(payload).unwrap(),
+        VersionReplicationMessage::BaoReadAccepted { size: 12, .. }
+    ));
+
+    let mut denied = IncomingBaoOperation::new(peer, local, realm, Ulid::from(9u128), req.clone());
+    denied.policy_allowed = false;
+    let turn = denied.handle_exact_version(Some(value.clone()));
+    assert_eq!(refusal_from(&turn), BaoReadRefusal::ReadDenied);
+
+    let mut bytes_req = req;
+    bytes_req.metadata_only = false;
+    let mut stream_read =
+        IncomingBaoOperation::new(peer, local, realm, Ulid::from(10u128), bytes_req);
+    stream_read.policy_allowed = true;
+    let turn = stream_read.handle_exact_version(Some(value));
+    assert_eq!(refusal_from(&turn), BaoReadRefusal::NotFound);
+}
+
+#[test]
 fn denied_keeps_blob() {
     // A device may bypass the group check for its own observations, never
     // for a materialized copy it holds.

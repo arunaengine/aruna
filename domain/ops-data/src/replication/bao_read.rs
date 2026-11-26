@@ -35,6 +35,7 @@ use aruna_core::structs::storage::distribution::snapshot::DistributionView;
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRef, ReadLease,
 };
+use aruna_core::structs::storage::link::LinkTarget;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::types::{GroupId, Key, KeySpace, Value};
 use aruna_core::user::id::UserId;
@@ -979,6 +980,18 @@ impl IncomingBaoOperation {
         if let Some(held) = self.held_version(&version) {
             return self.read_kept(held);
         }
+        if let BlobVersionState::Reference {
+            source,
+            cached_metadata,
+            ..
+        } = &version.state
+            && self.request.metadata_only
+            && self.request.range.is_none()
+            && self.request.expected_blake3.is_none()
+            && LinkTarget::of(source, self.local_realm).is_some()
+        {
+            return self.probe_link(cached_metadata.content_length, cached_metadata.etag.clone());
+        }
         let Some(blob_hash) = version.blob_hash().copied() else {
             return self.serve_observation(version);
         };
@@ -1109,6 +1122,20 @@ impl IncomingBaoOperation {
     fn serves_own_data(&self) -> bool {
         self.local_owner
             .is_some_and(|owner| self.peer_is_infra || self.request.auth_context.user_id == owner)
+    }
+
+    /// Probes an authorized link version without disclosing or streaming target bytes.
+    fn probe_link(&mut self, size: u64, etag: Option<String>) -> ServeTurn {
+        if !self.policy_allowed || !self.version_refs.is_empty() {
+            return self.send_refusal(BaoReadRefusal::ReadDenied);
+        }
+        self.blob_hash = Some([0; 32]);
+        self.source_size = Some(size);
+        self.source_fingerprint = etag;
+        self.version_key = self
+            .exact_target()
+            .map(|target| VersionKey::new(&target.bucket, &target.key, target.version));
+        self.observation_settings()
     }
 
     /// Serves one version this node never materialized: a device streams the
