@@ -6,8 +6,8 @@
 use std::path::{Path, PathBuf};
 
 use aruna_workflow_contract::host::{
-    DirectInput, ExpectedOutput, SecretPlaceholder, StagedFile, StartTask, TaskFinished,
-    TaskFolders, TaskOutput, TaskResources,
+    DirectInput, DirectoryFile, ExpectedOutput, SecretPlaceholder, StagedFile, StartTask,
+    TaskFinished, TaskFolders, TaskOutput, TaskResources,
 };
 use aruna_workflow_contract::settings::ArunaStepSettings;
 use aruna_workflow_contract::{ContractError, HostRpcRequest, HostRpcResult};
@@ -279,29 +279,40 @@ impl CoordinatorBackend {
             None => root.join(WORK).join(&output.path),
         };
         if output.directory {
+            if let Some(token) = output.files_token.as_deref() {
+                std::fs::create_dir_all(&local)?;
+                let mut page = 0u32;
+                loop {
+                    let request = HostRpcRequest::TaskDirectoryPage {
+                        token: token.to_owned(),
+                        page,
+                    };
+                    let (files, next_page) = match self.rpc.call(request).await {
+                        Ok(HostRpcResult::TaskDirectoryPage { files, next_page }) => {
+                            (files, next_page)
+                        }
+                        Ok(other) => {
+                            return Err(engine_error(format!("unexpected answer {other:?}")));
+                        }
+                        Err(error) => return Err(engine_error(error.to_string())),
+                    };
+                    self.download_entries(&local, &output.path, &files).await?;
+                    match next_page {
+                        Some(next) if next > page => page = next,
+                        Some(_) => {
+                            return Err(engine_error(
+                                "remote directory manifest page did not advance".into(),
+                            ));
+                        }
+                        None => break,
+                    }
+                }
+                return Ok(());
+            }
             if !output.files.is_empty() || output.address.is_empty() {
                 std::fs::create_dir_all(&local)?;
-                for entry in &output.files {
-                    if entry.path.is_empty()
-                        || entry.path.starts_with('/')
-                        || entry
-                            .path
-                            .split('/')
-                            .any(|part| part.is_empty() || part == "." || part == "..")
-                        || entry.path.contains('\\')
-                    {
-                        return Err(invalid("a directory file leaves the task folder"));
-                    }
-                    let child = local.join(&entry.path);
-                    if let Some(parent) = child.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    storage::download_file(&self.rpc, &entry.address, &child)
-                        .await
-                        .map_err(|error| {
-                            engine_error(format!("cannot read output {}: {error}", entry.path))
-                        })?;
-                }
+                self.download_entries(&local, &output.path, &output.files)
+                    .await?;
                 return Ok(());
             }
             return self.fetch_folder(&output.address, &local).await;
@@ -314,6 +325,38 @@ impl CoordinatorBackend {
             .map_err(|error| {
                 engine_error(format!("cannot read output {}: {error}", output.path))
             })?;
+        Ok(())
+    }
+
+    async fn download_entries(
+        &self,
+        local: &Path,
+        output_path: &str,
+        files: &[DirectoryFile],
+    ) -> Result<(), ExecutorError> {
+        for entry in files {
+            if entry.path.is_empty()
+                || entry.path.starts_with('/')
+                || entry
+                    .path
+                    .split('/')
+                    .any(|part| part.is_empty() || part == "." || part == "..")
+                || entry.path.contains('\\')
+            {
+                return Err(ExecutorError::Unsupported(format!(
+                    "output {output_path}: a directory file leaves the task folder"
+                )));
+            }
+            let child = local.join(&entry.path);
+            if let Some(parent) = child.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            storage::download_file(&self.rpc, &entry.address, &child)
+                .await
+                .map_err(|error| {
+                    engine_error(format!("cannot read output {}: {error}", entry.path))
+                })?;
+        }
         Ok(())
     }
 

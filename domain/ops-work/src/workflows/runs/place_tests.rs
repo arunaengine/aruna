@@ -175,10 +175,12 @@ fn reads_remote_outputs() {
     here.node_id = Some(run.node_id);
     assert!(!file_address(run.node_id, &here).unwrap().contains("node="));
 
-    // A remote directory output expands into exact-version child addresses so the coordinator
-    // downloads them without calling StorageList on another node.
+    // A remote directory output expands into exact-version child addresses, including `.` for
+    // the work root and paging when overlapping directories exceed the inline frame budget.
     let dir_child_key = format!("{}/tasks/run-7-1/work/outdir/sub/item.csv", run.run_id);
     let dir_child_ver = Ulid::from_bytes([11; 16]);
+    let root_file_key = format!("{}/tasks/run-7-1/work/root.txt", run.run_id);
+    let root_file_ver = Ulid::from_bytes([12; 16]);
     let dir_child = OutputObject {
         node_id: executor,
         bucket: bucket.clone(),
@@ -189,26 +191,94 @@ fn reads_remote_outputs() {
         size: 7,
         digest: None,
     };
-    let dir_ran = projection(&fixture, executor, vec![dir_child]);
+    let root_file = OutputObject {
+        node_id: executor,
+        bucket: bucket.clone(),
+        key: root_file_key.clone(),
+        version_id: root_file_ver,
+        execution_id: Ulid::from_bytes([6; 16]),
+        container_path: "/uwe/work/root.txt".into(),
+        size: 5,
+        digest: None,
+    };
+    let dir_ran = projection(&fixture, executor, vec![dir_child, root_file]);
     let mut dir_task = RunTaskOperation::new(run.clone(), ingress(), Box::new(start_task()));
     dir_task.placed = Placed::of(&dir_ran, &fixture.spec());
     let summary = ChildSummary::from_projection(&dir_ran);
     let mut control_files = BTreeMap::new();
     control_files.insert("exit".into(), b"0\n".to_vec());
-    control_files.insert("manifest".into(), b"directory outdir\n".to_vec());
+    control_files.insert(
+        "manifest".into(),
+        b"directory .\ndirectory ./outdir/\n".to_vec(),
+    );
     let _ = dir_task.collected(summary, control_files).unwrap();
-    let TaskStep::Pin(parts) = dir_task.step else {
+    let TaskStep::Pin(ref parts) = dir_task.step else {
         panic!("expected pinned task answer");
     };
-    let (_, finished) = *parts;
-    assert_eq!(finished.outputs.len(), 1);
-    let dir_out = &finished.outputs[0];
-    assert!(dir_out.directory);
-    assert!(dir_out.address.is_empty());
-    assert_eq!(dir_out.files.len(), 1);
-    assert_eq!(dir_out.files[0].path, "sub/item.csv");
+    let (_, finished) = parts.as_ref();
+    assert_eq!(finished.outputs.len(), 2);
+    let dot_out = &finished.outputs[0];
+    assert!(dot_out.directory && dot_out.address.is_empty() && dot_out.files_token.is_none());
+    assert_eq!(dot_out.path, ".");
+    assert_eq!(dot_out.files.len(), 2);
+    assert_eq!(dot_out.files[0].path, "outdir/sub/item.csv");
+    assert_eq!(dot_out.files[1].path, "root.txt");
+    let sub_out = &finished.outputs[1];
+    assert!(sub_out.directory && sub_out.address.is_empty() && sub_out.files_token.is_none());
+    assert_eq!(sub_out.files.len(), 1);
+    assert_eq!(sub_out.files[0].path, "sub/item.csv");
     assert_eq!(
-        dir_out.files[0].address,
+        sub_out.files[0].address,
         address_on(&bucket, &dir_child_key, Some(dir_child_ver), executor)
     );
+
+    // When inline budget is exceeded, remote directory entries spill into size-bounded pages.
+    let summary = ChildSummary::from_projection(&dir_ran);
+    let manifest = vec![(".".to_owned(), true), ("outdir".to_owned(), true)];
+    let run_files: Vec<RunFile> = manifest
+        .iter()
+        .map(|(path, _)| dir_task.output_file(&summary, path))
+        .collect();
+    let (paged_outputs, writes) = dir_task
+        .build_outputs(&summary, &manifest, &run_files, (1, 1))
+        .unwrap();
+    assert!(paged_outputs[0].files.is_empty());
+    let token = paged_outputs[0].files_token.clone().expect("paged token");
+    assert_eq!(writes.len(), 3, "2 pages for `.` plus 1 page for `outdir`");
+    let mut reader = DirPageOperation::new(run.run_id, token.clone(), 0);
+    let Next::Call(IoCall::Read(keys)) = reader.first().unwrap() else {
+        panic!("expected read call");
+    };
+    let row0 = writes
+        .iter()
+        .find(|(_, k, _)| *k == keys[0].1)
+        .expect("page 0 row")
+        .2
+        .clone();
+    let Next::Done(HostRpcResult::TaskDirectoryPage { files, next_page }) =
+        reader.next(IoResult::Values(vec![Some(row0)])).unwrap()
+    else {
+        panic!("expected directory page 0");
+    };
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].path, "outdir/sub/item.csv");
+    assert_eq!(next_page, Some(1));
+    let mut reader1 = DirPageOperation::new(run.run_id, token, 1);
+    let Next::Call(IoCall::Read(keys1)) = reader1.first().unwrap() else {
+        panic!("expected read call for page 1");
+    };
+    let row1 = writes
+        .iter()
+        .find(|(_, k, _)| *k == keys1[0].1)
+        .expect("page 1 row")
+        .2
+        .clone();
+    let Next::Done(HostRpcResult::TaskDirectoryPage { files, next_page }) =
+        reader1.next(IoResult::Values(vec![Some(row1)])).unwrap()
+    else {
+        panic!("expected directory page 1");
+    };
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].path, "root.txt");
+    assert_eq!(next_page, None);
 }

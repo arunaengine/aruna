@@ -299,6 +299,11 @@ impl MockNode {
                 });
                 HostRpcResult::UploadAck { seq, receipt }
             }
+            HostRpcRequest::TaskDirectoryPage { .. } => {
+                HostRpcResult::Failed(ContractError::NotFound {
+                    message: "no paged remote directory in mock host".into(),
+                })
+            }
             HostRpcRequest::DeliverOutput { target_path, .. } => HostRpcResult::Delivered {
                 location: target_path,
             },
@@ -330,6 +335,7 @@ impl MockNode {
                 digest: None,
                 size: content.len() as u64,
                 files: Vec::new(),
+                files_token: None,
             });
         }
         TaskFinished {
