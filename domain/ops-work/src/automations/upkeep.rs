@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::automation::keys::{KEPT_ROW, SEEN_ROW, USAGE_ROW, record_prefix};
+use aruna_core::automation::keys::{KEPT_ROW, REPLAY_ROW, SEEN_ROW, USAGE_ROW, record_prefix};
 use aruna_core::automation::record::{Automation, KeptEvent};
 use aruna_core::automation::usage::{count_u64, counter_ended};
 use aruna_core::calls::{IoCall, IoResult, Next};
@@ -15,6 +15,7 @@ use aruna_core::types::Key;
 
 use super::AutoError;
 use super::identity::SyncIdentityOperation;
+use super::start::parse_replay;
 
 const RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
@@ -31,6 +32,7 @@ enum UpkeepPhase {
     Counters(Option<Key>),
     Seen(Option<Key>),
     Kept(Option<Key>),
+    Replay(Option<Key>),
     DeleteBatch(Box<UpkeepPhase>),
     Records(Option<Key>),
     Sync,
@@ -87,6 +89,10 @@ impl AutoUpkeepOperation {
             UpkeepPhase::Kept(after) => {
                 self.phase = UpkeepPhase::Kept(after.clone());
                 Self::page(Key::from(vec![KEPT_ROW]), after)
+            }
+            UpkeepPhase::Replay(after) => {
+                self.phase = UpkeepPhase::Replay(after.clone());
+                Self::page(Key::from(vec![REPLAY_ROW]), after)
             }
             UpkeepPhase::Records(after) => {
                 self.phase = UpkeepPhase::Records(after.clone());
@@ -155,10 +161,28 @@ impl Operation for AutoUpkeepOperation {
                     .collect();
                 let follow = match next {
                     Some(after) => UpkeepPhase::Kept(Some(after)),
-                    None => UpkeepPhase::Records(None),
+                    None => UpkeepPhase::Replay(None),
                 };
                 if !dead.is_empty() {
                     self.report.pruned_kept += dead.len();
+                    self.phase = UpkeepPhase::DeleteBatch(Box::new(follow));
+                    return Ok(Next::Call(IoCall::Delete(dead)));
+                }
+                Ok(self.continue_phase(follow))
+            }
+            UpkeepPhase::Replay(_) => {
+                let (rows, next) = result.page()?;
+                let dead: Vec<_> = rows
+                    .into_iter()
+                    .filter(|(_, v)| parse_replay(v).is_some_and(|(_, at)| at < cutoff))
+                    .map(|(k, _)| (AUTOMATIONS_KEYSPACE.to_string(), k))
+                    .collect();
+                let follow = match next {
+                    Some(after) => UpkeepPhase::Replay(Some(after)),
+                    None => UpkeepPhase::Records(None),
+                };
+                if !dead.is_empty() {
+                    self.report.pruned_seen += dead.len();
                     self.phase = UpkeepPhase::DeleteBatch(Box::new(follow));
                     return Ok(Next::Call(IoCall::Delete(dead)));
                 }

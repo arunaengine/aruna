@@ -1,11 +1,13 @@
-//! Manual starts and replaying kept matched events into new automation firings.
+//! Manual starts and idempotent replay of kept matched events into new automation firings.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeSet;
+
 use aruna_core::applet::record::{SubmissionReceipt, submission_key};
 use aruna_core::automation::firing::{Firing, TriggerPayload};
-use aruna_core::automation::keys::{active_key, index_key, kept_key};
-use aruna_core::automation::record::{Automation, KeptEvent, Lifecycle, RunStatus, Trigger};
+use aruna_core::automation::keys::{firing_key, kept_key, replay_key};
+use aruna_core::automation::record::{Automation, KeptEvent, Lifecycle, RunStatus};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
@@ -16,34 +18,12 @@ use aruna_core::operation::Operation;
 use aruna_core::plugin_runs::{SourceEvent, SourceKind};
 use aruna_core::structs::execution::workflow_run::{RunState, WorkflowRunRecord, run_key};
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::types::{Key, KeySpace, Value};
-use byteview::ByteView;
 use ulid::Ulid;
 
-use super::firing_reads::decode_ulid;
-use super::limits::CountUsageOperation;
-use super::{AutoAccessOperation, AutoError, Need, active_page, firing_row};
-
-/// Writes a newly created firing along with its active-set and firing-id index rows.
-pub(crate) fn new_firing_rows(firing: &Firing) -> Result<Vec<(KeySpace, Key, Value)>, AutoError> {
-    let auto_bytes = ByteView::from(firing.automation_id.to_bytes().to_vec());
-    let mut rows = vec![
-        firing_row(firing)?,
-        (
-            AUTOMATION_RUNS_KEYSPACE.to_string(),
-            index_key(firing.firing_id),
-            auto_bytes.clone(),
-        ),
-    ];
-    if firing.state.is_active() {
-        rows.push((
-            AUTOMATION_RUNS_KEYSPACE.to_string(),
-            active_key(firing.firing_id),
-            auto_bytes,
-        ));
-    }
-    Ok(rows)
-}
+#[cfg(test)]
+pub(crate) use super::admit::new_firing_rows;
+pub(crate) use super::admit::{AdmitFiringOp, AdmitOutcome, parse_replay};
+use super::{AutoAccessOperation, AutoError, Need};
 
 /// Parses a `DataUploaded` source event into `(bucket, version_id, key)`.
 pub(crate) fn parse_upload(event: &SourceEvent) -> Option<(String, Ulid, String)> {
@@ -61,9 +41,7 @@ pub(crate) fn parse_upload(event: &SourceEvent) -> Option<(String, Ulid, String)
 #[derive(Debug, PartialEq)]
 enum ManualStep {
     Access,
-    Active,
-    Count,
-    Write(Box<Firing>),
+    Admit,
 }
 
 /// Starts an active automation manually (`POST /compute/automations/{id}/start`).
@@ -75,8 +53,6 @@ pub struct StartManualOperation {
     values_json: String,
     ids: IdMint,
     now_ms: u64,
-    auto: Option<Automation>,
-    active_count: u32,
     step: ManualStep,
 }
 
@@ -89,8 +65,6 @@ impl StartManualOperation {
             values_json,
             ids: IdMint::default(),
             now_ms: 0,
-            auto: None,
-            active_count: 0,
             step: ManualStep::Access,
         }
     }
@@ -114,76 +88,26 @@ impl Operation for StartManualOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Firing>, AutoError> {
-        match std::mem::replace(&mut self.step, ManualStep::Active) {
+        match std::mem::replace(&mut self.step, ManualStep::Admit) {
             ManualStep::Access => {
                 let auto = result.child::<Automation, AutoError>()??;
-                if auto.lifecycle != Lifecycle::Active {
-                    return Err(AutoError::Conflict(
-                        "automation must be active to start".into(),
-                    ));
-                }
-                if !auto
-                    .spec
-                    .triggers
-                    .iter()
-                    .any(|t| matches!(t, Trigger::Manual { .. }))
-                {
-                    return Err(AutoError::Invalid(
-                        "automation has no manual trigger".into(),
-                    ));
-                }
-                self.auto = Some(auto);
-                Ok(Next::Call(active_page(None)))
-            }
-            ManualStep::Active => {
-                let auto = self.auto.as_ref().ok_or(IoError::Unfinished)?;
-                let (rows, next) = result.page()?;
-                for (_, value) in rows {
-                    if decode_ulid(&value) == Some(auto.automation_id) {
-                        self.active_count = self.active_count.saturating_add(1);
-                    }
-                }
-                if let Some(after) = next {
-                    return Ok(Next::Call(active_page(Some(after))));
-                }
-                if self.active_count >= auto.spec.scope.limits.max_active_firings {
-                    return Err(AutoError::Limited(
-                        "max_active_firings limit reached".into(),
-                    ));
-                }
-                self.step = ManualStep::Count;
-                let count =
-                    CountUsageOperation::firing(auto.automation_id, &auto.spec.scope.limits);
-                Ok(Next::Call(IoCall::retry(
-                    count,
-                    &auto.automation_id.to_bytes(),
-                )))
-            }
-            ManualStep::Count => {
-                result.child::<(), AutoError>()??;
-                let auto = self.auto.as_ref().ok_or(IoError::Unfinished)?;
                 let firing_id = self.ids.mint(self.now_ms);
                 let payload = TriggerPayload::Manual {
                     values_json: self.values_json.clone(),
                     actor: self.auth.user_id,
                 };
-                let firing = Firing::new(
-                    firing_id,
-                    auto.automation_id,
-                    auto.group_id,
-                    auto.revision,
-                    &auto.spec,
-                    payload,
-                    self.now_ms,
-                );
-                let writes = new_firing_rows(&firing)?;
-                self.step = ManualStep::Write(Box::new(firing));
-                Ok(Next::Call(IoCall::Write(writes)))
+                let admit = AdmitFiringOp::manual(auto.automation_id, firing_id, payload);
+                Ok(Next::Call(IoCall::retry(
+                    admit,
+                    &auto.automation_id.to_bytes(),
+                )))
             }
-            ManualStep::Write(firing) => {
-                result.done()?;
-                Ok(Next::Done(*firing))
-            }
+            ManualStep::Admit => match result.child::<AdmitOutcome, AutoError>()?? {
+                AdmitOutcome::Created(firing) | AdmitOutcome::Existing(firing) => {
+                    Ok(Next::Done(firing))
+                }
+                AdmitOutcome::AlreadySeen => Err(IoError::Unfinished.into()),
+            },
         }
     }
 
@@ -193,17 +117,22 @@ impl Operation for StartManualOperation {
 }
 
 #[derive(Debug, PartialEq)]
+enum ReplayItem {
+    Kept(Box<KeptEvent>),
+    Replayed(Ulid),
+}
+
+#[derive(Debug, PartialEq)]
 enum ReplayStep {
     Access,
     ReadKept,
-    Active,
+    LoadReplayed,
     Enrich(Box<KeptEvent>),
-    Count(Box<(KeptEvent, TriggerPayload)>),
-    Write(Box<(KeptEvent, Firing)>),
-    DropKept,
+    Admit,
 }
 
-/// Starts chosen kept events (`POST /compute/automations/{id}/events/start`), deleting started ones.
+/// Starts chosen kept events (`POST /compute/automations/{id}/events/start`), claiming each event
+/// atomically and answering idempotently for duplicate or already-replayed event IDs.
 #[derive(Debug, PartialEq)]
 pub struct StartEventsOperation {
     auth: AuthContext,
@@ -212,15 +141,15 @@ pub struct StartEventsOperation {
     event_ids: Vec<Ulid>,
     ids: IdMint,
     now_ms: u64,
-    auto: Option<Automation>,
-    active_count: u32,
-    pending: Vec<KeptEvent>,
+    pending: Vec<ReplayItem>,
     started: Vec<Firing>,
     step: ReplayStep,
 }
 
 impl StartEventsOperation {
-    pub fn new(auth: &AuthContext, id: Ulid, local: NodeId, event_ids: Vec<Ulid>) -> Self {
+    pub fn new(auth: &AuthContext, id: Ulid, local: NodeId, mut event_ids: Vec<Ulid>) -> Self {
+        let mut seen = BTreeSet::new();
+        event_ids.retain(|eid| seen.insert(*eid));
         Self {
             auth: auth.clone(),
             id,
@@ -228,24 +157,26 @@ impl StartEventsOperation {
             event_ids,
             ids: IdMint::default(),
             now_ms: 0,
-            auto: None,
-            active_count: 0,
             pending: Vec::new(),
             started: Vec::new(),
             step: ReplayStep::Access,
         }
     }
 
-    fn next_kept(&mut self) -> Result<Next<Vec<Firing>>, AutoError> {
-        let auto = self.auto.as_ref().ok_or(IoError::Unfinished)?;
-        let Some(kept) = self.pending.pop() else {
+    fn next_item(&mut self) -> Result<Next<Vec<Firing>>, AutoError> {
+        let Some(item) = self.pending.pop() else {
             return Ok(Next::Done(std::mem::take(&mut self.started)));
         };
-        if self.active_count >= auto.spec.scope.limits.max_active_firings {
-            return Err(AutoError::Limited(
-                "max_active_firings limit reached".into(),
-            ));
-        }
+        let kept = match item {
+            ReplayItem::Replayed(firing_id) => {
+                self.step = ReplayStep::LoadReplayed;
+                return Ok(Next::Call(IoCall::Read(vec![(
+                    AUTOMATION_RUNS_KEYSPACE.to_string(),
+                    firing_key(self.id, firing_id),
+                )])));
+            }
+            ReplayItem::Kept(kept) => *kept,
+        };
         match kept.event.kind {
             SourceKind::DataUploaded => {
                 let (bucket, version_id, key) = parse_upload(&kept.event)
@@ -257,7 +188,7 @@ impl StartEventsOperation {
                     path: kept.event.path.clone(),
                     size_bytes: 0,
                 };
-                self.begin_count(kept, payload)
+                self.begin_admit(kept.event_id, payload)
             }
             SourceKind::AppletSubmission => {
                 let applet_id = Ulid::from_string(&kept.event.resource)
@@ -279,22 +210,19 @@ impl StartEventsOperation {
                     run_key(run_id),
                 )])))
             }
-            _ => self.next_kept(),
+            _ => self.next_item(),
         }
     }
 
-    fn begin_count(
+    fn begin_admit(
         &mut self,
-        kept: KeptEvent,
+        event_id: Ulid,
         payload: TriggerPayload,
     ) -> Result<Next<Vec<Firing>>, AutoError> {
-        let auto = self.auto.as_ref().ok_or(IoError::Unfinished)?;
-        self.step = ReplayStep::Count(Box::new((kept, payload)));
-        let count = CountUsageOperation::firing(auto.automation_id, &auto.spec.scope.limits);
-        Ok(Next::Call(IoCall::retry(
-            count,
-            &auto.automation_id.to_bytes(),
-        )))
+        let firing_id = self.ids.mint(self.now_ms);
+        let admit = AdmitFiringOp::replay(self.id, event_id, firing_id, payload);
+        self.step = ReplayStep::Admit;
+        Ok(Next::Call(IoCall::retry(admit, &self.id.to_bytes())))
     }
 }
 
@@ -319,7 +247,7 @@ impl Operation for StartEventsOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Vec<Firing>>, AutoError> {
-        match std::mem::replace(&mut self.step, ReplayStep::DropKept) {
+        match std::mem::replace(&mut self.step, ReplayStep::Admit) {
             ReplayStep::Access => {
                 let auto = result.child::<Automation, AutoError>()??;
                 if auto.lifecycle != Lifecycle::Active {
@@ -327,48 +255,47 @@ impl Operation for StartEventsOperation {
                         "automation must be active to start".into(),
                     ));
                 }
-                let reads = self
-                    .event_ids
-                    .iter()
-                    .map(|eid| {
-                        (
-                            AUTOMATIONS_KEYSPACE.to_string(),
-                            kept_key(auto.automation_id, *eid),
-                        )
-                    })
-                    .collect();
-                self.auto = Some(auto);
+                let mut reads = Vec::with_capacity(self.event_ids.len() * 2);
+                for eid in &self.event_ids {
+                    reads.push((
+                        AUTOMATIONS_KEYSPACE.to_string(),
+                        kept_key(auto.automation_id, *eid),
+                    ));
+                    reads.push((
+                        AUTOMATIONS_KEYSPACE.to_string(),
+                        replay_key(auto.automation_id, *eid),
+                    ));
+                }
                 self.step = ReplayStep::ReadKept;
                 Ok(Next::Call(IoCall::Read(reads)))
             }
             ReplayStep::ReadKept => {
-                for value in result.values()?.into_iter().flatten() {
-                    self.pending.push(KeptEvent::from_bytes(&value)?);
+                let values = result.values()?;
+                for pair in values.as_chunks::<2>().0 {
+                    if let Some(bytes) = &pair[0] {
+                        let kept = KeptEvent::from_bytes(bytes)?;
+                        self.pending.push(ReplayItem::Kept(Box::new(kept)));
+                    } else if let Some(bytes) = &pair[1]
+                        && let Some((firing_id, _)) = parse_replay(bytes)
+                    {
+                        self.pending.push(ReplayItem::Replayed(firing_id));
+                    }
                 }
                 if self.pending.is_empty() {
                     return Err(AutoError::NotFound);
                 }
                 self.pending.reverse();
-                self.step = ReplayStep::Active;
-                Ok(Next::Call(active_page(None)))
+                self.next_item()
             }
-            ReplayStep::Active => {
-                let auto = self.auto.as_ref().ok_or(IoError::Unfinished)?;
-                let (rows, next) = result.page()?;
-                for (_, value) in rows {
-                    if decode_ulid(&value) == Some(auto.automation_id) {
-                        self.active_count = self.active_count.saturating_add(1);
-                    }
+            ReplayStep::LoadReplayed => {
+                if let Some(bytes) = result.value()? {
+                    self.started.push(Firing::from_bytes(&bytes)?);
                 }
-                if let Some(after) = next {
-                    self.step = ReplayStep::Active;
-                    return Ok(Next::Call(active_page(Some(after))));
-                }
-                self.next_kept()
+                self.next_item()
             }
             ReplayStep::Enrich(kept) => {
                 let Some(bytes) = result.value()? else {
-                    return self.next_kept();
+                    return self.next_item();
                 };
                 let payload = match kept.event.kind {
                     SourceKind::AppletSubmission => {
@@ -378,6 +305,7 @@ impl Operation for StartEventsOperation {
                             version_id: rec.version_id,
                             pseudonym: rec.pseudonym,
                             guest: rec.guest,
+                            outside_input: rec.outside_input || rec.guest,
                             bucket: rec.bucket,
                             key: rec.key,
                             files: rec.files,
@@ -394,50 +322,36 @@ impl Operation for StartEventsOperation {
                             .as_ref()
                             .map_or(0, |o| o.depth)
                             .saturating_add(1);
+                        let applet_id = rec
+                            .automation
+                            .as_ref()
+                            .and_then(|o| o.applet_id)
+                            .or_else(|| rec.applet.as_ref().map(|a| a.applet_id));
+                        let outside_input =
+                            rec.automation.as_ref().is_some_and(|o| o.outside_input)
+                                || rec.applet.as_ref().is_some_and(|a| a.outside_input);
                         TriggerPayload::RunFinished {
                             workflow_id: rec.workflow_id,
                             run_id: rec.run_id,
                             status,
                             outputs: rec.outputs,
-                            applet_id: rec.automation.as_ref().and_then(|o| o.applet_id),
+                            applet_id,
+                            outside_input,
                             depth,
                         }
                     }
-                    _ => return self.next_kept(),
+                    _ => return self.next_item(),
                 };
-                self.begin_count(*kept, payload)
+                self.begin_admit(kept.event_id, payload)
             }
-            ReplayStep::Count(boxed) => {
-                result.child::<(), AutoError>()??;
-                let (kept, payload) = *boxed;
-                let auto = self.auto.as_ref().ok_or(IoError::Unfinished)?;
-                let firing = Firing::new(
-                    self.ids.mint(self.now_ms),
-                    auto.automation_id,
-                    auto.group_id,
-                    auto.revision,
-                    &auto.spec,
-                    payload,
-                    self.now_ms,
-                );
-                let writes = new_firing_rows(&firing)?;
-                self.step = ReplayStep::Write(Box::new((kept, firing)));
-                Ok(Next::Call(IoCall::Write(writes)))
-            }
-            ReplayStep::Write(boxed) => {
-                result.done()?;
-                let (kept, firing) = *boxed;
-                self.active_count = self.active_count.saturating_add(1);
-                self.started.push(firing);
-                self.step = ReplayStep::DropKept;
-                Ok(Next::Call(IoCall::Delete(vec![(
-                    AUTOMATIONS_KEYSPACE.to_string(),
-                    kept_key(self.id, kept.event_id),
-                )])))
-            }
-            ReplayStep::DropKept => {
-                result.done()?;
-                self.next_kept()
+            ReplayStep::Admit => {
+                match result.child::<AdmitOutcome, AutoError>()?? {
+                    AdmitOutcome::Created(firing) | AdmitOutcome::Existing(firing) => {
+                        self.started.push(firing);
+                    }
+                    AdmitOutcome::AlreadySeen => {}
+                }
+                self.next_item()
             }
         }
     }
