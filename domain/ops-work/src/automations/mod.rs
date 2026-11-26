@@ -10,6 +10,7 @@ pub mod firing_reads;
 pub mod identity;
 pub mod lifecycle;
 pub mod limits;
+pub mod matcher;
 pub mod reads;
 pub mod start;
 pub mod upkeep;
