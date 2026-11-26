@@ -41,7 +41,7 @@ use aruna_core::types::Key;
 use aruna_ops_data::s3::object::get::{
     GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult,
 };
-use aruna_workflow_contract::host::{StartTask, TaskFinished, TaskOutput};
+use aruna_workflow_contract::host::{DirectoryFile, StartTask, TaskFinished, TaskOutput};
 use aruna_workflow_contract::{ArunaStepSettings, ContractError, HostRpcResult};
 use tracing::warn;
 use ulid::Ulid;
@@ -50,8 +50,8 @@ use super::cache::{
     CacheEntry, CacheHit, LookupCacheOperation, StoreCacheOperation, deterministic, task_scope,
 };
 use super::data::{
-    ObjectAccessOperation, Target, WriteBody, WriteObjectOperation, area_of, bucket_answer,
-    file_address, resolve,
+    ObjectAccessOperation, Target, WriteBody, WriteObjectOperation, address_of, address_on,
+    area_of, bucket_answer, file_address, resolve,
 };
 use super::{RunChange, RunTasksOperation, change_call, changed, creator_auth, tasks_answer};
 use crate::jobs::job::cancel::{CancelJobOutcome, CancelOwnedOperation, CancelReport};
@@ -676,6 +676,7 @@ impl RunTaskOperation {
                     address: file_address(self.run.node_id, file)?,
                     digest: None,
                     size: file.size.unwrap_or_default(),
+                    files: Vec::new(),
                 })
             })
             .collect();
@@ -714,6 +715,9 @@ impl RunTaskOperation {
         match result.child::<Vec<RunFile>, CatalogError>()? {
             Ok(pinned) => {
                 for output in &mut finished.outputs {
+                    if output.directory {
+                        continue;
+                    }
                     let file = pinned.iter().find(|file| file.name == output.path);
                     if let Some(file) = file.filter(|file| file.version_id.is_some()) {
                         if let Some(address) = file_address(self.run.node_id, file) {
@@ -1123,12 +1127,64 @@ impl RunTaskOperation {
             .map(|(path, _)| self.output_file(&summary, path))
             .collect();
         let outputs = (files.iter().zip(&manifest))
-            .map(|(file, (_, directory))| TaskOutput {
-                path: file.name.clone(),
-                directory: *directory,
-                address: file_address(self.run.node_id, file).unwrap_or_default(),
-                digest: None,
-                size: file.size.unwrap_or_default(),
+            .map(|(file, (_, directory))| {
+                if *directory && file.node_id.is_some_and(|node| node != self.run.node_id) {
+                    let dir_bucket = file.bucket.as_deref().unwrap_or_default();
+                    let dir_prefix = format!(
+                        "{}/",
+                        file.key
+                            .as_deref()
+                            .unwrap_or_default()
+                            .trim_end_matches('/')
+                    );
+                    let dir_files: Vec<DirectoryFile> = summary
+                        .outputs
+                        .iter()
+                        .filter(|obj| obj.bucket == dir_bucket)
+                        .filter_map(|obj| {
+                            let rel = obj.key.strip_prefix(&dir_prefix)?;
+                            if rel.is_empty()
+                                || rel
+                                    .split('/')
+                                    .any(|part| part.is_empty() || part == "." || part == "..")
+                                || rel.contains('\\')
+                            {
+                                return None;
+                            }
+                            let address = match obj.node_id == self.run.node_id {
+                                true => address_of(&obj.bucket, &obj.key, Some(obj.version_id)),
+                                false => address_on(
+                                    &obj.bucket,
+                                    &obj.key,
+                                    Some(obj.version_id),
+                                    obj.node_id,
+                                ),
+                            };
+                            Some(DirectoryFile {
+                                path: rel.to_owned(),
+                                address,
+                                size: obj.size,
+                            })
+                        })
+                        .collect();
+                    let size = dir_files.iter().map(|entry| entry.size).sum();
+                    return TaskOutput {
+                        path: file.name.clone(),
+                        directory: true,
+                        address: String::new(),
+                        digest: None,
+                        size,
+                        files: dir_files,
+                    };
+                }
+                TaskOutput {
+                    path: file.name.clone(),
+                    directory: *directory,
+                    address: file_address(self.run.node_id, file).unwrap_or_default(),
+                    digest: None,
+                    size: file.size.unwrap_or_default(),
+                    files: Vec::new(),
+                }
             })
             .collect();
         let seconds = |name: &str| text(name).and_then(|value| value.parse::<f64>().ok());

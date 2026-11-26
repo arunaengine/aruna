@@ -329,6 +329,7 @@ impl MockNode {
                 address,
                 digest: None,
                 size: content.len() as u64,
+                files: Vec::new(),
             });
         }
         TaskFinished {

@@ -174,4 +174,41 @@ fn reads_remote_outputs() {
     let mut here = file.clone();
     here.node_id = Some(run.node_id);
     assert!(!file_address(run.node_id, &here).unwrap().contains("node="));
+
+    // A remote directory output expands into exact-version child addresses so the coordinator
+    // downloads them without calling StorageList on another node.
+    let dir_child_key = format!("{}/tasks/run-7-1/work/outdir/sub/item.csv", run.run_id);
+    let dir_child_ver = Ulid::from_bytes([11; 16]);
+    let dir_child = OutputObject {
+        node_id: executor,
+        bucket: bucket.clone(),
+        key: dir_child_key.clone(),
+        version_id: dir_child_ver,
+        execution_id: Ulid::from_bytes([6; 16]),
+        container_path: "/uwe/work/outdir/sub/item.csv".into(),
+        size: 7,
+        digest: None,
+    };
+    let dir_ran = projection(&fixture, executor, vec![dir_child]);
+    let mut dir_task = RunTaskOperation::new(run.clone(), ingress(), Box::new(start_task()));
+    dir_task.placed = Placed::of(&dir_ran, &fixture.spec());
+    let summary = ChildSummary::from_projection(&dir_ran);
+    let mut control_files = BTreeMap::new();
+    control_files.insert("exit".into(), b"0\n".to_vec());
+    control_files.insert("manifest".into(), b"directory outdir\n".to_vec());
+    let _ = dir_task.collected(summary, control_files).unwrap();
+    let TaskStep::Pin(parts) = dir_task.step else {
+        panic!("expected pinned task answer");
+    };
+    let (_, finished) = *parts;
+    assert_eq!(finished.outputs.len(), 1);
+    let dir_out = &finished.outputs[0];
+    assert!(dir_out.directory);
+    assert!(dir_out.address.is_empty());
+    assert_eq!(dir_out.files.len(), 1);
+    assert_eq!(dir_out.files[0].path, "sub/item.csv");
+    assert_eq!(
+        dir_out.files[0].address,
+        address_on(&bucket, &dir_child_key, Some(dir_child_ver), executor)
+    );
 }

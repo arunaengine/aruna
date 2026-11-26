@@ -222,6 +222,14 @@ pub struct TaskFinished {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryFile {
+    /// Path relative to the owning directory output.
+    pub path: String,
+    pub address: String,
+    pub size: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskOutput {
     /// The path as the task named it, relative to its work folder or absolute.
     pub path: String,
@@ -229,6 +237,9 @@ pub struct TaskOutput {
     pub address: String,
     pub digest: Option<String>,
     pub size: u64,
+    /// Exact-version child files when a directory output lives on a remote node.
+    #[serde(default)]
+    pub files: Vec<DirectoryFile>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

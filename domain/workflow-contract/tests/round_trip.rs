@@ -364,6 +364,7 @@ fn rpc_results() -> Vec<HostRpcResult> {
                 address: "aruna://object/out".into(),
                 digest: Some("sha256:00".into()),
                 size: 3,
+                files: Vec::new(),
             }],
             stdout_tail: b"hello\n".to_vec(),
             stderr_tail: Vec::new(),

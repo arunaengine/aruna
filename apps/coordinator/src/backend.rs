@@ -279,6 +279,31 @@ impl CoordinatorBackend {
             None => root.join(WORK).join(&output.path),
         };
         if output.directory {
+            if !output.files.is_empty() || output.address.is_empty() {
+                std::fs::create_dir_all(&local)?;
+                for entry in &output.files {
+                    if entry.path.is_empty()
+                        || entry.path.starts_with('/')
+                        || entry
+                            .path
+                            .split('/')
+                            .any(|part| part.is_empty() || part == "." || part == "..")
+                        || entry.path.contains('\\')
+                    {
+                        return Err(invalid("a directory file leaves the task folder"));
+                    }
+                    let child = local.join(&entry.path);
+                    if let Some(parent) = child.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    storage::download_file(&self.rpc, &entry.address, &child)
+                        .await
+                        .map_err(|error| {
+                            engine_error(format!("cannot read output {}: {error}", entry.path))
+                        })?;
+                }
+                return Ok(());
+            }
             return self.fetch_folder(&output.address, &local).await;
         }
         if let Some(parent) = local.parent() {
@@ -294,11 +319,11 @@ impl CoordinatorBackend {
 
     /// Reads a folder of the node file by file, through its listings.
     async fn fetch_folder(&self, address: &str, local: &Path) -> Result<(), ExecutorError> {
-        let mut pending = vec![(address.trim_end_matches('/').to_owned(), local.to_owned())];
+        let mut pending = vec![(address.to_owned(), local.to_owned())];
         while let Some((folder, target)) = pending.pop() {
             std::fs::create_dir_all(&target)?;
             let request = HostRpcRequest::StorageList {
-                address: format!("{folder}/"),
+                address: folder_list_address(&folder),
             };
             let entries = match self.rpc.call(request).await {
                 Ok(HostRpcResult::StorageList { entries }) => entries,
@@ -537,6 +562,14 @@ fn segment(text: &str) -> String {
         .collect()
 }
 
+/// Places the trailing folder slash before any `?query` suffix when listing a folder.
+fn folder_list_address(folder: &str) -> String {
+    match folder.split_once('?') {
+        Some((base, query)) => format!("{}/?{query}", base.trim_end_matches('/')),
+        None => format!("{}/", folder.trim_end_matches('/')),
+    }
+}
+
 /// Joins one listed child name onto a folder address, percent-encoding special key characters
 /// while leaving any query suffix intact.
 fn child_address(folder: &str, name: &str) -> String {
@@ -668,12 +701,16 @@ mod tests {
     #[test]
     fn encodes_child_address() {
         assert_eq!(
+            folder_list_address("aruna://results/dir?node=peer"),
+            "aruna://results/dir/?node=peer"
+        );
+        assert_eq!(
             child_address("aruna://results/dir", "score%20.csv"),
             "aruna://results/dir/score%2520.csv"
         );
         assert_eq!(
-            child_address("aruna://results/dir/", "what?#1.csv"),
-            "aruna://results/dir/what%3F%231.csv"
+            child_address("aruna://results/dir/?node=peer", "what?#1.csv"),
+            "aruna://results/dir/what%3F%231.csv?node=peer"
         );
     }
 }
