@@ -198,6 +198,18 @@ fn not_found(message: impl Into<String>) -> ContractError {
     }
 }
 
+pub(super) fn folder_entry() -> StorageEntry {
+    StorageEntry {
+        directory: true,
+        size: 0,
+        modified_ms: None,
+        version: None,
+        sha256: None,
+        aruna_id: None,
+        endpoints: Vec::new(),
+    }
+}
+
 /// Resolves an address of the contract: `aruna://` and `s3://` name a bucket and key with an
 /// optional `?version=`, `aruna-staging://` a file in the run's area.
 pub fn resolve(record: &WorkflowRunRecord, address: &str) -> Result<Target, ContractError> {
@@ -378,6 +390,7 @@ pub struct ReadDataOperation {
     run: WorkflowRunRecord,
     node_id: NodeId,
     call: DataCall,
+    reported_version: Option<Ulid>,
     entries: Vec<ListEntry>,
     step: Option<ReadStep>,
 }
@@ -390,6 +403,7 @@ impl ReadDataOperation {
             run,
             node_id,
             call,
+            reported_version: None,
             entries: Vec::new(),
             step: None,
         }
@@ -490,7 +504,10 @@ impl ReadDataOperation {
                 entry: Some(Self::folder_entry()),
             })),
             Ok(head) => {
-                let version = head.resolved_version_id.or(head.version_id);
+                let version = self
+                    .reported_version
+                    .or(head.resolved_version_id)
+                    .or(head.version_id);
                 let entry = StorageEntry {
                     directory: false,
                     size: head
@@ -557,15 +574,7 @@ impl ReadDataOperation {
     }
 
     fn folder_entry() -> StorageEntry {
-        StorageEntry {
-            directory: true,
-            size: 0,
-            modified_ms: None,
-            version: None,
-            sha256: None,
-            aruna_id: None,
-            endpoints: Vec::new(),
-        }
+        folder_entry()
     }
 
     fn listed(
@@ -696,10 +705,12 @@ impl ReadDataOperation {
                         entry: Some(Self::folder_entry()),
                     }));
                 }
-                if let Some(entry) = entry
-                    && !self.entries.contains(&entry)
-                {
-                    self.entries.push(entry);
+                if let Some(entry) = entry {
+                    if let Some(existing) = self.entries.iter_mut().find(|e| e.name == entry.name) {
+                        existing.directory |= entry.directory;
+                    } else {
+                        self.entries.push(entry);
+                    }
                 }
             }
             Err(
@@ -755,13 +766,27 @@ impl ReadDataOperation {
             _ => return Err(crate::workflows::unexpected("JobEvent::CollectedUpTo")),
         };
         let eof = offset + bytes.len() as u64 >= object.info.size;
-        let version =
-            (object.resolved_version_id.or(object.version_id)).map(|version| version.to_string());
+        let version = self
+            .reported_version
+            .or(object.resolved_version_id)
+            .or(object.version_id)
+            .map(|version| version.to_string());
         Ok(Next::Done(HostRpcResult::StorageChunk {
             bytes,
             eof,
             version,
         }))
+    }
+    /// Resolves `(requested_pin, resolved_target)` so remote and local link reads preserve the
+    /// admitted pin version on responses while reading bytes from the resolved target.
+    pub(super) fn prepare_read(&self) -> Result<(Target, Target), ContractError> {
+        let requested = remote::pin_directory_child(
+            &self.run,
+            resolve(&self.run, self.call.address())?,
+            self.node_id,
+        );
+        let target = remote::resolve_precaptured(&self.run, requested.clone(), self.node_id);
+        Ok((requested, target))
     }
 }
 
@@ -770,14 +795,18 @@ impl Operation for ReadDataOperation {
     type Error = CatalogError;
 
     fn first(&mut self) -> ReadNext {
-        let target = match resolve(&self.run, self.call.address()) {
-            Ok(target) => remote::resolve_precaptured(&self.run, target, self.node_id),
+        let (requested, target) = match self.prepare_read() {
+            Ok(pair) => pair,
             Err(error) => return Self::failed(error),
         };
         if let Some(node) = target.remote(self.node_id) {
-            let read = RemoteReadOperation::new(self.run.clone(), target, node, self.call.clone());
+            let read =
+                RemoteReadOperation::new(self.run.clone(), requested, node, self.call.clone());
             self.step = Some(ReadStep::Remote);
             return Ok(Next::Call(IoCall::child(read)));
+        }
+        if requested.key != target.key || requested.bucket != target.bucket {
+            self.reported_version = requested.version;
         }
         let access = ObjectAccessOperation::new(
             &creator_auth(&self.run),

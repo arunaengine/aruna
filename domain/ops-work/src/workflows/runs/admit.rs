@@ -359,9 +359,13 @@ impl StartRunOperation {
                     name: String::new(),
                     bucket: root.bucket.clone(),
                     key: root.prefix.trim_end_matches('/').to_owned(),
-                    version_id: Ulid::nil(),
+                    version_id: root.version_id.unwrap_or_else(Ulid::nil),
                     source_node_id: None,
                 });
+                if let Some(version_id) = root.version_id {
+                    self.retained_pins
+                        .push((root.bucket.clone(), root.prefix.clone(), version_id));
+                }
             }
         }
         self.directory_pins = pins;
@@ -712,14 +716,24 @@ impl StartRunOperation {
             });
         }
         for root in &self.directory_roots {
-            if let Some(node) = root.source_node_id.filter(|n| *n != local)
-                && !cfg
+            if let Some(node) = root.source_node_id.filter(|n| *n != local) {
+                if !cfg
                     .node_kind(&node)
                     .is_some_and(|kind| kind.is_sync_eligible())
-            {
-                return Err(CatalogError::Invalid(format!(
-                    "input node {node} is not an eligible realm server"
-                )));
+                {
+                    return Err(CatalogError::Invalid(format!(
+                        "input node {node} is not an eligible realm server"
+                    )));
+                }
+                if let Some(version_id) = root.version_id {
+                    pins.push(PinnedInput {
+                        name: String::new(),
+                        bucket: root.bucket.clone(),
+                        key: root.prefix.clone(),
+                        version_id,
+                        source_node_id: Some(node),
+                    });
+                }
             }
         }
         for pin in pins {
@@ -976,6 +990,7 @@ impl Operation for StartRunOperation {
                         self.directory_roots.push(DirectoryRoot {
                             bucket: bucket.clone(),
                             prefix: prefix.clone(),
+                            version_id: None,
                             source_node_id: None,
                         });
                     }
@@ -1010,11 +1025,15 @@ impl Operation for StartRunOperation {
                     Ok(()) => {
                         if let Some((key, version_id)) = checking {
                             if key.ends_with('/') {
-                                if !self.directory_roots.iter().any(|root| {
-                                    root.source_node_id.is_none()
-                                        && root.bucket == scan.bucket
-                                        && root.prefix == key
-                                }) {
+                                if let Some(existing) =
+                                    self.directory_roots.iter_mut().find(|root| {
+                                        root.source_node_id.is_none()
+                                            && root.bucket == scan.bucket
+                                            && root.prefix == key
+                                    })
+                                {
+                                    existing.version_id = Some(version_id);
+                                } else {
                                     if self.directory_roots.len() >= self.dir_limit {
                                         return Err(CatalogError::Invalid(format!(
                                             "directory inputs exceed the maximum of {} captured directories",
@@ -1024,6 +1043,7 @@ impl Operation for StartRunOperation {
                                     self.directory_roots.push(DirectoryRoot {
                                         bucket: scan.bucket.clone(),
                                         prefix: key,
+                                        version_id: Some(version_id),
                                         source_node_id: None,
                                     });
                                 }

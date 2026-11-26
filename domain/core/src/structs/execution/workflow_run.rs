@@ -256,6 +256,7 @@ pub struct DirectoryPin {
 pub struct DirectoryRoot {
     pub bucket: String,
     pub prefix: String,
+    pub version_id: Option<Ulid>,
     pub source_node_id: Option<NodeId>,
 }
 
