@@ -694,6 +694,7 @@ pub(super) fn sample_run() -> WorkflowRunRecord {
         path_restrictions: None,
         captured_remote: Vec::new(),
         directory_pins: Vec::new(),
+        directory_roots: Vec::new(),
         used_tools: Vec::new(),
     }
 }
@@ -1716,7 +1717,7 @@ async fn resumes_directory_values() {
     let resumed_values: Value = serde_json::from_str(&resumed.values_json).unwrap();
     assert_eq!(
         resumed_values["dir"],
-        format!("s3://results/folder/?node={origin}")
+        format!("s3://{origin}@results/folder/")
     );
     assert_eq!(resumed.directory_pins.len(), 2);
     assert!(
@@ -1726,14 +1727,18 @@ async fn resumes_directory_values() {
             .all(|p| p.source_node_id == Some(origin))
     );
 
-    // RemoteReadOperation serves stat and list for the captured remote folder.
-    let dir_target = resolve(&resumed, &format!("s3://results/folder/?node={origin}")).unwrap();
+    // RemoteReadOperation serves stat and list for the captured remote folder via authority form.
+    let remote_dir = format!("s3://{origin}@results/folder/");
+    let dir_target = resolve(&resumed, &remote_dir).unwrap();
+    assert_eq!(dir_target.node, Some(origin));
+    assert_eq!(dir_target.bucket, "results");
+    assert_eq!(dir_target.key, "folder/");
     let mut stat_op = RemoteReadOperation::new(
         resumed.clone(),
         dir_target.clone(),
         origin,
         DataCall::Stat {
-            address: format!("s3://results/folder/?node={origin}"),
+            address: remote_dir.clone(),
         },
     );
     match stat_op.first().unwrap() {
@@ -1747,7 +1752,7 @@ async fn resumes_directory_values() {
         dir_target,
         origin,
         DataCall::List {
-            address: format!("s3://results/folder/?node={origin}"),
+            address: remote_dir,
         },
     );
     match list_op.first().unwrap() {
@@ -1985,4 +1990,254 @@ async fn retains_local_pins() {
                 && key == "snap/a.txt"
                 && version_id.as_deref() == Some(&ver_old.to_string())
     )));
+
+    // Empty admitted directory is retained in `directory_roots` and never picks up later files.
+    let empty_req = runs.request(None, json!({ "empty": "s3://results/snap_empty/" }));
+    let mut empty_run = runs
+        .start(&runs.fixture.alice, empty_req)
+        .await
+        .unwrap()
+        .record;
+    assert!(empty_run.directory_pins.is_empty());
+    assert!(
+        empty_run
+            .directory_roots
+            .iter()
+            .any(|r| r.bucket == "results" && r.prefix == "snap_empty/")
+    );
+    seed_object(
+        &runs,
+        "results",
+        "snap_empty/late.txt",
+        Ulid::from_bytes([84; 16]),
+    )
+    .await;
+    empty_run.state = RunState::Succeeded;
+    write(
+        &runs.fixture.context,
+        WORKFLOW_RUN_KEYSPACE,
+        super::run_key(empty_run.run_id).to_vec(),
+        empty_run.to_bytes().unwrap(),
+    )
+    .await;
+    let repeated = drive(
+        FollowRunOperation::new(
+            &runs.fixture.alice,
+            runs.serving(),
+            empty_run.run_id,
+            Follow::Repeat,
+        ),
+        &runs.fixture.context,
+    )
+    .await
+    .unwrap();
+    assert!(repeated.directory_pins.is_empty());
+    let empty_list = drive(
+        ReadDataOperation::new(
+            repeated,
+            runs.fixture.node,
+            DataCall::List {
+                address: "s3://results/snap_empty/".into(),
+            },
+        ),
+        &runs.fixture.context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        empty_list,
+        HostRpcResult::StorageList {
+            entries: Vec::new()
+        }
+    );
+
+    // Local captured list and stat run per-entry READ authorization and hide denied children.
+    use aruna_core::structs::storage::blob::object_permission_path;
+    let mut restricted_parent = resumed.clone();
+    restricted_parent.path_restrictions = Some(vec![
+        aruna_core::structs::identity::auth::PathRestriction {
+            pattern: object_permission_path(
+                runs.fixture.alice.realm_id,
+                runs.fixture.group_a,
+                runs.fixture.node,
+                "results",
+                "snap/",
+            ),
+            permission: aruna_core::structs::identity::auth::Permission::READ,
+        },
+        aruna_core::structs::identity::auth::PathRestriction {
+            pattern: object_permission_path(
+                runs.fixture.alice.realm_id,
+                runs.fixture.group_a,
+                runs.fixture.node,
+                "results",
+                "snap",
+            ),
+            permission: aruna_core::structs::identity::auth::Permission::READ,
+        },
+    ]);
+    let hidden_list = drive(
+        ReadDataOperation::new(
+            restricted_parent.clone(),
+            runs.fixture.node,
+            DataCall::List {
+                address: "s3://results/snap/".into(),
+            },
+        ),
+        &runs.fixture.context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        hidden_list,
+        HostRpcResult::StorageList {
+            entries: Vec::new()
+        }
+    );
+    let hidden_stat = drive(
+        ReadDataOperation::new(
+            restricted_parent,
+            runs.fixture.node,
+            DataCall::Stat {
+                address: "s3://results/snap/".into(),
+            },
+        ),
+        &runs.fixture.context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(hidden_stat, HostRpcResult::StorageStat { entry: None });
+}
+
+// Delivering an empty output directory persists a folder marker visible to stat and list.
+#[tokio::test]
+async fn delivers_empty_dir() {
+    use super::data::{
+        DataCall, ReadDataOperation, WriteBody, WriteObjectOperation, delivery_target,
+    };
+    use aruna_blob::blob::BlobHandler;
+    use aruna_core::egress::EgressPolicy;
+    use aruna_core::structs::storage::blob::{Backend, BackendConfig};
+    use aruna_p2p::NetHandle;
+    use std::collections::HashMap;
+
+    let mut runs = runs().await;
+    let dir = tempfile::tempdir().unwrap();
+    let blob_root = dir.path().join("blobs").to_string_lossy().into_owned();
+    std::fs::create_dir_all(&blob_root).unwrap();
+    let net = NetHandle::new(
+        aruna_runner::testing::local_net(),
+        runs.fixture.context.storage_handle.clone(),
+    )
+    .await
+    .unwrap();
+    let blob = BlobHandler::with_egress(
+        BackendConfig {
+            backend_type: Backend::FileSystem,
+            bucket_prefix: Some("aruna_".to_string()),
+            max_bucket_size: Some(100_000),
+            multipart_bucket: Some("multipart".to_string()),
+            root: blob_root,
+            service_config: HashMap::new(),
+            timeouts: Default::default(),
+        },
+        runs.fixture.context.storage_handle.clone(),
+        net.clone(),
+        EgressPolicy::loopback(),
+    )
+    .await
+    .unwrap();
+    runs.fixture.context.net_handle = Some(net);
+    runs.fixture.context.blob_handle = Some(blob);
+
+    let record = runs.started().await;
+    let target = delivery_target(&record, "empty/").unwrap();
+    assert_eq!(target.bucket, "results");
+    assert_eq!(target.key, "hello/empty/");
+
+    let delivered = drive(
+        WriteObjectOperation::new(
+            (record.clone(), runs.fixture.node),
+            NodeRouting::default(),
+            target,
+            WriteBody::Bytes(Vec::new()),
+        )
+        .delivery("empty/"),
+        &runs.fixture.context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        delivered,
+        HostRpcResult::Delivered {
+            location: "aruna://results/hello/empty/".into(),
+        }
+    );
+
+    // Stat finds the empty directory with or without trailing slash.
+    for addr in [
+        "aruna://results/hello/empty/",
+        "aruna://results/hello/empty",
+    ] {
+        let stat = drive(
+            ReadDataOperation::new(
+                record.clone(),
+                runs.fixture.node,
+                DataCall::Stat {
+                    address: addr.into(),
+                },
+            ),
+            &runs.fixture.context,
+        )
+        .await
+        .unwrap();
+        match stat {
+            HostRpcResult::StorageStat { entry: Some(entry) } => {
+                assert!(entry.directory, "{addr}: {entry:?}");
+            }
+            other => panic!("{addr}: expected directory stat, got {other:?}"),
+        }
+    }
+
+    // Listing inside the empty directory returns empty, while parent listing shows `empty`.
+    let inner = drive(
+        ReadDataOperation::new(
+            record.clone(),
+            runs.fixture.node,
+            DataCall::List {
+                address: "aruna://results/hello/empty/".into(),
+            },
+        ),
+        &runs.fixture.context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        inner,
+        HostRpcResult::StorageList {
+            entries: Vec::new()
+        }
+    );
+
+    let parent = drive(
+        ReadDataOperation::new(
+            record,
+            runs.fixture.node,
+            DataCall::List {
+                address: "aruna://results/hello/".into(),
+            },
+        ),
+        &runs.fixture.context,
+    )
+    .await
+    .unwrap();
+    match parent {
+        HostRpcResult::StorageList { entries } => {
+            assert!(
+                entries.iter().any(|e| e.name == "empty" && e.directory),
+                "{entries:?}"
+            );
+        }
+        other => panic!("expected parent listing with empty dir, got {other:?}"),
+    }
 }
