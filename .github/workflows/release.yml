@@ -471,7 +471,9 @@ jobs:
   # Moves v3 and v3-beta only after release publication succeeds and this version is newest.
   promote:
     needs: [plan, node-image, release]
-    if: success() && needs.plan.outputs.publish == 'true'
+    if: >-
+      !cancelled() && needs.plan.outputs.publish == 'true'
+      && needs.node-image.result == 'success' && needs.release.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     concurrency:
