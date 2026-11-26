@@ -120,6 +120,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(execution::jobs::router())
         .merge(execution::runs::router())
         .merge(execution::workflow::router())
+        .merge(execution::automations::router())
         .merge(execution::job::audit::router())
         .merge(metadata::router())
         .merge(git::router())
@@ -800,6 +801,38 @@ pub(crate) mod tests {
             "/compute/workflow-runs/{run_id}/tasks/{task_id}/logs",
         ),
         ("GET", "/compute/workflow-runs/{run_id}/tasks/{task_id}/why"),
+        ("GET", "/compute/automations"),
+        ("POST", "/compute/automations"),
+        ("GET", "/compute/automations/{automation_id}"),
+        ("PATCH", "/compute/automations/{automation_id}"),
+        ("DELETE", "/compute/automations/{automation_id}"),
+        (
+            "POST",
+            "/compute/automations/{automation_id}/request-approval",
+        ),
+        ("POST", "/compute/automations/{automation_id}/approve"),
+        ("POST", "/compute/automations/{automation_id}/reject"),
+        ("POST", "/compute/automations/{automation_id}/pause"),
+        ("POST", "/compute/automations/{automation_id}/resume"),
+        ("GET", "/compute/automations/{automation_id}/diff"),
+        ("POST", "/compute/automations/{automation_id}/check"),
+        ("GET", "/compute/automations/{automation_id}/graph"),
+        ("POST", "/compute/automations/{automation_id}/start"),
+        ("GET", "/compute/automations/{automation_id}/events"),
+        ("POST", "/compute/automations/{automation_id}/events/start"),
+        ("GET", "/compute/automation-runs"),
+        ("GET", "/compute/automation-runs/{firing_id}"),
+        ("POST", "/compute/automation-runs/{firing_id}/cancel"),
+        ("POST", "/compute/automation-runs/{firing_id}/resolve"),
+        ("POST", "/compute/automation-runs/{firing_id}/resume"),
+        (
+            "POST",
+            "/compute/automation-runs/{firing_id}/stages/{stage}/approve",
+        ),
+        (
+            "POST",
+            "/compute/automation-runs/{firing_id}/stages/{stage}/reject",
+        ),
         ("GET", "/ga4gh/wes/v1/service-info"),
         ("GET", "/ga4gh/wes/v1/runs"),
         ("POST", "/ga4gh/wes/v1/runs"),
