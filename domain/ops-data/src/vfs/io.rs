@@ -5,7 +5,7 @@
 
 use super::handles::{
     ClaimHandleOperation, HandleAllocation, HandleClaim, HandleUse, Held, WitnessFacts,
-    detached_allows,
+    detached_allows, select_witness,
 };
 use super::path::{NameFacts, NameUse, Projected, check_component, marker_key, project_name};
 use super::policy::{VfsAccess, VfsAccessContext, VfsGrant, VfsRequest, authorize_call, grant_of};
@@ -28,13 +28,13 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::encryption::EncryptionMode;
 use aruna_core::structs::storage::object_read::ObjectRangeRequest;
 use aruna_core::structs::storage::vfs::{
-    BucketScope, DirectoryWitness, FileIdentity, HandleIdentity, HandleKind, NfsStageRecord,
-    StageBase, StageOwner, StageScope, VfsKey,
+    BucketScope, DetachReason, DirectoryWitness, FileIdentity, HandleIdentity, HandleKind,
+    NfsStageRecord, StageBase, StageOwner, StageScope, VfsKey,
 };
 use aruna_core::types::Key;
 use aruna_core::vfs_effects::{
     ByteLock, ByteRange, InstanceSummary, OpenRequest, ReadLockCheck, RebindRequest, ShareMode,
-    StageSlice, VfsEffect, VfsEvent,
+    StageSlice, VfsEffect, VfsEvent, VfsFailure,
 };
 use ulid::Ulid;
 
@@ -210,6 +210,8 @@ pub struct VfsOpenOperation {
     probe_more: bool,
     /// The probe pages on only for more child witnesses of an implicit directory.
     witnessing: bool,
+    /// The directory's own witness, the same for every caller whatever child admits them.
+    canonical: Option<DirectoryWitness>,
 }
 
 impl VfsOpenOperation {
@@ -233,6 +235,7 @@ impl VfsOpenOperation {
             probe_after: None,
             probe_more: false,
             witnessing: false,
+            canonical: None,
         }
     }
 
@@ -341,6 +344,7 @@ impl VfsOpenOperation {
                     return self.open_instance();
                 }
                 self.witness.unpublished.sort();
+                self.canonical = select_witness(&self.witness);
                 self.next_witness()
             }
             (Projected::File, HandleKind::File) => {
@@ -354,24 +358,19 @@ impl VfsOpenOperation {
     }
 
     /// An implicit directory shows only through a child the caller may see: committed children
-    /// in key order, page by page, then unpublished ones.
+    /// in key order, page by page, then unpublished ones. The child only admits the caller.
     fn next_witness(&mut self) -> OpenTurn {
         self.witness.descendants.sort();
-        let (witness, child) = if !self.witness.descendants.is_empty() {
-            let (key, life_id) = self.witness.descendants.remove(0);
-            let child = key.clone();
-            (DirectoryWitness::Descendant { key, life_id }, child)
+        let child = if !self.witness.descendants.is_empty() {
+            self.witness.descendants.remove(0).0
         } else if self.probe_more && self.probe_after.is_some() {
             self.witnessing = true;
             return self.probe_call();
         } else if !self.witness.unpublished.is_empty() {
-            let (key, token) = self.witness.unpublished.remove(0);
-            let child = key.clone();
-            (DirectoryWitness::Unpublished { key, token }, child)
+            self.witness.unpublished.remove(0).0
         } else {
             return Err(VfsError::NotFound);
         };
-        self.identity = Some(HandleIdentity::Directory(witness));
         let request = VfsRequest::new(VfsAccess::Head, &self.bucket(), Some(&child));
         let call = authorize_call(&self.input.context, request);
         self.call(OpenStep::Witness, call)
@@ -566,7 +565,11 @@ impl Operation for VfsOpenOperation {
             OpenStep::Probe => self.probed(result),
             OpenStep::Staged => self.staged_read(result),
             OpenStep::Witness => match grant_of(result) {
-                Ok(_) => self.open_instance(),
+                Ok(_) => {
+                    let witness = self.canonical.clone().ok_or(VfsError::NotFound)?;
+                    self.identity = Some(HandleIdentity::Directory(witness));
+                    self.open_instance()
+                }
                 Err(VfsError::Denied) => self.next_witness(),
                 Err(error) => Err(error),
             },
@@ -719,6 +722,8 @@ pub struct ReadResult {
     pub eof: bool,
     /// The committed version the base bytes come from; `None` for an unpublished name.
     pub version_id: Option<Ulid>,
+    /// The ranges whose bytes came from `version_id`, as read; empty when none did.
+    pub base_ranges: Vec<ByteRange>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -907,16 +912,21 @@ impl VfsReadOperation {
 
     fn assemble(&mut self) -> ReadTurn {
         let mut data = Vec::new();
+        let mut base_ranges = Vec::new();
         for (index, slice) in std::mem::take(&mut self.slices).into_iter().enumerate() {
             match slice {
                 StageSlice::Written { data: bytes, .. } => data.extend_from_slice(&bytes),
                 StageSlice::Zero { length, .. } => {
                     data.resize(data.len() + usize::try_from(length).unwrap_or(0), 0)
                 }
-                StageSlice::Base { .. } => {
+                StageSlice::Base { offset, .. } => {
                     let Some(part) = self.parts.get_mut(index).and_then(Option::take) else {
                         break;
                     };
+                    if !part.is_empty() {
+                        let length = part.len() as u64;
+                        base_ranges.push(ByteRange { offset, length });
+                    }
                     data.extend_from_slice(&part);
                 }
             }
@@ -928,6 +938,7 @@ impl VfsReadOperation {
             data,
             eof,
             version_id,
+            base_ranges,
         }))
     }
 }
@@ -1241,6 +1252,8 @@ enum CommitStep {
     Guard,
     Wait,
     Instance,
+    Reconcile,
+    Reconciled,
     Authorize,
     Stage,
     Begin,
@@ -1253,6 +1266,7 @@ enum CommitStep {
     Synced,
     Settle,
     Check,
+    Released,
     Promoted,
     Verifier,
 }
@@ -1276,6 +1290,10 @@ pub struct VfsCommitOperation {
     /// The row write may have committed, so its sealed file may be named and stays.
     row_uncertain: bool,
     failure: Option<VfsError>,
+    /// An earlier request's leftover claim and the promoted generation it would replace.
+    draft: Option<(Ulid, u64, Option<u64>)>,
+    /// The leftover claim already settled once, which must not come back.
+    reconciled: Option<(Ulid, u64)>,
 }
 
 impl VfsCommitOperation {
@@ -1292,6 +1310,8 @@ impl VfsCommitOperation {
             written: false,
             row_uncertain: false,
             failure: None,
+            draft: None,
+            reconciled: None,
         }
     }
 
@@ -1337,6 +1357,9 @@ impl VfsCommitOperation {
             VfsEvent::Instance(_) => return Err(VfsError::StaleHandle),
             other => return Err(unexpected(&other)),
         };
+        if let Some((stage_id, generation)) = summary.draft {
+            return self.reconcile(&summary, stage_id, generation);
+        }
         if summary.detached.is_some() {
             return Err(VfsError::StaleHandle);
         }
@@ -1365,6 +1388,64 @@ impl VfsCommitOperation {
         request.length = Some(summary.logical_size);
         let call = authorize_call(&self.input.context, request);
         self.call(CommitStep::Authorize, call)
+    }
+
+    /// A claim left by an earlier request whose row write had an unknown outcome is settled
+    /// against both durable rows before a new generation starts; the guard keeps it stable.
+    fn reconcile(
+        &mut self,
+        summary: &InstanceSummary,
+        stage_id: Ulid,
+        generation: u64,
+    ) -> CommitTurn {
+        if self.reconciled == Some((stage_id, generation)) {
+            return Err(VfsError::Conflict);
+        }
+        let old = (summary.stage_id).filter(|id| *id == stage_id);
+        self.draft = Some((stage_id, generation, old.map(|_| summary.generation)));
+        let scope = self.scope()?;
+        let live = VfsKey::LiveStage(scope.clone(), self.input.record.handle_id);
+        let retained = VfsKey::RetainedStage(scope, stage_id);
+        self.call(CommitStep::Reconcile, state_read(&[live, retained])?)
+    }
+
+    /// A live row naming the claim promotes it, a retained one keeps its file and only drops
+    /// the claim, and a claim no row names is aborted; the handle is then looked up again.
+    fn reconcile_read(&mut self, result: IoResult) -> CommitTurn {
+        let [live, retained] = aruna_core::rows::values::<2>(result)?;
+        let live = record_of::<NfsStageRecord>(live.as_ref())?;
+        let retained = record_of::<NfsStageRecord>(retained.as_ref())?;
+        let (stage_id, generation, old_generation) = self.draft.take().ok_or(VfsError::Conflict)?;
+        let names = |row: &Option<NfsStageRecord>| {
+            (row.as_ref())
+                .is_some_and(|row| (row.stage_id, row.generation) == (stage_id, generation))
+        };
+        let (scope, instance_id) = (self.scope()?, self.input.instance_id);
+        let effect = if names(&live) {
+            VfsEffect::PromoteCheckpoint {
+                scope,
+                instance_id,
+                stage_id,
+                generation,
+                old_generation,
+            }
+        } else if names(&retained) {
+            VfsEffect::ReleaseDraft {
+                scope,
+                instance_id,
+                stage_id,
+                generation,
+            }
+        } else {
+            VfsEffect::AbortCheckpoint {
+                scope,
+                instance_id,
+                stage_id,
+                generation,
+            }
+        };
+        self.reconciled = Some((stage_id, generation));
+        self.call(CommitStep::Reconciled, vfs_call(effect))
     }
 
     /// A clean instance has nothing to make durable except a new unpublished file's initial
@@ -1517,17 +1598,33 @@ impl VfsCommitOperation {
         }
     }
 
-    /// The row names this generation only if the uncertain write committed.
+    /// The live row names this generation only if the uncertain write committed; a retained
+    /// row naming it means the write committed and the stage moved on, so its file stays.
     fn row_checked(&mut self, result: IoResult) -> CommitTurn {
-        let [row] = aruna_core::rows::values::<1>(result)?;
-        let current = record_of::<NfsStageRecord>(row.as_ref())?;
-        // The synced row is read back, so its outcome is known either way.
+        let [live, retained] = aruna_core::rows::values::<2>(result)?;
+        let live = record_of::<NfsStageRecord>(live.as_ref())?;
+        let retained = record_of::<NfsStageRecord>(retained.as_ref())?;
+        // The synced rows are read back, so the outcome is known either way.
         self.row_uncertain = false;
-        if current.as_ref() != Some(&self.input.record) {
+        if live.as_ref() == Some(&self.input.record) {
+            self.written = true;
+            return self.promote();
+        }
+        let record = &self.input.record;
+        let moved = (retained.as_ref()).is_some_and(|row| {
+            (row.stage_id, row.generation) == (record.stage_id, record.generation)
+        });
+        if !moved {
             return Err(self.failure.take().unwrap_or(VfsError::Conflict));
         }
         self.written = true;
-        self.promote()
+        let effect = VfsEffect::ReleaseDraft {
+            scope: self.scope()?,
+            instance_id: self.input.instance_id,
+            stage_id: record.stage_id,
+            generation: record.generation,
+        };
+        self.call(CommitStep::Released, vfs_call(effect))
     }
 
     fn promote(&mut self) -> CommitTurn {
@@ -1563,6 +1660,13 @@ impl Operation for VfsCommitOperation {
                 self.guard()
             }
             CommitStep::Instance => self.instance_read(result),
+            CommitStep::Reconcile => self.reconcile_read(result),
+            CommitStep::Reconciled => {
+                vfs_event(result)?;
+                let (scope, handle_id) = (self.scope()?, self.input.record.handle_id);
+                let effect = VfsEffect::LookupHandle { scope, handle_id };
+                self.call(CommitStep::Instance, vfs_call(effect))
+            }
             CommitStep::Authorize => self.authorized(result),
             CommitStep::Stage => self.stage_read(result),
             CommitStep::Begin => self.planned(result),
@@ -1584,10 +1688,16 @@ impl Operation for VfsCommitOperation {
             }
             CommitStep::Settle => {
                 result.done()?;
-                let key = stage_key(&self.scope()?, &self.input.record);
-                self.call(CommitStep::Check, state_read(&[key])?)
+                let scope = self.scope()?;
+                let live = stage_key(&scope, &self.input.record);
+                let retained = VfsKey::RetainedStage(scope, self.input.record.stage_id);
+                self.call(CommitStep::Check, state_read(&[live, retained])?)
             }
             CommitStep::Check => self.row_checked(result),
+            CommitStep::Released => match vfs_event(result)? {
+                VfsEvent::Done => Err(self.failure.take().unwrap_or(VfsError::Conflict)),
+                other => Err(unexpected(&other)),
+            },
             CommitStep::Promoted => {
                 vfs_event(result)?;
                 self.call(CommitStep::Verifier, vfs_call(VfsEffect::WriteVerifier))
@@ -2045,6 +2155,54 @@ impl Operation for LookupInstanceOperation {
         match vfs_event(result)? {
             VfsEvent::Instance(summary) => Ok(Next::Done(summary)),
             other => Err(unexpected(&other)),
+        }
+    }
+}
+
+/// Moves the open instance of one handle off its name; `None` when no instance holds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DetachInstanceOperation {
+    scope: BucketScope,
+    handle_id: u64,
+    instance_id: Option<u64>,
+    reason: DetachReason,
+}
+
+impl DetachInstanceOperation {
+    pub fn new(
+        scope: BucketScope,
+        handle_id: u64,
+        instance_id: Option<u64>,
+        reason: DetachReason,
+    ) -> Self {
+        Self {
+            scope,
+            handle_id,
+            instance_id,
+            reason,
+        }
+    }
+}
+
+impl Operation for DetachInstanceOperation {
+    type Output = Option<InstanceSummary>;
+    type Error = VfsError;
+
+    fn first(&mut self) -> Result<Next<Option<InstanceSummary>>, VfsError> {
+        Ok(Next::Call(vfs_call(VfsEffect::DetachInstance {
+            scope: self.scope.clone(),
+            handle_id: self.handle_id,
+            instance_id: self.instance_id,
+            reason: self.reason,
+        })))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Option<InstanceSummary>>, VfsError> {
+        match vfs_event(result) {
+            Ok(VfsEvent::Instance(summary)) => Ok(Next::Done(summary)),
+            Err(VfsError::Vfs(VfsFailure::NotFound)) => Ok(Next::Done(None)),
+            Ok(other) => Err(unexpected(&other)),
+            Err(error) => Err(error),
         }
     }
 }

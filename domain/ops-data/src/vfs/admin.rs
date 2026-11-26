@@ -393,6 +393,32 @@ impl Operation for GetHostOperation {
     }
 }
 
+/// Reads one host row whoever owns it; `None` when it was never enrolled.
+#[derive(Debug, PartialEq)]
+pub struct LookupHostOperation {
+    host_id: Ulid,
+}
+
+impl LookupHostOperation {
+    pub fn new(host_id: Ulid) -> Self {
+        Self { host_id }
+    }
+}
+
+impl Operation for LookupHostOperation {
+    type Output = Option<EnrolledHostRecord>;
+    type Error = VfsError;
+
+    fn first(&mut self) -> Result<Next<Option<EnrolledHostRecord>>, VfsError> {
+        Ok(Next::Call(state_read(&[VfsKey::Host(self.host_id)])?))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Option<EnrolledHostRecord>>, VfsError> {
+        let [row] = aruna_core::rows::values::<1>(result)?;
+        Ok(Next::Done(record_of::<EnrolledHostRecord>(row.as_ref())?))
+    }
+}
+
 /// One page of a caller's rows and where the next one starts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdminPage<T> {
@@ -548,6 +574,8 @@ pub struct CreateMountOperation {
     binding: Option<NfsMountBinding>,
     /// The host is a live trusted worker pool rather than one the caller owns.
     worker_pool: bool,
+    /// The caller's own mount id, which makes a repeated create return the same binding.
+    fixed_mount_id: Option<Ulid>,
 }
 
 impl CreateMountOperation {
@@ -559,7 +587,15 @@ impl CreateMountOperation {
             now_ms: 0,
             binding: None,
             worker_pool: false,
+            fixed_mount_id: None,
         }
+    }
+
+    /// Creates the mount under `mount_id`; an existing equal binding is returned unchanged and
+    /// a different one is a conflict.
+    pub fn with_mount_id(mut self, mount_id: Ulid) -> Self {
+        self.fixed_mount_id = Some(mount_id);
+        self
     }
 
     /// Binds the mount to a live trusted worker pool host instead of one the caller owns.
@@ -581,8 +617,9 @@ impl CreateMountOperation {
     }
 
     fn start_host(&mut self, target: NfsMountTarget) -> Result<Next<NfsMountBinding>, VfsError> {
+        let mount_id = (self.fixed_mount_id).unwrap_or_else(|| self.ids.mint(self.now_ms));
         self.binding = Some(NfsMountBinding {
-            mount_id: self.ids.mint(self.now_ms),
+            mount_id,
             host_id: self.input.host_id,
             owner: self.input.caller,
             access_key: self.input.context.access_key.clone(),
@@ -596,7 +633,11 @@ impl CreateMountOperation {
             created_at_ms: self.now_ms,
         });
         self.step = MountStep::Host;
-        Ok(Next::Call(state_read(&[VfsKey::Host(self.input.host_id)])?))
+        let mut keys = vec![VfsKey::Host(self.input.host_id)];
+        if self.fixed_mount_id.is_some() {
+            keys.push(VfsKey::Mount(mount_id));
+        }
+        Ok(Next::Call(state_read(&keys)?))
     }
 
     fn authorized(&mut self, grant: VfsGrant) -> Result<Next<NfsMountBinding>, VfsError> {
@@ -677,12 +718,25 @@ impl Operation for CreateMountOperation {
                 self.start_host(target)
             }
             MountStep::Host => {
-                let [row] = aruna_core::rows::values::<1>(result)?;
+                let mut rows = result.values()?.into_iter();
+                let row = rows.next().flatten();
                 match self.worker_pool {
                     true => pool_host(row.as_ref())?,
                     false => owned_host(row.as_ref(), self.input.caller)?,
                 };
                 let binding = self.binding.as_ref().ok_or(VfsError::Conflict)?;
+                let stored = rows.next().flatten();
+                if let Some(mut existing) = record_of::<NfsMountBinding>(stored.as_ref())? {
+                    // Every field but the creation time must match for the create to repeat.
+                    let created_at_ms = existing.created_at_ms;
+                    existing.created_at_ms = binding.created_at_ms;
+                    if existing != *binding {
+                        return Err(VfsError::Conflict);
+                    }
+                    existing.created_at_ms = created_at_ms;
+                    self.binding = None;
+                    return Ok(Next::Done(existing));
+                }
                 let write = state_row(&VfsKey::Mount(binding.mount_id), binding)?;
                 // The host row is read in the same transaction, so a revocation conflicts.
                 self.step = MountStep::Written;

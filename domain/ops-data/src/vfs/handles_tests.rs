@@ -125,6 +125,7 @@ pub(super) fn instance() -> InstanceSummary {
         edit_generation: 3,
         allows_delete: true,
         sealed_edit: None,
+        draft: None,
     }
 }
 
@@ -694,4 +695,49 @@ fn committed_page_first() {
         .collect();
     assert_eq!(names, ["a", "b"]);
     assert_eq!(listed.next, ListNext::After("b/".to_string()));
+}
+
+/// Lists one truncated staged page holding only `key` and answers the directory's list check
+/// and its one probe with `visible`.
+fn staged_dir(resume: ListResume, key: &str, visible: bool) -> VfsListing {
+    let mut operation = listing(resume);
+    operation.first().unwrap();
+    operation.next(granted()).unwrap();
+    let staged = VfsEvent::StagedList {
+        entries: vec![staged_file(key)],
+        sequence: 4,
+        truncated: true,
+    };
+    operation.next(vfs(staged)).unwrap();
+    let turn = page_with(&mut operation, &[]);
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    let turn = operation.next(granted());
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    let Ok(Next::Done(listed)) = operation.next(if visible { granted() } else { denied() }) else {
+        panic!("expected the listing");
+    };
+    listed
+}
+
+#[test]
+fn staged_dir_resumes() {
+    // A hidden staged child ends the page at its exact key, so the next page tries its sibling;
+    // a directory shown through a child ends the page past the whole directory.
+    let hidden = staged_dir(ListResume::Start, "d/s/a", false);
+    assert!(hidden.entries.is_empty());
+    assert_eq!(hidden.next, ListNext::After("s/a".to_string()));
+    let mut operation = listing(ListResume::After("s/a".to_string()));
+    operation.first().unwrap();
+    let VfsEffect::ListStaged { after, .. } = asked(&operation.next(granted())) else {
+        panic!("expected the staged page");
+    };
+    assert_eq!(after, Some("d/s/a".to_string()));
+    let shown = staged_dir(ListResume::After("s/a".to_string()), "d/s/b", true);
+    let names: Vec<_> = shown
+        .entries
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+    assert_eq!(names, ["s"]);
+    assert_eq!(shown.next, ListNext::After("s/".to_string()));
 }

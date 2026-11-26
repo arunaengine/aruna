@@ -312,6 +312,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> NfsClient<S> {
         results.handle()
     }
 
+    /// Looks up one child handle under `parent`.
+    pub(crate) async fn lookup(&mut self, parent: &[u8], name: &str) -> TestResult<Vec<u8>> {
+        let compound = self.sequenced().putfh(parent).lookup(name).getfh();
+        let mut results = self.run_sequenced(compound).await?;
+        results.next(NfsOp4::Putfh)?;
+        results.next(NfsOp4::Lookup)?;
+        results.handle()
+    }
+
     pub(crate) async fn mkdir(&mut self, parent: &[u8], name: &str) -> TestResult<Vec<u8>> {
         let compound = self.sequenced().putfh(parent);
         let compound = compound.op(NfsOp4::Create, |ops| {

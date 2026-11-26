@@ -13,8 +13,8 @@ use aruna_core::id::NodeId;
 use aruna_core::stream::{BackendStream, ByteStream};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::vfs::{
-    BucketScope, DetachReason, NfsMountBinding, NfsMountTarget, NfsStageRecord, StageBase,
-    StageDisposition,
+    BucketScope, DetachReason, EnrolledHostRecord, NfsMountBinding, NfsMountTarget, NfsStageRecord,
+    StageBase, StageDisposition,
 };
 use aruna_core::vfs_effects::{InstanceSummary, VfsProtocol};
 use aruna_ops_data::s3::object::put::{PutObjectConfig, PutObjectInput};
@@ -22,7 +22,7 @@ use aruna_ops_data::s3::realm_usage::{RealmUsageOperation, RealmUsageScope};
 use aruna_ops_data::vfs::io::CommitInput;
 use aruna_ops_data::vfs::publish::PublishInput;
 use aruna_ops_data::vfs::{
-    CHUNK_BYTES, GetHostOperation, InstanceTarget, LiveStageOperation, LookupInstanceOperation,
+    CHUNK_BYTES, InstanceTarget, LiveStageOperation, LookupHostOperation, LookupInstanceOperation,
     LookupMountOperation, QuotaStageOperation, ReadCheckpointOperation, VfsAccessContext,
     VfsCommitOperation, VfsError, VfsPublishOperation,
 };
@@ -177,10 +177,11 @@ async fn prepare(
     let Some(instance) = instance else {
         return Ok(Ready::Later);
     };
+    // Newer edits seal first, so the headroom check sees the size of the image that publishes.
     let sealed_edit = match seal_state(&instance, stage) {
         Seal::Held => return Ok(Ready::Held),
-        Seal::Current(edit) => Some(edit),
-        Seal::Stale => None,
+        Seal::Stale => return seal(context, access, instance.instance_id, stage).await,
+        Seal::Current(edit) => edit,
     };
     let bucket = GetBucketOperation::new(scope.bucket.clone());
     let info = drive(bucket, context).await.map_err(failed("bucket"))?;
@@ -200,9 +201,6 @@ async fn prepare(
             return Ok(Ready::Full);
         }
     }
-    let Some(sealed_edit) = sealed_edit else {
-        return seal(context, access, instance.instance_id, stage).await;
-    };
     let rules = BucketRules::of(&info);
     let snapshot = SnapshotOperation::new(&node_routing(context), info.group_id, rules);
     let routing = drive(snapshot, context).await.map_err(failed("routing"))?;
@@ -251,12 +249,17 @@ async fn live_binding(
     let Some(binding) = drive(mount, context).await.map_err(failed("mount"))? else {
         return Ok(None);
     };
-    let host = GetHostOperation::new(binding.host_id, binding.owner);
+    let host = LookupHostOperation::new(binding.host_id);
     match drive(host, context).await {
-        Ok(host) if host.revoked_at_ms.is_none() => Ok(Some(binding)),
-        Ok(_) | Err(VfsError::NotFound) => Ok(None),
+        Ok(Some(host)) if host_admits(&host, &binding) => Ok(Some(binding)),
+        Ok(Some(_) | None) => Ok(None),
         Err(error) => Err(format!("host: {error:?}")),
     }
+}
+
+/// An unrevoked host serves its owner's bindings; a worker pool host also those of other owners.
+fn host_admits(host: &EnrolledHostRecord, binding: &NfsMountBinding) -> bool {
+    host.revoked_at_ms.is_none() && (binding.owner == host.owner || host.worker_pool)
 }
 
 /// The admission the owner wrote under: an SMB successor's bucket share by its access key, or
@@ -573,6 +576,7 @@ mod tests {
             edit_generation: 3,
             allows_delete: true,
             sealed_edit: Some(3),
+            draft: None,
         }
     }
 
@@ -636,5 +640,56 @@ mod tests {
             ..instance()
         };
         assert_eq!(seal_state(&unsealed, &record), Seal::Held);
+    }
+
+    #[test]
+    fn truncated_overlay_seals() {
+        // A writer truncated the quota-blocked file after its seal: the smaller overlay seals
+        // before any headroom check, which then sees the new generation's size.
+        let record = stage(Ulid::nil());
+        let truncated = InstanceSummary {
+            logical_size: 1,
+            edit_generation: 4,
+            ..instance()
+        };
+        assert!(truncated.logical_size < record.logical_size);
+        assert_eq!(seal_state(&truncated, &record), Seal::Stale);
+    }
+
+    #[test]
+    fn worker_pool_admits() {
+        let mounted = binding(NfsMountTarget::for_bucket("bucket", 7).unwrap());
+        let tenant = UserId::new(id(2), serving().1);
+        let plain = EnrolledHostRecord {
+            host_id: id(14),
+            owner: tenant,
+            fingerprints: Vec::new(),
+            allowed_networks: Vec::new(),
+            worker_pool: false,
+            created_at_ms: 1,
+            revoked_at_ms: None,
+        };
+        assert!(
+            !host_admits(&plain, &mounted),
+            "a plain host admits only its owner's bindings"
+        );
+        let own = EnrolledHostRecord {
+            owner: mounted.owner,
+            ..plain.clone()
+        };
+        assert!(host_admits(&own, &mounted));
+        let pool = EnrolledHostRecord {
+            worker_pool: true,
+            ..plain
+        };
+        assert!(
+            host_admits(&pool, &mounted),
+            "a worker pool host admits other owners' bindings"
+        );
+        let revoked = EnrolledHostRecord {
+            revoked_at_ms: Some(9),
+            ..pool
+        };
+        assert!(!host_admits(&revoked, &mounted));
     }
 }

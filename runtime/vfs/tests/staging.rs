@@ -842,3 +842,85 @@ async fn boot_counter_monotonic() {
     let exhausted = configure(&handle, (1 << 24) - 1).await;
     assert_eq!(exhausted, VfsEvent::Failed(VfsFailure::CounterExhausted));
 }
+
+#[tokio::test]
+async fn release_draft_keeps() {
+    let (folder, handle) = booted(MIB).await;
+    let stage_id = Ulid::generate();
+    let instance_id = opened(&handle, "d.txt", unpublished(), 0).await;
+    write(&handle, instance_id, 0, b"draft").await;
+    let plan = begin(&handle, instance_id, stage_id, 1).await;
+    assert!(matches!(plan, VfsEvent::CheckpointPlan { .. }));
+    let seal = VfsEffect::SealCheckpoint {
+        scope: scope(),
+        instance_id,
+        stage_id,
+        generation: 1,
+    };
+    let sealed = handle.execute(seal).await;
+    assert!(matches!(sealed, VfsEvent::CheckpointWritten { .. }));
+    assert_eq!(
+        by_id(&handle, instance_id).await.unwrap().draft,
+        Some((stage_id, 1))
+    );
+    let release = VfsEffect::ReleaseDraft {
+        scope: scope(),
+        instance_id,
+        stage_id,
+        generation: 1,
+    };
+    assert_eq!(handle.execute(release.clone()).await, VfsEvent::Done);
+    assert_eq!(handle.execute(release).await, VfsEvent::Done);
+    assert_eq!(by_id(&handle, instance_id).await.unwrap().draft, None);
+    let file = folder
+        .path()
+        .join("stage")
+        .join(format!("chk-{stage_id}-1.bin"));
+    assert!(file.exists(), "the sealed file was removed");
+    let inventory = handle.execute(VfsEffect::ScanStages).await;
+    let files = vec![DiskStage {
+        stage_id,
+        generation: 1,
+        bytes: 5,
+        corrupt: false,
+    }];
+    assert_eq!(inventory, VfsEvent::StageInventory { files });
+    let reused = begin(&handle, instance_id, stage_id, 1).await;
+    assert_eq!(reused, VfsEvent::Failed(VfsFailure::Conflict));
+    let next = begin(&handle, instance_id, stage_id, 2).await;
+    assert!(matches!(next, VfsEvent::CheckpointPlan { .. }), "{next:?}");
+    assert!(file.exists(), "the sealed file was removed");
+}
+
+#[tokio::test]
+async fn detach_reclaims_idle() {
+    let (folder, handle) = booted(MIB).await;
+    let (instance_id, open_id) = open_request(&handle, "k.txt", committed(), 0).await;
+    write(&handle, instance_id, 0, b"dirty").await;
+    close(&handle, open_id).await;
+    let kept = by_id(&handle, instance_id).await.unwrap();
+    assert!(kept.dirty && kept.stage_id.is_none() && kept.open_count == 0);
+    let volatile = folder
+        .path()
+        .join("stage")
+        .join(format!("vol-{instance_id}.tmp"));
+    assert!(volatile.exists(), "the unstable write has no file");
+    let detach = VfsEffect::DetachInstance {
+        scope: scope(),
+        handle_id: 11,
+        instance_id: Some(instance_id),
+        reason: DetachReason::LostLife,
+    };
+    let answer = handle.execute(detach).await;
+    let VfsEvent::Instance(Some(summary)) = answer else {
+        panic!("unexpected answer {answer:?}");
+    };
+    assert_eq!(summary.detached, Some(DetachReason::LostLife));
+    assert_eq!(handle.execute(lookup_key()).await, VfsEvent::Instance(None));
+    assert_eq!(by_id(&handle, instance_id).await, None);
+    assert!(!volatile.exists(), "the volatile file was kept");
+    let fence = handle
+        .execute(VfsEffect::FenceVault { scope: scope() })
+        .await;
+    assert!(matches!(fence, VfsEvent::VaultFenced { .. }), "{fence:?}");
+}

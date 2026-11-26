@@ -381,13 +381,14 @@ impl NfsBackend for ArunaNfsBackend {
         object: ObjectRef,
         owner: &OwnerKey,
     ) -> Result<(), NfsStat4> {
-        let closed = self.close(caller, object, owner).await;
+        // A close that ended the open released it, whatever it answered the client; one that
+        // kept it stays pending, also when it failed as stale.
+        let _ = self.close(caller, object, owner).await;
         let key = (object, owner.clone());
         let mut tables = self.tables.lock();
         tables.closed_errors.remove(&key);
-        // A close that ended the open released it, whatever it answered the client.
         match tables.opens.contains_key(&key) {
-            true => closed.and(Err(NfsStat4::Delay)),
+            true => Err(NfsStat4::Delay),
             false => Ok(()),
         }
     }

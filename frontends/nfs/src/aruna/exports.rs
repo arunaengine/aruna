@@ -5,7 +5,7 @@
 
 use aruna_core::structs::storage::vfs::{
     BucketScope, DirectoryWitness, FileIdentity, HandleIdentity, HandleKind, NfsMountBinding,
-    NfsMountTarget, StageScope,
+    NfsMountTarget,
 };
 use aruna_core::vfs_effects::{InstanceSummary, ShareMode, VfsProtocol};
 use aruna_ops_data::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
@@ -19,6 +19,7 @@ use aruna_ops_data::vfs::publish::CloseInput;
 use aruna_ops_data::vfs::{
     AllocateHandleOperation, InstanceTarget, LookupInstanceOperation, ReadChangeOperation,
     ResolveHandleOperation, VfsCloseOperation, VfsError, VfsListOperation, VfsOpenOperation,
+    stage_scope,
 };
 use aruna_runner::driver::drive;
 use tracing::debug;
@@ -425,7 +426,7 @@ impl ArunaNfsBackend {
             stable: false,
             mode: display_mode(binding, kind),
             mount_id: binding.mount_id,
-            stage_scope: StageScope::User,
+            stage_scope: stage_scope(&binding.access_key),
         };
         let opened = drive(VfsOpenOperation::new(input), &self.context).await?;
         self.discard_open(binding, open_id).await;

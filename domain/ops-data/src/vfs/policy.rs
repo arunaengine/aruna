@@ -18,11 +18,12 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{BUCKET_CREATION_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
+use aruna_core::structs::execution::job::local::credential_job_id;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess, incarnation};
 use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode};
-use aruna_core::structs::storage::vfs::NfsMountTarget;
+use aruna_core::structs::storage::vfs::{NfsMountTarget, StageScope};
 use aruna_core::types::Key;
 use aruna_core::user::id::UserId;
 use aruna_core::vfs_effects::VfsProtocol;
@@ -34,6 +35,15 @@ use aruna_ops_identity::auth::scope::SubpathScope;
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 use ulid::Ulid;
+
+/// The stage scope of a credential: a job workspace credential stages for its attempt, every
+/// other credential for its user.
+pub fn stage_scope(access_key: &str) -> StageScope {
+    match credential_job_id(access_key) {
+        Some(job_id) => StageScope::Attempt { job_id },
+        None => StageScope::User,
+    }
+}
 
 /// The S3 action a file server action is checked as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

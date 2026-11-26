@@ -6,9 +6,10 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use aruna_core::structs::execution::job::identity::JobId;
-use aruna_core::structs::storage::vfs::{EnrolledHostRecord, FileIdentity};
+use aruna_core::structs::execution::job::local::workspace_credential_id;
+use aruna_core::structs::storage::vfs::{EnrolledHostRecord, FileIdentity, StageScope};
 use aruna_core::user::id::UserId;
-use aruna_core::vfs_effects::{ReadLockCheck, VfsFailure};
+use aruna_core::vfs_effects::{ByteRange, ReadLockCheck, VfsFailure};
 use aruna_ops_data::vfs::admin::{EnrollInput, HostChange};
 use aruna_ops_data::vfs::handles::{ListNext, ListResume};
 use aruna_ops_data::vfs::{EnrollHostOperation, RevokeHostOperation, RotateHostOperation};
@@ -17,7 +18,7 @@ use aruna_runner::testing::memory_context;
 
 use super::admit::{host_allows, owner_allows};
 use super::exports::{holds, resume_after, root_key};
-use super::writes::{lock_check, owner_number};
+use super::writes::{covers, lock_check, owner_number, stage_owner};
 use super::*;
 use crate::backend::{ReadSource, ReplayAccess, ReplayCheck};
 use crate::rpc::RpcPrincipal;
@@ -558,6 +559,7 @@ async fn replay_needs_source() {
         key: "a".to_string(),
         version_id: None,
         instance_id: None,
+        base_ranges: Vec::new(),
     };
     let unpinned = backend.recheck_live(&bucket, &read(Some(unpinned))).await;
     assert_eq!(unpinned, Err(NfsStat4::Access));
@@ -565,6 +567,7 @@ async fn replay_needs_source() {
         key: "a".to_string(),
         version_id: Some(Ulid::from_parts(7, 7)),
         instance_id: None,
+        base_ranges: Vec::new(),
     };
     let folder = binding(NfsMountTarget::for_folder("data", 7, "team").expect("a folder"));
     let confined = backend
@@ -648,13 +651,114 @@ async fn revoked_close_withholds() {
     let key = (object, owner.clone());
     backend.tables.lock().opens.insert(key.clone(), slot);
     let released = backend.release_open(&caller, object, &owner).await;
-    assert!(
-        released.is_err(),
+    assert_eq!(
+        released,
+        Err(NfsStat4::Delay),
         "a node without file server state keeps the open"
     );
     let tables = backend.tables.lock();
     assert!(tables.opens.contains_key(&key));
     assert!(tables.closing.contains_key(&bucket.mount_id));
+}
+
+// A cleanup release whose close failed as stale while the backend still holds the open answers
+// DELAY, so the engine keeps it pending and retries it instead of dropping it.
+#[tokio::test]
+async fn stale_release_retried() {
+    let backend = backend();
+    let bucket = bucket_binding();
+    let caller = admitted(&backend, &bucket);
+    backend.tables.lock().mounts.remove(&bucket.mount_id);
+    let object = ObjectRef {
+        mount_id: bucket.mount_id,
+        object_id: 5,
+    };
+    let owner = client_owner(b"owner");
+    let slot = OpenSlot {
+        open_id: Ulid::from_parts(8, 1),
+        instance_id: 3,
+        key: "a".to_string(),
+        write: false,
+        identity: HandleIdentity::File(FileIdentity::Committed {
+            life_id: Ulid::from_parts(8, 2),
+        }),
+        version_id: Some(Ulid::from_parts(8, 3)),
+        size: 4,
+        access: share::READ,
+        deny: 0,
+    };
+    let key = (object, owner.clone());
+    backend.tables.lock().opens.insert(key.clone(), slot);
+    let closed = backend.close(&caller, object, &owner).await;
+    assert_eq!(closed, Err(NfsStat4::Stale));
+    let released = backend.release_open(&caller, object, &owner).await;
+    assert_eq!(released, Err(NfsStat4::Delay));
+    assert!(backend.tables.lock().opens.contains_key(&key));
+}
+
+// A replayed READ that served committed bytes reads them again from that version alone: base
+// ranges without a version refuse, and a version the node cannot serve refuses even while the
+// open instance that overlays them still exists.
+#[tokio::test]
+async fn replay_rereads_base() {
+    let backend = backend();
+    let bucket = bucket_binding();
+    let object = ObjectRef {
+        mount_id: bucket.mount_id,
+        object_id: 5,
+    };
+    let read = |source| ReplayCheck {
+        object,
+        access: ReplayAccess::Read {
+            offset: 0,
+            length: 4,
+            source: Some(source),
+        },
+    };
+    let base_ranges = vec![ByteRange {
+        offset: 0,
+        length: 4,
+    }];
+    let unversioned = ReadSource {
+        key: "a".to_string(),
+        version_id: None,
+        instance_id: Some(3),
+        base_ranges: base_ranges.clone(),
+    };
+    let unversioned = backend.recheck_live(&bucket, &read(unversioned)).await;
+    assert_eq!(unversioned, Err(NfsStat4::Access));
+    let overlaid = ReadSource {
+        key: "a".to_string(),
+        version_id: Some(Ulid::from_parts(7, 7)),
+        instance_id: Some(3),
+        base_ranges,
+    };
+    let overlaid = backend.recheck_live(&bucket, &read(overlaid)).await;
+    assert!(overlaid.is_err(), "a missing base version refuses");
+}
+
+// Base ranges skip the overlay read only when together they cover the whole read.
+#[test]
+fn ranges_cover_reads() {
+    let range = |offset, length| ByteRange { offset, length };
+    assert!(covers(&[range(0, 4)], (0, 4)));
+    assert!(covers(&[range(2, 2), range(0, 2)], (0, 4)));
+    assert!(covers(&[], (3, 0)));
+    assert!(!covers(&[range(0, 2)], (0, 4)));
+    assert!(!covers(&[range(0, 1), range(2, 2)], (0, 4)));
+    assert!(!covers(&[], (0, 1)));
+}
+
+// A job's attempt credential checkpoints an attempt stage, any other credential a user stage.
+#[test]
+fn job_stages_attempt() {
+    let mut bucket = bucket_binding();
+    assert_eq!(stage_owner(&bucket).scope, StageScope::User);
+    let job_id = JobId::from_bytes([8; 16]);
+    bucket.access_key = workspace_credential_id(job_id);
+    let owner = stage_owner(&bucket);
+    assert_eq!(owner.scope, StageScope::Attempt { job_id });
+    assert_eq!(owner.access_key, bucket.access_key);
 }
 
 // The bypass stateid reads past byte locks, the anonymous one meets every exclusive lock, and

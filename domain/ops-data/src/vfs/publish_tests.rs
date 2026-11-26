@@ -526,3 +526,30 @@ fn refused_publish_errs() {
     >(VfsError::Denied)));
     assert_eq!(operation.next(refused), Err(VfsError::Denied));
 }
+
+#[test]
+fn failed_delete_errors() {
+    // A final delete that fails with no durable checkpoint is the close's error, so the name
+    // never stays delete-pending behind a reported success.
+    let input = CloseInput {
+        context: context(),
+        scope: scope(),
+        open_id: id(22),
+        publish: None,
+        stage: None,
+    };
+    let mut operation = VfsCloseOperation::new(input);
+    operation.first().unwrap();
+    let last = CloseSummary {
+        remaining_opens: 0,
+        delete_pending: true,
+        disposition_owner: Some(owner("KEY1", StageScope::User)),
+        ..summary(0)
+    };
+    let turn = operation.next(vfs(VfsEvent::Closed(last)));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    let refused = IoResult::Child(aruna_core::calls::ChildOutcome::new(Err::<(), VfsError>(
+        VfsError::Conflict,
+    )));
+    assert_eq!(operation.next(refused), Err(VfsError::Conflict));
+}

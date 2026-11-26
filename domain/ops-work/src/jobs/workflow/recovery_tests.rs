@@ -107,7 +107,8 @@ fn prepare_call() -> Next<bool> {
     let job = Arc::new(pinned_record());
     let run = scope.run(&job).unwrap();
     let prepare =
-        PrepareAttemptOperation::new(run, (scope.spec.clone(), job), &scope.bucket, None, false);
+        PrepareAttemptOperation::new(run, (scope.spec.clone(), job), &scope.bucket, None, false)
+            .with_attempt(scope.fence.attempt.attempt);
     Next::Call(IoCall::child(prepare))
 }
 

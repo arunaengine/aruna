@@ -14,8 +14,8 @@ use rustls::pki_types::CertificateDer;
 use ulid::Ulid;
 
 use super::nfs_client::{self, CREATOR, FILE_SYNC, NfsClient, READER, Share, UNSTABLE};
-use super::smb_client::{FILE_CREATE, FILE_OPEN, NOT_DIRECTORY, READ_ATTRIBUTES, READ_DATA};
-use super::smb_client::{SmbClient, WRITER};
+use super::smb_client::{DELETE, FILE_CREATE, FILE_OPEN, NOT_DIRECTORY, READ_ATTRIBUTES};
+use super::smb_client::{READ_DATA, SmbClient, WRITER};
 use super::{BUCKET, HostKey, Mounts, loopback_tls, server_tls};
 use crate::shared::{TestResult, WAIT_CAP, wait_until};
 
@@ -225,6 +225,54 @@ async fn live_steps(mounts: &Mounts, authority: &CertificateDer<'static>) -> Tes
         move || async move { writer_opens(&mut *shared.lock().await, "fresh.txt").await },
     )
     .await
+}
+
+/// The CREATE option `FILE_DELETE_ON_CLOSE`, which removes the file at its last close.
+const DELETE_ON_CLOSE: u32 = 0x0000_1000;
+
+#[tokio::test]
+async fn nfs_finishes_delete() -> TestResult<()> {
+    let mounts = Mounts::start(true, Some(loopback_tls())).await?;
+    let result = finish_steps(&mounts).await;
+    mounts.shutdown().await;
+    result
+}
+
+/// An SMB delete-on-close under an implicit directory waits for an NFS reader that stays open,
+/// and the final NFS close removes the child while preserving the parent marker.
+async fn finish_steps(mounts: &Mounts) -> TestResult<()> {
+    let smb_address = mounts.smb.ok_or("no SMB listener")?;
+    let nfs_address = mounts.nfs.ok_or("no NFS listener")?;
+    let (_, mount) = mounts.bind_host(&HostKey::generate()?).await?;
+    let mut smb = SmbClient::login(smb_address, &mounts.keys, BUCKET).await?;
+    let mut nfs = nfs_client::plain(nfs_address).await?;
+    let root = nfs.export_root(&mount.mount_id).await?;
+
+    mounts
+        .put("implicit/cross.txt", b"deleted across protocols")
+        .await?;
+    let dir = nfs.lookup(&root, "implicit").await?;
+    let (reader, file) = nfs.open(&dir, "cross.txt", READER).await?;
+    let access = DELETE | READ_ATTRIBUTES;
+    let options = NOT_DIRECTORY | DELETE_ON_CLOSE;
+    let doomed = smb
+        .open("implicit\\cross.txt", access, FILE_OPEN, options)
+        .await?;
+    smb.close(doomed).await?;
+    assert!(
+        mounts.exists("implicit/cross.txt").await,
+        "the open NFS reader keeps the object"
+    );
+    nfs.close(&file, &reader).await?;
+    assert!(
+        mounts.missing("implicit/cross.txt").await,
+        "the final NFS close removed the object"
+    );
+    assert!(
+        mounts.exists("implicit/").await,
+        "the final NFS close preserved the implicit parent marker"
+    );
+    Ok(())
 }
 
 #[tokio::test]

@@ -711,7 +711,11 @@ impl ColdStartOperation {
         let [row] = aruna_core::rows::values::<1>(result)?;
         let host = record_of::<EnrolledHostRecord>(row.as_ref())?;
         let binding = self.binding.take().ok_or(VfsError::Conflict)?;
-        if !host.is_some_and(|host| host.revoked_at_ms.is_none()) {
+        // A trusted worker pool host serves mounts of other owners too.
+        let live = host.is_some_and(|host| {
+            host.revoked_at_ms.is_none() && (binding.owner == host.owner || host.worker_pool)
+        });
+        if !live {
             return self.retain_current();
         }
         self.admit(binding.target, VfsProtocol::Nfs, binding.read_only)
@@ -759,7 +763,8 @@ impl ColdStartOperation {
         }
     }
 
-    /// The live checkpoint that may not show again is kept by its stage id before anything else.
+    /// The live checkpoint that may not show again is kept by its stage id before anything else,
+    /// then charged as the retained row it became.
     fn retain_current(&mut self) -> ColdTurn {
         let (key, record) = self.current.clone().ok_or(VfsError::Conflict)?;
         let scope = Self::scope_of(&key)
@@ -767,12 +772,19 @@ impl ColdStartOperation {
             .ok_or(VfsError::CorruptStage)?;
         let kept = retained(&record, DetachReason::LostLife, self.now_ms);
         self.report.retained += 1;
-        let change = StageMoveOperation::new(scope, record.clone(), Some(kept));
+        let change = StageMoveOperation::new(scope.clone(), record.clone(), Some(kept.clone()));
+        self.current = Some((VfsKey::RetainedStage(scope, record.stage_id), kept));
         let seed = record.stage_id.to_bytes();
         self.call(ColdStep::Stage, IoCall::retry(change, &seed))
     }
 
     fn restore(&mut self, key: VfsKey, record: NfsStageRecord) -> ColdTurn {
+        self.report.restored += 1;
+        self.restore_call(key, record)
+    }
+
+    /// Restores `record` into memory; a retained one is only charged to the scratch budget.
+    fn restore_call(&mut self, key: VfsKey, record: NfsStageRecord) -> ColdTurn {
         let scope = Self::scope_of(&key)
             .cloned()
             .ok_or(VfsError::CorruptStage)?;
@@ -806,7 +818,6 @@ impl ColdStartOperation {
             owner: Some(record.owner.clone()),
             base_version,
         };
-        self.report.restored += 1;
         self.call(
             ColdStep::Restored,
             vfs_call(VfsEffect::RestoreStage(request)),
@@ -876,8 +887,8 @@ impl Operation for ColdStartOperation {
             ColdStep::Admit => self.admitted(result),
             ColdStep::Stage => {
                 result.child::<(), VfsError>()??;
-                self.current = None;
-                self.next_stage()
+                let (key, record) = self.current.take().ok_or(VfsError::Conflict)?;
+                self.restore_call(key, record)
             }
             // A live row reopens its instance; a retained one is only charged and answers done.
             ColdStep::Restored => match vfs_event(result)? {

@@ -194,6 +194,7 @@ fn renamed_instance(base: Option<Ulid>, life_id: Ulid) -> InstanceSummary {
         edit_generation: 0,
         allows_delete: true,
         sealed_edit: None,
+        draft: None,
     }
 }
 

@@ -936,7 +936,8 @@ pub struct VfsListOperation {
     grant: Option<VfsGrant>,
     after: Option<String>,
     staged: Vec<StagedEntry>,
-    /// The order key of the last staged name read when more follow; the page ends there.
+    /// The exact relative key of the last staged name read when more follow; the page ends
+    /// there, so a hidden staged child never makes the next page skip its siblings.
     staged_cap: Option<String>,
     sequence: u64,
     queue: VecDeque<VfsEntry>,
@@ -1098,12 +1099,7 @@ impl VfsListOperation {
         let last = entries
             .last()
             .and_then(|entry| entry.key.strip_prefix(&prefix));
-        self.staged_cap = last
-            .filter(|_| truncated)
-            .map(|rest| match rest.split_once('/') {
-                Some((name, _)) => marker_key(name),
-                None => rest.to_string(),
-            });
+        self.staged_cap = last.filter(|_| truncated).map(str::to_string);
         let grant = self.grant.as_ref().ok_or(VfsError::Denied)?;
         self.staged = entries
             .into_iter()
@@ -1222,7 +1218,10 @@ impl VfsListOperation {
                 },
             };
             let key = entry.order_key();
-            let before = self.after.as_ref().is_some_and(|after| key <= *after);
+            // A staged child resumes after its exact key, so its directory may show again.
+            let collapsed = rest.contains('/');
+            let position = if collapsed { rest } else { key.as_str() };
+            let before = (self.after.as_deref()).is_some_and(|after| position <= after);
             if rest.is_empty() || before || !within(&key) {
                 continue;
             }
@@ -1232,7 +1231,6 @@ impl VfsListOperation {
             if entry.kind == HandleKind::Directory {
                 found.remove(&entry.name);
             }
-            let collapsed = rest.contains('/');
             if found.entry(key.clone()).or_insert(entry).staged && collapsed {
                 self.descendants.entry(key).or_default().push(staged.key);
             }
@@ -1281,11 +1279,30 @@ impl VfsListOperation {
             let call = authorize_call(&self.request.context, request);
             return self.call(ListStep::Check, call);
         }
+        let next = match self.next.take() {
+            Some(ListNext::After(end)) => ListNext::After(self.past_shown(end)),
+            next => next.unwrap_or(ListNext::End),
+        };
         Ok(Next::Done(VfsListing {
             entries: std::mem::take(&mut self.kept),
-            next: self.next.take().unwrap_or(ListNext::End),
+            next,
             sequence: self.sequence,
         }))
+    }
+
+    /// A page ending inside a directory it showed continues after that whole directory, so
+    /// the directory never shows twice; a hidden one continues after the exact staged key.
+    fn past_shown(&self, end: String) -> String {
+        let directory = match end.split_once('/') {
+            Some((name, rest)) if !rest.is_empty() => marker_key(name),
+            _ => return end,
+        };
+        let shown = (self.kept.iter())
+            .any(|entry| entry.kind == HandleKind::Directory && entry.order_key() == directory);
+        match shown {
+            true => directory,
+            false => end,
+        }
     }
 
     fn checked(&mut self, result: IoResult) -> ListTurn {

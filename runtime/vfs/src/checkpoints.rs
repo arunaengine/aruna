@@ -416,6 +416,24 @@ impl VfsHandle {
         remove_files(names).await
     }
 
+    /// Ends the draft claim of an instance on `stage_id` at `generation` but keeps its sealed
+    /// file and accounting, since a durable retained row already names that generation.
+    pub(crate) fn release_draft(
+        &self,
+        scope: &BucketScope,
+        instance_id: u64,
+        stage_id: Ulid,
+        generation: u64,
+    ) -> Answer {
+        let mut state = self.shared.state.lock();
+        if let Ok(instance) = instance_mut(&mut state, scope, instance_id)
+            && instance.draft == Some((stage_id, generation))
+        {
+            instance.draft = None;
+        }
+        Ok(VfsEvent::Done)
+    }
+
     /// Removes a generation no claim and no open or named instance references; a writerless
     /// detached instance gives up its reference and leaves once idle.
     pub(crate) async fn remove_checkpoint(&self, stage_id: Ulid, generation: u64) -> Answer {

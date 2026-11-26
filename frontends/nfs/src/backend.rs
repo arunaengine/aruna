@@ -8,6 +8,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use aruna_core::user::id::UserId;
+use aruna_core::vfs_effects::ByteRange;
 use bytes::Bytes;
 use tokio::sync::broadcast;
 use ulid::Ulid;
@@ -143,6 +144,8 @@ pub struct ReadSource {
     pub key: String,
     pub version_id: Option<Ulid>,
     pub instance_id: Option<u64>,
+    /// The ranges served from the committed version, read again past any later overlay.
+    pub base_ranges: Vec<ByteRange>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

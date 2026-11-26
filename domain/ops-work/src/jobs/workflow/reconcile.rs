@@ -623,7 +623,8 @@ impl ResumeAttemptOperation {
             &scope.bucket,
             scope.wiring.encryption_key.clone(),
             false,
-        );
+        )
+        .with_attempt(scope.fence.attempt.attempt);
         self.call(ResumeStep::Prepare, IoCall::child(prepare))
     }
 

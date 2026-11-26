@@ -108,6 +108,8 @@ pub struct InstanceSummary {
     pub allows_delete: bool,
     /// The `edit_generation` captured when the current promoted checkpoint was sealed, if any.
     pub sealed_edit: Option<u64>,
+    /// The in-progress checkpoint `(stage_id, generation)` this instance claims, if any.
+    pub draft: Option<(Ulid, u64)>,
 }
 
 /// One directory witness update applied to open directory instances after a mutation.
@@ -366,6 +368,14 @@ pub enum VfsEffect {
     },
     /// Drops the generation the instance claimed and its files; any other generation is `NotFound`.
     AbortCheckpoint {
+        scope: BucketScope,
+        instance_id: u64,
+        stage_id: Ulid,
+        generation: u64,
+    },
+    /// Releases an instance's in-progress draft claim without removing the sealed checkpoint file,
+    /// used when readback proves a durable retained row already references that generation.
+    ReleaseDraft {
         scope: BucketScope,
         instance_id: u64,
         stage_id: Ulid,

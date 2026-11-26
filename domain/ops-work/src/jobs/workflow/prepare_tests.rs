@@ -350,8 +350,9 @@ fn share_create(target: NfsMountTarget) -> Next<PreparedTask> {
         display_gid: NOBODY.gid,
         mode: if read_only { 0o555 } else { 0o700 },
     };
+    let mount_id = binding_id(HOST, job(), record().attempts, !read_only);
     let create = CreateMountOperation::new(input).for_worker_pool();
-    Next::Call(IoCall::child(create))
+    Next::Call(IoCall::child(create.with_mount_id(mount_id)))
 }
 
 fn bound(mount_id: Ulid) -> IoResult {
@@ -395,7 +396,10 @@ fn provisions_nfs_bindings() {
     let view = NfsMountTarget::JobInputView { job_id: job() };
     assert_eq!(prepare.next(minted), Ok(share_create(view)));
     let scope = BucketScopeOperation::new(BUCKET);
-    let (input, session) = (Ulid::from_parts(1, 2), Ulid::from_parts(1, 3));
+    let attempt = record().attempts;
+    let input = binding_id(HOST, job(), attempt, false);
+    let session = binding_id(HOST, job(), attempt, true);
+    assert_ne!(input, session);
     assert_eq!(
         prepare.next(bound(input)),
         Ok(Next::Call(IoCall::child(scope)))
@@ -435,4 +439,32 @@ fn refuses_nfs_host() {
         let refused = child(Err::<NfsMountBinding, _>(refusal));
         assert_eq!(prepare.next(refused).unwrap_err().kind, kind);
     }
+}
+
+// Every preparation of one attempt asks for the same binding ids, so a retried volume names
+// the bindings the first one made; another attempt, job or share gets its own.
+#[test]
+fn reuses_attempt_bindings() {
+    let view = NfsMountTarget::JobInputView { job_id: job() };
+    let folder = NfsMountTarget::for_bucket(BUCKET, 7).unwrap();
+    let ask = |attempt: u32, job_id: JobId, target: &NfsMountTarget| {
+        let mut prepare = nfs_session().with_attempt(attempt);
+        prepare.run.job_id = job_id;
+        prepare.share_mount(target.clone()).unwrap()
+    };
+    let other = JobId::from_bytes([9; 16]);
+    for target in [&view, &folder] {
+        assert_eq!(ask(1, job(), target), ask(1, job(), target));
+        assert_ne!(ask(1, job(), target), ask(2, job(), target));
+        assert_ne!(ask(1, job(), target), ask(1, other, target));
+    }
+    let ids = [
+        binding_id(HOST, job(), 1, false),
+        binding_id(HOST, job(), 1, true),
+        binding_id(HOST, job(), 2, false),
+        binding_id(HOST, other, 1, false),
+    ];
+    let distinct: BTreeSet<_> = ids.iter().collect();
+    assert_eq!(distinct.len(), ids.len());
+    assert!(ids.iter().all(|id| !id.is_nil()));
 }

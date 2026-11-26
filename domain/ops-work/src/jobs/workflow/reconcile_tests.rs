@@ -393,7 +393,8 @@ fn preparing(job: JobRecord) -> ResumeAttemptOperation {
         &scope.bucket,
         None,
         false,
-    );
+    )
+    .with_attempt(scope.fence.attempt.attempt);
     let fenced = child(Ok::<(), JobError>(()));
     assert_eq!(resume.next(fenced), Ok(Next::Call(IoCall::child(prepare))));
     resume

@@ -144,6 +144,7 @@ impl Instance {
             edit_generation: self.stage.edits,
             allows_delete: self.allows_delete(),
             sealed_edit: self.stage.sealed.map(|sealed| sealed.edits),
+            draft: self.draft,
         }
     }
 
@@ -586,27 +587,44 @@ impl VfsHandle {
         Ok(VfsEvent::Instance(Some(summary)))
     }
 
-    pub(crate) fn detach_instance(
+    /// Detaches the instance of a handle and reclaims it at once when nothing keeps it any more.
+    pub(crate) async fn detach_instance(
         &self,
         scope: &BucketScope,
         handle_id: u64,
         instance_id: Option<u64>,
         reason: DetachReason,
     ) -> Answer {
-        let mut state = self.shared.state.lock();
-        let bucket = state.buckets.get_mut(scope).ok_or(VfsFailure::NotFound)?;
-        let id = instance_id.or_else(|| bucket.by_handle.get(&handle_id).copied());
-        let id = id.ok_or(VfsFailure::NotFound)?;
-        if !bucket.instances.contains_key(&id) {
-            return Err(VfsFailure::NotFound);
+        let (summary, unused) = {
+            let mut state = self.shared.state.lock();
+            let bucket = state.buckets.get_mut(scope).ok_or(VfsFailure::NotFound)?;
+            let id = instance_id.or_else(|| bucket.by_handle.get(&handle_id).copied());
+            let id = id.ok_or(VfsFailure::NotFound)?;
+            if !bucket.instances.contains_key(&id) {
+                return Err(VfsFailure::NotFound);
+            }
+            bucket.detach(id, reason);
+            let instance = bucket.instances.get_mut(&id).ok_or(VfsFailure::NotFound)?;
+            instance.change = self
+                .shared
+                .changes
+                .touch(&scope.bucket, &instance.key, true)?;
+            let summary = instance.summary();
+            let unused = match instance.idle() {
+                true => reclaim(&mut state, scope, id),
+                false => None,
+            };
+            (summary, unused)
+        };
+        if let Some(name) = unused {
+            let path = self.path(&name);
+            crate::blocking(move || {
+                crate::remove_quietly(&path);
+                Ok(())
+            })
+            .await?;
         }
-        bucket.detach(id, reason);
-        let instance = bucket.instances.get_mut(&id).ok_or(VfsFailure::NotFound)?;
-        instance.change = self
-            .shared
-            .changes
-            .touch(&scope.bucket, &instance.key, true)?;
-        Ok(VfsEvent::Instance(Some(instance.summary())))
+        Ok(VfsEvent::Instance(Some(summary)))
     }
 
     /// Detaches the instance still naming `stage_id` at `generation` and, once no open holds

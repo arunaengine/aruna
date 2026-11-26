@@ -514,6 +514,7 @@ impl NfsBackend for MockBackend {
                 key: node.name.clone(),
                 version_id: None,
                 instance_id: Some(object.object_id),
+                base_ranges: Vec::new(),
             }),
         })
     }

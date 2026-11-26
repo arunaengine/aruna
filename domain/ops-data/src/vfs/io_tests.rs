@@ -150,7 +150,7 @@ fn uncertain_row_read() {
         ..dirty_stage()
     };
     let row = Value::from(written.to_bytes().unwrap());
-    let turn = operation.next(IoResult::Values(vec![Some(row)]));
+    let turn = operation.next(IoResult::Values(vec![Some(row), None]));
     assert!(matches!(
         asked(&turn),
         VfsEffect::PromoteCheckpoint {
@@ -401,7 +401,7 @@ fn uncertain_file_kept() {
     assert_eq!(check.abort(), vec![release()]);
     let mut absent = uncertain();
     absent.next(IoResult::Done).unwrap();
-    let turn = absent.next(IoResult::Values(vec![None]));
+    let turn = absent.next(IoResult::Values(vec![None, None]));
     assert_eq!(turn, Err(VfsError::Storage("lost reply".to_string())));
     let abort = VfsEffect::AbortCheckpoint {
         scope: scope(),
@@ -413,8 +413,9 @@ fn uncertain_file_kept() {
 }
 
 #[test]
-fn second_child_opens() {
-    // An implicit directory whose first child is hidden still opens through a visible one.
+fn stable_dir_witness() {
+    // An implicit directory whose first child is hidden still opens through a visible one, and
+    // keeps the directory's own first child as its witness, the same for every caller.
     let mut operation = VfsOpenOperation::new(OpenInput {
         context: context(),
         key: "d".to_string(),
@@ -464,8 +465,8 @@ fn second_child_opens() {
         panic!("expected the open through the second child");
     };
     let witness = DirectoryWitness::Descendant {
-        key: "d/b".to_string(),
-        life_id: id(9),
+        key: "d/a".to_string(),
+        life_id: id(7),
     };
     assert_eq!(request.identity, HandleIdentity::Directory(witness));
 }
@@ -500,7 +501,87 @@ fn staged_read_version() {
         panic!("expected the read");
     };
     assert_eq!(output.version_id, Some(id(2)));
+    assert!(output.base_ranges.is_empty());
     assert!(output.eof);
+}
+
+/// A served exact-version read of version 2, whose bytes the collect step answers.
+fn served_base() -> IoResult {
+    let info = aruna_core::structs::storage::object_read::ObjectInfo {
+        size: 5,
+        version_created_at: None,
+        etag: None,
+        checksum_type: aruna_core::structs::storage::multipart::MultipartChecksumType::FullObject,
+        hashes: Default::default(),
+        composite_hashes: Default::default(),
+        part_count: None,
+    };
+    let empty = futures_util::stream::empty::<Result<bytes::Bytes, std::io::Error>>();
+    let read = GetObjectResult {
+        blob: aruna_core::stream::BackendStream::new(empty),
+        location: None,
+        metadata: Default::default(),
+        info,
+        source_metadata: None,
+        source_binding: None,
+        last_refresh: None,
+        version_id: Some(id(2)),
+        resolved_version_id: Some(id(2)),
+        resolved_range: None,
+        source_policies: Vec::new(),
+        served_source: None,
+    };
+    IoResult::Child(ChildOutcome::new(Ok::<GetObjectResult, GetObjectError>(
+        read,
+    )))
+}
+
+#[test]
+fn base_ranges_read() {
+    // A read over a staged write and the base reports the base bytes it served, as read: a
+    // short read at the end of the base reports only the bytes that came back.
+    let mut operation = VfsReadOperation::new(ReadInput {
+        context: context(),
+        key: "p/a".to_string(),
+        instance_id: Some(1),
+        version_id: Some(id(2)),
+        offset: 0,
+        length: 8,
+        lock_check: ReadLockCheck::Owner(5),
+    });
+    operation.first().unwrap();
+    operation.next(granted()).unwrap();
+    let read = VfsEvent::StageRead {
+        slices: vec![
+            StageSlice::Written {
+                offset: 0,
+                data: vec![1, 2],
+            },
+            StageSlice::Base {
+                offset: 2,
+                length: 6,
+            },
+        ],
+        logical_size: 8,
+        base_limit: 8,
+    };
+    let turn = operation.next(vfs(read));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    let turn = operation.next(served_base());
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Effect(_)))));
+    let bytes = BlobEvent::StreamCollected {
+        bytes: Ok(vec![3, 4, 5]),
+    };
+    let collected = IoResult::Event(Box::new(aruna_core::events::Event::blob(bytes)));
+    let Ok(Next::Done(output)) = operation.next(collected) else {
+        panic!("expected the read");
+    };
+    assert_eq!(output.data, vec![1, 2, 3, 4, 5]);
+    let served = ByteRange {
+        offset: 2,
+        length: 3,
+    };
+    assert_eq!(output.base_ranges, vec![served]);
 }
 
 #[test]
@@ -558,4 +639,108 @@ fn delete_close_owner() {
         request.owner.map(|owner| owner.access_key),
         Some("KEY1".to_string())
     );
+}
+
+#[test]
+fn retained_readback_keeps() {
+    // An uncertain row write that committed and moved to retained before the read back keeps
+    // its sealed file: the claim is only released, never aborted.
+    let mut operation = uncertain();
+    let turn = operation.next(IoResult::Done);
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Read(ref reads))) if reads.len() == 2));
+    let moved = NfsStageRecord {
+        generation: 6,
+        checkpoint: "c-6".to_string(),
+        disposition: aruna_core::structs::storage::vfs::StageDisposition::Retained {
+            reason: DetachReason::LostLife,
+        },
+        ..dirty_stage()
+    };
+    let moved = Value::from(moved.to_bytes().unwrap());
+    let turn = operation.next(IoResult::Values(vec![None, Some(moved)]));
+    let release_draft = VfsEffect::ReleaseDraft {
+        scope: scope(),
+        instance_id: 1,
+        stage_id: id(12),
+        generation: 6,
+    };
+    assert_eq!(asked(&turn), release_draft);
+    let turn = operation.next(vfs(VfsEvent::Done));
+    assert_eq!(turn, Err(VfsError::Storage("lost reply".to_string())));
+    assert_eq!(operation.abort(), vec![release()]);
+}
+
+#[test]
+fn stale_draft_reconciles() {
+    // A claim an earlier request left behind is settled against the live and retained rows
+    // before a new generation starts: promoted when the live row names it, else aborted.
+    let drafted = InstanceSummary {
+        stage_id: Some(id(12)),
+        generation: 5,
+        draft: Some((id(12), 6)),
+        ..instance()
+    };
+    let mut live = committing();
+    let turn = live.next(vfs(VfsEvent::Instance(Some(drafted.clone()))));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Read(ref reads))) if reads.len() == 2));
+    let row = |generation| {
+        let record = NfsStageRecord {
+            generation,
+            ..dirty_stage()
+        };
+        Some(Value::from(record.to_bytes().unwrap()))
+    };
+    let turn = live.next(IoResult::Values(vec![row(6), None]));
+    let promote = VfsEffect::PromoteCheckpoint {
+        scope: scope(),
+        instance_id: 1,
+        stage_id: id(12),
+        generation: 6,
+        old_generation: Some(5),
+    };
+    assert_eq!(asked(&turn), promote);
+    let turn = live.next(vfs(VfsEvent::Done));
+    assert!(matches!(
+        asked(&turn),
+        VfsEffect::LookupHandle { handle_id: 4, .. }
+    ));
+    // The new commit goes on from the settled instance.
+    let settled = InstanceSummary {
+        generation: 6,
+        draft: None,
+        ..drafted.clone()
+    };
+    let turn = live.next(vfs(VfsEvent::Instance(Some(settled))));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+
+    let mut absent = committing();
+    absent
+        .next(vfs(VfsEvent::Instance(Some(drafted.clone()))))
+        .unwrap();
+    let turn = absent.next(IoResult::Values(vec![row(5), None]));
+    let abort = VfsEffect::AbortCheckpoint {
+        scope: scope(),
+        instance_id: 1,
+        stage_id: id(12),
+        generation: 6,
+    };
+    assert_eq!(asked(&turn), abort);
+    absent.next(vfs(VfsEvent::Done)).unwrap();
+    // A settled claim that shows again is a conflict, and the abort touches nothing more.
+    let turn = absent.next(vfs(VfsEvent::Instance(Some(drafted))));
+    assert_eq!(turn, Err(VfsError::Conflict));
+    assert_eq!(absent.abort(), vec![release()]);
+}
+
+#[test]
+fn detach_missing_none() {
+    // Detaching a handle no instance holds answers no summary instead of an error.
+    let mut operation = DetachInstanceOperation::new(scope(), 4, None, DetachReason::Unlinked);
+    let turn = operation.first();
+    assert!(matches!(
+        asked(&turn),
+        VfsEffect::DetachInstance { handle_id: 4, .. }
+    ));
+    let missing = vfs(VfsEvent::Failed(VfsFailure::NotFound));
+    assert_eq!(operation.next(missing), Ok(Next::Done(None)));
 }

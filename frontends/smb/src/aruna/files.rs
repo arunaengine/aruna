@@ -5,10 +5,7 @@
 
 use std::time::Duration;
 
-use aruna_core::structs::execution::job::local::credential_job_id;
-use aruna_core::structs::storage::vfs::{
-    BucketScope, HandleIdentity, HandleKind, StageOwner, StageScope,
-};
+use aruna_core::structs::storage::vfs::{BucketScope, HandleIdentity, HandleKind, StageOwner};
 use aruna_core::vfs_effects::{
     ByteLock, InstanceSummary, ReadLockCheck, ShareMode, VfsFailure, VfsProtocol,
 };
@@ -20,7 +17,7 @@ use aruna_ops_data::vfs::path::marker_key;
 use aruna_ops_data::vfs::policy::{VfsAccess, VfsRequest};
 use aruna_ops_data::vfs::{
     InstanceTarget, LookupInstanceOperation, VfsAccessContext, VfsError, VfsLockOperation,
-    VfsOpenOperation, VfsReadOperation, VfsWriteOperation,
+    VfsOpenOperation, VfsReadOperation, VfsWriteOperation, stage_scope,
 };
 use aruna_runner::driver::drive;
 use bytes::Bytes;
@@ -48,14 +45,6 @@ const LOCK_PAUSE_MAX: Duration = Duration::from_millis(500);
 pub(crate) fn lock_owner(open_id: Ulid) -> u64 {
     let value = u128::from(open_id);
     (value as u64) ^ ((value >> 64) as u64)
-}
-
-/// A job's attempt credential writes attempt stages; any other credential writes user stages.
-fn stage_scope(access_key: &str) -> StageScope {
-    match credential_job_id(access_key) {
-        Some(job_id) => StageScope::Attempt { job_id },
-        None => StageScope::User,
-    }
 }
 
 fn share_mode(granted: u32, share_access: u32) -> ShareMode {

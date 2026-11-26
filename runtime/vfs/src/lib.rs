@@ -215,7 +215,10 @@ impl VfsHandle {
                 handle_id,
                 instance_id,
                 reason,
-            } => self.detach_instance(&scope, handle_id, instance_id, reason),
+            } => {
+                self.detach_instance(&scope, handle_id, instance_id, reason)
+                    .await
+            }
             VfsEffect::RetainInstance {
                 scope,
                 instance_id,
@@ -344,6 +347,12 @@ impl VfsHandle {
                 self.abort_checkpoint(&scope, instance_id, (stage_id, generation))
                     .await
             }
+            VfsEffect::ReleaseDraft {
+                scope,
+                instance_id,
+                stage_id,
+                generation,
+            } => self.release_draft(&scope, instance_id, stage_id, generation),
             VfsEffect::ReadCheckpoint {
                 stage_id,
                 generation,

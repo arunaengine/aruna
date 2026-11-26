@@ -946,6 +946,8 @@ impl VfsCloseOperation {
     fn removed(&mut self, result: IoResult) -> CloseTurn {
         match result.child::<(), VfsError>()? {
             Ok(()) => self.discard_as(CloseOutcome::Deleted),
+            // With no durable checkpoint to keep, the failed delete is the close's error.
+            Err(error) if self.input.stage.is_none() => Err(error),
             // A lapsed delete authority or a new life leaves the name and keeps the bytes.
             Err(VfsError::Denied | VfsError::StaleHandle | VfsError::Conflict) => {
                 self.retain(DetachReason::LostLife)

@@ -500,3 +500,55 @@ fn revoked_key_unmounts() {
     };
     assert_eq!(none.next(empty), Ok(Next::Done(0)));
 }
+
+/// A bucket mount of the test bucket under the caller's mount id 60, up to its host read.
+fn fixed_mount() -> CreateMountOperation {
+    let input = MountInput {
+        context: context(),
+        caller: user(),
+        host_id: id(30),
+        group_id: id(3),
+        bucket: "bucket".to_string(),
+        prefix: None,
+        job_id: None,
+        read_only: false,
+        allowed_networks: Vec::new(),
+        display_uid: 1000,
+        display_gid: 1000,
+        mode: 0o750,
+    };
+    let mut operation = CreateMountOperation::new(input).with_mount_id(id(60));
+    operation.first().unwrap();
+    let turn = operation.next(granted());
+    // The host and the existing binding are read together.
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Read(ref reads))) if reads.len() == 2));
+    operation
+}
+
+#[test]
+fn mount_id_reuses() {
+    // A repeated create returns the equal stored binding without a write, refuses a different
+    // one, and writes under the caller's id when none is stored.
+    let existing = NfsMountBinding {
+        target: NfsMountTarget::for_bucket("bucket", 7).unwrap(),
+        ..binding(user(), 60)
+    };
+    let rows = vec![row(&host(user())), row(&existing)];
+    let turn = fixed_mount().next(IoResult::Values(rows));
+    assert_eq!(turn, Ok(Next::Done(existing.clone())));
+    let other = NfsMountBinding {
+        read_only: true,
+        ..existing
+    };
+    let rows = vec![row(&host(user())), row(&other)];
+    assert_eq!(
+        fixed_mount().next(IoResult::Values(rows)),
+        Err(VfsError::Conflict)
+    );
+    let rows = vec![row(&host(user())), None];
+    let Ok(Next::Call(IoCall::Write(writes))) = fixed_mount().next(IoResult::Values(rows)) else {
+        panic!("expected the binding write");
+    };
+    let stored = NfsMountBinding::from_bytes(&writes[0].2).unwrap();
+    assert_eq!(stored.mount_id, id(60));
+}

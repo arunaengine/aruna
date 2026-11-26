@@ -18,6 +18,7 @@ use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::operation::Operation;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::structs::execution::job::family::JobFamilyId;
+use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::execution::job::input::{
     ExecutionSpec, PLUGIN_REPORT_TAG, WORKFLOW_RUN_TAG, WORKFLOW_SECRETS_TAG,
     parse_workflow_secrets, tagged,
@@ -44,6 +45,7 @@ use aruna_core::job_request::session_of;
 use aruna_ops_data::vfs::admin::MountInput;
 use aruna_ops_data::vfs::{BucketScopeOperation, CreateMountOperation, VfsAccessContext, VfsError};
 use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use ulid::Ulid;
 
 pub const NETWORK_TAG_KEY: &str = "aruna-engine.org/network";
 /// Set to `files` so a run never mounts its inputs, and so never gets an input credential.
@@ -90,6 +92,21 @@ fn share_error(error: VfsError) -> JobError {
     }
 }
 
+/// The binding id of one attempt's share on `host_id`, the same for every preparation of
+/// that attempt, so a retried volume names the binding the first preparation created.
+fn binding_id(host_id: Ulid, job_id: JobId, attempt: u32, session: bool) -> Ulid {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"aruna-worker-nfs-mount-v1");
+    hasher.update(&host_id.to_bytes());
+    hasher.update(&job_id.to_bytes());
+    hasher.update(&attempt.to_be_bytes());
+    let role: &[u8] = if session { b"session" } else { b"input" };
+    hasher.update(role);
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    Ulid::from_bytes(id)
+}
+
 #[derive(Debug, PartialEq)]
 enum PrepareStep {
     Access,
@@ -119,6 +136,8 @@ pub struct PrepareAttemptOperation {
     run: RunIdentity,
     spec: Arc<ExecutionSpec>,
     record: Arc<JobRecord>,
+    /// The attempt number its task spec carries, which names its NFS bindings.
+    attempt: u32,
     bucket: String,
     encryption_key: Option<CredentialEncryptionKey>,
     /// A first preparation also authorizes the bucket of an `Existing`-mode run.
@@ -143,10 +162,12 @@ impl PrepareAttemptOperation {
         encryption_key: Option<CredentialEncryptionKey>,
         check_workspace: bool,
     ) -> Self {
+        let attempt = record.attempts;
         Self {
             run,
             spec,
             record,
+            attempt,
             bucket: bucket.to_string(),
             encryption_key,
             check_workspace,
@@ -159,6 +180,12 @@ impl PrepareAttemptOperation {
             now_ms: 0,
             step: PrepareStep::Access,
         }
+    }
+
+    /// Prepares the attempt `attempt` instead of the record's current attempt count.
+    pub fn with_attempt(mut self, attempt: u32) -> Self {
+        self.attempt = attempt;
+        self
     }
 
     fn call(&mut self, step: PrepareStep, call: IoCall) -> PrepareNext {
@@ -418,7 +445,9 @@ impl PrepareAttemptOperation {
             display_gid: run_as.gid,
             mode: if read_only { 0o555 } else { 0o700 },
         };
-        Ok(CreateMountOperation::new(input).for_worker_pool())
+        let mount_id = binding_id(share.host_id, self.run.job_id, self.attempt, !read_only);
+        let create = CreateMountOperation::new(input).for_worker_pool();
+        Ok(create.with_mount_id(mount_id))
     }
 
     /// The session's folder in its bucket, `None` when it mounts the whole bucket.

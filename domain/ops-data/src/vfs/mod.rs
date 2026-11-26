@@ -16,21 +16,22 @@ pub use admin::{
     BucketScopeOperation, CheckpointChunk, CreateMountOperation, DeleteMountOperation,
     DeleteStageOperation, EnrollHostOperation, FindHostOperation, GetHostOperation,
     GetMountOperation, GetStageOperation, ListHostsOperation, ListMountsOperation,
-    ListStagesOperation, LiveStageOperation, LookupMountOperation, LoopbackHostOperation,
-    PublishStageOperation, ReadCheckpointOperation, RevokeHostOperation, RevokeMountsOperation,
-    RotateHostOperation,
+    ListStagesOperation, LiveStageOperation, LookupHostOperation, LookupMountOperation,
+    LoopbackHostOperation, PublishStageOperation, ReadCheckpointOperation, RevokeHostOperation,
+    RevokeMountsOperation, RotateHostOperation,
 };
 pub use handles::{
     AllocateHandleOperation, ResolveHandleOperation, RetireHandleOperation, VfsListOperation,
 };
 pub use io::{
-    ChangeSnapshot, DispositionInput, InstanceTarget, LookupInstanceOperation, ReadChangeOperation,
-    UpdateShareOperation, VfsCommitOperation, VfsDispositionOperation, VfsLockOperation,
-    VfsOpenOperation, VfsReadOperation, VfsTruncateOperation, VfsWriteOperation,
+    ChangeSnapshot, DetachInstanceOperation, DispositionInput, InstanceTarget,
+    LookupInstanceOperation, ReadChangeOperation, UpdateShareOperation, VfsCommitOperation,
+    VfsDispositionOperation, VfsLockOperation, VfsOpenOperation, VfsReadOperation,
+    VfsTruncateOperation, VfsWriteOperation,
 };
 pub use mutate::{VfsMkdirOperation, VfsRemoveOperation, VfsRenameOperation};
 pub use path::{JobEntry, JobNodeKind, JobTree, JobTreeItem};
-pub use policy::{AuthorizeVfsOperation, VfsAccessContext, vfs_policy_extras};
+pub use policy::{AuthorizeVfsOperation, VfsAccessContext, stage_scope, vfs_policy_extras};
 pub use publish::{QuotaStageOperation, VfsCloseOperation, VfsPublishOperation};
 pub use recovery::{ColdStartOperation, SweepTombstonesOperation, VfsReceiptOperation};
 

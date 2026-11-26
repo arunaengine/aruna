@@ -424,7 +424,8 @@ impl ExecutionRunOperation {
             &self.bucket,
             self.wiring.encryption_key.clone(),
             true,
-        );
+        )
+        .with_attempt(self.attempt().attempt);
         self.call(RunStep::Prepare, IoCall::child(prepare))
     }
 

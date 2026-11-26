@@ -488,10 +488,17 @@ fn heading(record: &NfsStageRecord) -> ColdStartOperation {
     operation
 }
 
-/// Answers the retention of the current stage and the empty orphan pass with the report.
+/// Answers the retention of the current stage, its scratch charge as a detached retained row
+/// and the empty orphan pass with the report.
 fn retained_report(operation: &mut ColdStartOperation, turn: Result<Next<ColdStart>, VfsError>) {
     assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
-    let Ok(Next::Done(report)) = operation.next(child(())) else {
+    let turn = operation.next(child(()));
+    let VfsEffect::RestoreStage(request) = asked(&turn) else {
+        panic!("expected the retained checkpoint to be charged");
+    };
+    let lost = aruna_core::structs::storage::vfs::DetachReason::LostLife;
+    assert_eq!(request.detached, Some(lost));
+    let Ok(Next::Done(report)) = operation.next(vfs(VfsEvent::Done)) else {
         panic!("expected the report");
     };
     assert_eq!((report.retained, report.restored), (1, 0));
@@ -576,4 +583,35 @@ fn denied_writer_retained() {
     assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
     let turn = operation.next(denied());
     retained_report(&mut operation, turn);
+}
+
+#[test]
+fn pool_host_restores() {
+    // A trusted worker pool host serves another owner's mount, so its stage is admitted again;
+    // a plain host of another owner retains the stage.
+    let realm = aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]);
+    let stranger = aruna_core::user::id::UserId::new(id(40), realm);
+    let foreign = |worker_pool| EnrolledHostRecord {
+        owner: stranger,
+        worker_pool,
+        ..host(None)
+    };
+    for (worker_pool, admitted) in [(true, true), (false, false)] {
+        let mut operation = heading(&stage(2, None));
+        operation
+            .next(IoResult::Values(vec![Some(head(2, Some(8))), None]))
+            .unwrap();
+        operation
+            .next(IoResult::Values(vec![row(&binding())]))
+            .unwrap();
+        let turn = operation.next(IoResult::Values(vec![row(&foreign(worker_pool))]));
+        match admitted {
+            true => {
+                assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+                let turn = operation.next(granted());
+                assert!(matches!(asked(&turn), VfsEffect::RestoreStage(_)));
+            }
+            false => retained_report(&mut operation, turn),
+        }
+    }
 }
