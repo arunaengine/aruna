@@ -4,6 +4,8 @@
 
 
 pub mod change;
+pub mod check;
+pub mod diff;
 pub mod identity;
 pub mod lifecycle;
 pub mod limits;
