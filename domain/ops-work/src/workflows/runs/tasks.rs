@@ -43,7 +43,7 @@ use aruna_ops_data::s3::object::get::{
     GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult,
 };
 use aruna_workflow_contract::host::{DirectoryFile, StartTask, TaskFinished, TaskOutput};
-use aruna_workflow_contract::{ArunaStepSettings, ContractError, HostRpcResult};
+use aruna_workflow_contract::{ArunaStepSettings, ContractError, HostRpcResult, HostToCoordinator};
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -87,7 +87,7 @@ const CONTROL_FILES: [&str; 6] = ["exit", "start", "end", "manifest", "stdout", 
 
 /// Normalizes a relative manifest path like container output capture; returns `""` for `.`.
 fn normalize_rel(path: &str) -> Option<String> {
-    if path.contains('\0') || path.contains('\\') || path.starts_with('/') {
+    if path.contains('\0') || path.starts_with('/') {
         return None;
     }
     let mut parts = Vec::new();
@@ -101,10 +101,25 @@ fn normalize_rel(path: &str) -> Option<String> {
     Some(parts.join("/"))
 }
 
-/// Normalizes an absolute manifest path to its relative segments under `/`.
+/// Normalizes an absolute manifest path (stripping repeated leading slashes) to segments under `/`.
 fn normalize_abs(path: &str) -> Option<String> {
-    let rest = path.strip_prefix('/')?;
+    let rest = path
+        .starts_with('/')
+        .then(|| path.trim_start_matches('/'))?;
     normalize_rel(rest).filter(|norm| !norm.is_empty())
+}
+
+/// Normalizes one manifest path for both storage lookup and coordinator local output joining.
+fn manifest_path(path: &str, directory: bool) -> Option<String> {
+    if path.starts_with('/') {
+        return normalize_abs(path).map(|abs| format!("/{abs}"));
+    }
+    let rel = normalize_rel(path)?;
+    match (rel.is_empty(), directory) {
+        (true, true) => Some(".".to_owned()),
+        (true, false) => None,
+        (false, _) => Some(rel),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1181,10 +1196,10 @@ impl RunTaskOperation {
                             false => obj.key.strip_prefix(&dir_prefix)?,
                         };
                         if rel.is_empty()
+                            || rel.contains('\0')
                             || rel
                                 .split('/')
                                 .any(|part| part.is_empty() || part == "." || part == "..")
-                            || rel.contains('\\')
                         {
                             return None;
                         }
@@ -1288,13 +1303,14 @@ impl RunTaskOperation {
         };
         let manifest: Vec<(String, bool)> = (text("manifest").unwrap_or_default().lines())
             .filter_map(|line| line.split_once(' '))
-            .filter(|(kind, path)| match (*kind, path.starts_with('/')) {
-                ("file", true) | ("directory", true) => normalize_abs(path).is_some(),
-                ("file", false) => normalize_rel(path).is_some_and(|norm| !norm.is_empty()),
-                ("directory", false) => normalize_rel(path).is_some(),
-                _ => false,
+            .filter_map(|(kind, path)| {
+                let directory = match kind {
+                    "file" => false,
+                    "directory" => true,
+                    _ => return None,
+                };
+                Some((manifest_path(path, directory)?, directory))
             })
-            .map(|(kind, path)| (path.to_owned(), kind == "directory"))
             .collect();
         let files: Vec<RunFile> = (manifest.iter())
             .map(|(path, _)| self.output_file(&summary, path))
@@ -1349,24 +1365,45 @@ impl RunTaskOperation {
     }
 }
 
-/// Splits remote directory entries into pages whose encoded JSON size fits within `budget`.
+/// Splits remote directory entries into pages whose full `RpcResponse` JSON size fits `budget`.
 fn page_dir_files(
     files: Vec<DirectoryFile>,
     budget: usize,
 ) -> Result<Vec<Vec<DirectoryFile>>, CatalogError> {
+    let empty_reply = HostToCoordinator::RpcResponse {
+        call_id: u64::MAX,
+        result: HostRpcResult::TaskDirectoryPage {
+            files: Vec::new(),
+            next_page: Some(u32::MAX),
+        },
+    };
+    let overhead = serde_json::to_vec(&empty_reply)
+        .map_err(|error| CatalogError::Storage(error.to_string()))?
+        .len();
     let mut pages = Vec::new();
     let mut current = Vec::new();
-    let mut used = 2usize;
+    let mut used = overhead;
     for entry in files {
         let item_size = serde_json::to_vec(&entry)
             .map_err(|error| CatalogError::Storage(error.to_string()))?
-            .len()
-            + 1;
-        if !current.is_empty() && used.saturating_add(item_size) > budget {
-            pages.push(std::mem::take(&mut current));
-            used = 2;
+            .len();
+        let single_size = overhead.saturating_add(item_size);
+        if single_size > budget {
+            return Err(CatalogError::Invalid(format!(
+                "remote directory entry `{}` exceeds the {budget}-byte page limit",
+                entry.path
+            )));
         }
-        used = used.saturating_add(item_size);
+        let added = match current.is_empty() {
+            true => item_size,
+            false => item_size.saturating_add(1),
+        };
+        if !current.is_empty() && used.saturating_add(added) > budget {
+            pages.push(std::mem::take(&mut current));
+            used = single_size;
+        } else {
+            used = used.saturating_add(added);
+        }
         current.push(entry);
     }
     if !current.is_empty() {

@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use aruna_workflow_contract::host::{
     DirectInput, DirectoryFile, ExpectedOutput, SecretPlaceholder, StagedFile, StartTask,
@@ -271,12 +271,8 @@ impl CoordinatorBackend {
     async fn fetch_output(&self, root: &Path, output: &TaskOutput) -> Result<(), ExecutorError> {
         let invalid =
             |why: &str| ExecutorError::Unsupported(format!("output {}: {why}", output.path));
-        if output.path.is_empty() || output.path.split('/').any(|part| part == "..") {
+        let Some(local) = output_local_path(root, &output.path) else {
             return Err(invalid("the path leaves the task folder"));
-        }
-        let local = match output.path.strip_prefix('/') {
-            Some(absolute) => root.join(CONTROL).join(wrapper::ROOT).join(absolute),
-            None => root.join(WORK).join(&output.path),
         };
         if output.directory {
             if let Some(token) = output.files_token.as_deref() {
@@ -336,12 +332,9 @@ impl CoordinatorBackend {
     ) -> Result<(), ExecutorError> {
         for entry in files {
             if entry.path.is_empty()
+                || entry.path.contains('\0')
                 || entry.path.starts_with('/')
-                || entry
-                    .path
-                    .split('/')
-                    .any(|part| part.is_empty() || part == "." || part == "..")
-                || entry.path.contains('\\')
+                || !entry.path.split('/').all(single_segment)
             {
                 return Err(ExecutorError::Unsupported(format!(
                     "output {output_path}: a directory file leaves the task folder"
@@ -375,7 +368,7 @@ impl CoordinatorBackend {
             };
             for entry in entries {
                 let name = entry.name.trim_end_matches('/');
-                if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
+                if name.contains('\0') || name.contains('/') || !single_segment(name) {
                     return Err(engine_error(format!("the listing names {name:?}")));
                 }
                 let (child, path) = (child_address(&folder, name), target.join(name));
@@ -630,6 +623,46 @@ fn engine_error(message: String) -> ExecutorError {
     }
 }
 
+/// Whether `part` is a single normal path component on this OS (allows POSIX literal `\`).
+fn single_segment(part: &str) -> bool {
+    let mut comps = Path::new(part).components();
+    matches!(comps.next(), Some(Component::Normal(_))) && comps.next().is_none()
+}
+
+/// Resolves a manifest output path strictly inside `root`, normalizing repeated leading slashes.
+fn output_local_path(root: &Path, path: &str) -> Option<PathBuf> {
+    if path.is_empty() || path.contains('\0') {
+        return None;
+    }
+    if path.starts_with('/') {
+        let mut parts = Vec::new();
+        for part in path.trim_start_matches('/').split('/') {
+            match part {
+                "" | "." => continue,
+                normal if single_segment(normal) => parts.push(normal),
+                _ => return None,
+            }
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        let mut local = root.join(CONTROL).join(wrapper::ROOT);
+        for part in parts {
+            local.push(part);
+        }
+        return Some(local);
+    }
+    let mut local = root.join(WORK);
+    for part in path.split('/') {
+        match part {
+            "" | "." => continue,
+            normal if single_segment(normal) => local.push(normal),
+            _ => return None,
+        }
+    }
+    Some(local)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -755,5 +788,17 @@ mod tests {
             child_address("aruna://results/dir/?node=peer", "what?#1.csv"),
             "aruna://results/dir/what%3F%231.csv?node=peer"
         );
+        let root = Path::new("/scratch/task");
+        assert_eq!(
+            output_local_path(root, "//tmp/result"),
+            Some(root.join(CONTROL).join(wrapper::ROOT).join("tmp/result"))
+        );
+        assert_eq!(output_local_path(root, "."), Some(root.join(WORK)));
+        assert_eq!(
+            output_local_path(root, "a\\b.txt"),
+            Some(root.join(WORK).join("a\\b.txt"))
+        );
+        assert_eq!(output_local_path(root, "/"), None);
+        assert_eq!(output_local_path(root, "../escape"), None);
     }
 }
