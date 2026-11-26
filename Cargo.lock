@@ -319,7 +319,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "aruna"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-api",
  "aruna-blob",
@@ -400,7 +400,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-api"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "ahash",
  "aruna-blob",
@@ -478,7 +478,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-blob"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-clock",
  "aruna-core",
@@ -531,7 +531,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-cli"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "apple-native-keyring-store",
  "aruna-plugin-contract",
@@ -562,7 +562,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-clock"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-core",
  "nix",
@@ -572,7 +572,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-compute"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-clock",
  "aruna-core",
@@ -603,7 +603,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-compute-helper"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "rustix",
  "serde_json",
@@ -613,7 +613,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-config"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-clock",
  "aruna-core",
@@ -647,7 +647,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-core"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aes-gcm 0.11.1",
  "argon2",
@@ -706,7 +706,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-doctor"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "ahash",
  "aruna",
@@ -757,7 +757,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-egress"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-core",
  "async-trait",
@@ -777,7 +777,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-gateway"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -785,7 +785,7 @@ dependencies = [
  "bytes",
  "chacha20poly1305",
  "futures-util",
- "lru 0.19.1",
+ "lru 0.19.2",
  "rand 0.10.4",
  "reqwest 0.13.5",
  "serde",
@@ -798,7 +798,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-kpabe"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aes-gcm 0.11.1",
  "bls12_381_plus",
@@ -814,7 +814,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-kpabe-wasm"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-kpabe",
  "blake3",
@@ -828,7 +828,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-ops-data"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-blob",
  "aruna-core",
@@ -876,7 +876,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-ops-identity"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-core",
  "aruna-p2p",
@@ -910,7 +910,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-ops-work"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-blob",
  "aruna-compute",
@@ -955,7 +955,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "spareval",
  "tempfile",
  "thiserror 2.0.21",
@@ -969,7 +969,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-p2p"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-clock",
  "aruna-core",
@@ -999,7 +999,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-plugin"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-plugin-contract",
  "serde",
@@ -1009,7 +1009,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-plugin-contract"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "hex",
  "regex",
@@ -1025,7 +1025,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-plugin-fixture"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-plugin",
  "serde_json",
@@ -1034,7 +1034,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-rdf-graph"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-core",
  "chrono",
@@ -1057,7 +1057,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-registry"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-blob",
  "aruna-clock",
@@ -1088,7 +1088,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-runner"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-blob",
  "aruna-clock",
@@ -1123,7 +1123,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-scheduler"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-core",
  "async-trait",
@@ -1137,7 +1137,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-storage"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-clock",
  "aruna-core",
@@ -1161,7 +1161,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-test-harness"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-blob",
  "aruna-core",
@@ -1193,7 +1193,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-wasm-host"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-plugin-contract",
  "async-trait",
@@ -1223,7 +1223,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-wire"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-core",
  "serde",
@@ -1232,7 +1232,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-workflow"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-compute",
  "aruna-core",
@@ -1248,7 +1248,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-workflow-contract"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "serde",
  "serde_json",
