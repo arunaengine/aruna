@@ -1,5 +1,5 @@
 # Builds the workflow coordinator image: a Cargo release build, then a non-root runtime stage.
-# Image: harbor.computational.bio.uni-giessen.de/aruna/coordinator
+# Image: ghcr.io/arunaengine/aruna-coordinator
 # Copyright (c) 2026 The Aruna Contributors
 # SPDX-License-Identifier: MIT or Apache-2.0
 

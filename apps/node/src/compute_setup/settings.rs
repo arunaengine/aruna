@@ -655,7 +655,7 @@ mod pure_tests {
         let env = BTreeMap::from([
             (
                 "ARUNA_WORKFLOW_COORDINATOR_IMAGE".to_string(),
-                "harbor.computational.bio.uni-giessen.de/aruna/coordinator:1".to_string(),
+                "ghcr.io/arunaengine/aruna-coordinator:1".to_string(),
             ),
             (
                 "ARUNA_WORKFLOW_PREFLIGHT_WORKERS".to_string(),
