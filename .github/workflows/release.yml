@@ -390,11 +390,44 @@ jobs:
 
       - name: Write the image list and checksums
         env:
+          GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.plan.outputs.tag }}
+          BUILD_HELPERS: ${{ needs.plan.outputs.build_helpers }}
         run: |
           set -euo pipefail
-          cat images/*.jsonl | jq -s --arg release "$TAG" --arg commit "$GITHUB_SHA" \
-            '{release: $release, commit: $commit, images: sort_by(.name)}' >dist/release-images.json
+          prev_file="$RUNNER_TEMP/prev-release-images.json"
+          printf '{"images":[]}\n' >"$prev_file"
+          if [ "$BUILD_HELPERS" != "true" ]; then
+            rel_body="$(mktemp)"
+            trap 'rm -f "$rel_body"' EXIT
+            code="$(curl -sS -o "$rel_body" -w '%{http_code}' \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/tags/$TAG")"
+            if [ "$code" = "200" ]; then
+              if jq -e '.assets[] | select(.name == "release-images.json")' "$rel_body" >/dev/null; then
+                gh release download "$TAG" --pattern release-images.json \
+                  --output "$prev_file" --clobber --repo "$GITHUB_REPOSITORY"
+                prev_commit="$(jq -r '.commit // empty' "$prev_file")"
+                if [ "$prev_commit" != "$GITHUB_SHA" ]; then
+                  echo "existing release-images.json is for $prev_commit, refusing to merge with $GITHUB_SHA" >&2
+                  exit 1
+                fi
+              fi
+            elif [ "$code" != "404" ]; then
+              cat "$rel_body" >&2
+              echo "failed to inspect existing release $TAG (HTTP $code)" >&2
+              exit 1
+            fi
+          fi
+          cat images/*.jsonl | jq -s --slurpfile prev "$prev_file" \
+            --arg release "$TAG" --arg commit "$GITHUB_SHA" \
+            '($prev[0].images // []) as $old | (map(.name)) as $fresh |
+             {
+               release: $release,
+               commit: $commit,
+               images: (($old | map(select(.name as $n | $fresh | index($n) | not))) + .) | sort_by(.name)
+             }' >dist/release-images.json
           jq . dist/release-images.json
           (cd dist && sha256sum -- * >SHA256SUMS)
           cat dist/SHA256SUMS
