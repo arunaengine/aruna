@@ -11,20 +11,27 @@ use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::id::NodeId;
 use aruna_core::jobs::{JobEffect, JobEvent};
+use aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::replication_protocol::{BaoReadRequest, BaoReadTarget};
+use aruna_core::replication_protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use aruna_core::structs::checksum::HASH_SHA256;
 use aruna_core::structs::execution::job::input::InputSource;
 use aruna_core::structs::execution::workflow_run::WorkflowRunRecord;
+use aruna_core::structs::identity::auth::Permission;
+use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
+use aruna_core::types::Key;
 use aruna_ops_data::replication::bao_read::{BaoReadError, BaoReadOutput};
 use aruna_ops_data::replication::managed_read::ManagedReadOperation;
+use aruna_ops_data::s3::object::head::{
+    HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
+};
 use aruna_workflow_contract::host::{ListEntry, StorageEntry};
 use aruna_workflow_contract::{ContractError, DATA_CHUNK_BYTES, HostRpcResult};
 use ulid::Ulid;
 
 use super::creator_auth;
-use super::data::{DataCall, Target};
+use super::data::{DataCall, ObjectAccessOperation, Target, bucket_answer};
 use crate::workflows::CatalogError;
 
 /// Attaches the admitted version for an unversioned directory child while keeping the original
@@ -244,15 +251,13 @@ fn remote_dir_checks(
     out
 }
 
-/// The read of an exact version `node` holds, as the run's creator; `None` without a version.
-pub fn read_call(
+/// Builds a holder read for the exact `(bucket, key, version)` without resolving precaptured links.
+fn exact_read(
     run: &WorkflowRunRecord,
-    target: &Target,
-    node: NodeId,
+    holder: NodeId,
+    target: Target,
     (metadata_only, range): (bool, Option<Range<u64>>),
 ) -> Option<IoCall> {
-    let target = resolve_precaptured(run, target.clone(), node);
-    let holder = target.node.unwrap_or(node);
     let request = BaoReadRequest {
         auth_context: creator_auth(run),
         realm_id: run.realm_id,
@@ -273,22 +278,65 @@ pub fn read_call(
     Some(IoCall::child(ManagedReadOperation::new(holder, request)))
 }
 
+/// The read of an exact version `node` holds, as the run's creator; `None` without a version.
+pub fn read_call(
+    run: &WorkflowRunRecord,
+    target: &Target,
+    node: NodeId,
+    (metadata_only, range): (bool, Option<Range<u64>>),
+) -> Option<IoCall> {
+    let target = resolve_precaptured(run, target.clone(), node);
+    let holder = target.node.unwrap_or(node);
+    exact_read(run, holder, target, (metadata_only, range))
+}
+
+/// Maps a holder refusal onto the coordinator error class without hiding backend faults.
+fn refusal_error(refusal: BaoReadRefusal) -> ContractError {
+    let message = format!("the holder refused the read: {refusal:?}");
+    match refusal {
+        BaoReadRefusal::ReadDenied | BaoReadRefusal::BucketLocked(_) => {
+            ContractError::Denied { message }
+        }
+        BaoReadRefusal::NotFound => ContractError::NotFound { message },
+        BaoReadRefusal::InvalidTarget => ContractError::Invalid { message },
+        BaoReadRefusal::BackendFailure
+        | BaoReadRefusal::HashMismatch
+        | BaoReadRefusal::RealmPeerDenied
+        | BaoReadRefusal::HeldBy { .. } => ContractError::Internal { message },
+    }
+}
+
 /// The answer of a [`read_call`], or the refusal the coordinator reads.
 pub fn read_answer(result: IoResult) -> Result<Result<BaoReadOutput, ContractError>, CatalogError> {
     Ok(match result.child::<BaoReadOutput, BaoReadError>()? {
         Ok(output) => Ok(output),
-        Err(BaoReadError::Refused(refusal)) => Err(ContractError::Denied {
-            message: format!("the holder refused the read: {refusal:?}"),
-        }),
+        Err(BaoReadError::Refused(refusal)) => Err(refusal_error(refusal)),
         Err(error) => Err(ContractError::internal(error.to_string())),
     })
 }
 
 #[derive(Debug, PartialEq)]
+enum CheckPhase {
+    Remote,
+    LocalAccess(Target),
+    LocalEncrypt(Target),
+    LocalHead,
+}
+
+#[derive(Debug, PartialEq)]
+struct DirCheck {
+    entry: Option<ListEntry>,
+    follow_up: Option<Target>,
+    phase: CheckPhase,
+}
+
+#[derive(Debug, PartialEq)]
 struct AuthDir {
     stat: bool,
+    holder: NodeId,
+    bucket: String,
     pending: VecDeque<(String, Ulid, Option<ListEntry>)>,
-    checking: Option<Option<ListEntry>>,
+    checking: Option<DirCheck>,
     allowed: BTreeMap<String, bool>,
     any_allowed: bool,
 }
@@ -306,6 +354,8 @@ enum RemoteStep {
 pub struct RemoteReadOperation {
     run: WorkflowRunRecord,
     target: Target,
+    /// Requested directory `(holder, bucket, key)` kept before resolving precaptured markers.
+    dir_target: Option<(NodeId, String, String)>,
     /// Admitted version of the requested address (preserves link version across multi-chunk reads).
     reported_version: Option<Ulid>,
     node: NodeId,
@@ -319,12 +369,26 @@ type RemoteNext = Result<Next<HostRpcResult>, CatalogError>;
 impl RemoteReadOperation {
     pub fn new(run: WorkflowRunRecord, target: Target, node: NodeId, call: DataCall) -> Self {
         let pinned = pin_directory_child(&run, target, run.node_id);
+        let dir_target = match &call {
+            DataCall::List { .. } => Some((
+                pinned.node.unwrap_or(node),
+                pinned.bucket.clone(),
+                pinned.key.clone(),
+            )),
+            DataCall::Stat { .. } if pinned.version.is_none() => Some((
+                pinned.node.unwrap_or(node),
+                pinned.bucket.clone(),
+                pinned.key.clone(),
+            )),
+            _ => None,
+        };
         let reported_version = pinned.version;
         let target = resolve_precaptured(&run, pinned, run.node_id);
         let node = target.node.unwrap_or(node);
         Self {
             run,
             target,
+            dir_target,
             reported_version,
             node,
             call,
@@ -387,16 +451,27 @@ impl RemoteReadOperation {
 
     fn next_dir_auth(&mut self, mut state: AuthDir) -> RemoteNext {
         if let Some((key, version, entry)) = state.pending.pop_front() {
-            let item = Target {
-                bucket: self.target.bucket.clone(),
+            let pin = Target {
+                bucket: state.bucket.clone(),
                 key,
                 version: Some(version),
                 owned: false,
-                node: Some(self.node),
+                node: Some(state.holder),
             };
-            let call =
-                read_call(&self.run, &item, self.node, (true, None)).ok_or(IoError::Unfinished)?;
-            state.checking = Some(entry);
+            let resolved = resolve_precaptured(&self.run, pin.clone(), self.run.node_id);
+            let resolved_node = resolved.node.unwrap_or(state.holder);
+            let is_alias = resolved_node != state.holder
+                || resolved.bucket != pin.bucket
+                || resolved.key != pin.key
+                || resolved.version != pin.version;
+            // Check READ on the original pin at its holder before accepting any link target.
+            let call = exact_read(&self.run, state.holder, pin, (true, None))
+                .ok_or(IoError::Unfinished)?;
+            state.checking = Some(DirCheck {
+                entry,
+                follow_up: is_alias.then_some(resolved),
+                phase: CheckPhase::Remote,
+            });
             self.step = RemoteStep::AuthList(Box::new(state));
             return Ok(Next::Call(call));
         }
@@ -417,6 +492,77 @@ impl RemoteReadOperation {
             .collect();
         Ok(Next::Done(HostRpcResult::StorageList { entries }))
     }
+
+    fn accept_entry(&mut self, mut state: AuthDir, entry: Option<ListEntry>) -> RemoteNext {
+        state.any_allowed = true;
+        if state.stat {
+            return Ok(Next::Done(HostRpcResult::StorageStat {
+                entry: Some(super::data::folder_entry()),
+            }));
+        }
+        if let Some(entry) = entry {
+            state
+                .allowed
+                .entry(entry.name)
+                .and_modify(|is_dir| *is_dir |= entry.directory)
+                .or_insert(entry.directory);
+        }
+        self.next_dir_auth(state)
+    }
+
+    fn check_target(
+        &mut self,
+        mut state: AuthDir,
+        entry: Option<ListEntry>,
+        target: Target,
+    ) -> RemoteNext {
+        let holder = target.node.unwrap_or(state.holder);
+        if holder == self.run.node_id {
+            let access = ObjectAccessOperation::new(
+                &creator_auth(&self.run),
+                self.run.node_id,
+                (&target.bucket, &target.key),
+                Permission::READ,
+            )
+            .owned(target.owned);
+            state.checking = Some(DirCheck {
+                entry,
+                follow_up: None,
+                phase: CheckPhase::LocalAccess(target),
+            });
+            self.step = RemoteStep::AuthList(Box::new(state));
+            return Ok(Next::Call(IoCall::child(access)));
+        }
+        let call =
+            exact_read(&self.run, holder, target, (true, None)).ok_or(IoError::Unfinished)?;
+        state.checking = Some(DirCheck {
+            entry,
+            follow_up: None,
+            phase: CheckPhase::Remote,
+        });
+        self.step = RemoteStep::AuthList(Box::new(state));
+        Ok(Next::Call(call))
+    }
+
+    fn head_local(
+        &mut self,
+        mut state: AuthDir,
+        entry: Option<ListEntry>,
+        target: Target,
+    ) -> RemoteNext {
+        let head = HeadObjectOperation::new(HeadObjectInput {
+            bucket: target.bucket,
+            key: target.key,
+            version_id: target.version,
+        });
+        state.checking = Some(DirCheck {
+            entry,
+            follow_up: None,
+            phase: CheckPhase::LocalHead,
+        });
+        self.step = RemoteStep::AuthList(Box::new(state));
+        Ok(Next::Call(IoCall::child(head)))
+    }
 }
 
 impl Operation for RemoteReadOperation {
@@ -425,28 +571,34 @@ impl Operation for RemoteReadOperation {
 
     fn first(&mut self) -> RemoteNext {
         if matches!(self.call, DataCall::List { .. }) {
-            let checks =
-                remote_dir_checks(&self.run, self.node, &self.target.bucket, &self.target.key);
+            let Some((holder, bucket, key)) = self.dir_target.clone() else {
+                return Err(IoError::Unfinished.into());
+            };
+            let checks = remote_dir_checks(&self.run, holder, &bucket, &key);
             if checks.is_empty() {
                 return Self::failed(ContractError::unsupported(format!(
-                    "a folder on node {} is not listed from here",
-                    self.node
+                    "a folder on node {holder} is not listed from here"
                 )));
             }
             return self.next_dir_auth(AuthDir {
                 stat: false,
+                holder,
+                bucket,
                 pending: checks.into(),
                 checking: None,
                 allowed: BTreeMap::new(),
                 any_allowed: false,
             });
         }
-        if matches!(self.call, DataCall::Stat { .. }) && self.target.version.is_none() {
-            let checks =
-                remote_dir_checks(&self.run, self.node, &self.target.bucket, &self.target.key);
+        if matches!(self.call, DataCall::Stat { .. })
+            && let Some((holder, bucket, key)) = self.dir_target.clone()
+        {
+            let checks = remote_dir_checks(&self.run, holder, &bucket, &key);
             if !checks.is_empty() {
                 return self.next_dir_auth(AuthDir {
                     stat: true,
+                    holder,
+                    bucket,
                     pending: checks.into(),
                     checking: None,
                     allowed: BTreeMap::new(),
@@ -502,27 +654,66 @@ impl Operation for RemoteReadOperation {
                 }))
             }
             RemoteStep::AuthList(mut state) => {
-                let entry = state.checking.take().flatten();
-                match read_answer(result)? {
-                    Ok(BaoReadOutput::Metadata { .. }) | Ok(BaoReadOutput::Stream { .. }) => {
-                        state.any_allowed = true;
-                        if state.stat {
-                            return Ok(Next::Done(HostRpcResult::StorageStat {
-                                entry: Some(super::data::folder_entry()),
-                            }));
+                let check = state.checking.take().ok_or(IoError::Unfinished)?;
+                match check.phase {
+                    CheckPhase::Remote => match result.child::<BaoReadOutput, BaoReadError>()? {
+                        Ok(BaoReadOutput::Metadata { .. }) | Ok(BaoReadOutput::Stream { .. }) => {
+                            match check.follow_up {
+                                Some(target) => self.check_target(*state, check.entry, target),
+                                None => self.accept_entry(*state, check.entry),
+                            }
                         }
-                        if let Some(entry) = entry {
-                            state
-                                .allowed
-                                .entry(entry.name)
-                                .and_modify(|is_dir| *is_dir |= entry.directory)
-                                .or_insert(entry.directory);
+                        Err(BaoReadError::Refused(BaoReadRefusal::ReadDenied)) => {
+                            self.next_dir_auth(*state)
+                        }
+                        Err(BaoReadError::Refused(refusal)) => Self::failed(refusal_error(refusal)),
+                        Err(error) => Self::failed(ContractError::internal(error.to_string())),
+                    },
+                    CheckPhase::LocalAccess(target) => match bucket_answer(result) {
+                        Ok(_) if !self.run.protected && !target.owned => {
+                            let key = Key::from(target.bucket.as_bytes().to_vec());
+                            state.checking = Some(DirCheck {
+                                entry: check.entry,
+                                follow_up: None,
+                                phase: CheckPhase::LocalEncrypt(target),
+                            });
+                            self.step = RemoteStep::AuthList(state);
+                            Ok(Next::Call(IoCall::Read(vec![(
+                                BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+                                key,
+                            )])))
+                        }
+                        Ok(_) => self.head_local(*state, check.entry, target),
+                        Err(CatalogError::Forbidden) => self.next_dir_auth(*state),
+                        Err(CatalogError::NotFound) => Self::failed(ContractError::NotFound {
+                            message: format!("{} does not exist", target.key),
+                        }),
+                        Err(error) => Err(error),
+                    },
+                    CheckPhase::LocalEncrypt(target) => {
+                        let row = result.value()?;
+                        let settings = BucketEncryption::from_row(row.as_deref())
+                            .map_err(|error| CatalogError::Storage(error.to_string()))?;
+                        if settings.is_encrypted() {
+                            self.next_dir_auth(*state)
+                        } else {
+                            self.head_local(*state, check.entry, target)
                         }
                     }
-                    Err(ContractError::Denied { .. }) => {}
-                    Err(error) => return Self::failed(error),
+                    CheckPhase::LocalHead => {
+                        match result.child::<HeadObjectResult, HeadObjectError>()? {
+                            Ok(_) => self.accept_entry(*state, check.entry),
+                            Err(
+                                HeadObjectError::NoSuchKey
+                                | HeadObjectError::NoSuchVersion
+                                | HeadObjectError::DeleteMarker,
+                            ) => Self::failed(ContractError::NotFound {
+                                message: "the link target does not exist".into(),
+                            }),
+                            Err(error) => Err(CatalogError::Storage(error.to_string())),
+                        }
+                    }
                 }
-                self.next_dir_auth(*state)
             }
         }
     }
