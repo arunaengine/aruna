@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::applet::record::{Applet, StartGrant};
-use aruna_core::applet::usage::caps;
+use aruna_core::applet::usage::{caps, run_limits};
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
@@ -237,7 +237,8 @@ impl Operation for VisitRunOperation {
         };
         result.child::<(), AppletError>()??;
         let auth = self.visitor_auth()?;
-        let start = StartRunOperation::new(&auth, self.node, request);
+        let limits = run_limits(&self.applet, self.visit.guest);
+        let start = StartRunOperation::new(&auth, self.node, request).with_limits(limits);
         Ok(Next::Call(IoCall::child(start)))
     }
 

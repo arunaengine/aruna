@@ -81,6 +81,7 @@ pub struct LimitsBody {
     pub visitor_hourly: Option<u32>,
     pub visitor_daily: Option<u32>,
     pub applet_daily: Option<u32>,
+    pub active_runs: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -342,6 +343,7 @@ impl From<&Grants> for GrantsBody {
                 visitor_hourly: limits.visitor_hourly,
                 visitor_daily: limits.visitor_daily,
                 applet_daily: limits.applet_daily,
+                active_runs: limits.active_runs,
             },
         }
     }
@@ -414,6 +416,7 @@ impl GrantsBody {
                 visitor_hourly: limits.visitor_hourly,
                 visitor_daily: limits.visitor_daily,
                 applet_daily: limits.applet_daily,
+                active_runs: limits.active_runs,
             },
         })
     }

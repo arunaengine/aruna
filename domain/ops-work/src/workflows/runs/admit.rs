@@ -22,9 +22,9 @@ use aruna_core::structs::execution::job::input::{
 };
 use aruna_core::structs::execution::job::local::{WorkspaceMode, user_dedup_key};
 use aruna_core::structs::execution::workflow_run::{
-    CacheScope, DirectoryPin, DirectoryRoot, PrecapturedInput, RunKeyRecord, RunOutput, RunState,
-    WorkflowRunRecord, WorkflowRunSpec, WorkflowSecretBinding, WorkflowSecretScope, run_key,
-    run_key_row,
+    CacheScope, DirectoryPin, DirectoryRoot, PrecapturedInput, RunKeyRecord, RunLimits, RunOutput,
+    RunState, WorkflowRunRecord, WorkflowRunSpec, WorkflowSecretBinding, WorkflowSecretScope,
+    run_key, run_key_row,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -249,7 +249,7 @@ enum AdmitStep {
     Record,
     Submit(Box<WorkflowRunRecord>),
     Job(Box<WorkflowRunRecord>),
-    Failed(String),
+    Failed(CatalogError),
 }
 
 /// Admits one run on this node; see the module comment for the checks, in that order.
@@ -260,6 +260,7 @@ pub struct StartRunOperation {
     node: (NodeId, RealmId),
     request: RunRequest,
     lineage: Lineage,
+    limits: Option<RunLimits>,
     bad_address: Option<String>,
     pending: Vec<PinnedInput>,
     value_heads: Vec<(String, String)>,
@@ -321,6 +322,7 @@ impl StartRunOperation {
             resolved_values,
             request,
             lineage: Lineage::default(),
+            limits: None,
             bad_address,
             remote: BTreeMap::new(),
             asked: Vec::new(),
@@ -388,6 +390,12 @@ impl StartRunOperation {
     /// Starts the run in an existing lineage, as a resume or a repeat does.
     pub fn in_lineage(mut self, lineage: Lineage) -> Self {
         self.lineage = lineage;
+        self
+    }
+
+    /// Bounds compute resources and concurrent active runs for this run.
+    pub fn with_limits(mut self, limits: RunLimits) -> Self {
+        self.limits = (!limits.is_empty()).then_some(limits);
         self
     }
 
@@ -645,6 +653,7 @@ impl StartRunOperation {
             directory_pins: std::mem::take(&mut self.directory_pins),
             directory_roots: std::mem::take(&mut self.directory_roots),
             used_tools: self.lineage.used_tools.clone(),
+            limits: self.limits,
         };
         let key = request.idempotency_key.as_ref().map(|key| {
             let row = self.key_row(key);
@@ -815,7 +824,7 @@ impl StartRunOperation {
             retention_ms: RETENTION_MS,
             workspace_mode: WorkspaceMode::None,
             workspace_bucket: None,
-            active_cap: None,
+            active_cap: record.limits.and_then(|limits| limits.active_cap),
         };
         let serving = (!record.local_only).then_some(self.node);
         let submit = SubmitLocalOperation::new(spec, self.node.1, serving);
@@ -842,6 +851,21 @@ impl Operation for StartRunOperation {
         }
         if let Some(error) = self.bad_address.take() {
             return Err(CatalogError::Invalid(error));
+        }
+        if let Some(limits) = self.limits {
+            if limits.active_cap == Some(0) {
+                return Err(CatalogError::Conflict(
+                    "active workflow run limit reached".into(),
+                ));
+            }
+            if limits.cpu_cores == Some(0)
+                || limits.ram_bytes == Some(0)
+                || limits.walltime_ms == Some(0)
+            {
+                return Err(CatalogError::Invalid(
+                    "run compute limits must be greater than zero".into(),
+                ));
+            }
         }
         let Some(output) = &self.request.output else {
             return Err(CatalogError::Invalid(
@@ -1171,11 +1195,17 @@ impl Operation for StartRunOperation {
                 }
                 Err(error) => {
                     let message = format!("the run could not be queued: {error}");
+                    let returned = match error {
+                        SubmitJobError::ActiveJobLimit { .. } => {
+                            CatalogError::Conflict(error.to_string())
+                        }
+                        _ => CatalogError::Storage(message.clone()),
+                    };
                     let change = RunChange::State {
                         state: RunState::Failed,
-                        error: Some(message.clone()),
+                        error: Some(message),
                     };
-                    self.step = AdmitStep::Failed(message);
+                    self.step = AdmitStep::Failed(returned);
                     Ok(Next::Call(change_call(record.run_id, vec![change])))
                 }
             },
@@ -1186,9 +1216,9 @@ impl Operation for StartRunOperation {
                     created: true,
                 }))
             }
-            AdmitStep::Failed(message) => {
+            AdmitStep::Failed(error) => {
                 changed(result)?;
-                Err(CatalogError::Storage(message))
+                Err(error)
             }
         }
     }
@@ -1196,7 +1226,10 @@ impl Operation for StartRunOperation {
     fn expected_error(error: &CatalogError) -> bool {
         matches!(
             error,
-            CatalogError::NotFound | CatalogError::Forbidden | CatalogError::Invalid(_)
+            CatalogError::NotFound
+                | CatalogError::Forbidden
+                | CatalogError::Invalid(_)
+                | CatalogError::Conflict(_)
         )
     }
 }

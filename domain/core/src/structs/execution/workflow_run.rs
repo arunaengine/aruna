@@ -320,6 +320,25 @@ impl StepRecord {
     }
 }
 
+/// Compute and active-run caps enforced at admission and on every task of the run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunLimits {
+    pub cpu_cores: Option<u32>,
+    pub ram_bytes: Option<u64>,
+    pub walltime_ms: Option<u64>,
+    /// Maximum concurrent active workflow runs for the submitting account.
+    pub active_cap: Option<u32>,
+}
+
+impl RunLimits {
+    pub fn is_empty(self) -> bool {
+        self.cpu_cores.is_none()
+            && self.ram_bytes.is_none()
+            && self.walltime_ms.is_none()
+            && self.active_cap.is_none()
+    }
+}
+
 /// One workflow run of a group on this node.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowRunRecord {
@@ -390,6 +409,9 @@ pub struct WorkflowRunRecord {
     /// Resolved `(tool_id, version)` pairs a composed workflow lowered against for this run.
     #[serde(default)]
     pub used_tools: Vec<(String, String)>,
+    /// Compute and concurrency caps captured at admission from an applet or automation.
+    #[serde(default)]
+    pub limits: Option<RunLimits>,
 }
 
 /// One task of a run, with the state of its newest attempt.

@@ -198,6 +198,9 @@ impl FollowRunOperation {
         if !directory_pins.is_empty() || !directory_roots.is_empty() {
             start = start.with_directories(directory_pins, directory_roots);
         }
+        if let Some(limits) = source.limits {
+            start = start.with_limits(limits);
+        }
         if source.created_by == self.auth.user_id && self.auth.path_restrictions.is_none() {
             start = start.with_captured(source.captured_remote.clone());
         }

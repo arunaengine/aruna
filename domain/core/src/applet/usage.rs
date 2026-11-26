@@ -5,9 +5,12 @@
 use ulid::Ulid;
 
 use crate::applet::record::Applet;
+use crate::structs::execution::workflow_run::RunLimits;
 use crate::types::Key;
 
 const USAGE_ROW: u8 = 3;
+/// Default active workflow run cap for anonymous guest runs when the applet sets none.
+pub const GUEST_ACTIVE_CAP: u32 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Window {
@@ -67,6 +70,42 @@ pub fn caps(applet: &Applet, guest: bool) -> Caps {
     }
 }
 
+fn min_cap<T: Copy + Ord>(left: Option<T>, right: T) -> Option<T> {
+    Some(left.map_or(right, |left| left.min(right)))
+}
+
+/// Compute and concurrency caps for one workflow run started through `applet`.
+pub fn run_limits(applet: &Applet, guest: bool) -> RunLimits {
+    let limits = &applet.grants.limits;
+    match (guest, &applet.guests) {
+        (true, Some(policy)) => {
+            let guest_active = limits
+                .active_runs
+                .unwrap_or(GUEST_ACTIVE_CAP)
+                .min(GUEST_ACTIVE_CAP)
+                .min(policy.hourly);
+            RunLimits {
+                cpu_cores: min_cap(limits.cpu_cores, policy.cpu_cores),
+                ram_bytes: min_cap(limits.ram_bytes, policy.ram_bytes),
+                walltime_ms: min_cap(limits.walltime_ms, policy.walltime_ms),
+                active_cap: Some(guest_active),
+            }
+        }
+        (true, None) => RunLimits {
+            cpu_cores: Some(0),
+            ram_bytes: Some(0),
+            walltime_ms: Some(0),
+            active_cap: Some(0),
+        },
+        (false, _) => RunLimits {
+            cpu_cores: limits.cpu_cores,
+            ram_bytes: limits.ram_bytes,
+            walltime_ms: limits.walltime_ms,
+            active_cap: limits.active_runs,
+        },
+    }
+}
+
 /// The counter row of `visitor` (a pseudonym; `None` counts the whole applet) in one window.
 pub fn usage_key(applet_id: Ulid, (window, start): (Window, u32), visitor: Option<&str>) -> Key {
     let mut row = usage_prefix(applet_id).to_vec();
@@ -121,5 +160,62 @@ mod tests {
         assert!(usage_ended(&day, now + Window::Day.span_ms()));
         assert_eq!(usage_count(Some(&7u32.to_be_bytes())), 7);
         assert_eq!(usage_count(None), 0);
+    }
+
+    #[test]
+    fn guest_limits_bounded() {
+        use crate::applet::record::{Access, Applet, Embedding, Grants, GuestPolicy, Lifecycle};
+        use crate::structs::identity::realm::RealmId;
+        use crate::user::id::UserId;
+
+        let realm = RealmId([1; 32]);
+        let user = UserId::local(Ulid::from_bytes([2; 16]), realm);
+        let mut applet = Applet {
+            applet_id: Ulid::from_bytes([3; 16]),
+            group_id: Ulid::from_bytes([4; 16]),
+            name: "demo".into(),
+            slug: "demo".into(),
+            host: "demo.local".into(),
+            repository: None,
+            host_node: iroh::SecretKey::from_bytes(&[5; 32]).public(),
+            lifecycle: Lifecycle::Live,
+            access: Access::Public,
+            live: Some(1),
+            versions: Vec::new(),
+            drafts: Vec::new(),
+            grants: Grants::default(),
+            embedding: Embedding::default(),
+            guests: None,
+            domains: Vec::new(),
+            pending: None,
+            account: None,
+            role_id: None,
+            visitor_salt: [0; 32],
+            created_by: user,
+            created_at_ms: 1,
+            revision: 1,
+        };
+        assert_eq!(run_limits(&applet, true).active_cap, Some(0));
+        applet.grants.limits.cpu_cores = Some(2);
+        applet.grants.limits.active_runs = Some(6);
+        applet.guests = Some(GuestPolicy {
+            enabled_by: user,
+            in_frames: false,
+            cpu_cores: 4,
+            ram_bytes: 512,
+            walltime_ms: 10_000,
+            file_bytes: 1024,
+            hourly: 3,
+            daily: 10,
+            expiry_days: 1,
+        });
+        let guest = run_limits(&applet, true);
+        assert_eq!(guest.cpu_cores, Some(2));
+        assert_eq!(guest.ram_bytes, Some(512));
+        assert_eq!(guest.walltime_ms, Some(10_000));
+        assert_eq!(guest.active_cap, Some(3));
+        let signed = run_limits(&applet, false);
+        assert_eq!(signed.cpu_cores, Some(2));
+        assert_eq!(signed.active_cap, Some(6));
     }
 }

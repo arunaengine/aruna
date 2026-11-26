@@ -696,6 +696,7 @@ pub(super) fn sample_run() -> WorkflowRunRecord {
         directory_pins: Vec::new(),
         directory_roots: Vec::new(),
         used_tools: Vec::new(),
+        limits: None,
     }
 }
 
@@ -2784,4 +2785,76 @@ fn keeps_empty_link() {
             .unwrap(),
         Next::Done(HostRpcResult::Failed(ContractError::Denied { .. }))
     ));
+}
+
+#[tokio::test]
+async fn enforces_run_limits() {
+    // Admission enforces active_cap and rejects zero caps; task_spec clamps and enforces compute.
+    use aruna_core::structs::execution::workflow_run::RunLimits;
+
+    let mut run = sample_run();
+    run.limits = Some(RunLimits {
+        cpu_cores: Some(2),
+        ram_bytes: Some(1024),
+        walltime_ms: Some(30_000),
+        active_cap: Some(1),
+    });
+    let mut task = start_task();
+    task.resources = TaskResources::default();
+    let spec = task_spec(&run, &task, "k1").unwrap();
+    assert_eq!(spec.resources.cpu_cores, Some(2));
+    assert_eq!(spec.resources.ram_bytes, Some(1024));
+    assert_eq!(spec.resources.max_walltime_ms, Some(30_000));
+
+    task.resources.cpus = 4;
+    assert!(matches!(
+        task_spec(&run, &task, "k2"),
+        Err(aruna_workflow_contract::ContractError::Denied { .. })
+    ));
+    task.resources.cpus = 1;
+    task.resources.memory_bytes = Some(2048);
+    assert!(matches!(
+        task_spec(&run, &task, "k3"),
+        Err(aruna_workflow_contract::ContractError::Denied { .. })
+    ));
+    task.resources.memory_bytes = Some(512);
+    task.resources.time_seconds = Some(60);
+    assert!(matches!(
+        task_spec(&run, &task, "k4"),
+        Err(aruna_workflow_contract::ContractError::Denied { .. })
+    ));
+
+    let runs = runs().await;
+    let cap = RunLimits {
+        cpu_cores: Some(2),
+        ram_bytes: Some(1024),
+        walltime_ms: Some(30_000),
+        active_cap: Some(1),
+    };
+    let first = drive(
+        StartRunOperation::new(
+            &runs.fixture.alice,
+            runs.serving(),
+            runs.request(None, json!({})),
+        )
+        .with_limits(cap),
+        &runs.fixture.context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.record.limits, Some(cap));
+    let second = drive(
+        StartRunOperation::new(
+            &runs.fixture.alice,
+            runs.serving(),
+            runs.request(None, json!({})),
+        )
+        .with_limits(cap),
+        &runs.fixture.context,
+    )
+    .await;
+    assert!(
+        matches!(second, Err(CatalogError::Conflict(_))),
+        "{second:?}"
+    );
 }

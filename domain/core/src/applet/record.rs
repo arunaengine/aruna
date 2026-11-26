@@ -132,6 +132,8 @@ pub struct Limits {
     pub visitor_hourly: Option<u32>,
     pub visitor_daily: Option<u32>,
     pub applet_daily: Option<u32>,
+    #[serde(default)]
+    pub active_runs: Option<u32>,
 }
 
 /// What an approver granted. Grants never come from code; only an approval changes them.
