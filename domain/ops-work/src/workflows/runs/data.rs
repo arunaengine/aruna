@@ -726,7 +726,10 @@ impl ReadDataOperation {
         let object = match result.child::<GetObjectResult, GetObjectError>()? {
             Ok(object) => object,
             Err(GetObjectError::InvalidRange) => {
-                let version = target.version.map(|version| version.to_string());
+                let version = self
+                    .reported_version
+                    .or(target.version)
+                    .map(|version| version.to_string());
                 return Ok(Next::Done(HostRpcResult::StorageChunk {
                     bytes: Vec::new(),
                     eof: true,
@@ -805,7 +808,10 @@ impl Operation for ReadDataOperation {
             self.step = Some(ReadStep::Remote);
             return Ok(Next::Call(IoCall::child(read)));
         }
-        if requested.key != target.key || requested.bucket != target.bucket {
+        if requested.key != target.key
+            || requested.bucket != target.bucket
+            || requested.version != target.version
+        {
             self.reported_version = requested.version;
         }
         let access = ObjectAccessOperation::new(

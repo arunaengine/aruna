@@ -2515,3 +2515,137 @@ async fn delivers_empty_dir() {
         other => panic!("expected parent listing with empty dir, got {other:?}"),
     }
 }
+
+// Local empty-file reads of a precaptured link report the admitted link version on InvalidRange.
+#[test]
+fn keeps_empty_link() {
+    use super::data::{DataCall, ReadDataOperation};
+    use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
+    use aruna_core::operation::Operation;
+    use aruna_core::structs::execution::job::input::{InputMode, InputSelection, InputSource};
+    use aruna_core::structs::execution::workflow_run::{
+        CacheScope, DirectoryPin, PrecapturedInput, RunState, WorkflowRunRecord,
+    };
+    use aruna_core::structs::storage::blob::BucketInfo;
+    use aruna_ops_data::s3::object::get::{GetObjectError, GetObjectResult};
+
+    let local = crate::tests::records::node(1);
+    let link_ver = Ulid::from_parts(8, 1);
+    let target_ver = Ulid::from_parts(9, 1);
+    let sel = InputSelection {
+        source: InputSource::S3 {
+            bucket: "results".into(),
+            key: "folder/empty.dat".into(),
+            version_id: Some(target_ver.to_string()),
+        },
+        source_node_id: Some(local),
+        dest_key: "results/folder/empty.link".into(),
+        mode: InputMode::Snapshot,
+        container_path: None,
+        name: None,
+        description: None,
+    };
+    let mut cap = crate::tests::records::captured_input(&sel, local);
+    cap.version_id = target_ver;
+    let run = WorkflowRunRecord {
+        run_id: Ulid::from_parts(1, 1),
+        lineage: Ulid::from_parts(1, 1),
+        group_id: aruna_core::types::GroupId::from_bytes([1; 16]),
+        workflow_id: Ulid::from_parts(1, 2),
+        workflow_name: "demo".into(),
+        version: 1,
+        realm_id: crate::tests::records::REALM,
+        node_id: local,
+        local_only: false,
+        last_event_seq: 0,
+        state: RunState::Running,
+        created_by: crate::tests::records::user(),
+        created_at_ms: 1,
+        started_at_ms: None,
+        finished_at_ms: None,
+        error: None,
+        values_json: "{}".into(),
+        inputs_json: None,
+        output: None,
+        provenance_crate: false,
+        provenance_status: None,
+        provenance_document_id: None,
+        outputs: Vec::new(),
+        origin: None,
+        parent_job_id: None,
+        claim_token_digest: None,
+        attempts: 1,
+        steps: Vec::new(),
+        resumes_run_id: None,
+        repeats_run_id: None,
+        cache_scope: CacheScope::Group,
+        placement_site: None,
+        protected: false,
+        secrets: Default::default(),
+        path_restrictions: None,
+        captured_remote: vec![PrecapturedInput {
+            pin_node_id: local,
+            pin_bucket: "results".into(),
+            pin_key: "folder/empty.link".into(),
+            pin_version_id: link_ver,
+            resolved: sel,
+            captured: cap,
+        }],
+        directory_pins: vec![DirectoryPin {
+            bucket: "results".into(),
+            key: "folder/empty.link".into(),
+            version_id: link_ver,
+            source_node_id: Some(local),
+        }],
+        directory_roots: Vec::new(),
+        used_tools: Vec::new(),
+    };
+    let mut read = ReadDataOperation::new(
+        run,
+        local,
+        DataCall::Download {
+            address: "s3://results/folder/empty.link".into(),
+            offset: 0,
+        },
+    );
+    assert!(matches!(
+        read.first().unwrap(),
+        Next::Call(IoCall::Child(_))
+    ));
+    let info = BucketInfo {
+        group_id: aruna_core::types::GroupId::from_bytes([1; 16]),
+        created_at: std::time::UNIX_EPOCH,
+        created_by: crate::tests::records::user(),
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: Default::default(),
+        distribution: None,
+    };
+    assert!(matches!(
+        read.next(IoResult::Child(ChildOutcome::new(Ok::<_, CatalogError>(
+            info
+        ))))
+        .unwrap(),
+        Next::Call(IoCall::Read(_))
+    ));
+    let get_call = read.next(IoResult::Values(vec![None])).unwrap();
+    assert!(format!("{get_call:?}").contains("folder/empty.dat"));
+    let eof = read
+        .next(IoResult::Child(ChildOutcome::new(Err::<
+            GetObjectResult,
+            GetObjectError,
+        >(
+            GetObjectError::InvalidRange,
+        ))))
+        .unwrap();
+    assert_eq!(
+        eof,
+        Next::Done(HostRpcResult::StorageChunk {
+            bytes: Vec::new(),
+            eof: true,
+            version: Some(link_ver.to_string()),
+        })
+    );
+}
