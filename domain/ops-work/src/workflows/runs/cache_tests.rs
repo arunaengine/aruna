@@ -420,3 +420,75 @@ async fn follows_lineage() {
         Some(format!("run:{}", repeated.run_id))
     );
 }
+
+// Listing a folder outside the run's own area filters objects and common prefixes through the
+// creator's scoped READ permissions so explicitly denied child names are never disclosed.
+#[tokio::test]
+async fn hides_denied_listing() {
+    use aruna_core::structs::identity::auth::{PathRestriction, Permission};
+    use aruna_core::structs::storage::blob::bucket_permission_path;
+    use aruna_workflow_contract::host::{HostRpcResult, ListEntry};
+
+    let runs = runs().await;
+    let root = tempfile::tempdir().unwrap();
+    let context = blobs(&runs, root.path()).await;
+    let group = runs.fixture.group_a;
+    let owner = runs.fixture.alice.user_id;
+    let node = runs.fixture.node;
+    let realm = runs.fixture.alice.realm_id;
+    aruna_runner::testing::seed_bucket(&context, "reads", group, owner, Vec::new()).await;
+    for key in [
+        "dir/public.txt",
+        "dir/hidden.txt",
+        "dir/open/a.txt",
+        "dir/secret/b.txt",
+    ] {
+        put(&runs, &context, ("reads", key), b"ok").await;
+    }
+
+    let mut record = runs.started().await;
+    let base = bucket_permission_path(realm, group, node, "reads");
+    record.path_restrictions = Some(vec![
+        PathRestriction {
+            pattern: format!("{base}/**"),
+            permission: Permission::READ,
+        },
+        PathRestriction {
+            pattern: format!("{base}/dir/hidden.txt"),
+            permission: Permission::DENY,
+        },
+        PathRestriction {
+            pattern: format!("{base}/dir/secret/**"),
+            permission: Permission::DENY,
+        },
+    ]);
+    let listed = drive(
+        super::data::ReadDataOperation::new(
+            record.clone(),
+            node,
+            super::data::DataCall::List {
+                address: "aruna://reads/dir/".into(),
+            },
+        ),
+        &context,
+    )
+    .await
+    .unwrap();
+    let HostRpcResult::StorageList { mut entries } = listed else {
+        panic!("expected StorageList, got {listed:?}");
+    };
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    assert_eq!(
+        entries,
+        vec![
+            ListEntry {
+                name: "open".into(),
+                directory: true,
+            },
+            ListEntry {
+                name: "public.txt".into(),
+                directory: false,
+            },
+        ]
+    );
+}

@@ -3,6 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::VecDeque;
+
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
@@ -319,12 +321,23 @@ impl DataCall {
 }
 
 #[derive(Debug, PartialEq)]
+struct ListState {
+    target: Target,
+    info: BucketInfo,
+    stat: bool,
+    pending: VecDeque<(String, ListEntry)>,
+    checking: Option<ListEntry>,
+    next_token: Option<ListContinuationToken>,
+}
+
+#[derive(Debug, PartialEq)]
 enum ReadStep {
     Access(Target),
     Encryption(Target, Box<BucketInfo>),
     Head(Target, Box<BucketInfo>),
-    Folder,
+    Folder(Target, Box<BucketInfo>),
     List(Target, Box<BucketInfo>),
+    Filter(Box<ListState>),
     Get(Target),
     Collect(Box<GetObjectResult>),
     Remote,
@@ -390,7 +403,7 @@ impl ReadDataOperation {
         }
     }
 
-    /// One listing page below the target, as a folder; a stat lists one key to find a folder.
+    /// One listing page below the target, as a folder; a stat lists keys to check for a visible entry.
     fn list(
         &mut self,
         target: Target,
@@ -403,13 +416,13 @@ impl ReadDataOperation {
             bucket: target.bucket.clone(),
             group_id: info.group_id,
             continuation_token: token,
-            max_keys: Some(if stat { 1 } else { LIST_KEYS }),
+            max_keys: Some(if stat && target.owned { 1 } else { LIST_KEYS }),
             prefix: (!prefix.is_empty()).then_some(prefix),
             delimiter: Some("/".into()),
             start_after: None,
         });
         self.step = Some(match stat {
-            true => ReadStep::Folder,
+            true => ReadStep::Folder(target, Box::new(info)),
             false => ReadStep::List(target, Box::new(info)),
         });
         Ok(Next::Call(IoCall::child(list)))
@@ -451,9 +464,60 @@ impl ReadDataOperation {
         }
     }
 
-    fn listed(&mut self, target: Target, info: BucketInfo, result: IoResult) -> ReadNext {
+    fn folder_entry() -> StorageEntry {
+        StorageEntry {
+            directory: true,
+            size: 0,
+            modified_ms: None,
+            version: None,
+            sha256: None,
+            aruna_id: None,
+            endpoints: Vec::new(),
+        }
+    }
+
+    fn listed(
+        &mut self,
+        target: Target,
+        info: BucketInfo,
+        stat: bool,
+        result: IoResult,
+    ) -> ReadNext {
         let listed = result.child::<ListBucketResult, ListBucketError>()?;
         let listed = listed.map_err(|error| CatalogError::Storage(error.to_string()))?;
+        if target.owned {
+            if stat {
+                let exists = !(listed.objects.is_empty() && listed.common_prefixes.is_empty());
+                return Ok(Next::Done(HostRpcResult::StorageStat {
+                    entry: exists.then(Self::folder_entry),
+                }));
+            }
+            let prefix = folder(&target.key);
+            let name = |key: &str| {
+                key.strip_prefix(&prefix)
+                    .unwrap_or(key)
+                    .trim_end_matches('/')
+                    .to_owned()
+            };
+            for object in &listed.objects {
+                self.entries.push(ListEntry {
+                    name: name(&object.head.key),
+                    directory: false,
+                });
+            }
+            for common in &listed.common_prefixes {
+                self.entries.push(ListEntry {
+                    name: name(common),
+                    directory: true,
+                });
+            }
+            return match listed.continuation_token {
+                Some(token) => self.list(target, info, Some(token)),
+                None => Ok(Next::Done(HostRpcResult::StorageList {
+                    entries: std::mem::take(&mut self.entries),
+                })),
+            };
+        }
         let prefix = folder(&target.key);
         let name = |key: &str| {
             key.strip_prefix(&prefix)
@@ -461,24 +525,87 @@ impl ReadDataOperation {
                 .trim_end_matches('/')
                 .to_owned()
         };
-        for object in &listed.objects {
-            self.entries.push(ListEntry {
-                name: name(&object.head.key),
-                directory: false,
-            });
+        let mut pending =
+            VecDeque::with_capacity(listed.objects.len() + listed.common_prefixes.len());
+        for object in listed.objects {
+            let display = name(&object.head.key);
+            pending.push_back((
+                object.head.key,
+                ListEntry {
+                    name: display,
+                    directory: false,
+                },
+            ));
         }
-        for common in &listed.common_prefixes {
-            self.entries.push(ListEntry {
-                name: name(common),
-                directory: true,
-            });
+        for common in listed.common_prefixes {
+            let display = name(&common);
+            pending.push_back((
+                common,
+                ListEntry {
+                    name: display,
+                    directory: true,
+                },
+            ));
         }
-        match listed.continuation_token {
-            Some(token) => self.list(target, info, Some(token)),
-            None => Ok(Next::Done(HostRpcResult::StorageList {
-                entries: std::mem::take(&mut self.entries),
-            })),
+        self.check_next(ListState {
+            target,
+            info,
+            stat,
+            pending,
+            checking: None,
+            next_token: listed.continuation_token,
+        })
+    }
+
+    fn check_next(&mut self, mut state: ListState) -> ReadNext {
+        if let Some((key, entry)) = state.pending.pop_front() {
+            let auth = creator_auth(&self.run);
+            let path = object_permission_path(
+                auth.realm_id,
+                state.info.group_id,
+                self.node_id,
+                &state.target.bucket,
+                &key,
+            );
+            let check = AuthorizeOperation::new(
+                auth.realm_id,
+                &auth,
+                &path,
+                &Permission::READ,
+                PolicyRequestExtras::rest(),
+            );
+            state.checking = Some(entry);
+            self.step = Some(ReadStep::Filter(Box::new(state)));
+            return Ok(Next::Call(IoCall::child(check)));
         }
+        if let Some(token) = state.next_token.take() {
+            return self.list(state.target, state.info, Some(token));
+        }
+        if state.stat {
+            return Ok(Next::Done(HostRpcResult::StorageStat { entry: None }));
+        }
+        Ok(Next::Done(HostRpcResult::StorageList {
+            entries: std::mem::take(&mut self.entries),
+        }))
+    }
+
+    fn filtered(&mut self, mut state: ListState, result: IoResult) -> ReadNext {
+        let entry = state.checking.take();
+        match result.child::<(), AuthorizeError>()? {
+            Ok(()) => {
+                if state.stat {
+                    return Ok(Next::Done(HostRpcResult::StorageStat {
+                        entry: Some(Self::folder_entry()),
+                    }));
+                }
+                if let Some(entry) = entry {
+                    self.entries.push(entry);
+                }
+            }
+            Err(AuthorizeError::PermissionDenied | AuthorizeError::Policy(_)) => {}
+            Err(error) => return Err(CatalogError::Storage(error.to_string())),
+        }
+        self.check_next(state)
     }
 
     fn got(&mut self, target: Target, result: IoResult) -> ReadNext {
@@ -592,22 +719,9 @@ impl Operation for ReadDataOperation {
                 self.accessed(target, *info)
             }
             ReadStep::Head(target, info) => self.headed(target, *info, result),
-            ReadStep::Folder => {
-                let listed = result.child::<ListBucketResult, ListBucketError>()?;
-                let listed = listed.map_err(|error| CatalogError::Storage(error.to_string()))?;
-                let folder = !(listed.objects.is_empty() && listed.common_prefixes.is_empty());
-                let entry = folder.then(|| StorageEntry {
-                    directory: true,
-                    size: 0,
-                    modified_ms: None,
-                    version: None,
-                    sha256: None,
-                    aruna_id: None,
-                    endpoints: Vec::new(),
-                });
-                Ok(Next::Done(HostRpcResult::StorageStat { entry }))
-            }
-            ReadStep::List(target, info) => self.listed(target, *info, result),
+            ReadStep::Folder(target, info) => self.listed(target, *info, true, result),
+            ReadStep::List(target, info) => self.listed(target, *info, false, result),
+            ReadStep::Filter(state) => self.filtered(*state, result),
             ReadStep::Get(target) => self.got(target, result),
             ReadStep::Collect(object) => self.collected(*object, result),
             ReadStep::Remote => Ok(Next::Done(result.child::<HostRpcResult, CatalogError>()??)),
