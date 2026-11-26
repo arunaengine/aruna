@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::handles_tests::{asked, child, head, id, scope, user, vfs};
+use super::handles_tests::{asked, child, context, denied, granted, head, id, scope, user, vfs};
 use super::recovery::*;
 use super::{TOMBSTONE_RETENTION_MS, VfsError, state_key};
 use aruna_core::calls::{IoCall, IoResult, Next};
@@ -453,7 +453,9 @@ fn failed_removal_keeps() {
 
 /// Runs a cold start whose one live stage row is `record` up to its head read.
 fn heading(record: &NfsStageRecord) -> ColdStartOperation {
-    let mut operation = ColdStartOperation::new();
+    let admission = context();
+    let mut operation =
+        ColdStartOperation::new().with_admission(admission.realm_id, admission.node_id);
     operation.first().unwrap();
     operation.next(IoResult::Values(vec![None])).unwrap();
     operation.next(IoResult::Done).unwrap();
@@ -552,8 +554,11 @@ fn revoked_host_retained() {
 
 #[test]
 fn live_binding_restores() {
-    // A stage on its exact base with a live binding restores with that base version.
+    // A stage on its exact base with a live binding restores with that base version once its
+    // writer's credential is admitted to write the name again.
     let (mut operation, turn) = hosted(None);
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    let turn = operation.next(granted());
     let VfsEffect::RestoreStage(request) = asked(&turn) else {
         panic!("expected the restore");
     };
@@ -562,4 +567,13 @@ fn live_binding_restores() {
         panic!("expected the report");
     };
     assert_eq!((report.retained, report.restored), (0, 1));
+}
+
+#[test]
+fn denied_writer_retained() {
+    // A writer whose credential no longer admits the write keeps its bytes by stage id only.
+    let (mut operation, turn) = hosted(None);
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    let turn = operation.next(denied());
+    retained_report(&mut operation, turn);
 }

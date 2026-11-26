@@ -17,8 +17,8 @@ use ulid::Ulid;
 
 use crate::arguments::{self, ExchangeArgs, Operation, SequenceArgs, SessionArgs};
 use crate::backend::{
-    Caller, ChangeInfo, HostIdentity, LockRange, MountExport, NfsBackend, ObjectRef, ReplayAccess,
-    ReplayCheck, ReplayGrant, Revocation,
+    Caller, ChangeInfo, HostIdentity, LockRange, MountExport, NfsBackend, ObjectRef, OwnerKey,
+    ReplayAccess, ReplayCheck, ReplayGrant, Revocation,
 };
 use crate::filehandle::{Filehandle, FilehandleKey};
 use crate::rpc::{AuthStat, RpcPrincipal};
@@ -38,6 +38,8 @@ const REPLY_RESERVE: usize = 512;
 const OPERATION_RESERVE: usize = 128;
 /// An operation code and status, the result of a failed operation without a body.
 const STATUS_SIZE: usize = 8;
+/// The eof flag and data length of a READ result.
+const READ_FIXED: usize = 8;
 /// `channel_dir_from_server4` value for the fore channel.
 const FORE_CHANNEL: u32 = 1;
 /// `channel_dir_from_client4` value asking for the back channel only.
@@ -186,6 +188,8 @@ pub struct Context<'a> {
     pub grant: GrantTrace,
     pub now: Instant,
     pub max_response: usize,
+    /// The encoded COMPOUND4res bytes before the results: status, tag and count.
+    header: usize,
     session: Option<SessionUse>,
     /// A retry of an uncached reply: the operation after SEQUENCE answers RETRY_UNCACHED_REP.
     uncached: bool,
@@ -229,6 +233,25 @@ impl Context<'_> {
     pub fn reply_limit(&self) -> usize {
         let limit = self.cache_limit().unwrap_or(usize::MAX);
         self.max_response.min(limit)
+    }
+
+    /// The READ length that fits after `results` bytes of results, in whole XDR words. When
+    /// no data byte fits, a READ for some bytes fails instead of answering zero short of eof.
+    pub fn read_room(&self, results: usize, wanted: u32) -> Result<u32, NfsStat4> {
+        let fixed = results + READ_FIXED;
+        let open = self.max_response.saturating_sub(fixed + REPLY_RESERVE) & !3;
+        let cached = self.cache_limit().map(|limit| {
+            let used = self.header + fixed + STATUS_SIZE;
+            limit.saturating_sub(used) & !3
+        });
+        if wanted > 0 && cached == Some(0) {
+            return Err(NfsStat4::ReplyUncacheable);
+        }
+        if wanted > 0 && open == 0 {
+            return Err(NfsStat4::ReplyTooBig);
+        }
+        let room = cached.map_or(open, |cached| cached.min(open));
+        Ok(wanted.min(u32::try_from(room).unwrap_or(u32::MAX)))
     }
 
     pub fn client_id(&self) -> Result<u64, NfsStat4> {
@@ -276,6 +299,9 @@ pub struct Engine<B> {
     session_key: [u8; 32],
     server_owner: Bytes,
     sessions_made: AtomicU64,
+    /// Releases of revoked or expired state that failed; each sweep and revocation retries
+    /// them until the backend no longer holds the open or lock.
+    pending: Mutex<Vec<Cleanup>>,
 }
 
 impl<B: NfsBackend> Engine<B> {
@@ -292,6 +318,7 @@ impl<B: NfsBackend> Engine<B> {
             session_key: config.session_key,
             server_owner: config.server_owner,
             sessions_made: AtomicU64::new(0),
+            pending: Mutex::new(Vec::new()),
         }
     }
 
@@ -327,6 +354,7 @@ impl<B: NfsBackend> Engine<B> {
             grant: GrantTrace::default(),
             now,
             max_response: self.limits.max_response as usize,
+            header: reply_size(&tag, 0),
             session: None,
             uncached: false,
         };
@@ -719,7 +747,8 @@ impl<B: NfsBackend> Engine<B> {
     /// Revokes expired leases, forgets long idle clients and releases what they held. Runs
     /// on a timer and before a conflict is reported, so an idle holder never blocks others.
     pub async fn sweep(&self, now: Instant) {
-        let cleanups = {
+        let mut cleanups = std::mem::take(&mut *self.pending.lock());
+        let expired = {
             let mut tables = self.tables.lock();
             let mut cleanups = Vec::new();
             for client_id in tables.sessions.expired(now, self.lease) {
@@ -734,13 +763,15 @@ impl<B: NfsBackend> Engine<B> {
             }
             cleanups
         };
+        cleanups.extend(expired);
         self.run_cleanups(cleanups).await;
     }
 
     /// Applies one revocation: a host loses its clients, sessions and state; a binding or a
     /// key loses only the state made through it.
     pub async fn revoke(&self, revocation: &Revocation) {
-        let cleanups = {
+        let mut cleanups = std::mem::take(&mut *self.pending.lock());
+        let revoked = {
             let mut tables = self.tables.lock();
             match revocation {
                 Revocation::Host(host_id) => {
@@ -760,6 +791,7 @@ impl<B: NfsBackend> Engine<B> {
                 ),
             }
         };
+        cleanups.extend(revoked);
         self.run_cleanups(cleanups).await;
     }
 
@@ -767,14 +799,19 @@ impl<B: NfsBackend> Engine<B> {
         self.tables.lock().sessions.disconnect(connection);
     }
 
+    /// Releases what revoked or expired state held; a failed release stays pending for the
+    /// next sweep or revocation, and a gone binding or object leaves nothing to release.
     pub(crate) async fn run_cleanups(&self, cleanups: Vec<Cleanup>) {
+        let mut failed = Vec::new();
         for cleanup in cleanups {
             let result = match &cleanup {
+                // The owner opened the file again; its live open now holds the backend open.
+                Cleanup::Close { object, owner, .. } if self.reopened(owner, *object) => Ok(()),
                 Cleanup::Close {
                     caller,
                     object,
                     owner,
-                } => self.backend.close(caller, *object, owner).await,
+                } => self.backend.release_open(caller, *object, owner).await,
                 Cleanup::Unlock {
                     caller,
                     object,
@@ -785,10 +822,24 @@ impl<B: NfsBackend> Engine<B> {
                     .await
                     .map(|_| ()),
             };
-            if let Err(status) = result {
-                debug!(?status, "An NFS state cleanup did not complete");
+            match result {
+                Ok(()) | Err(NfsStat4::Stale) => {}
+                Err(status) => {
+                    debug!(?status, "An NFS state release failed and stays pending");
+                    failed.push(cleanup);
+                }
             }
         }
+        self.pending.lock().extend(failed);
+    }
+
+    /// Whether `owner` holds a live open of `object` again.
+    fn reopened(&self, owner: &OwnerKey, object: ObjectRef) -> bool {
+        self.tables
+            .lock()
+            .states
+            .open_modes(owner, object)
+            .is_some()
     }
 }
 

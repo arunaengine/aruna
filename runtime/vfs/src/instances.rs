@@ -57,6 +57,8 @@ pub(crate) struct Instance {
     pub(crate) base_version: Option<Ulid>,
     /// The one checkpoint generation this instance began and has not promoted or aborted.
     pub(crate) draft: Option<(Ulid, u64)>,
+    /// Its checkpoint moved to retained recovery; the last close gives up the reference.
+    pub(crate) retained: bool,
 }
 
 impl Instance {
@@ -81,6 +83,7 @@ impl Instance {
             generation: 0,
             base_version: None,
             draft: None,
+            retained: false,
         }
     }
 
@@ -140,6 +143,7 @@ impl Instance {
             base_version: self.base_version,
             edit_generation: self.stage.edits,
             allows_delete: self.allows_delete(),
+            sealed_edit: self.stage.sealed.map(|sealed| sealed.edits),
         }
     }
 
@@ -381,6 +385,11 @@ impl VfsHandle {
                     instance.disposition_owner = open.owner;
                 }
             }
+            if instance.retained && instance.opens.is_empty() {
+                instance.stage_id = None;
+                instance.generation = 0;
+                instance.stage.sealed = None;
+            }
             let summary = instance.close_summary();
             let unused = match instance.idle() {
                 true => reclaim(&mut state, scope, instance_id),
@@ -416,6 +425,13 @@ impl VfsHandle {
             let id = bucket.by_handle.get(&handle_id)?;
             bucket.instances.get(id)
         });
+        Ok(VfsEvent::Instance(instance.map(Instance::summary)))
+    }
+
+    pub(crate) fn lookup_by_id(&self, scope: &BucketScope, instance_id: u64) -> Answer {
+        let state = self.shared.state.lock();
+        let bucket = state.buckets.get(scope);
+        let instance = bucket.and_then(|bucket| bucket.instances.get(&instance_id));
         Ok(VfsEvent::Instance(instance.map(Instance::summary)))
     }
 
@@ -489,7 +505,7 @@ impl VfsHandle {
                     .checkpoints
                     .get(&(stage_id, generation))
                     .filter(|checkpoint| checkpoint.sealed)
-                    .map(|checkpoint| checkpoint.size),
+                    .map(|checkpoint| (checkpoint.size, checkpoint.edits)),
                 _ => None,
             };
             let bucket = state
@@ -518,6 +534,7 @@ impl VfsHandle {
             instance.identity = request.identity;
             instance.kind = instance.identity.kind();
             instance.detached = None;
+            instance.retained = false;
             instance.base_version = request.base_version;
             let edits = instance.stage.edits;
             let current = request
@@ -540,10 +557,11 @@ impl VfsHandle {
             if let (Some(stage_id), Some(generation)) = (request.stage_id, request.generation) {
                 instance.stage_id = Some(stage_id);
                 instance.generation = generation;
-                instance.stage.sealed = sealed.map(|size| stages::Sealed {
+                instance.stage.sealed = sealed.map(|(size, edits)| stages::Sealed {
                     stage_id,
                     generation,
                     limit: size.min(instance.stage.logical_size),
+                    edits,
                 });
             }
             let group_id = instance.group_id;
@@ -589,6 +607,51 @@ impl VfsHandle {
             .changes
             .touch(&scope.bucket, &instance.key, true)?;
         Ok(VfsEvent::Instance(Some(instance.summary())))
+    }
+
+    /// Detaches the instance still naming `stage_id` at `generation` and, once no open holds
+    /// it, gives up its checkpoint reference; any other instance state is left alone.
+    pub(crate) async fn retain_instance(
+        &self,
+        scope: &BucketScope,
+        instance_id: u64,
+        stage_id: Ulid,
+        generation: u64,
+        reason: DetachReason,
+    ) -> Answer {
+        let unused = {
+            let mut state = self.shared.state.lock();
+            let Some(bucket) = state.buckets.get_mut(scope) else {
+                return Ok(VfsEvent::Done);
+            };
+            let named = (bucket.instances.get(&instance_id)).is_some_and(|instance| {
+                instance.stage_id == Some(stage_id) && instance.generation == generation
+            });
+            if !named {
+                return Ok(VfsEvent::Done);
+            }
+            bucket.detach(instance_id, reason);
+            let instance = (bucket.instances.get_mut(&instance_id)).ok_or(VfsFailure::NotFound)?;
+            instance.retained = true;
+            instance.change = self
+                .shared
+                .changes
+                .touch(&scope.bucket, &instance.key, true)?;
+            let closed = instance.opens.is_empty();
+            match closed {
+                true => release_stage(&mut state, scope, instance_id),
+                false => None,
+            }
+        };
+        if let Some(name) = unused {
+            let path = self.path(&name);
+            crate::blocking(move || {
+                crate::remove_quietly(&path);
+                Ok(())
+            })
+            .await?;
+        }
+        Ok(VfsEvent::Done)
     }
 
     pub(crate) fn update_witnesses(
@@ -644,6 +707,32 @@ impl VfsHandle {
             }
         }
         Ok(VfsEvent::Instance(Some(instance.summary())))
+    }
+
+    /// Replaces the share reservation of one open if every other open of its instance admits it.
+    pub(crate) fn update_share(
+        &self,
+        scope: &BucketScope,
+        open_id: Ulid,
+        share: ShareMode,
+    ) -> Answer {
+        let mut state = self.shared.state.lock();
+        if (share.write_access || share.delete_access) && state.fences.closed(scope) {
+            return Err(fenced());
+        }
+        let bucket = state.buckets.get_mut(scope).ok_or(VfsFailure::NotFound)?;
+        let instance_id = *bucket.by_open.get(&open_id).ok_or(VfsFailure::NotFound)?;
+        let instance = (bucket.instances.get_mut(&instance_id)).ok_or(VfsFailure::NotFound)?;
+        let mut others = (instance.opens.iter()).filter(|(id, _)| **id != open_id);
+        if !others.all(|(_, other)| shares_with(&other.share, &share)) {
+            return Err(VfsFailure::ShareViolation);
+        }
+        let open = instance
+            .opens
+            .get_mut(&open_id)
+            .ok_or(VfsFailure::NotFound)?;
+        open.share = share;
+        Ok(VfsEvent::Done)
     }
 }
 

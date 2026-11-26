@@ -410,3 +410,93 @@ fn rotation_proves_new() {
     let stored = EnrolledHostRecord::from_bytes(&writes[0].2).unwrap();
     assert_eq!(stored.fingerprints, vec![[1; 32], [2; 32]]);
 }
+
+/// A bucket mount of the test bucket on host 30, run up to its guarded host read.
+fn mounting(pool: bool) -> CreateMountOperation {
+    let input = MountInput {
+        context: context(),
+        caller: user(),
+        host_id: id(30),
+        group_id: id(3),
+        bucket: "bucket".to_string(),
+        prefix: None,
+        job_id: None,
+        read_only: false,
+        allowed_networks: Vec::new(),
+        display_uid: 1000,
+        display_gid: 1000,
+        mode: 0o750,
+    };
+    let mut operation = CreateMountOperation::new(input);
+    if pool {
+        operation = operation.for_worker_pool();
+    }
+    operation.first().unwrap();
+    let turn = operation.next(granted());
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
+    operation
+}
+
+#[test]
+fn worker_pool_mounts() {
+    // A worker pool mount needs a live pool host, which the caller does not own; a public
+    // mount still needs the caller's own host.
+    let pool = EnrolledHostRecord {
+        worker_pool: true,
+        ..host(stranger())
+    };
+    let turn = mounting(true).next(IoResult::Values(vec![row(&pool)]));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Write(_)))));
+    let plain = host(user());
+    let turn = mounting(true).next(IoResult::Values(vec![row(&plain)]));
+    assert_eq!(turn, Err(VfsError::Denied));
+    let revoked = EnrolledHostRecord {
+        revoked_at_ms: Some(9),
+        ..pool.clone()
+    };
+    let turn = mounting(true).next(IoResult::Values(vec![row(&revoked)]));
+    assert_eq!(turn, Err(VfsError::Denied));
+    let turn = mounting(true).next(IoResult::Values(vec![None]));
+    assert_eq!(turn, Err(VfsError::NotFound));
+    let turn = mounting(false).next(IoResult::Values(vec![row(&pool)]));
+    assert_eq!(turn, Err(VfsError::Denied));
+}
+
+#[test]
+fn revoked_key_unmounts() {
+    // Every mount of the revoked key goes in one write, then each one's live state is revoked.
+    let key = |mount| Key::from([&[2u8][..], &id(mount).to_bytes()].concat());
+    let other = NfsMountBinding {
+        access_key: "KEY2".to_string(),
+        ..binding(user(), 51)
+    };
+    let rows = vec![
+        (key(50), row(&binding(user(), 50)).unwrap()),
+        (key(51), row(&other).unwrap()),
+        (key(52), row(&binding(stranger(), 52)).unwrap()),
+    ];
+    let mut operation = RevokeMountsOperation::new("KEY1".to_string());
+    assert_eq!(operation.transaction(), TransactionMode::Write);
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Page { .. }))
+    ));
+    let turn = operation.next(IoResult::Page { rows, next: None });
+    let Ok(Next::Call(IoCall::Delete(deletes))) = turn else {
+        panic!("expected the mount deletes");
+    };
+    let deleted: Vec<_> = deletes.iter().map(|(_, key)| key.clone()).collect();
+    let state = |mount| super::state_key(&VfsKey::Mount(id(mount))).unwrap();
+    assert_eq!(deleted, vec![state(50), state(52)]);
+    let Ok(Next::Then { output, calls }) = operation.next(IoResult::Done) else {
+        panic!("expected the count with the revocations");
+    };
+    assert_eq!((output, calls.len()), (2, 2));
+    let mut none = RevokeMountsOperation::new("KEY9".to_string());
+    none.first().unwrap();
+    let empty = IoResult::Page {
+        rows: Vec::new(),
+        next: None,
+    };
+    assert_eq!(none.next(empty), Ok(Next::Done(0)));
+}

@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::compute::ResourceEnvelope;
+use aruna_core::compute::{NfsShareConfig, ResourceEnvelope};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -240,7 +240,12 @@ pub enum ShareDriver {
     Smb { inputs: bool, sessions: bool },
     /// `csi-driver-nfs` on trusted, enrolled workers. Each attempt brings its own NFS
     /// bindings; the worker's mTLS identity logs in, so only isolated pods may mount them.
-    Nfs { inputs: bool, sessions: bool },
+    Nfs {
+        /// Enrolled worker-pool host that the per-attempt bindings are issued for.
+        host_id: ulid::Ulid,
+        inputs: bool,
+        sessions: bool,
+    },
 }
 
 impl ShareMount {
@@ -276,6 +281,22 @@ impl KubernetesConfig {
     /// The share that mounts session data, when it takes it over.
     pub fn share_sessions(&self) -> Option<&ShareMount> {
         self.share_mount.as_deref().filter(|share| share.sessions())
+    }
+
+    /// Enrolled worker-pool NFS host configuration when NFS takes over inputs or sessions.
+    pub fn nfs_share(&self) -> Option<NfsShareConfig> {
+        match self.share_mount.as_deref()?.driver {
+            ShareDriver::Nfs {
+                host_id,
+                inputs,
+                sessions,
+            } if inputs || sessions => Some(NfsShareConfig {
+                host_id,
+                inputs,
+                sessions,
+            }),
+            ShareDriver::Nfs { .. } | ShareDriver::Smb { .. } => None,
+        }
     }
 }
 

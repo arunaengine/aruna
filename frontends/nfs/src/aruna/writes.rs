@@ -4,10 +4,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::structs::storage::vfs::{
-    DirectoryWitness, FileIdentity, HandleIdentity, HandleKind, NfsMountBinding, NfsStageRecord,
-    StageBase, StageDisposition, StageOwner, StageScope,
+    DetachReason, DirectoryWitness, FileIdentity, HandleIdentity, HandleKind, NfsMountBinding,
+    NfsStageRecord, StageBase, StageDisposition, StageOwner, StageScope,
 };
-use aruna_core::vfs_effects::{ByteLock, InstanceSummary, VfsFailure, VfsProtocol};
+use aruna_core::vfs_effects::{ByteLock, InstanceSummary, ReadLockCheck, VfsFailure, VfsProtocol};
 use aruna_ops_data::s3::object::put::PutObjectConfig;
 use aruna_ops_data::vfs::handles::HandleClaim;
 use aruna_ops_data::vfs::io::{
@@ -19,8 +19,9 @@ use aruna_ops_data::vfs::path::{NameUse, check_component, child_key, split_paren
 use aruna_ops_data::vfs::publish::{CloseInput, CloseOutcome, PublishInput};
 use aruna_ops_data::vfs::{
     AllocateHandleOperation, InstanceTarget, LiveStageOperation, LookupInstanceOperation,
-    VfsCloseOperation, VfsCommitOperation, VfsError, VfsLockOperation, VfsMkdirOperation,
-    VfsOpenOperation, VfsReadOperation, VfsRemoveOperation, VfsRenameOperation, VfsWriteOperation,
+    QuotaStageOperation, UpdateShareOperation, VfsCloseOperation, VfsCommitOperation, VfsError,
+    VfsLockOperation, VfsMkdirOperation, VfsOpenOperation, VfsReadOperation, VfsRemoveOperation,
+    VfsRenameOperation, VfsWriteOperation,
 };
 use aruna_runner::driver::drive;
 use bytes::Bytes;
@@ -33,8 +34,9 @@ use super::exports::{
 };
 use super::{ArunaNfsBackend, OpenSlot};
 use crate::backend::{
-    AttributeChange, ChangeInfo, CreateMode, CreateReply, IoState, LockDenial, LockError, LockKind,
-    LockRange, ObjectRef, OwnerKey, ReadReply, SetTime, ShareRequest, WriteReply,
+    AttributeChange, Caller, ChangeInfo, CreateMode, CreateReply, IoState, LockDenial, LockError,
+    LockKind, LockRange, ObjectRef, OwnerKey, ReadReply, ReadSource, SetTime, ShareRequest,
+    WriteReply,
 };
 use crate::types::{IO_LIMIT, NfsStat4, StableHow, share};
 
@@ -56,6 +58,18 @@ fn open_number(open_id: Ulid) -> u64 {
 /// The byte I/O owner of a stateid: its lock owner, else its open owner.
 fn io_owner(owner: &OwnerKey, lock_owner: Option<&OwnerKey>) -> u64 {
     owner_number(lock_owner.unwrap_or(owner))
+}
+
+/// How a client READ under `state` meets exclusive byte-range locks: the bypass stateid
+/// ignores them, the anonymous one conflicts with any, an open with any other owner's.
+pub(super) fn lock_check(state: &IoState) -> ReadLockCheck {
+    match state {
+        IoState::Anonymous => ReadLockCheck::Anonymous,
+        IoState::Bypass => ReadLockCheck::Bypass,
+        IoState::Open { owner, lock_owner } => {
+            ReadLockCheck::Owner(io_owner(owner, lock_owner.as_ref()))
+        }
+    }
 }
 
 /// `slot` with the name, identity, base version and size its shared instance has now.
@@ -216,6 +230,7 @@ impl ArunaNfsBackend {
             match tables.created.remove(&key) {
                 Some(mut slot) if !tables.opens.contains_key(&key) => {
                     (slot.access, slot.deny) = (share.access, share.deny);
+                    tables.closed_errors.remove(&key);
                     tables.opens.insert(key, slot);
                     return Ok(());
                 }
@@ -255,7 +270,11 @@ impl ArunaNfsBackend {
             }
             other => other?,
         };
-        let replaced = self.tables.lock().opens.insert(key, slot);
+        let replaced = {
+            let mut tables = self.tables.lock();
+            tables.closed_errors.remove(&key);
+            tables.opens.insert(key, slot)
+        };
         if let Some(old) = replaced {
             self.release_quietly(binding, object, old).await;
         }
@@ -264,16 +283,27 @@ impl ArunaNfsBackend {
 
     pub(super) async fn live_close(
         &self,
+        caller: &Caller,
         binding: &NfsMountBinding,
         object: ObjectRef,
         owner: &OwnerKey,
     ) -> Result<(), NfsStat4> {
         let key = (object, owner.clone());
         // The slot stays until its open has ended, so a CLOSE that failed first can be retried.
-        let slot = self.tables.lock().opens.get(&key).cloned();
-        let Some(slot) = slot else {
-            return Ok(());
+        let (slot, ended) = {
+            let tables = self.tables.lock();
+            let ended = tables.closed_errors.get(&key).copied();
+            (tables.opens.get(&key).cloned(), ended)
         };
+        let Some(slot) = slot else {
+            // A retried CLOSE whose open already ended answers as the close that ended it.
+            return ended.map_or(Ok(()), Err);
+        };
+        if !self.release_admitted(caller, binding).await? {
+            self.revoked_close(binding, object, &slot).await?;
+            self.tables.lock().opens.remove(&key);
+            return Ok(());
+        }
         let (input, detached) = self.close_input(binding, object, &slot).await?;
         let status = match drive(VfsCloseOperation::new(input), &self.context).await {
             Ok(outcome) => close_status(outcome, detached),
@@ -281,8 +311,47 @@ impl ArunaNfsBackend {
             Err(VfsError::Vfs(VfsFailure::NotFound)) => Err(NfsStat4::Io),
             Err(error) => return Err(status_of(error)),
         };
-        self.tables.lock().opens.remove(&key);
+        let mut tables = self.tables.lock();
+        tables.opens.remove(&key);
+        if let Err(status) = status {
+            tables.closed_errors.insert(key, status);
+        }
         status
+    }
+
+    /// Ends an open whose binding or host was revoked without publishing through it: the open
+    /// and its share end, and an acknowledged checkpoint the last writer leaves is retained.
+    async fn revoked_close(
+        &self,
+        binding: &NfsMountBinding,
+        object: ObjectRef,
+        slot: &OpenSlot,
+    ) -> Result<(), NfsStat4> {
+        let scope = bucket_scope(binding).map_err(status_of)?;
+        let read = LiveStageOperation::new(scope.clone(), object.object_id);
+        let stage = drive(read, &self.context).await.map_err(status_of)?;
+        let input = CloseInput {
+            context: self.access_context(binding),
+            scope: scope.clone(),
+            open_id: slot.open_id,
+            publish: None,
+            stage: stage.clone(),
+        };
+        let stage = match drive(VfsCloseOperation::new(input), &self.context).await {
+            Ok(CloseOutcome::Pending) => stage,
+            // An earlier attempt ended the open; a live checkpoint of this binding stays.
+            Err(VfsError::Vfs(VfsFailure::NotFound)) => {
+                stage.filter(|stage| stage.owner.mount_id == binding.mount_id)
+            }
+            Ok(_) => None,
+            Err(error) => return Err(status_of(error)),
+        };
+        let Some(stage) = stage else {
+            return Ok(());
+        };
+        let retain = QuotaStageOperation::retain(scope, stage, DetachReason::LostLife)
+            .with_instance(slot.instance_id);
+        drive(retain, &self.context).await.map_err(status_of)
     }
 
     /// Ends one VFS open; the last dirty writer publishes the effective image.
@@ -389,7 +458,7 @@ impl ArunaNfsBackend {
             version_id: slot.version_id,
             offset: 0,
             length: 0,
-            owner_id: None,
+            lock_check: ReadLockCheck::Bypass,
         };
         let body = image_body(self.context.clone(), read, size);
         let exists = matches!(base, StageBase::Committed { .. });
@@ -571,17 +640,12 @@ impl ArunaNfsBackend {
         if located.kind == HandleKind::Directory {
             return Err(NfsStat4::IsDirectory);
         }
-        let (own, owner_id) = match state {
-            IoState::Open { owner, lock_owner } => {
-                let slot = self
-                    .tables
-                    .lock()
-                    .opens
-                    .get(&(object, owner.clone()))
-                    .cloned();
-                (slot, Some(io_owner(owner, lock_owner.as_ref())))
+        let own = match state {
+            IoState::Open { owner, .. } => {
+                let tables = self.tables.lock();
+                tables.opens.get(&(object, owner.clone())).cloned()
             }
-            IoState::Anonymous | IoState::Bypass => (None, None),
+            IoState::Anonymous | IoState::Bypass => None,
         };
         let mut key = located.key;
         let (instance_id, version_id) = match (own, &located.detached) {
@@ -610,19 +674,49 @@ impl ArunaNfsBackend {
         };
         let input = ReadInput {
             context: self.access_context(binding),
-            key,
+            key: key.clone(),
             instance_id,
             version_id,
             offset,
             length: count.min(IO_LIMIT),
-            owner_id,
+            lock_check: lock_check(state),
         };
         let read = drive(VfsReadOperation::new(input), &self.context).await;
         let read = read.map_err(status_of)?;
         Ok(ReadReply {
             data: read.data.into(),
             eof: read.eof,
+            source: Some(ReadSource {
+                key,
+                version_id: read.version_id,
+                instance_id,
+            }),
         })
+    }
+
+    /// Reads the exact bytes a cached READ served again, admitted as a fresh read of that
+    /// version or instance; a withdrawn version or a gone instance refuses the replay.
+    pub(super) async fn replay_read(
+        &self,
+        binding: &NfsMountBinding,
+        source: &ReadSource,
+        (offset, length): (u64, u32),
+    ) -> Result<(), NfsStat4> {
+        let pinned = source.version_id.is_some() || source.instance_id.is_some();
+        if !pinned || !holds(binding, &source.key) {
+            return Err(NfsStat4::Access);
+        }
+        let input = ReadInput {
+            context: self.access_context(binding),
+            key: source.key.clone(),
+            instance_id: source.instance_id,
+            version_id: source.version_id,
+            offset,
+            length: length.min(IO_LIMIT),
+            lock_check: ReadLockCheck::Bypass,
+        };
+        let read = drive(VfsReadOperation::new(input), &self.context).await;
+        read.map(|_| ()).map_err(status_of)
     }
 
     pub(super) async fn live_write(
@@ -795,7 +889,7 @@ impl ArunaNfsBackend {
         let opened = drive(VfsOpenOperation::new(input), &self.context).await;
         let opened = opened.map_err(status_of)?;
         let settled = self
-            .settle_create(binding, (&key, open_id, modes), &opened, change)
+            .settle_create(binding, (&key, open_id, share), &opened, change)
             .await;
         let (object, slot) = match settled {
             Ok(settled) => settled,
@@ -826,15 +920,17 @@ impl ArunaNfsBackend {
         })
     }
 
-    /// Gives a new or opened file its handle, makes a new file durable in a checkpoint and
-    /// applies a requested size, before the creating writer waits for its OPEN.
+    /// Gives a new or opened file its handle, makes a new file durable in a checkpoint,
+    /// applies a requested size and drops the write share a read-only OPEN did not ask for,
+    /// before the creating writer waits for its OPEN.
     async fn settle_create(
         &self,
         binding: &NfsMountBinding,
-        (key, open_id, modes): (&str, Ulid, (u32, u32)),
+        (key, open_id, share): (&str, Ulid, &ShareRequest),
         opened: &OpenResult,
         change: &AttributeChange,
     ) -> Result<(ObjectRef, OpenSlot), NfsStat4> {
+        let modes = (share.access | share::WRITE, share.deny);
         let handle_id = match opened.handle {
             Some(handle) => handle.handle_id,
             None => {
@@ -864,6 +960,13 @@ impl ArunaNfsBackend {
                 .apply_change(binding, object, writer, resize, WriteStable::FileSync)
                 .await?;
             slot.size = resized.new_size;
+        }
+        if share.access & share::WRITE == 0 {
+            let scope = bucket_scope(binding).map_err(status_of)?;
+            let reduced = share_mode(share.access, share.deny);
+            let update = UpdateShareOperation::new(scope, open_id, reduced);
+            drive(update, &self.context).await.map_err(status_of)?;
+            (slot.write, slot.access, slot.deny) = (false, share.access, share.deny);
         }
         Ok((object, slot))
     }
@@ -1031,7 +1134,7 @@ impl ArunaNfsBackend {
                     version_id: source_version,
                     offset: 0,
                     length: 0,
-                    owner_id: None,
+                    lock_check: ReadLockCheck::Bypass,
                 };
                 let body = image_body(self.context.clone(), read, size);
                 let put = self
@@ -1050,7 +1153,7 @@ impl ArunaNfsBackend {
                     version_id: None,
                     offset: 0,
                     length: 0,
-                    owner_id: None,
+                    lock_check: ReadLockCheck::Bypass,
                 };
                 let body = image_body(self.context.clone(), read, size);
                 let put = self.put_config(binding, &to, body, (size, true)).await?;

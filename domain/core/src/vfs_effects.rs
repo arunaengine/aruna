@@ -44,6 +44,18 @@ pub struct ShareMode {
     pub share_delete: bool,
 }
 
+/// How a staged read checks exclusive byte-range locks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReadLockCheck {
+    /// Internal publication or checkpoint read; never blocked by client byte locks.
+    #[default]
+    Bypass,
+    /// Anonymous client read with no lock owner; conflicts with any held exclusive lock.
+    Anonymous,
+    /// Client read on behalf of one owner; conflicts with any other owner's exclusive lock.
+    Owner(u64),
+}
+
 /// One contiguous slice of a staged file read image.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StageSlice {
@@ -94,6 +106,8 @@ pub struct InstanceSummary {
     pub edit_generation: u64,
     /// Whether every open of this instance shares delete access.
     pub allows_delete: bool,
+    /// The `edit_generation` captured when the current promoted checkpoint was sealed, if any.
+    pub sealed_edit: Option<u64>,
 }
 
 /// One directory witness update applied to open directory instances after a mutation.
@@ -222,6 +236,11 @@ pub enum VfsEffect {
     LookupInstance { scope: BucketScope, key: String },
     /// Looks up a live or detached shared instance by durable NFS handle id.
     LookupHandle { scope: BucketScope, handle_id: u64 },
+    /// Looks up a live or detached shared instance by its node-local instance id.
+    LookupById {
+        scope: BucketScope,
+        instance_id: u64,
+    },
     /// Lists staged and unpublished entries under `prefix` in key order, strictly after `after`
     /// and at most `limit` of them, together with the observer sequence.
     ListStaged {
@@ -239,6 +258,15 @@ pub enum VfsEffect {
         instance_id: Option<u64>,
         reason: DetachReason,
     },
+    /// Detaches an instance whose durable checkpoint moved to retained recovery state,
+    /// releasing its checkpoint reference once no open holders remain.
+    RetainInstance {
+        scope: BucketScope,
+        instance_id: u64,
+        stage_id: Ulid,
+        generation: u64,
+        reason: DetachReason,
+    },
     /// Advances matching directory witnesses in the open directory registry.
     UpdateWitnesses {
         scope: BucketScope,
@@ -251,6 +279,12 @@ pub enum VfsEffect {
         open_id: Ulid,
         pending: bool,
         owner: Option<StageOwner>,
+    },
+    /// Atomically updates the share reservation of an existing open after checking other opens.
+    UpdateShare {
+        scope: BucketScope,
+        open_id: Ulid,
+        share: ShareMode,
     },
     /// Acquires one or more byte-range locks, rolling back on conflict when `atomic` is set.
     LockRanges {
@@ -271,14 +305,14 @@ pub enum VfsEffect {
         instance_id: u64,
         lock: ByteLock,
     },
-    /// Reads staged slices and reports untouched base ranges and zero holes. With `owner_id`,
-    /// an exclusive byte-range lock of another owner over the range refuses the read.
+    /// Reads staged slices and reports untouched base ranges and zero holes; `lock_check` says
+    /// which exclusive byte-range locks over the range refuse the read.
     ReadStage {
         scope: BucketScope,
         instance_id: u64,
         offset: u64,
         length: u32,
-        owner_id: Option<u64>,
+        lock_check: ReadLockCheck,
     },
     /// Writes bytes to the volatile stage overlay under the instance guard.
     WriteStage {

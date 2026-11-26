@@ -91,6 +91,11 @@ pub(crate) fn read_conflict(
     first_overlap(exclusive.filter(|lock| lock.owner != owner), start, end)
 }
 
+/// The first exclusive lock of any owner over `[start, end)`, for a read that names no owner.
+pub(crate) fn anonymous_read_conflict(held: &[ByteLock], start: u64, end: u64) -> Option<ByteLock> {
+    first_overlap(held.iter().filter(|lock| lock.exclusive), start, end)
+}
+
 fn first_overlap<'a>(
     mut locks: impl Iterator<Item = &'a ByteLock>,
     start: u64,

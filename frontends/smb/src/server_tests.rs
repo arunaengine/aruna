@@ -538,6 +538,69 @@ async fn disconnect_ends_lock() {
     );
 }
 
+/// Takes the range on `holder`, then sends ECHO and a waiting LOCK on `waiter` as one
+/// compound; returns the LOCK's MessageId.
+async fn compound_waiter(client: &mut TestClient, holder: FileId, waiter: FileId) -> u64 {
+    let taken = client
+        .call(
+            Command::Lock,
+            &lock_body(holder, &[(0, 8, LOCK_EXCLUSIVE | LOCK_IMMEDIATE)]),
+        )
+        .await;
+    assert_eq!(taken.status(), status::SUCCESS);
+    let echo = client.header(Command::Echo, 1);
+    let echo = TestClient::message(&echo, &crate::messages::empty_body());
+    let header = client.header(Command::Lock, 1);
+    let lock = TestClient::message(&header, &lock_body(waiter, &[(0, 8, LOCK_EXCLUSIVE)]));
+    client
+        .send_sealed(&wire::join_compound(vec![echo, lock]))
+        .await;
+    header.message_id
+}
+
+#[tokio::test(start_paused = true)]
+async fn compound_lock_disconnect() {
+    let (mut client, harness, backend) = logged_in().await;
+    let (holder, waiter) = two_opens(&mut client, &backend).await;
+    compound_waiter(&mut client, holder, waiter).await;
+    drop(client);
+    let ended = tokio::time::timeout(Duration::from_secs(60), harness.task).await;
+    assert!(
+        ended.is_ok(),
+        "a waiting LOCK in a compound does not hold the connection"
+    );
+    assert!(
+        backend.state.lock().handles.is_empty(),
+        "the disconnect closes every open"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn compound_lock_cancel() {
+    let (mut client, _harness, backend) = logged_in().await;
+    let (holder, waiter) = two_opens(&mut client, &backend).await;
+    let message_id = compound_waiter(&mut client, holder, waiter).await;
+    let cancel = Header {
+        command: Command::Cancel.code(),
+        message_id,
+        session_id: client.session_id,
+        ..Header::default()
+    };
+    client
+        .send_sealed(&TestClient::message(
+            &cancel,
+            &crate::messages::empty_body(),
+        ))
+        .await;
+    let response = client.receive().await.expect("compound response");
+    let parts = wire::split_compound(&response.raw).expect("compound splits");
+    let statuses: Vec<u32> = parts
+        .iter()
+        .map(|part| Header::decode(part).expect("header").status)
+        .collect();
+    assert_eq!(statuses, vec![status::SUCCESS, status::CANCELLED]);
+}
+
 #[tokio::test]
 async fn revocation_expires_session() {
     let (mut client, _harness, backend) = logged_in().await;

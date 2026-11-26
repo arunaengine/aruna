@@ -463,7 +463,13 @@ fn lost_life_retains() {
     assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
     operation.next(child(())).unwrap();
     let turn = operation.next(IoResult::Done);
-    assert_eq!(turn, Ok(Next::Done(CloseOutcome::Retained(id(12)))));
+    assert!(matches!(
+        turn,
+        Ok(Next::Then {
+            output: CloseOutcome::Retained(_),
+            ..
+        })
+    ));
     let kept = retained(&stage("p/a"), DetachReason::LostLife, 9);
     assert_eq!(
         kept.disposition,

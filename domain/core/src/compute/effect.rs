@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
-use super::offer::ExecutorOffer;
+use super::offer::{ExecutorOffer, NfsShareConfig};
 use super::session::EndReason;
 use super::{
     AttemptStatus, BackendError, CancelEvidence, ExecutorKind, FenceContext, GrantedResources,
@@ -114,6 +114,8 @@ pub struct BackendFacts {
     /// Where the workers of a non-local backend run, when that is declared.
     pub worker_location: Option<String>,
     pub run_as: UserSpec,
+    /// Enrolled NFS worker-pool host that serves this backend's per-attempt mounts.
+    pub nfs_share: Option<NfsShareConfig>,
 }
 
 /// The S3 endpoints a container reaches this node under.

@@ -26,6 +26,7 @@ use super::compute::{attempt_call, compute_answer, compute_call};
 use super::stop_record::StopRecordOperation;
 use aruna_core::jobs::JobRunOutcome;
 use aruna_ops_data::s3::access::revoke::{RevokeUserError, RevokeUserOperation};
+use aruna_ops_data::vfs::{RevokeMountsOperation, VfsError};
 
 #[derive(Debug, PartialEq)]
 enum CleanupStep {
@@ -38,11 +39,13 @@ enum CleanupStep {
     Tombstone(FenceContext),
     Record,
     Revoke,
+    /// The NFS bindings of the run's key go after it, keeping the revoke's failure.
+    Mounts(Option<JobError>),
 }
 
-/// Removes a finished attempt from its backend and revokes the run's credential. The revoke runs
-/// even when the backend work failed, so one failure cannot strand a live workspace key. On a
-/// node with a network the stop record of the execution lands with the attempt tombstone.
+/// Removes a finished attempt from its backend and revokes the run's credential and NFS bindings.
+/// The revokes run even when the backend work failed, so one failure cannot strand a live key. On
+/// a node with a network the stop record of the execution lands with the attempt tombstone.
 #[derive(Debug, PartialEq)]
 pub struct TerminalCleanupOperation {
     for_job: JobId,
@@ -105,6 +108,26 @@ impl TerminalCleanupOperation {
     fn failed(&mut self, error: JobError) -> Next<()> {
         self.backend_error = Some(error);
         self.revoke()
+    }
+
+    /// Ends the cleanup with every failure joined, or offers a stored stop record at once.
+    fn finished(
+        &mut self,
+        revoke_error: Option<JobError>,
+        mounts_error: Option<JobError>,
+    ) -> Result<Next<()>, JobError> {
+        let errors = [revoke_error, mounts_error, self.backend_error.take()];
+        match cleanup_error(errors) {
+            Some(error) => Err(error),
+            // A stored stop record is offered to the holders at once.
+            None if self.stopped => Ok(Next::Then {
+                output: (),
+                calls: vec![IoCall::Effect(Box::new(schedule_outbox_drain(
+                    Duration::ZERO,
+                )))],
+            }),
+            None => Ok(Next::Done(())),
+        }
     }
 
     fn backend_name(&self) -> &str {
@@ -301,17 +324,21 @@ impl Operation for TerminalCleanupOperation {
                     Ok(_) | Err(RevokeUserError::NotFound) => None,
                     Err(error) => Some(revoke_error(error)),
                 };
-                match cleanup_error([revoke_error, self.backend_error.take()]) {
-                    Some(error) => Err(error),
-                    // A stored stop record is offered to the holders at once.
-                    None if self.stopped => Ok(Next::Then {
-                        output: (),
-                        calls: vec![IoCall::Effect(Box::new(schedule_outbox_drain(
-                            Duration::ZERO,
-                        )))],
-                    }),
-                    None => Ok(Next::Done(())),
+                if self.access_key.is_empty() {
+                    return self.finished(revoke_error, None);
                 }
+                self.step = CleanupStep::Mounts(revoke_error);
+                let mounts = RevokeMountsOperation::new(self.access_key.clone());
+                Ok(Next::Call(IoCall::child(mounts)))
+            }
+            CleanupStep::Mounts(revoke_error) => {
+                let mounts_error = match result.child::<usize, VfsError>()? {
+                    Ok(_) => None,
+                    Err(error) => Some(JobError::retryable(format!(
+                        "NFS mount bindings revoke failed: {error}"
+                    ))),
+                };
+                self.finished(revoke_error, mounts_error)
             }
         }
     }
@@ -331,7 +358,7 @@ fn revoke_error(error: RevokeUserError) -> JobError {
     JobError::retryable(format!("workspace credential revoke failed: {error}"))
 }
 
-fn cleanup_error(errors: [Option<JobError>; 2]) -> Option<JobError> {
+fn cleanup_error(errors: [Option<JobError>; 3]) -> Option<JobError> {
     let errors: Vec<_> = errors.into_iter().flatten().collect();
     if errors.is_empty() {
         return None;

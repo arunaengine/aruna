@@ -1,5 +1,5 @@
-//! SMB 3.1.1 mounts end to end: streamed writes published by FLUSH, renames and deletes that
-//! keep implicit parents, byte-range locks, and live sessions ended by S3 key revocation.
+//! SMB 3.1.1 mounts end to end: streamed writes published by FLUSH, renames and deletes (also
+//! create-time delete-on-close) that keep implicit parents, locks, and S3 key revocation.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -105,24 +105,43 @@ async fn roundtrip_steps(mounts: &Mounts) -> TestResult<()> {
     Ok(())
 }
 
+/// The CREATE option `FILE_DELETE_ON_CLOSE`, which removes the file at its last close.
+const DELETE_ON_CLOSE: u32 = 0x0000_1000;
+
 #[tokio::test]
 async fn smb_delete_marker() -> TestResult<()> {
     let mounts = Mounts::start(true, None).await?;
-    let result = marker_steps(&mounts).await;
+    let result = marker_steps(&mounts, false).await;
     mounts.shutdown().await;
     result
 }
 
-async fn marker_steps(mounts: &Mounts) -> TestResult<()> {
+#[tokio::test]
+async fn close_delete_marker() -> TestResult<()> {
+    let mounts = Mounts::start(true, None).await?;
+    let result = marker_steps(&mounts, true).await;
+    mounts.shutdown().await;
+    result
+}
+
+/// Deletes the last child of an implicit directory by a SetInfo disposition, or `at_create` by
+/// the CREATE option, and checks the directory stays as a marker.
+async fn marker_steps(mounts: &Mounts, at_create: bool) -> TestResult<()> {
     let address = mounts.smb.ok_or("no SMB listener")?;
     // `implicit` exists only through this object, which makes it an implicit directory.
     mounts.put("implicit/only.txt", b"the last child").await?;
     let mut client = SmbClient::login(address, &mounts.keys, BUCKET).await?;
     let access = DELETE | READ_ATTRIBUTES;
+    let options = match at_create {
+        true => NOT_DIRECTORY | DELETE_ON_CLOSE,
+        false => NOT_DIRECTORY,
+    };
     let file = client
-        .open("implicit\\only.txt", access, FILE_OPEN, NOT_DIRECTORY)
+        .open("implicit\\only.txt", access, FILE_OPEN, options)
         .await?;
-    client.dispose(file).await?;
+    if !at_create {
+        client.dispose(file).await?;
+    }
     client.close(file).await?;
     assert!(
         mounts.missing("implicit/only.txt").await,

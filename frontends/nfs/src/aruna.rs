@@ -103,6 +103,9 @@ struct Tables {
     /// Deleted bindings whose opens and locks the engine still releases.
     closing: HashMap<Ulid, NfsMountBinding>,
     opens: HashMap<(ObjectRef, OwnerKey), OpenSlot>,
+    /// The answer of each close that ended its open with an error, so a retried CLOSE of the
+    /// same stateid gets it again; a new open of the owner or its release forgets it.
+    closed_errors: HashMap<(ObjectRef, OwnerKey), NfsStat4>,
     /// The open of a new file with its creating owner's modes, until that owner's OPEN takes
     /// it over.
     created: HashMap<(ObjectRef, OwnerKey), OpenSlot>,
@@ -151,6 +154,10 @@ impl ArunaNfsBackend {
             }
             tables.cookies.forget(*mount_id);
             tables.exclusive.retain(|(mount, _), _| mount != mount_id);
+            let other_mount = |object: &ObjectRef| object.mount_id != *mount_id;
+            tables
+                .closed_errors
+                .retain(|(object, _), _| other_mount(object));
         }
         // No subscriber means no server runs yet; nothing holds state to revoke.
         let _ = self.events.send(event);
@@ -362,10 +369,27 @@ impl NfsBackend for ArunaNfsBackend {
         let binding = self.release_binding(caller)?;
         let closed = match job_view(&binding) {
             true => Ok(()),
-            false => self.live_close(&binding, object, owner).await,
+            false => self.live_close(caller, &binding, object, owner).await,
         };
         self.settle_closing(binding.mount_id);
         closed
+    }
+
+    async fn release_open(
+        &self,
+        caller: &Caller,
+        object: ObjectRef,
+        owner: &OwnerKey,
+    ) -> Result<(), NfsStat4> {
+        let closed = self.close(caller, object, owner).await;
+        let key = (object, owner.clone());
+        let mut tables = self.tables.lock();
+        tables.closed_errors.remove(&key);
+        // A close that ended the open released it, whatever it answered the client.
+        match tables.opens.contains_key(&key) {
+            true => closed.and(Err(NfsStat4::Delay)),
+            false => Ok(()),
+        }
     }
 
     async fn read(

@@ -30,7 +30,7 @@ use ulid::Ulid;
 
 use super::exports::object_key;
 use super::{ArunaNfsBackend, LIVE_ROOT, job_view, vfs_status};
-use crate::backend::{HostIdentity, IoState, MountExport, ReplayAccess, ReplayCheck, ReplayGrant};
+use crate::backend::{Caller, HostIdentity, MountExport, ReplayAccess, ReplayCheck, ReplayGrant};
 use crate::types::NfsStat4;
 
 /// Whether `peer` lies in one of `networks`; a malformed network admits nothing.
@@ -57,6 +57,12 @@ pub(super) fn key_allows(host: &EnrolledHostRecord, identity: &HostIdentity) -> 
 /// A binding without networks follows its host's; otherwise the peer must be in one.
 pub(super) fn binding_allows(binding: &NfsMountBinding, peer: IpAddr) -> bool {
     binding.allowed_networks.is_empty() || network_allows(&binding.allowed_networks, peer)
+}
+
+/// A binding serves only its own host. A worker pool host also mounts the per-attempt bindings
+/// of other owners; any other host only its owner's.
+pub(super) fn owner_allows(binding: &NfsMountBinding, host: &EnrolledHostRecord) -> bool {
+    binding.host_id == host.host_id && (binding.owner == host.owner || host.worker_pool)
 }
 
 /// The handle incarnation of a job input view, fixed by its job id.
@@ -157,7 +163,7 @@ impl ArunaNfsBackend {
             .await
             .map_err(|error| vfs_status(&error))?
             .ok_or(NfsStat4::Stale)?;
-        if binding.host_id != host.host_id || binding.owner != host.owner {
+        if binding.host_id != host.host_id || !owner_allows(&binding, &record) {
             return Err(NfsStat4::Stale);
         }
         if !binding_allows(&binding, peer) {
@@ -184,6 +190,37 @@ impl ArunaNfsBackend {
         };
         self.tables.lock().mounts.insert(mount_id, binding);
         Ok(export)
+    }
+
+    /// Whether a close through `saved` may still publish: the binding is not deleted, and it
+    /// and its host still admit `caller` with the same credential. A lookup that failed for
+    /// now answers DELAY, so the close is retried instead of withholding the publication.
+    pub(super) async fn release_admitted(
+        &self,
+        caller: &Caller,
+        saved: &NfsMountBinding,
+    ) -> Result<bool, NfsStat4> {
+        if self.tables.lock().closing.contains_key(&saved.mount_id) {
+            return Ok(false);
+        }
+        let host = GetHostOperation::new(caller.host.host_id, caller.host.owner);
+        let record = match drive(host, &self.context).await {
+            Ok(record) => record,
+            Err(error) => return lapsed(&error),
+        };
+        if !host_allows(&record, caller.peer) || !key_allows(&record, &caller.host) {
+            return Ok(false);
+        }
+        let binding = match drive(LookupMountOperation::new(saved.mount_id), &self.context).await {
+            Ok(binding) => binding,
+            Err(error) => return lapsed(&error),
+        };
+        Ok(binding.is_some_and(|binding| {
+            owner_allows(&binding, &record)
+                && binding.host_id == caller.host.host_id
+                && binding_allows(&binding, caller.peer)
+                && binding.access_key == saved.access_key
+        }))
     }
 
     /// A job view admits only the live, local credential of the attempt that owns the view.
@@ -254,18 +291,22 @@ impl ArunaNfsBackend {
     }
 
     /// One object use of a bucket or folder export, as a fresh request would admit it; a read
-    /// runs again through the live read path with its exact range.
+    /// runs again on the exact version or instance it served, never on the current head.
     pub(super) async fn recheck_live(
         &self,
         binding: &NfsMountBinding,
         check: &ReplayCheck,
     ) -> Result<(), NfsStat4> {
         let object = check.object;
-        match check.access {
+        match &check.access {
             ReplayAccess::Head => self.live_attributes(binding, object).await.map(|_| ()),
-            ReplayAccess::Read { offset, length } => {
-                let read = self.live_read(binding, object, &IoState::Bypass, offset, length);
-                read.await.map(|_| ())
+            ReplayAccess::Read {
+                offset,
+                length,
+                source,
+            } => {
+                let source = source.as_ref().ok_or(NfsStat4::Access)?;
+                self.replay_read(binding, source, (*offset, *length)).await
             }
             ReplayAccess::List => {
                 let located = self.directory_of(binding, object).await?;
@@ -297,12 +338,12 @@ impl ArunaNfsBackend {
         check: &ReplayCheck,
     ) -> Result<(), NfsStat4> {
         let object = check.object;
-        match check.access {
+        match &check.access {
             ReplayAccess::Head | ReplayAccess::List => {
                 self.view_attributes(binding, object).await.map(|_| ())
             }
-            ReplayAccess::Read { offset, length } => {
-                let read = self.view_read(binding, object, offset, length);
+            ReplayAccess::Read { offset, length, .. } => {
+                let read = self.view_read(binding, object, *offset, *length);
                 read.await.map(|_| ())
             }
             ReplayAccess::Write => Err(NfsStat4::ReadOnly),
@@ -326,6 +367,14 @@ fn export_of(
         root,
         read_only: binding.read_only || persistent,
         persistent,
+    }
+}
+
+/// A host or binding lookup that failed for now asks for a retry; any other failure is a lapse.
+fn lapsed(error: &VfsError) -> Result<bool, NfsStat4> {
+    match hidden_status(error) {
+        NfsStat4::Delay | NfsStat4::ServerFault => Err(NfsStat4::Delay),
+        _ => Ok(false),
     }
 }
 

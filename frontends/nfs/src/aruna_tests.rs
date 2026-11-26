@@ -1,23 +1,25 @@
-//! Tests of the Aruna NFS backend: error mapping, host networks, keys and revocation, folder
-//! confinement, refused writes on job views and the replay recheck against live state.
+//! Tests of the Aruna NFS backend: errors, hosts, keys, revocation, folders, job view writes,
+//! replay rechecks, closes through revoked bindings, read lock checks and hidden pages.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use aruna_core::structs::execution::job::identity::JobId;
-use aruna_core::structs::storage::vfs::EnrolledHostRecord;
+use aruna_core::structs::storage::vfs::{EnrolledHostRecord, FileIdentity};
 use aruna_core::user::id::UserId;
-use aruna_core::vfs_effects::VfsFailure;
+use aruna_core::vfs_effects::{ReadLockCheck, VfsFailure};
 use aruna_ops_data::vfs::admin::{EnrollInput, HostChange};
+use aruna_ops_data::vfs::handles::{ListNext, ListResume};
 use aruna_ops_data::vfs::{EnrollHostOperation, RevokeHostOperation, RotateHostOperation};
 use aruna_runner::driver::drive;
 use aruna_runner::testing::memory_context;
 
-use super::admit::host_allows;
-use super::exports::{holds, root_key};
+use super::admit::{host_allows, owner_allows};
+use super::exports::{holds, resume_after, root_key};
+use super::writes::{lock_check, owner_number};
 use super::*;
-use crate::backend::{ReplayAccess, ReplayCheck};
+use crate::backend::{ReadSource, ReplayAccess, ReplayCheck};
 use crate::rpc::RpcPrincipal;
 use crate::types::share;
 
@@ -80,6 +82,17 @@ async fn enroll_host(backend: &ArunaNfsBackend, key: u8, networks: &[&str]) -> E
     drive(enroll, &backend.context)
         .await
         .expect("host enrolled")
+}
+
+fn client_owner(name: &'static [u8]) -> OwnerKey {
+    OwnerKey {
+        client_id: 1,
+        owner: Bytes::from_static(name),
+    }
+}
+
+fn bucket_binding() -> NfsMountBinding {
+    binding(NfsMountTarget::for_bucket("data", 7).expect("a bucket"))
 }
 
 fn peer(last: u8) -> IpAddr {
@@ -501,4 +514,185 @@ async fn revoked_mount_releases() {
     assert!(backend.tables.lock().closing.is_empty());
     let again = backend.unlock(&caller, object, &owner, range).await;
     assert_eq!(again, Err(NfsStat4::Stale));
+}
+
+// A worker pool host mounts the per-attempt binding of another owner; any other host only its
+// owner's, and no host the binding of another host.
+#[test]
+fn worker_pool_mounts() {
+    let mut tenant = bucket_binding();
+    tenant.owner = UserId::new(Ulid::from_parts(9, 9), RealmId([1; 32]));
+    let plain = host_record(&["10.1.0.0/16"], None);
+    let mut pool = plain.clone();
+    pool.worker_pool = true;
+    assert!(owner_allows(&tenant, &pool));
+    assert!(!owner_allows(&tenant, &plain));
+    assert!(owner_allows(&bucket_binding(), &plain));
+    let mut elsewhere = tenant.clone();
+    elsewhere.host_id = Ulid::from_parts(3, 2);
+    assert!(!owner_allows(&elsewhere, &pool));
+}
+
+// A replayed READ is admitted again only on the exact bytes it served: a missing source or one
+// naming neither version nor instance refuses, and a withdrawn version never falls back to the
+// current head.
+#[tokio::test]
+async fn replay_needs_source() {
+    let backend = backend();
+    let bucket = bucket_binding();
+    let object = ObjectRef {
+        mount_id: bucket.mount_id,
+        object_id: 5,
+    };
+    let read = |source| ReplayCheck {
+        object,
+        access: ReplayAccess::Read {
+            offset: 0,
+            length: 4,
+            source,
+        },
+    };
+    let missing = backend.recheck_live(&bucket, &read(None)).await;
+    assert_eq!(missing, Err(NfsStat4::Access));
+    let unpinned = ReadSource {
+        key: "a".to_string(),
+        version_id: None,
+        instance_id: None,
+    };
+    let unpinned = backend.recheck_live(&bucket, &read(Some(unpinned))).await;
+    assert_eq!(unpinned, Err(NfsStat4::Access));
+    let outside = ReadSource {
+        key: "a".to_string(),
+        version_id: Some(Ulid::from_parts(7, 7)),
+        instance_id: None,
+    };
+    let folder = binding(NfsMountTarget::for_folder("data", 7, "team").expect("a folder"));
+    let confined = backend
+        .recheck_live(&folder, &read(Some(outside.clone())))
+        .await;
+    assert_eq!(confined, Err(NfsStat4::Access));
+    let withdrawn = backend.recheck_live(&bucket, &read(Some(outside))).await;
+    assert!(
+        withdrawn.is_err(),
+        "a version the node cannot serve refuses"
+    );
+}
+
+// A CLOSE retried after its open ended with an error answers that error again; the engine's
+// release forgets it, and so does deleting the binding.
+#[tokio::test]
+async fn retried_close_repeats() {
+    let backend = backend();
+    let bucket = bucket_binding();
+    let caller = admitted(&backend, &bucket);
+    let object = ObjectRef {
+        mount_id: bucket.mount_id,
+        object_id: 5,
+    };
+    let owner = client_owner(b"owner");
+    let key = (object, owner.clone());
+    let refused = NfsStat4::QuotaExceeded;
+    backend
+        .tables
+        .lock()
+        .closed_errors
+        .insert(key.clone(), refused);
+    for _ in 0..2 {
+        assert_eq!(backend.close(&caller, object, &owner).await, Err(refused));
+    }
+    assert_eq!(backend.release_open(&caller, object, &owner).await, Ok(()));
+    assert_eq!(backend.close(&caller, object, &owner).await, Ok(()));
+    backend
+        .tables
+        .lock()
+        .closed_errors
+        .insert(key, NfsStat4::Io);
+    backend.publish_revocation(Revocation::Mount(bucket.mount_id));
+    assert!(backend.tables.lock().closed_errors.is_empty());
+}
+
+// A close through a deleted binding, or one whose host is gone, never publishes through it;
+// a release that could not end the open keeps it, so the engine retries it.
+#[tokio::test]
+async fn revoked_close_withholds() {
+    let backend = backend();
+    let bucket = bucket_binding();
+    let caller = admitted(&backend, &bucket);
+    let unknown = backend.release_admitted(&caller, &bucket).await;
+    assert_eq!(
+        unknown,
+        Ok(false),
+        "a host without a record never publishes"
+    );
+    backend.publish_revocation(Revocation::Mount(bucket.mount_id));
+    let deleted = backend.release_admitted(&caller, &bucket).await;
+    assert_eq!(deleted, Ok(false));
+    let object = ObjectRef {
+        mount_id: bucket.mount_id,
+        object_id: 5,
+    };
+    let owner = client_owner(b"owner");
+    let slot = OpenSlot {
+        open_id: Ulid::from_parts(8, 1),
+        instance_id: 3,
+        key: "a".to_string(),
+        write: true,
+        identity: HandleIdentity::File(FileIdentity::Committed {
+            life_id: Ulid::from_parts(8, 2),
+        }),
+        version_id: Some(Ulid::from_parts(8, 3)),
+        size: 4,
+        access: share::BOTH,
+        deny: 0,
+    };
+    let key = (object, owner.clone());
+    backend.tables.lock().opens.insert(key.clone(), slot);
+    let released = backend.release_open(&caller, object, &owner).await;
+    assert!(
+        released.is_err(),
+        "a node without file server state keeps the open"
+    );
+    let tables = backend.tables.lock();
+    assert!(tables.opens.contains_key(&key));
+    assert!(tables.closing.contains_key(&bucket.mount_id));
+}
+
+// The bypass stateid reads past byte locks, the anonymous one meets every exclusive lock, and
+// an open reads as its lock owner when the stateid names one.
+#[test]
+fn read_lock_checks() {
+    assert_eq!(lock_check(&IoState::Anonymous), ReadLockCheck::Anonymous);
+    assert_eq!(lock_check(&IoState::Bypass), ReadLockCheck::Bypass);
+    let owner = client_owner(b"owner");
+    let locker = client_owner(b"lock");
+    let open = IoState::Open {
+        owner: owner.clone(),
+        lock_owner: None,
+    };
+    assert_eq!(
+        lock_check(&open),
+        ReadLockCheck::Owner(owner_number(&owner))
+    );
+    let locked = IoState::Open {
+        owner,
+        lock_owner: Some(locker.clone()),
+    };
+    let expected = ReadLockCheck::Owner(owner_number(&locker));
+    assert_eq!(lock_check(&locked), expected);
+}
+
+// A READDIR page whose entries were all hidden continues after its last position instead of
+// answering an empty page, and a scan that would not move forward fails instead of looping.
+#[test]
+fn hidden_pages_skipped() {
+    assert_eq!(resume_after(ListNext::End, &ListResume::Start), Ok(None));
+    let sealed = resume_after(ListNext::Sealed("s".to_string()), &ListResume::Start);
+    assert_eq!(sealed, Ok(Some(ListResume::Sealed(b"s".to_vec()))));
+    let first = resume_after(ListNext::After("a".to_string()), &ListResume::Start);
+    assert_eq!(first, Ok(Some(ListResume::After("a".to_string()))));
+    let before = ListResume::After("b".to_string());
+    let next = resume_after(ListNext::After("c".to_string()), &before);
+    assert_eq!(next, Ok(Some(ListResume::After("c".to_string()))));
+    let stuck = resume_after(ListNext::After("b".to_string()), &before);
+    assert_eq!(stuck, Err(NfsStat4::ServerFault));
 }

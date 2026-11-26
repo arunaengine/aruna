@@ -324,6 +324,11 @@ fn initial_create_commits() {
         dirty: false,
         stage_id: None,
         logical_size: 0,
+        identity: HandleIdentity::File(FileIdentity::Unpublished {
+            token: id(30),
+            predecessor: None,
+        }),
+        base_version: None,
         ..instance()
     };
     operation
@@ -331,4 +336,226 @@ fn initial_create_commits() {
         .unwrap();
     let turn = operation.next(granted());
     assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
+}
+
+#[test]
+fn commit_follows_instance() {
+    // A flush and rename through the other protocol before the guard moved the base and the
+    // key; the commit copies from the new exact version and admits the new name.
+    let mut operation = committing();
+    let moved = InstanceSummary {
+        key: "p/b".to_string(),
+        base_version: Some(id(9)),
+        ..instance()
+    };
+    let turn = operation.next(vfs(VfsEvent::Instance(Some(moved))));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    assert_eq!(operation.input.record.key, "p/b");
+    let base = StageBase::Committed {
+        version_id: id(9),
+        life_id: id(4),
+    };
+    assert_eq!(operation.input.record.base, base);
+    let mut detached = committing();
+    let gone = InstanceSummary {
+        detached: Some(aruna_core::structs::storage::vfs::DetachReason::Unlinked),
+        ..instance()
+    };
+    let turn = detached.next(vfs(VfsEvent::Instance(Some(gone))));
+    assert_eq!(turn, Err(VfsError::StaleHandle));
+}
+
+/// A commit whose row write lost its reply, up to the settling sync.
+fn uncertain() -> VfsCommitOperation {
+    let mut operation = begun();
+    let plan = VfsEvent::CheckpointPlan {
+        missing_base: Vec::new(),
+        logical_size: 5,
+    };
+    operation.next(vfs(plan)).unwrap();
+    let sealed = VfsEvent::CheckpointWritten {
+        filename: "c-6".to_string(),
+        size: 5,
+    };
+    operation.next(vfs(sealed)).unwrap();
+    let lost = IoResult::Child(ChildOutcome::new(Err::<(), VfsError>(VfsError::Storage(
+        "lost reply".to_string(),
+    ))));
+    assert_eq!(operation.next(lost), Ok(Next::Call(IoCall::Sync)));
+    operation
+}
+
+#[test]
+fn uncertain_file_kept() {
+    // A sealed file a row may name stays when the sync or the read back fails; only a row
+    // read back without it lets the abort drop the claim.
+    let mut settle = uncertain();
+    assert!(settle.next(IoResult::Woke).is_err());
+    assert_eq!(settle.abort(), vec![release()]);
+    let mut check = uncertain();
+    assert!(matches!(
+        check.next(IoResult::Done),
+        Ok(Next::Call(IoCall::Read(_)))
+    ));
+    assert!(check.next(IoResult::Done).is_err());
+    assert_eq!(check.abort(), vec![release()]);
+    let mut absent = uncertain();
+    absent.next(IoResult::Done).unwrap();
+    let turn = absent.next(IoResult::Values(vec![None]));
+    assert_eq!(turn, Err(VfsError::Storage("lost reply".to_string())));
+    let abort = VfsEffect::AbortCheckpoint {
+        scope: scope(),
+        instance_id: 1,
+        stage_id: id(12),
+        generation: 6,
+    };
+    assert_eq!(absent.abort(), vec![vfs_call(abort), release()]);
+}
+
+#[test]
+fn second_child_opens() {
+    // An implicit directory whose first child is hidden still opens through a visible one.
+    let mut operation = VfsOpenOperation::new(OpenInput {
+        context: context(),
+        key: "d".to_string(),
+        kind: HandleKind::Directory,
+        create: false,
+        exclusive: false,
+        write: false,
+        share: ShareMode::default(),
+        delete_on_close: false,
+        open_id: id(20),
+        stable: false,
+        mode: 0,
+        mount_id: Ulid::nil(),
+        stage_scope: StageScope::User,
+    });
+    operation.first().unwrap();
+    operation.next(granted()).unwrap();
+    operation
+        .next(vfs(VfsEvent::PermitAcquired { permit_id: id(9) }))
+        .unwrap();
+    operation
+        .next(IoResult::Values(vec![None, None, None]))
+        .unwrap();
+    let rows = vec![
+        (
+            super::super::head_key("bucket", "d/a").unwrap(),
+            head(6, Some(7)),
+        ),
+        (
+            super::super::head_key("bucket", "d/b").unwrap(),
+            head(8, Some(9)),
+        ),
+    ];
+    let turn = operation.next(IoResult::Page { rows, next: None });
+    assert!(matches!(asked(&turn), VfsEffect::ListStaged { .. }));
+    let staged = VfsEvent::StagedList {
+        entries: Vec::new(),
+        sequence: 1,
+        truncated: false,
+    };
+    let turn = operation.next(vfs(staged));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    let turn = operation.next(denied());
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    let turn = operation.next(granted());
+    let VfsEffect::OpenInstance(request) = asked(&turn) else {
+        panic!("expected the open through the second child");
+    };
+    let witness = DirectoryWitness::Descendant {
+        key: "d/b".to_string(),
+        life_id: id(9),
+    };
+    assert_eq!(request.identity, HandleIdentity::Directory(witness));
+}
+
+#[test]
+fn staged_read_version() {
+    // A staged read passes its lock check on and reports the version its base names.
+    let mut operation = VfsReadOperation::new(ReadInput {
+        context: context(),
+        key: "p/a".to_string(),
+        instance_id: Some(1),
+        version_id: Some(id(2)),
+        offset: 0,
+        length: 3,
+        lock_check: ReadLockCheck::Owner(5),
+    });
+    operation.first().unwrap();
+    let turn = operation.next(granted());
+    let VfsEffect::ReadStage { lock_check, .. } = asked(&turn) else {
+        panic!("expected the staged read");
+    };
+    assert_eq!(lock_check, ReadLockCheck::Owner(5));
+    let read = VfsEvent::StageRead {
+        slices: vec![StageSlice::Written {
+            offset: 0,
+            data: vec![1, 2, 3],
+        }],
+        logical_size: 3,
+        base_limit: 3,
+    };
+    let Ok(Next::Done(output)) = operation.next(vfs(read)) else {
+        panic!("expected the read");
+    };
+    assert_eq!(output.version_id, Some(id(2)));
+    assert!(output.eof);
+}
+
+#[test]
+fn delete_close_owner() {
+    // A read-only open with delete-on-close records its disposition owner for final delete.
+    let mut operation = VfsOpenOperation::new(OpenInput {
+        context: context(),
+        key: "p/only".to_string(),
+        kind: HandleKind::File,
+        create: false,
+        exclusive: false,
+        write: false,
+        share: ShareMode {
+            delete_access: true,
+            ..ShareMode::default()
+        },
+        delete_on_close: true,
+        open_id: id(22),
+        stable: false,
+        mode: 0,
+        mount_id: Ulid::nil(),
+        stage_scope: StageScope::User,
+    });
+    operation.first().unwrap();
+    operation.next(granted()).unwrap();
+    operation
+        .next(vfs(VfsEvent::PermitAcquired { permit_id: id(9) }))
+        .unwrap();
+    operation
+        .next(IoResult::Values(vec![Some(head(2, Some(4))), None, None]))
+        .unwrap();
+    operation
+        .next(IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        })
+        .unwrap();
+    operation
+        .next(vfs(VfsEvent::StagedList {
+            entries: Vec::new(),
+            sequence: 1,
+            truncated: false,
+        }))
+        .unwrap();
+    let existing = InstanceSummary {
+        key: "p/only".to_string(),
+        ..instance()
+    };
+    let turn = operation.next(vfs(VfsEvent::Instance(Some(existing))));
+    let VfsEffect::OpenInstance(request) = asked(&turn) else {
+        panic!("expected instance open");
+    };
+    assert!(request.delete_on_close);
+    assert_eq!(
+        request.owner.map(|owner| owner.access_key),
+        Some("KEY1".to_string())
+    );
 }

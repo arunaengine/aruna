@@ -792,3 +792,25 @@ fn refused_marker_denies() {
     let kept = run(Some(head(1, Some(3))));
     assert!(matches!(kept, Ok(Next::Call(IoCall::Child(_)))));
 }
+
+#[test]
+fn unprepared_parent_refused() {
+    // The last child of an implicit parent is not removed without a prepared parent marker;
+    // a parent with a live marker needs none and is guarded instead.
+    let run = |parent: Option<Value>| {
+        let mut operation = VfsRemoveOperation::new(removing(HandleKind::File));
+        operation.first().unwrap();
+        operation.next(granted()).unwrap();
+        operation.next(permitted()).unwrap();
+        let turn = operation.next(no_open());
+        let Ok(Next::Call(IoCall::Read(reads))) = turn else {
+            panic!("expected the rows, got {turn:?}");
+        };
+        assert_eq!(reads.len(), 4);
+        let rows = vec![None, Some(head(2, Some(4))), None, parent];
+        operation.next(IoResult::Values(rows))
+    };
+    assert_eq!(run(None), Err(VfsError::Conflict));
+    let kept = run(Some(head(1, Some(3))));
+    assert!(matches!(kept, Ok(Next::Call(IoCall::Child(_)))));
+}

@@ -202,6 +202,7 @@ impl VfsHandle {
             VfsEffect::CloseOpen { scope, open_id } => self.close_open(&scope, open_id).await,
             VfsEffect::LookupInstance { scope, key } => self.lookup_instance(&scope, &key),
             VfsEffect::LookupHandle { scope, handle_id } => self.lookup_handle(&scope, handle_id),
+            VfsEffect::LookupById { scope, instance_id } => self.lookup_by_id(&scope, instance_id),
             VfsEffect::ListStaged {
                 scope,
                 prefix,
@@ -215,6 +216,16 @@ impl VfsHandle {
                 instance_id,
                 reason,
             } => self.detach_instance(&scope, handle_id, instance_id, reason),
+            VfsEffect::RetainInstance {
+                scope,
+                instance_id,
+                stage_id,
+                generation,
+                reason,
+            } => {
+                self.retain_instance(&scope, instance_id, stage_id, generation, reason)
+                    .await
+            }
             VfsEffect::UpdateWitnesses { scope, updates } => self.update_witnesses(&scope, updates),
             VfsEffect::SetDisposition {
                 scope,
@@ -223,6 +234,11 @@ impl VfsHandle {
                 pending,
                 owner,
             } => self.set_disposition(&scope, instance_id, open_id, pending, owner),
+            VfsEffect::UpdateShare {
+                scope,
+                open_id,
+                share,
+            } => self.update_share(&scope, open_id, share),
             VfsEffect::LockRanges {
                 scope,
                 instance_id,
@@ -244,9 +260,9 @@ impl VfsHandle {
                 instance_id,
                 offset,
                 length,
-                owner_id,
+                lock_check,
             } => {
-                self.read_stage(&scope, instance_id, offset, length, owner_id)
+                self.read_stage(&scope, instance_id, offset, length, lock_check)
                     .await
             }
             VfsEffect::WriteStage {

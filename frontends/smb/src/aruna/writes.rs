@@ -10,7 +10,7 @@ use aruna_core::structs::storage::vfs::{
     StageBase,
 };
 use aruna_core::user::id::UserId;
-use aruna_core::vfs_effects::{InstanceSummary, VfsProtocol};
+use aruna_core::vfs_effects::{InstanceSummary, ReadLockCheck, VfsProtocol};
 use aruna_ops_data::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use aruna_ops_data::s3::object::put::{PutObjectConfig, PutObjectInput};
 use aruna_ops_data::vfs::io::{DispositionInput, ReadInput};
@@ -30,6 +30,7 @@ use bytes::Bytes;
 use ulid::Ulid;
 
 use super::bodies::chunked_body;
+use super::files::current_open;
 use super::names::Resolution;
 use super::{ArunaSmbBackend, FileOpen, file_info, object_kind, vfs_failure};
 use crate::backend::{BackendError, FileInfo};
@@ -104,7 +105,7 @@ impl ArunaSmbBackend {
             version_id,
             offset: 0,
             length: 0,
-            owner_id: None,
+            lock_check: ReadLockCheck::Bypass,
         }
     }
 
@@ -265,11 +266,13 @@ impl ArunaSmbBackend {
         }
         for _ in 0..FLUSH_TRIES {
             let summary = self.summary(open).await?.ok_or(BackendError::NotFound)?;
-            if !summary.dirty {
+            // A detached instance has no name left to publish to.
+            if !summary.dirty || summary.detached.is_some() {
                 return Ok(());
             }
-            let stage = self.live_stage(open, &summary).await?;
-            let (input, put) = self.prepare(open, &summary, stage).await?;
+            let live = current_open(open, Some(&summary));
+            let stage = self.live_stage(&live, &summary).await?;
+            let (input, put) = self.prepare(&live, &summary, stage).await?;
             let publish = VfsPublishOperation::new(input, put);
             match drive(publish, &self.driver).await {
                 Ok(published) => {
@@ -308,7 +311,8 @@ impl ArunaSmbBackend {
     }
 
     /// What one close brings: the shared durable stage, the publication of the last dirty
-    /// writer and the parent marker of a final delete, each read from the live instance.
+    /// writer and the parent marker of a final delete, each read from the live instance. The
+    /// close itself turns FILE_DELETE_ON_CLOSE into delete-pending owned by this open.
     async fn close_parts(
         &self,
         open: &FileOpen,
@@ -316,12 +320,13 @@ impl ArunaSmbBackend {
         parts: &mut CloseParts,
     ) -> Result<(), BackendError> {
         parts.stage = self.live_stage(open, summary).await?;
-        if summary.delete_pending && summary.open_count <= 1 {
-            let owner = summary.disposition_owner.as_ref();
-            let user = owner.map_or(open.owner.user, |owner| owner.user);
-            parts.marker = self.parent_marker(open, &summary.key, user).await?;
+        let deleting = summary.delete_pending || open.delete_on_close;
+        if deleting && summary.open_count <= 1 {
+            let owner = summary.disposition_owner.as_ref().unwrap_or(&open.owner);
+            parts.marker = self.parent_marker(open, &summary.key, owner.user).await?;
         }
-        let last = summary.writer_count <= 1 && !summary.delete_pending;
+        let detached = summary.detached.is_some();
+        let last = summary.writer_count <= 1 && !deleting && !detached;
         if open.write && summary.dirty && last {
             let stage = parts.stage.clone();
             parts.publish = Some(self.prepare(open, summary, stage).await?);
@@ -335,11 +340,14 @@ impl ArunaSmbBackend {
         let mut parts = CloseParts::default();
         let mut failure = None;
         let mut time = open.version_id;
+        let mut detached = false;
         match self.summary(&open).await {
             Ok(Some(summary)) => {
                 parts.size = summary.logical_size;
                 time = summary.base_version.or(time);
-                failure = self.close_parts(&open, &summary, &mut parts).await.err();
+                detached = summary.detached.is_some();
+                let live = current_open(&open, Some(&summary));
+                failure = self.close_parts(&live, &summary, &mut parts).await.err();
             }
             Ok(None) => {}
             Err(error) => failure = Some(error),
@@ -362,6 +370,8 @@ impl ArunaSmbBackend {
                 time = Some(published.version_id);
             }
             CloseOutcome::Closed | CloseOutcome::Deleted | CloseOutcome::Discarded => {}
+            // A detached instance has no name left to publish to.
+            CloseOutcome::Pending if detached => {}
             CloseOutcome::QuotaBlocked => return Err(BackendError::DiskFull),
             CloseOutcome::Retained(_) => return Err(BackendError::Denied),
             CloseOutcome::Pending => {
@@ -382,6 +392,14 @@ impl ArunaSmbBackend {
         target: &str,
         replace: bool,
     ) -> Result<(), BackendError> {
+        // Pin the source as it lives now; a changed life refuses the whole move.
+        let (open, summary) = self.current(open).await?;
+        let summary = summary.ok_or(BackendError::NotFound)?;
+        // A detached object has no name left to move.
+        if summary.detached.is_some() {
+            return Err(BackendError::NotFound);
+        }
+        let open = &open;
         let context = self.open_context(open);
         let (parent, name) = split_parent(target).ok_or(BackendError::Invalid)?;
         check_component(name, VfsProtocol::Smb, NameUse::Create, parent.is_empty())
@@ -394,8 +412,6 @@ impl ArunaSmbBackend {
             Resolution::Found(found) => (found.key, true),
             Resolution::Missing(key) => (key, false),
         };
-        // Pin the source as it lives now; a changed life refuses the whole move.
-        let summary = self.summary(open).await?.ok_or(BackendError::NotFound)?;
         if to == open.key {
             let delete = VfsRequest::new(VfsAccess::Delete, &open.bucket, Some(&open.key));
             return match self.allows(&context, delete).await? {
@@ -481,12 +497,8 @@ impl ArunaSmbBackend {
         }
         drive(rename, &self.driver).await.map_err(vfs_failure)?;
         // The file instance at the destination tells its live identity and base version.
-        let moved = FileOpen {
-            key: to.clone(),
-            ..open.clone()
-        };
         let found = match open.kind {
-            HandleKind::File => self.summary(&moved).await.ok().flatten(),
+            HandleKind::File => self.summary(open).await.ok().flatten(),
             HandleKind::Directory => None,
         };
         let identity = found.as_ref().map(|found| found.identity.clone());
@@ -515,8 +527,9 @@ impl ArunaSmbBackend {
         open: &FileOpen,
         delete: bool,
     ) -> Result<(), BackendError> {
+        let (open, _) = self.current(open).await?;
         let input = DispositionInput {
-            context: self.open_context(open),
+            context: self.open_context(&open),
             key: open.key.clone(),
             kind: open.kind,
             instance_id: open.instance_id,

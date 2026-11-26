@@ -175,6 +175,22 @@ pub(super) fn share_mode(access: u32, deny: u32) -> ShareMode {
     }
 }
 
+/// Where a scan continues after a page whose entries were all hidden, or `None` at its end.
+/// A plain position must move strictly forward, so the scan always ends.
+pub(super) fn resume_after(
+    next: ListNext,
+    previous: &ListResume,
+) -> Result<Option<ListResume>, NfsStat4> {
+    match (next, previous) {
+        (ListNext::End, _) => Ok(None),
+        (ListNext::Sealed(sealed), _) => Ok(Some(ListResume::Sealed(sealed.into_bytes()))),
+        (ListNext::After(after), ListResume::After(before)) if after <= *before => {
+            Err(NfsStat4::ServerFault)
+        }
+        (ListNext::After(after), _) => Ok(Some(ListResume::After(after))),
+    }
+}
+
 /// A protected name answers as a missing one.
 pub(super) fn lookup_status(error: &VfsError) -> NfsStat4 {
     match error {
@@ -705,14 +721,13 @@ impl ArunaNfsBackend {
                     attributes: object_attributes(binding, claimed.handle_id, facts, time),
                 });
             }
-            match listing.next {
-                _ if full => break false,
-                ListNext::End => break true,
-                // Hidden entries alone continue the scan instead of ending the page early.
-                ListNext::Sealed(sealed) if entries.is_empty() => {
-                    resume = ListResume::Sealed(sealed.into_bytes());
-                }
-                _ => break false,
+            if full || !entries.is_empty() {
+                break !full && listing.next == ListNext::End;
+            }
+            // A page of hidden entries alone continues the scan instead of ending the page.
+            match resume_after(listing.next, &resume)? {
+                Some(next) => resume = next,
+                None => break true,
             }
         };
         Ok(DirectoryPage {

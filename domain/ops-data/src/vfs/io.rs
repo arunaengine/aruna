@@ -5,7 +5,7 @@
 
 use super::handles::{
     ClaimHandleOperation, HandleAllocation, HandleClaim, HandleUse, Held, WitnessFacts,
-    detached_allows, select_witness,
+    detached_allows,
 };
 use super::path::{NameFacts, NameUse, Projected, check_component, marker_key, project_name};
 use super::policy::{VfsAccess, VfsAccessContext, VfsGrant, VfsRequest, authorize_call, grant_of};
@@ -33,8 +33,8 @@ use aruna_core::structs::storage::vfs::{
 };
 use aruna_core::types::Key;
 use aruna_core::vfs_effects::{
-    ByteLock, ByteRange, InstanceSummary, OpenRequest, RebindRequest, ShareMode, StageSlice,
-    VfsEffect, VfsEvent,
+    ByteLock, ByteRange, InstanceSummary, OpenRequest, ReadLockCheck, RebindRequest, ShareMode,
+    StageSlice, VfsEffect, VfsEvent,
 };
 use ulid::Ulid;
 
@@ -206,6 +206,10 @@ pub struct VfsOpenOperation {
     opened: Option<(u64, bool, u64, u64)>,
     handle: Option<HandleAllocation>,
     probe_after: Option<Key>,
+    /// The last probe page was full and more heads follow it.
+    probe_more: bool,
+    /// The probe pages on only for more child witnesses of an implicit directory.
+    witnessing: bool,
 }
 
 impl VfsOpenOperation {
@@ -227,6 +231,8 @@ impl VfsOpenOperation {
             opened: None,
             handle: None,
             probe_after: None,
+            probe_more: false,
+            witnessing: false,
         }
     }
 
@@ -282,8 +288,12 @@ impl VfsOpenOperation {
             }
             self.probe_after = Some(key);
         }
-        if self.witness.descendants.is_empty() && full && next.is_some() {
+        self.probe_more = full && next.is_some();
+        if self.witness.descendants.is_empty() && self.probe_more {
             return self.probe_call();
+        }
+        if self.witnessing {
+            return self.next_witness();
         }
         self.facts.descendant = !self.witness.descendants.is_empty();
         let (scope, prefix) = (self.scope()?, self.input.key.clone());
@@ -325,20 +335,13 @@ impl VfsOpenOperation {
             (Projected::Directory, HandleKind::File) => Err(VfsError::IsDirectory),
             (Projected::File, HandleKind::Directory) => Err(VfsError::NotDirectory),
             (Projected::Directory, HandleKind::Directory) => {
-                let witness = select_witness(&self.witness).ok_or(VfsError::NotFound)?;
-                let child = match &witness {
-                    DirectoryWitness::Marker { .. } => None,
-                    DirectoryWitness::Descendant { key, .. }
-                    | DirectoryWitness::Unpublished { key, .. } => Some(key.clone()),
-                };
-                self.identity = Some(HandleIdentity::Directory(witness));
-                // An implicit directory shows only through a child the caller may see.
-                let Some(child) = child else {
+                if let Some(life_id) = self.witness.marker {
+                    let witness = DirectoryWitness::Marker { life_id };
+                    self.identity = Some(HandleIdentity::Directory(witness));
                     return self.open_instance();
-                };
-                let request = VfsRequest::new(VfsAccess::Head, &self.bucket(), Some(&child));
-                let call = authorize_call(&self.input.context, request);
-                self.call(OpenStep::Witness, call)
+                }
+                self.witness.unpublished.sort();
+                self.next_witness()
             }
             (Projected::File, HandleKind::File) => {
                 let (scope, key) = (self.scope()?, self.input.key.clone());
@@ -348,6 +351,30 @@ impl VfsOpenOperation {
                 )
             }
         }
+    }
+
+    /// An implicit directory shows only through a child the caller may see: committed children
+    /// in key order, page by page, then unpublished ones.
+    fn next_witness(&mut self) -> OpenTurn {
+        self.witness.descendants.sort();
+        let (witness, child) = if !self.witness.descendants.is_empty() {
+            let (key, life_id) = self.witness.descendants.remove(0);
+            let child = key.clone();
+            (DirectoryWitness::Descendant { key, life_id }, child)
+        } else if self.probe_more && self.probe_after.is_some() {
+            self.witnessing = true;
+            return self.probe_call();
+        } else if !self.witness.unpublished.is_empty() {
+            let (key, token) = self.witness.unpublished.remove(0);
+            let child = key.clone();
+            (DirectoryWitness::Unpublished { key, token }, child)
+        } else {
+            return Err(VfsError::NotFound);
+        };
+        self.identity = Some(HandleIdentity::Directory(witness));
+        let request = VfsRequest::new(VfsAccess::Head, &self.bucket(), Some(&child));
+        let call = authorize_call(&self.input.context, request);
+        self.call(OpenStep::Witness, call)
     }
 
     /// An existing stage is joined with its own identity; a committed head opens its life.
@@ -432,7 +459,7 @@ impl VfsOpenOperation {
                 _ => None,
             });
         self.base_version = base_version;
-        let owner = self.input.write.then(|| StageOwner {
+        let owner = (self.input.write || self.input.delete_on_close).then(|| StageOwner {
             user: grant.owner,
             access_key: self.input.context.access_key.clone(),
             mount_id: self.input.mount_id,
@@ -540,7 +567,7 @@ impl Operation for VfsOpenOperation {
             OpenStep::Staged => self.staged_read(result),
             OpenStep::Witness => match grant_of(result) {
                 Ok(_) => self.open_instance(),
-                Err(VfsError::Denied) => Err(VfsError::NotFound),
+                Err(VfsError::Denied) => self.next_witness(),
                 Err(error) => Err(error),
             },
             OpenStep::Instance => self.instance_read(result),
@@ -682,14 +709,16 @@ pub struct ReadInput {
     pub version_id: Option<Ulid>,
     pub offset: u64,
     pub length: u32,
-    /// The byte-range lock owner of the read; another owner's exclusive lock refuses it.
-    pub owner_id: Option<u64>,
+    /// Which exclusive byte-range locks over the range refuse the read.
+    pub lock_check: ReadLockCheck,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadResult {
     pub data: Vec<u8>,
     pub eof: bool,
+    /// The committed version the base bytes come from; `None` for an unpublished name.
+    pub version_id: Option<Ulid>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -714,11 +743,14 @@ pub struct VfsReadOperation {
     parts: Vec<Option<Vec<u8>>>,
     pending: Vec<(usize, ByteRange)>,
     size: u64,
+    /// The exact committed version that served the read.
+    version_id: Option<Ulid>,
 }
 
 impl VfsReadOperation {
     pub fn new(input: ReadInput) -> Self {
         Self {
+            version_id: input.version_id,
             input,
             step: ReadStep::Authorize,
             grant: None,
@@ -784,7 +816,7 @@ impl VfsReadOperation {
             instance_id,
             offset,
             length,
-            owner_id: self.input.owner_id,
+            lock_check: self.input.lock_check,
         };
         self.call(ReadStep::Stage, vfs_call(read))
     }
@@ -837,13 +869,27 @@ impl VfsReadOperation {
 
     fn base_read(&mut self, result: IoResult) -> ReadTurn {
         let (_, range) = self.pending.first().copied().ok_or(VfsError::Conflict)?;
-        match collect_call(result, range.length)? {
-            Some(call) => self.call(ReadStep::Collect, call),
+        match result.child::<GetObjectResult, GetObjectError>()? {
+            Ok(read) => {
+                // Every base chunk comes from the one version the read reports.
+                if let Some(served) = read.version_id {
+                    if self.version_id.is_some_and(|known| known != served) {
+                        return Err(VfsError::Conflict);
+                    }
+                    self.version_id = Some(served);
+                }
+                let collect = BlobEffect::CollectStream {
+                    blob: read.blob,
+                    limit: Some(range.length),
+                };
+                self.call(ReadStep::Collect, Effect::blob(collect).into())
+            }
             // Past the end of the base: nothing more is there.
-            None => {
+            Err(GetObjectError::InvalidRange) => {
                 self.pending.clear();
                 self.assemble()
             }
+            Err(error) => Err(read_error(error)),
         }
     }
 
@@ -877,7 +923,12 @@ impl VfsReadOperation {
         }
         let end = self.input.offset.saturating_add(data.len() as u64);
         let eof = end >= self.size || data.len() < self.input.length as usize;
-        Ok(Next::Done(ReadResult { data, eof }))
+        let version_id = self.version_id;
+        Ok(Next::Done(ReadResult {
+            data,
+            eof,
+            version_id,
+        }))
     }
 }
 
@@ -1222,6 +1273,8 @@ pub struct VfsCommitOperation {
     has_stage: bool,
     begun: bool,
     written: bool,
+    /// The row write may have committed, so its sealed file may be named and stays.
+    row_uncertain: bool,
     failure: Option<VfsError>,
 }
 
@@ -1237,6 +1290,7 @@ impl VfsCommitOperation {
             has_stage: false,
             begun: false,
             written: false,
+            row_uncertain: false,
             failure: None,
         }
     }
@@ -1273,7 +1327,8 @@ impl VfsCommitOperation {
         self.call(CommitStep::Instance, vfs_call(effect))
     }
 
-    /// The guarded size is the content length a fresh PUT admission checks, every time.
+    /// The guarded size is the content length a fresh PUT admission checks, every time. The
+    /// key and base come from the guarded instance too, so a flush or rename in between counts.
     fn instance_read(&mut self, result: IoResult) -> CommitTurn {
         let summary = match vfs_event(result)? {
             VfsEvent::Instance(Some(summary)) if summary.instance_id == self.input.instance_id => {
@@ -1282,6 +1337,26 @@ impl VfsCommitOperation {
             VfsEvent::Instance(_) => return Err(VfsError::StaleHandle),
             other => return Err(unexpected(&other)),
         };
+        if summary.detached.is_some() {
+            return Err(VfsError::StaleHandle);
+        }
+        self.input.record.base = match &summary.identity {
+            HandleIdentity::File(FileIdentity::Committed { life_id }) => {
+                let version_id = summary.base_version.ok_or(VfsError::Conflict)?;
+                StageBase::Committed {
+                    version_id,
+                    life_id: *life_id,
+                }
+            }
+            HandleIdentity::File(FileIdentity::Unpublished { token, predecessor }) => {
+                StageBase::Unpublished {
+                    token: *token,
+                    predecessor: *predecessor,
+                }
+            }
+            HandleIdentity::Directory(_) => return Err(VfsError::IsDirectory),
+        };
+        self.input.record.key = summary.key.clone();
         self.dirty = summary.dirty;
         self.has_stage = summary.stage_id.is_some();
         self.input.record.logical_size = summary.logical_size;
@@ -1418,6 +1493,7 @@ impl VfsCommitOperation {
         let (record, previous) = (self.input.record.clone(), self.input.previous.clone());
         let write = StageWriteOperation::new(self.scope()?, record, previous);
         let seed = self.input.record.stage_id.to_bytes();
+        self.row_uncertain = true;
         self.call(CommitStep::Row, IoCall::retry(write, &seed))
     }
 
@@ -1426,10 +1502,14 @@ impl VfsCommitOperation {
         let outcome = result.child::<(), VfsError>().map_err(VfsError::from);
         match outcome.and_then(|outcome| outcome) {
             Ok(()) => {
-                self.written = true;
+                (self.written, self.row_uncertain) = (true, false);
                 self.call(CommitStep::Synced, IoCall::Sync)
             }
-            Err(VfsError::Conflict) => Err(VfsError::Conflict),
+            // A refused write committed nothing.
+            Err(VfsError::Conflict) => {
+                self.row_uncertain = false;
+                Err(VfsError::Conflict)
+            }
             Err(error) => {
                 self.failure = Some(error);
                 self.call(CommitStep::Settle, IoCall::Sync)
@@ -1441,6 +1521,8 @@ impl VfsCommitOperation {
     fn row_checked(&mut self, result: IoResult) -> CommitTurn {
         let [row] = aruna_core::rows::values::<1>(result)?;
         let current = record_of::<NfsStageRecord>(row.as_ref())?;
+        // The synced row is read back, so its outcome is known either way.
+        self.row_uncertain = false;
         if current.as_ref() != Some(&self.input.record) {
             return Err(self.failure.take().unwrap_or(VfsError::Conflict));
         }
@@ -1521,11 +1603,13 @@ impl Operation for VfsCommitOperation {
     }
 
     /// Drops only the generation this request claimed and no row names; another request's
-    /// sealed or promoted file is never touched. The guard goes last.
+    /// sealed or promoted file, or one a row write of unknown outcome may name, is never
+    /// touched. The guard goes last.
     fn abort(&mut self) -> Vec<IoCall> {
         let mut calls = Vec::new();
         if self.begun
             && !self.written
+            && !self.row_uncertain
             && let Ok(scope) = self.scope()
         {
             let record = &self.input.record;
@@ -1914,11 +1998,12 @@ impl Operation for VfsDispositionOperation {
     }
 }
 
-/// Identifies a live shared instance either by exact key or by durable NFS handle id.
+/// Identifies a live shared instance by exact key, durable NFS handle id or instance id.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InstanceTarget {
     Key(String),
     Handle(u64),
+    Instance(u64),
 }
 
 /// Looks up one live or detached shared instance without issuing raw VFS effects.
@@ -1948,6 +2033,10 @@ impl Operation for LookupInstanceOperation {
                 scope: self.scope.clone(),
                 handle_id: *handle_id,
             },
+            InstanceTarget::Instance(instance_id) => VfsEffect::LookupById {
+                scope: self.scope.clone(),
+                instance_id: *instance_id,
+            },
         };
         Ok(Next::Call(vfs_call(effect)))
     }
@@ -1955,6 +2044,44 @@ impl Operation for LookupInstanceOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<Option<InstanceSummary>>, VfsError> {
         match vfs_event(result)? {
             VfsEvent::Instance(summary) => Ok(Next::Done(summary)),
+            other => Err(unexpected(&other)),
+        }
+    }
+}
+
+/// Changes the share reservation of one open after the adapter checks every other open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpdateShareOperation {
+    scope: BucketScope,
+    open_id: Ulid,
+    share: ShareMode,
+}
+
+impl UpdateShareOperation {
+    pub fn new(scope: BucketScope, open_id: Ulid, share: ShareMode) -> Self {
+        Self {
+            scope,
+            open_id,
+            share,
+        }
+    }
+}
+
+impl Operation for UpdateShareOperation {
+    type Output = ();
+    type Error = VfsError;
+
+    fn first(&mut self) -> Result<Next<()>, VfsError> {
+        Ok(Next::Call(vfs_call(VfsEffect::UpdateShare {
+            scope: self.scope.clone(),
+            open_id: self.open_id,
+            share: self.share,
+        })))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, VfsError> {
+        match vfs_event(result)? {
+            VfsEvent::Done => Ok(Next::Done(())),
             other => Err(unexpected(&other)),
         }
     }

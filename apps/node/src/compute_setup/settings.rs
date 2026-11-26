@@ -278,6 +278,7 @@ const SHARE_HOST: &str = "ARUNA_COMPUTE_K8S_SHARE_HOST";
 const SHARE_DRIVER: &str = "ARUNA_COMPUTE_K8S_SHARE_DRIVER";
 const SHARE_INPUTS: &str = "ARUNA_COMPUTE_K8S_SHARE_INPUTS";
 const SHARE_SESSIONS: &str = "ARUNA_COMPUTE_K8S_SHARE_SESSIONS";
+const NFS_HOST_ID: &str = "ARUNA_COMPUTE_K8S_NFS_HOST_ID";
 
 /// The node's SMB or NFS share that takes over run inputs or session data. Nothing set keeps
 /// the S3 and KubeDAL mounts; a partial or contradictory setting is refused.
@@ -289,8 +290,11 @@ pub(super) fn share_mount(
     let value = |key: &str| parse_nonempty(env.var(key).as_deref());
     let (host, driver) = (value(SHARE_HOST), value(SHARE_DRIVER));
     let (inputs, sessions) = (value(SHARE_INPUTS), value(SHARE_SESSIONS));
+    let host_id = value(NFS_HOST_ID);
     let (host, driver) = match (host, driver) {
-        (None, None) if inputs.is_none() && sessions.is_none() => return Ok(None),
+        (None, None) if inputs.is_none() && sessions.is_none() && host_id.is_none() => {
+            return Ok(None);
+        }
         (Some(host), Some(driver)) => (share_host(&host)?, driver),
         _ => {
             return Err(format!(
@@ -302,8 +306,15 @@ pub(super) fn share_mount(
     let inputs = share_switch(SHARE_INPUTS, inputs.as_deref())?;
     let sessions = share_switch(SHARE_SESSIONS, sessions.as_deref())?;
     let driver = match driver.as_str() {
+        "smb" if host_id.is_some() => {
+            return Err(format!("{NFS_HOST_ID} is only valid with the nfs driver"));
+        }
         "smb" => ShareDriver::Smb { inputs, sessions },
-        "nfs" => ShareDriver::Nfs { inputs, sessions },
+        "nfs" => ShareDriver::Nfs {
+            host_id: nfs_host(host_id.as_deref())?,
+            inputs,
+            sessions,
+        },
         other => return Err(format!("{SHARE_DRIVER} must be smb or nfs, not {other:?}")),
     };
     let share = ShareMount { host, driver };
@@ -324,6 +335,14 @@ fn share_host(host: &str) -> Result<String, String> {
             "{SHARE_HOST} must be a bare host name, not {host:?}"
         )),
     }
+}
+
+/// The enrolled worker-pool host the per-attempt NFS bindings are issued for.
+fn nfs_host(value: Option<&str>) -> Result<ulid::Ulid, String> {
+    let value = value.ok_or_else(|| format!("the nfs driver requires {NFS_HOST_ID}"))?;
+    value
+        .parse::<ulid::Ulid>()
+        .map_err(|error| format!("{NFS_HOST_ID} must be a ULID, not {value:?}: {error}"))
 }
 
 /// A share switch: an exact boolean spelling, since a typo must not silently disable it.
@@ -999,9 +1018,16 @@ mod pure_tests {
             },
         };
         assert_eq!(share_mount(&smb), Ok(Some(expected)));
-        let nfs = share_env(&[host, (SHARE_DRIVER, "nfs"), (SHARE_SESSIONS, "true")]);
+        let host_id = (NFS_HOST_ID, "01JABCDEF0123456789ABCDEFG");
+        let nfs = share_env(&[
+            host,
+            host_id,
+            (SHARE_DRIVER, "nfs"),
+            (SHARE_SESSIONS, "true"),
+        ]);
         let share = share_mount(&nfs).unwrap().unwrap();
         let driver = ShareDriver::Nfs {
+            host_id: "01JABCDEF0123456789ABCDEFG".parse().unwrap(),
             inputs: false,
             sessions: true,
         };
@@ -1034,5 +1060,29 @@ mod pure_tests {
         ]));
         let url = (SHARE_HOST, "smb://node-2.example.test");
         assert!(refused(&[url, (SHARE_DRIVER, "smb"), (SHARE_INPUTS, "1")]));
+    }
+
+    #[test]
+    fn checks_nfs_host() {
+        let host = (SHARE_HOST, "node-2.example.test");
+        let host_id = (NFS_HOST_ID, "01JABCDEF0123456789ABCDEFG");
+        let refused = |pairs: &[(&str, &str)]| share_mount(&share_env(pairs)).is_err();
+        // NFS bindings are issued for one enrolled host, so the driver needs its id.
+        assert!(refused(&[host, (SHARE_DRIVER, "nfs"), (SHARE_INPUTS, "1")]));
+        let malformed = (NFS_HOST_ID, "node-2");
+        assert!(refused(&[
+            host,
+            malformed,
+            (SHARE_DRIVER, "nfs"),
+            (SHARE_INPUTS, "1")
+        ]));
+        // A host id beside another driver or no share at all is contradictory.
+        assert!(refused(&[
+            host,
+            host_id,
+            (SHARE_DRIVER, "smb"),
+            (SHARE_INPUTS, "1")
+        ]));
+        assert!(refused(&[host_id]));
     }
 }

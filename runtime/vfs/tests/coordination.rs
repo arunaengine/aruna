@@ -7,7 +7,7 @@ use aruna_core::structs::storage::vfs::{
     BucketScope, DirectoryWitness, FileIdentity, HandleIdentity, HandleKind,
 };
 use aruna_core::vfs_effects::{
-    ByteLock, OpenRequest, ShareMode, VfsEffect, VfsEvent, VfsFailure, VfsProtocol,
+    ByteLock, OpenRequest, ReadLockCheck, ShareMode, VfsEffect, VfsEvent, VfsFailure, VfsProtocol,
 };
 use aruna_vfs::{VfsConfig, VfsHandle, open_owner};
 use std::sync::{Arc, Mutex};
@@ -417,22 +417,130 @@ async fn reads_respect_locks() {
         atomic: true,
     };
     assert_eq!(handle.execute(take).await, VfsEvent::Done);
-    let read = |owner_id, offset| VfsEffect::ReadStage {
+    let read = |lock_check, offset| VfsEffect::ReadStage {
         scope: scope(),
         instance_id,
         offset,
         length: 5,
-        owner_id,
+        lock_check,
     };
-    let blocked = handle.execute(read(Some(9), 0)).await;
-    assert_eq!(blocked, VfsEvent::Failed(VfsFailure::LockConflict));
-    for (owner_id, offset) in [(Some(1), 0), (Some(9), 20), (None, 0)] {
-        let answer = handle.execute(read(owner_id, offset)).await;
+    for lock_check in [ReadLockCheck::Owner(9), ReadLockCheck::Anonymous] {
+        let blocked = handle.execute(read(lock_check, 0)).await;
+        assert_eq!(blocked, VfsEvent::Failed(VfsFailure::LockConflict));
+    }
+    let admitted = [
+        (ReadLockCheck::Owner(1), 0),
+        (ReadLockCheck::Owner(9), 20),
+        (ReadLockCheck::Anonymous, 20),
+        (ReadLockCheck::Bypass, 0),
+    ];
+    for (lock_check, offset) in admitted {
+        let answer = handle.execute(read(lock_check, offset)).await;
         assert!(
             matches!(answer, VfsEvent::StageRead { .. }),
-            "owner {owner_id:?} at {offset} was refused"
+            "read {lock_check:?} at {offset} was refused"
         );
     }
+}
+
+#[tokio::test]
+async fn share_downgrade_admits() {
+    let (_folder, handle) = booted().await;
+    let writer = ShareMode {
+        write_access: true,
+        share_write: false,
+        ..reader()
+    };
+    let first = request("a.txt", committed(), writer);
+    let open_id = first.open_id;
+    opened(&handle, first).await;
+    let denies_writers = ShareMode {
+        share_write: false,
+        ..reader()
+    };
+    let second = || request("a.txt", committed(), denies_writers);
+    let answer = handle.execute(VfsEffect::OpenInstance(second())).await;
+    assert_eq!(answer, VfsEvent::Failed(VfsFailure::ShareViolation));
+    let downgrade = VfsEffect::UpdateShare {
+        scope: scope(),
+        open_id,
+        share: denies_writers,
+    };
+    assert_eq!(handle.execute(downgrade).await, VfsEvent::Done);
+    opened(&handle, second()).await;
+    let upgrade = VfsEffect::UpdateShare {
+        scope: scope(),
+        open_id,
+        share: writer,
+    };
+    let answer = handle.execute(upgrade).await;
+    assert_eq!(answer, VfsEvent::Failed(VfsFailure::ShareViolation));
+}
+
+#[tokio::test]
+async fn guard_refuses_fenced() {
+    let (_folder, handle) = booted().await;
+    let instance_id = opened(&handle, request("a.txt", committed(), reader())).await;
+    let held = guard(&handle, vec![instance_id]).await;
+    let VfsEvent::GuardAcquired { guard_id } = held else {
+        panic!("unexpected answer {held:?}");
+    };
+    let waiter = tokio::spawn({
+        let handle = handle.clone();
+        async move { guard(&handle, vec![instance_id]).await }
+    });
+    settle().await;
+    let release = VfsEffect::ReleaseGuard { guard_id };
+    assert_eq!(handle.execute(release).await, VfsEvent::Done);
+    // The fence closes before the waiter runs again, so its granted guards must give way.
+    let fence = handle
+        .execute(VfsEffect::FenceVault { scope: scope() })
+        .await;
+    assert!(matches!(fence, VfsEvent::VaultFenced { .. }));
+    let late = waiter.await.unwrap();
+    assert!(matches!(late, VfsEvent::Failed(VfsFailure::VaultFenced(_))));
+    let refused = guard(&handle, vec![instance_id]).await;
+    assert!(matches!(
+        refused,
+        VfsEvent::Failed(VfsFailure::VaultFenced(_))
+    ));
+}
+
+/// A named pipe as the volatile file holds the write in its file step until a reader opens it.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn admission_survives_cancel() {
+    use rustix::fs::{CWD, FileType, Mode};
+    let (folder, handle) = booted().await;
+    let instance_id = opened(&handle, request("a.txt", committed(), reader())).await;
+    let volatile = folder
+        .path()
+        .join("stage")
+        .join(format!("vol-{instance_id}.tmp"));
+    let mode = Mode::RUSR | Mode::WUSR;
+    rustix::fs::mknodat(CWD, volatile.as_path(), FileType::Fifo, mode, 0).unwrap();
+    let mut write = Box::pin(handle.execute(VfsEffect::WriteStage {
+        scope: scope(),
+        instance_id,
+        owner_id: 1,
+        offset: 0,
+        data: b"plain".to_vec(),
+        append: false,
+        group_id: group(),
+    }));
+    std::future::poll_fn(|context| {
+        assert!(write.as_mut().poll(context).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    drop(write);
+    let refused = handle
+        .execute(VfsEffect::FenceVault { scope: scope() })
+        .await;
+    let reason = "a stage write is in flight".to_string();
+    assert_eq!(refused, VfsEvent::Failed(VfsFailure::VaultFenced(reason)));
+    let drained = tokio::task::spawn_blocking(move || std::fs::read(&volatile));
+    drained.await.unwrap().unwrap();
 }
 
 #[tokio::test]

@@ -245,7 +245,47 @@ fn attempt_cannot_take() {
     assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
     operation.next(child(())).unwrap();
     let turn = operation.next(IoResult::Done);
-    assert_eq!(turn, Ok(Next::Done(CloseOutcome::Retained(id(12)))));
+    assert!(matches!(
+        turn,
+        Ok(Next::Then {
+            output: CloseOutcome::Retained(_),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn retained_close_detaches() {
+    // A synced retention detaches the instance from the checkpoint it moved, with its reason.
+    let input = CloseInput {
+        context: context(),
+        scope: scope(),
+        open_id: id(22),
+        publish: None,
+        stage: Some(stage()),
+    };
+    let mut operation = VfsCloseOperation::new(input);
+    operation.first().unwrap();
+    let last = CloseSummary {
+        remaining_opens: 0,
+        detached: Some(DetachReason::LostLife),
+        ..summary(0)
+    };
+    let turn = operation.next(vfs(VfsEvent::Closed(last)));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    assert_eq!(operation.next(child(())), Ok(Next::Call(IoCall::Sync)));
+    let Ok(Next::Then { output, calls }) = operation.next(IoResult::Done) else {
+        panic!("expected the retained outcome with the instance release");
+    };
+    assert_eq!(output, CloseOutcome::Retained(id(12)));
+    let retain = VfsEffect::RetainInstance {
+        scope: scope(),
+        instance_id: 1,
+        stage_id: id(12),
+        generation: 2,
+        reason: DetachReason::LostLife,
+    };
+    assert_eq!(calls, vec![vfs_call(retain)]);
 }
 
 #[test]
@@ -319,6 +359,23 @@ fn quota_retry_retains() {
     let (key, row) = moved(operation.stage_move(), &blocked);
     assert_eq!(key, VfsKey::RetainedStage(scope(), id(12)));
     assert_eq!(row, retained(&blocked, DetachReason::LostLife, 0));
+    // With its live instance named, the synced retention detaches that instance too.
+    let mut held =
+        QuotaStageOperation::retain(scope(), blocked, DetachReason::LostLife).with_instance(1);
+    held.first().unwrap();
+    assert_eq!(held.next(child(())), Ok(Next::Call(IoCall::Sync)));
+    let retain = VfsEffect::RetainInstance {
+        scope: scope(),
+        instance_id: 1,
+        stage_id: id(12),
+        generation: 2,
+        reason: DetachReason::LostLife,
+    };
+    let done = Next::Then {
+        output: (),
+        calls: vec![vfs_call(retain)],
+    };
+    assert_eq!(held.next(IoResult::Done), Ok(done));
 }
 
 #[test]
@@ -436,7 +493,13 @@ fn successor_from_summary() {
     assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
     operation.next(child(())).unwrap();
     let turn = operation.next(IoResult::Done);
-    assert_eq!(turn, Ok(Next::Done(CloseOutcome::Retained(id(12)))));
+    assert!(matches!(
+        turn,
+        Ok(Next::Then {
+            output: CloseOutcome::Retained(_),
+            ..
+        })
+    ));
 }
 
 #[test]

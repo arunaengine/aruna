@@ -1,5 +1,5 @@
-//! One bucket through SMB, NFS and S3 at once: publications seen by fresh and open handles, NFS
-//! deny modes and host revocation against SMB writers, and cold start over a corrupt checkpoint.
+//! One bucket through SMB, NFS and S3 at once: publications seen by fresh and open handles, SMB
+//! writes after an NFS rename, NFS deny modes and host revocation, and cold start recovery.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -89,6 +89,45 @@ async fn cross_steps(mounts: &Mounts) -> TestResult<()> {
         .open("locked.txt", WRITER, FILE_OPEN, NOT_DIRECTORY)
         .await?;
     smb.close(file).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn smb_tracks_rename() -> TestResult<()> {
+    let mounts = Mounts::start(true, Some(loopback_tls())).await?;
+    let result = tracking_steps(&mounts).await;
+    mounts.shutdown().await;
+    result
+}
+
+async fn tracking_steps(mounts: &Mounts) -> TestResult<()> {
+    let smb_address = mounts.smb.ok_or("no SMB listener")?;
+    let nfs_address = mounts.nfs.ok_or("no NFS listener")?;
+    let (_, mount) = mounts.bind_host(&HostKey::generate()?).await?;
+    let mut smb = SmbClient::login(smb_address, &mounts.keys, BUCKET).await?;
+    let mut nfs = nfs_client::plain(nfs_address).await?;
+    let root = nfs.export_root(&mount.mount_id).await?;
+
+    // An SMB writer keeps its open handle while NFS renames the committed file under it.
+    mounts.put("before.txt", b"committed").await?;
+    let file = smb
+        .open("before.txt", WRITER, FILE_OPEN, NOT_DIRECTORY)
+        .await?;
+    nfs.rename((&root, "before.txt"), (&root, "after.txt"))
+        .await?;
+    let written = b"written through the handle opened before the rename".to_vec();
+    smb.write(file, 0, &written).await?;
+    smb.flush(file).await?;
+    smb.close(file).await?;
+    assert_eq!(
+        mounts.get("after.txt").await?,
+        written,
+        "the SMB write publishes at the new name"
+    );
+    assert!(
+        mounts.missing("before.txt").await,
+        "the old name stays gone"
+    );
     Ok(())
 }
 
@@ -228,7 +267,9 @@ async fn cold_start(mounts: &Mounts, stage_dir: &Path) -> TestResult<ColdStart> 
         vfs_handle: Some(vfs),
         ..mounts.seed.context.as_ref().clone()
     };
-    Ok(drive(ColdStartOperation::new(), &context).await?)
+    let cold =
+        ColdStartOperation::new().with_admission(mounts.seed.realm_id, mounts.seed.net.node_id());
+    Ok(drive(cold, &context).await?)
 }
 
 async fn recovery_steps(mounts: &Mounts) -> TestResult<()> {

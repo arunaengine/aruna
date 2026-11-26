@@ -623,7 +623,7 @@ async fn fill(
     stopped(stop)?;
     // The file servers recover their durable state before any listener binds.
     if driver_ctx.vfs_handle.is_some() {
-        recover_vfs(driver_ctx.as_ref()).await?;
+        recover_vfs(driver_ctx.as_ref(), origin).await?;
         stopped(stop)?;
     }
 
@@ -664,7 +664,13 @@ fn open_vfs(
         .stage_dir
         .clone()
         .unwrap_or_else(|| std::path::PathBuf::from(&config.storage_path).join("vfs-stage"));
-    if !vfs.enabled() && !stage_dir.exists() {
+    let present = stage_dir.try_exists().map_err(|error| {
+        format!(
+            "failed to inspect VFS stage directory {}: {error}",
+            stage_dir.display()
+        )
+    })?;
+    if !vfs.enabled() && !present {
         return Ok(None);
     }
     let vfs_handle = VfsHandle::open(VfsConfig {
@@ -680,10 +686,14 @@ fn open_vfs(
 
 /// Syncs a new boot generation and settles receipts, handles and stages from durable rows.
 /// Referenced checkpoints that are missing or corrupt are storage failures that stop the start.
-async fn recover_vfs(driver_ctx: &DriverContext) -> Result<(), Box<dyn std::error::Error>> {
+async fn recover_vfs(
+    driver_ctx: &DriverContext,
+    (realm_id, node_id): (aruna_core::structs::identity::realm::RealmId, NodeId),
+) -> Result<(), Box<dyn std::error::Error>> {
     use aruna_ops_data::vfs::recovery::ColdStartOperation;
 
-    let report = drive(ColdStartOperation::new(), driver_ctx).await?;
+    let cold_start = ColdStartOperation::new().with_admission(realm_id, node_id);
+    let report = drive(cold_start, driver_ctx).await?;
     if !report.corrupt.is_empty() {
         error!(
             stages = ?report.corrupt,
@@ -1117,6 +1127,42 @@ mod tests {
 
     // A failure after any acquisition stage must release exactly the acquired
     // subset: every later stage is absent and the store lock is given back.
+    // An unreadable stage folder must stop the start, not hide its scratch files from fences.
+    #[tokio::test]
+    async fn stage_inspection_fails() {
+        use aruna_config::settings::read_settings_from;
+
+        let temp = tempdir().expect("temp dir");
+        let path = temp.path().to_str().expect("utf8 path").to_string();
+        let map: std::collections::BTreeMap<String, String> = [
+            ("DATABASE_DIR".to_string(), path),
+            ("SOCKET_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
+            ("P2P_SOCKET_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
+            ("S3_HOST".to_string(), "127.0.0.1:0".to_string()),
+            ("S3_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
+            ("PORTAL_MODE".to_string(), "disabled".to_string()),
+            ("ARUNA_FJALL_PERSIST_MODE".to_string(), "buffer".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let (config, storage) = resolve_settings(read_settings_from(&map).unwrap())
+            .await
+            .expect("test settings resolve");
+        // A regular file as parent makes the metadata lookup fail with ENOTDIR, even as root.
+        let file = temp.path().join("not-a-folder");
+        std::fs::write(&file, b"").expect("file written");
+        let vfs = VfsSettings {
+            stage_dir: Some(file.join("vfs-stage")),
+            ..VfsSettings::default()
+        };
+        let error = open_vfs(&vfs, &config, &storage).expect_err("inspection error propagates");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to inspect VFS stage directory")
+        );
+    }
+
     #[tokio::test]
     async fn stage_failure_releases() {
         use aruna_config::settings::read_settings_from;

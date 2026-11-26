@@ -5,7 +5,7 @@
 
 use aruna_core::structs::storage::vfs::BucketScope;
 use aruna_core::types::GroupId;
-use aruna_core::vfs_effects::{StageSlice, VfsEvent, VfsFailure};
+use aruna_core::vfs_effects::{ReadLockCheck, StageSlice, VfsEvent, VfsFailure};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -120,6 +120,8 @@ pub(crate) struct Sealed {
     pub(crate) generation: u64,
     /// Bytes of the checkpoint still part of the file after later truncation.
     pub(crate) limit: u64,
+    /// The stage edit count captured when this generation was sealed.
+    pub(crate) edits: u64,
 }
 
 /// Sparse stage state: reads take the overlay, then the checkpoint, then the base, then zeros.
@@ -276,15 +278,23 @@ impl VfsHandle {
         instance_id: u64,
         offset: u64,
         length: u32,
-        owner_id: Option<u64>,
+        lock_check: ReadLockCheck,
     ) -> Answer {
         let (plan, logical_size, base_limit) = {
             let mut state = self.shared.state.lock();
             let instance = instance_mut(&mut state, scope, instance_id)?;
             let asked = offset.saturating_add(u64::from(length));
-            if let Some(owner) = owner_id
-                && crate::locks::read_conflict(&instance.locks, owner, offset, asked).is_some()
-            {
+            let held = &instance.locks;
+            let conflict = match lock_check {
+                ReadLockCheck::Bypass => None,
+                ReadLockCheck::Anonymous => {
+                    crate::locks::anonymous_read_conflict(held, offset, asked)
+                }
+                ReadLockCheck::Owner(owner) => {
+                    crate::locks::read_conflict(held, owner, offset, asked)
+                }
+            };
+            if conflict.is_some() {
                 return Err(VfsFailure::LockConflict);
             }
             let stage = &instance.stage;
@@ -315,7 +325,7 @@ impl VfsHandle {
         write: StageWrite,
     ) -> Answer {
         let length = u32::try_from(write.data.len()).map_err(|_| VfsFailure::Overflow)?;
-        let (offset, end, group_id, reservation, _admission) = {
+        let (offset, end, group_id, reservation, admission) = {
             let mut state = self.shared.state.lock();
             if state.fences.closed(scope) {
                 return Err(fenced());
@@ -341,7 +351,9 @@ impl VfsHandle {
         };
         let path = self.path(&volatile_name(instance_id));
         let data = write.data;
-        crate::blocking(move || write_range(&path, offset, &data)).await?;
+        // The admission lives in the file step, so a cancelled caller cannot end it early.
+        let _admission =
+            crate::blocking(move || write_range(&path, offset, &data).map(|()| admission)).await?;
         let reserved = reservation.keep();
         let mut state = self.shared.state.lock();
         // Settles the charge to the bytes this write actually added, even if the instance left.
@@ -381,7 +393,7 @@ impl VfsHandle {
         if new_size > OFFSET_LIMIT {
             return Err(VfsFailure::Overflow);
         }
-        let (change, trimmed, _admission) = {
+        let (change, trimmed, admission) = {
             let mut state = self.shared.state.lock();
             if state.fences.closed(scope) {
                 return Err(fenced());
@@ -420,7 +432,11 @@ impl VfsHandle {
         };
         if trimmed > 0 {
             let path = self.path(&volatile_name(instance_id));
-            crate::blocking(move || shorten(&path, new_size)).await?;
+            crate::blocking(move || {
+                let _admission = admission;
+                shorten(&path, new_size)
+            })
+            .await?;
         }
         Ok(VfsEvent::StageWritten {
             offset: new_size,

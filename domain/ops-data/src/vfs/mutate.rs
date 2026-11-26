@@ -350,12 +350,17 @@ impl VfsRemoveOperation {
         }
     }
 
-    /// The parent marker key when an admitted marker write is prepared for a non-root parent.
+    /// The parent marker key of a non-root parent, read when a marker write is prepared or a
+    /// committed removal may take the last route to an implicit parent.
     fn marker_needed(&self) -> Option<String> {
         let (parent, _) = split_parent(&self.input.key)?;
-        let config = self.marker.as_ref()?;
-        (!parent.is_empty() && config.request.key == marker_key(parent))
-            .then(|| config.request.key.clone())
+        let committed = !matches!(
+            self.input.identity,
+            HandleIdentity::File(FileIdentity::Unpublished { .. })
+        );
+        let prepared =
+            (self.marker.as_ref()).is_some_and(|config| config.request.key == marker_key(parent));
+        (!parent.is_empty() && (committed || prepared)).then(|| marker_key(parent))
     }
 
     /// The prepared parent marker write, when admitted and the parent is a directory.
@@ -430,6 +435,10 @@ impl VfsRemoveOperation {
             return Err(VfsError::Denied);
         }
         let mut marker = self.marker_write().filter(|_| committed && !parent_live);
+        // Without a prepared marker the caller retries with one; the parent never just goes.
+        if committed && !parent_live && parent_marker.is_some() && marker.is_none() {
+            return Err(VfsError::Conflict);
+        }
         if committed
             && parent_live
             && let Some(key) = parent_marker

@@ -1059,7 +1059,8 @@ async fn uncached_retry_placed() {
     assert_eq!(retried.next(NfsOp4::Putfh), NfsStat4::RetryUncached.code());
 }
 
-// A cached reply records each object use, so its replay is admitted for exactly those.
+// A cached reply records each object use, so its replay is admitted for exactly those; a READ
+// keeps the exact source the backend served, not just its range.
 #[tokio::test]
 async fn replay_records_uses() {
     let mut harness = Harness::new().await;
@@ -1080,15 +1081,22 @@ async fn replay_records_uses() {
     assert_eq!(harness.call(body).await, first);
     let grant = harness.backend.state.lock().replayed.clone();
     let checks = grant.expect("the replay was checked").checks;
+    let source = crate::backend::ReadSource {
+        key: "data".to_string(),
+        version_id: None,
+        instance_id: Some(file),
+    };
     let read = ReplayAccess::Read {
         offset: 0,
         length: 16,
+        source: Some(source),
     };
     for access in [ReplayAccess::Write, read] {
-        assert!(
-            checks.contains(&ReplayCheck { object, access }),
-            "{access:?}"
-        );
+        let check = ReplayCheck {
+            object,
+            access: access.clone(),
+        };
+        assert!(checks.contains(&check), "{access:?}");
     }
 }
 
@@ -1132,4 +1140,85 @@ async fn lock_owner_writes() {
     let writers = harness.backend.state.lock().writers.clone();
     let owners: Vec<&[u8]> = writers.iter().map(|owner| &owner.owner[..]).collect();
     assert_eq!(owners, [&b"lock-a"[..], &b"owner"[..]]);
+}
+
+// A release of revoked state that fails stays pending, and the next sweep retries it until
+// the backend has ended the open.
+#[tokio::test]
+async fn failed_release_retried() {
+    let mut harness = Harness::new().await;
+    harness.open("data").await;
+    let closes = {
+        let mut state = harness.backend.state.lock();
+        state.close_failures = 1;
+        state.closes
+    };
+    let revocation = Revocation::Mount(harness.fixture.export.mount_id);
+    harness.engine.revoke(&revocation).await;
+    assert_eq!(harness.backend.state.lock().closes, closes + 1);
+    assert_eq!(
+        harness.engine.pending.lock().len(),
+        1,
+        "the failed close stays"
+    );
+    harness.engine.sweep(harness.now).await;
+    assert_eq!(harness.backend.state.lock().closes, closes + 2);
+    assert!(
+        harness.engine.pending.lock().is_empty(),
+        "the retry released it"
+    );
+    harness.engine.sweep(harness.now).await;
+    assert_eq!(harness.backend.state.lock().closes, closes + 2);
+}
+
+// A cached READ either returns some bytes or stops the compound with REP_TOO_BIG_TO_CACHE once
+// no data byte fits; it never answers zero bytes short of the end.
+#[tokio::test]
+async fn cached_read_progresses() {
+    let limit = 200;
+    let mut harness = Harness::cached(limit).await;
+    let mount = harness.fixture.export.mount_id;
+    let file = harness.backend.add_file(mount, "big", &[7; 4096]);
+    let handle = harness.handle(&harness.fixture.export, file);
+    let mut refused_read = false;
+    for fillers in 0..12 {
+        let mut ops = harness.ops().putfh(&handle);
+        for _ in 0..fillers {
+            ops = ops.getattr(&[]);
+        }
+        let outcome = harness
+            .call(ops.read(&Stateid::ANONYMOUS, 4096).body())
+            .await;
+        let CompoundOutcome::Reply(bytes) = &outcome else {
+            panic!("expected a reply, got {outcome:?}");
+        };
+        assert!(
+            bytes.len() <= limit as usize,
+            "the reply fits the cached size"
+        );
+        let mut result = reply(outcome);
+        result.sequence();
+        assert_eq!(result.next(NfsOp4::Putfh), 0);
+        let mut status = 0;
+        for _ in 0..fillers {
+            status = result.next(NfsOp4::Getattr);
+            if status != 0 {
+                break;
+            }
+            result.skip_fattr();
+        }
+        if status != 0 {
+            assert_eq!(status, NfsStat4::ReplyUncacheable.code());
+            continue;
+        }
+        let read = result.next(NfsOp4::Read);
+        if read == NfsStat4::ReplyUncacheable.code() {
+            refused_read = true;
+            continue;
+        }
+        assert_eq!(read, 0);
+        assert!(!result.flag(), "a short read is no eof");
+        assert!(!result.opaque().is_empty(), "a read makes progress");
+    }
+    assert!(refused_read, "a READ with no room left is refused");
 }

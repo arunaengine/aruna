@@ -29,7 +29,7 @@ pub(crate) struct Checkpoint {
     pub(crate) size: u64,
     pub(crate) sealed: bool,
     /// The instance edit count captured at seal time.
-    edits: u64,
+    pub(crate) edits: u64,
 }
 
 /// Which sealed generation an instance switches to, and which one it leaves.
@@ -157,7 +157,7 @@ impl VfsHandle {
         generation: u64,
     ) -> Answer {
         let key = (stage_id, generation);
-        let (missing, size, mut claim, _admission) = {
+        let (missing, size, mut claim, admission) = {
             let mut guard = self.shared.state.lock();
             let state = &mut *guard;
             if state.fences.closed(scope) {
@@ -198,6 +198,7 @@ impl VfsHandle {
         let draft = self.path(&draft_name(stage_id, generation));
         // Never opens an existing file: it may be another request's draft or a sealed generation.
         let created = crate::blocking(move || {
+            let _admission = admission;
             match OpenOptions::new().write(true).create_new(true).open(&draft) {
                 Ok(_) => Ok(true),
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(false),
@@ -228,7 +229,7 @@ impl VfsHandle {
         offset: u64,
         data: Vec<u8>,
     ) -> Answer {
-        let _admission = {
+        let admission = {
             let mut state = self.shared.state.lock();
             let checkpoint = state.checkpoints.get(&(stage_id, generation));
             let checkpoint = checkpoint.filter(|checkpoint| !checkpoint.sealed);
@@ -243,7 +244,11 @@ impl VfsHandle {
             WriteAdmission::enter(&self.shared, &mut state, &scope)
         };
         let draft = self.path(&draft_name(stage_id, generation));
-        crate::blocking(move || write_range(&draft, offset, &data)).await?;
+        crate::blocking(move || {
+            let _admission = admission;
+            write_range(&draft, offset, &data)
+        })
+        .await?;
         Ok(VfsEvent::Done)
     }
 
@@ -256,7 +261,7 @@ impl VfsHandle {
         stage_id: Ulid,
         generation: u64,
     ) -> Answer {
-        let (plan, edits, group_id, charged, extra, _admission) = {
+        let (plan, edits, group_id, charged, extra, admission) = {
             let mut state = self.shared.state.lock();
             if state.fences.closed(scope) {
                 return Err(fenced());
@@ -291,7 +296,7 @@ impl VfsHandle {
         };
         let size = plan.size;
         let filename = sealed_name(stage_id, generation);
-        crate::blocking(move || seal_file(&plan)).await?;
+        let _admission = crate::blocking(move || seal_file(&plan).map(|()| admission)).await?;
         let extra = extra.keep();
         let mut state = self.shared.state.lock();
         let held = charged + extra;
@@ -337,6 +342,7 @@ impl VfsHandle {
                 stage_id,
                 generation,
                 limit: size.min(stage.low_water).min(stage.logical_size),
+                edits,
             });
             let mut cleared = 0;
             if stage.edits == edits {
@@ -520,6 +526,7 @@ impl VfsHandle {
             stage_id: request.stage_id,
             generation: request.generation,
             limit: request.logical_size,
+            edits: 0,
         });
         instance.stage_id = Some(request.stage_id);
         instance.generation = request.generation;

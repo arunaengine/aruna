@@ -7,8 +7,8 @@ use aruna_core::structs::storage::vfs::{
     BucketScope, DetachReason, FileIdentity, HandleIdentity, HeadChangeObserver,
 };
 use aruna_core::vfs_effects::{
-    ByteRange, DiskStage, OpenRequest, RebindRequest, RestoreRequest, ShareMode, StageSlice,
-    VfsEffect, VfsEvent, VfsFailure, VfsProtocol,
+    ByteRange, DiskStage, InstanceSummary, OpenRequest, ReadLockCheck, RebindRequest,
+    RestoreRequest, ShareMode, StageSlice, VfsEffect, VfsEvent, VfsFailure, VfsProtocol,
 };
 use aruna_vfs::{VfsConfig, VfsHandle};
 use std::path::Path;
@@ -62,13 +62,24 @@ fn committed() -> HandleIdentity {
 }
 
 async fn opened(handle: &VfsHandle, key: &str, identity: HandleIdentity, base_size: u64) -> u64 {
+    open_request(handle, key, identity, base_size).await.0
+}
+
+/// Opens `key` for reading and writing and returns the instance and the open id.
+async fn open_request(
+    handle: &VfsHandle,
+    key: &str,
+    identity: HandleIdentity,
+    base_size: u64,
+) -> (u64, Ulid) {
+    let open_id = Ulid::generate();
     let request = OpenRequest {
         scope: scope(),
         key: key.to_string(),
         kind: identity.kind(),
         handle_id: Some(11),
         identity,
-        open_id: Ulid::generate(),
+        open_id,
         protocol: VfsProtocol::Nfs,
         share: ShareMode {
             read_access: true,
@@ -85,9 +96,29 @@ async fn opened(handle: &VfsHandle, key: &str, identity: HandleIdentity, base_si
         base_version: None,
     };
     match handle.execute(VfsEffect::OpenInstance(request)).await {
-        VfsEvent::Opened { instance_id, .. } => instance_id,
+        VfsEvent::Opened { instance_id, .. } => (instance_id, open_id),
         other => panic!("unexpected answer {other:?}"),
     }
+}
+
+async fn by_id(handle: &VfsHandle, instance_id: u64) -> Option<InstanceSummary> {
+    let lookup = VfsEffect::LookupById {
+        scope: scope(),
+        instance_id,
+    };
+    match handle.execute(lookup).await {
+        VfsEvent::Instance(summary) => summary,
+        other => panic!("unexpected answer {other:?}"),
+    }
+}
+
+async fn close(handle: &VfsHandle, open_id: Ulid) {
+    let close = VfsEffect::CloseOpen {
+        scope: scope(),
+        open_id,
+    };
+    let answer = handle.execute(close).await;
+    assert!(matches!(answer, VfsEvent::Closed(_)), "{answer:?}");
 }
 
 async fn write(handle: &VfsHandle, instance_id: u64, offset: u64, data: &[u8]) -> VfsEvent {
@@ -133,7 +164,7 @@ async fn read(handle: &VfsHandle, instance_id: u64, offset: u64, length: u32) ->
         instance_id,
         offset,
         length,
-        owner_id: None,
+        lock_check: ReadLockCheck::Bypass,
     };
     match handle.execute(effect).await {
         VfsEvent::StageRead { slices, .. } => slices,
@@ -542,6 +573,108 @@ async fn rebind_keeps_edits() {
         length: 3,
     };
     assert_eq!(read(&handle, instance_id, 0, 8).await, vec![base]);
+}
+
+#[tokio::test]
+async fn sealed_edit_stays() {
+    let (_folder, handle) = booted(MIB).await;
+    let stage_id = Ulid::generate();
+    let instance_id = opened(&handle, "e.txt", unpublished(), 0).await;
+    write(&handle, instance_id, 0, b"abc").await;
+    let before = by_id(&handle, instance_id).await.unwrap();
+    assert_eq!(before.sealed_edit, None);
+    checkpoint(&handle, instance_id, stage_id, 1).await;
+    let sealed = by_id(&handle, instance_id).await.unwrap();
+    assert_eq!(sealed.sealed_edit, Some(sealed.edit_generation));
+    write(&handle, instance_id, 3, b"d").await;
+    let later = by_id(&handle, instance_id).await.unwrap();
+    assert_eq!(later.edit_generation, sealed.edit_generation + 1);
+    assert_eq!(later.sealed_edit, sealed.sealed_edit);
+}
+
+/// Opens a staged file, checkpoints it once and returns the instance and its open id.
+async fn retained_stage(handle: &VfsHandle, stage_id: Ulid) -> (u64, Ulid) {
+    let (instance_id, open_id) = open_request(handle, "k.txt", unpublished(), 0).await;
+    write(handle, instance_id, 0, b"hello").await;
+    checkpoint(handle, instance_id, stage_id, 1).await;
+    (instance_id, open_id)
+}
+
+fn retain(instance_id: u64, stage_id: Ulid) -> VfsEffect {
+    VfsEffect::RetainInstance {
+        scope: scope(),
+        instance_id,
+        stage_id,
+        generation: 1,
+        reason: DetachReason::Unlinked,
+    }
+}
+
+fn lookup_key() -> VfsEffect {
+    VfsEffect::LookupInstance {
+        scope: scope(),
+        key: "k.txt".to_string(),
+    }
+}
+
+#[tokio::test]
+async fn retain_reclaims_idle() {
+    let (_folder, handle) = booted(MIB).await;
+    let stage_id = Ulid::generate();
+    let (instance_id, open_id) = retained_stage(&handle, stage_id).await;
+    close(&handle, open_id).await;
+    let remove = VfsEffect::RemoveCheckpoint {
+        stage_id,
+        generation: 1,
+    };
+    let held = handle.execute(remove.clone()).await;
+    assert_eq!(held, VfsEvent::Failed(VfsFailure::Conflict));
+    let other = Ulid::generate();
+    assert_eq!(
+        handle.execute(retain(instance_id, other)).await,
+        VfsEvent::Done
+    );
+    assert!(
+        by_id(&handle, instance_id).await.is_some(),
+        "a stale retain detached it"
+    );
+    assert_eq!(
+        handle.execute(retain(instance_id, stage_id)).await,
+        VfsEvent::Done
+    );
+    assert_eq!(handle.execute(lookup_key()).await, VfsEvent::Instance(None));
+    assert_eq!(by_id(&handle, instance_id).await, None);
+    assert_eq!(handle.execute(remove).await, VfsEvent::Done);
+}
+
+#[tokio::test]
+async fn retain_waits_reader() {
+    let (_folder, handle) = booted(MIB).await;
+    let stage_id = Ulid::generate();
+    let (instance_id, writer) = retained_stage(&handle, stage_id).await;
+    let (joined, holder) = open_request(&handle, "k.txt", unpublished(), 0).await;
+    assert_eq!(joined, instance_id);
+    close(&handle, writer).await;
+    assert_eq!(
+        handle.execute(retain(instance_id, stage_id)).await,
+        VfsEvent::Done
+    );
+    assert_eq!(handle.execute(lookup_key()).await, VfsEvent::Instance(None));
+    let summary = by_id(&handle, instance_id).await.unwrap();
+    assert_eq!(summary.detached, Some(DetachReason::Unlinked));
+    assert_eq!(
+        read(&handle, instance_id, 0, 16).await,
+        vec![written(0, b"hello")]
+    );
+    let remove = VfsEffect::RemoveCheckpoint {
+        stage_id,
+        generation: 1,
+    };
+    let held = handle.execute(remove.clone()).await;
+    assert_eq!(held, VfsEvent::Failed(VfsFailure::Conflict));
+    close(&handle, holder).await;
+    assert_eq!(by_id(&handle, instance_id).await, None);
+    assert_eq!(handle.execute(remove).await, VfsEvent::Done);
 }
 
 #[tokio::test]

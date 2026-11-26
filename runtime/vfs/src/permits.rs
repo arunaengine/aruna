@@ -112,6 +112,9 @@ impl VfsHandle {
         ordered.dedup();
         let semaphores: Vec<Arc<Semaphore>> = {
             let mut state = self.shared.state.lock();
+            if state.fences.closed(&scope) {
+                return Err(crate::instances::fenced());
+            }
             if let Some(attempt_id) = state.permits.pending(&ordered) {
                 return Ok(VfsEvent::PendingMutation { attempt_id });
             }
@@ -127,6 +130,12 @@ impl VfsHandle {
             permits.push(permit.map_err(|_| VfsFailure::NotFound)?);
         }
         let mut state = self.shared.state.lock();
+        // A fence that closed while this caller waited excludes it; the guards drop here.
+        if state.fences.closed(&scope) {
+            drop(state);
+            drop(permits);
+            return Err(crate::instances::fenced());
+        }
         // An attempt that began while this caller waited still wins; the guards drop here.
         if let Some(attempt_id) = state.permits.pending(&ordered) {
             drop(state);

@@ -17,8 +17,8 @@ use ulid::Ulid;
 use crate::backend::{
     AttributeChange, Caller, ChangeInfo, CreateMode, CreateReply, DirectoryEntry, DirectoryPage,
     HandleStatus, HostIdentity, IoState, LockDenial, LockError, LockKind, LockRange, MountExport,
-    NfsBackend, ObjectAttributes, ObjectRef, OwnerKey, ReadReply, ReplayGrant, Revocation,
-    ShareRequest, WriteReply,
+    NfsBackend, ObjectAttributes, ObjectRef, OwnerKey, ReadReply, ReadSource, ReplayGrant,
+    Revocation, ShareRequest, WriteReply,
 };
 use crate::types::{NfsStat4, NfsTime, NfsType4, StableHow, share};
 
@@ -58,6 +58,8 @@ pub struct MockState {
     pub writes: usize,
     pub creates: usize,
     pub closes: usize,
+    /// Closes that still fail with DELAY before one ends its open.
+    pub close_failures: usize,
 }
 
 pub struct MockBackend {
@@ -474,6 +476,10 @@ impl NfsBackend for MockBackend {
     ) -> Result<(), NfsStat4> {
         let mut state = self.state.lock();
         state.closes += 1;
+        if state.close_failures > 0 {
+            state.close_failures -= 1;
+            return Err(NfsStat4::Delay);
+        }
         if let Some(shares) = state.shares.get_mut(&object) {
             shares.remove(owner);
         }
@@ -504,6 +510,11 @@ impl NfsBackend for MockBackend {
         Ok(ReadReply {
             data: Bytes::copy_from_slice(&node.data[start..end]),
             eof: end == node.data.len(),
+            source: Some(ReadSource {
+                key: node.name.clone(),
+                version_id: None,
+                instance_id: Some(object.object_id),
+            }),
         })
     }
 

@@ -35,6 +35,8 @@ pub mod quota;
 pub mod runtimes;
 pub mod session;
 
+pub use offer::NfsShareConfig;
+
 /// Maximum executor backends one node advertises.
 pub const MAX_ADVERTISED_EXECUTORS: usize = 8;
 /// Group ids one backend's allow-list may name (owner decision 2026-11-17).

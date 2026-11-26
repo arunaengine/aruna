@@ -675,6 +675,9 @@ pub struct QuotaStageOperation {
     stage: NfsStageRecord,
     change: QuotaChange,
     now_ms: u64,
+    /// The live instance that still holds the checkpoint, detached once it is retained.
+    instance_id: Option<u64>,
+    synced: bool,
 }
 
 impl QuotaStageOperation {
@@ -685,17 +688,23 @@ impl QuotaStageOperation {
             stage,
             change: QuotaChange::Reschedule,
             now_ms: 0,
+            instance_id: None,
+            synced: false,
         }
     }
 
     /// The name can no longer take the checkpoint: it is retained for recovery.
     pub fn retain(scope: BucketScope, stage: NfsStageRecord, reason: DetachReason) -> Self {
         Self {
-            scope,
-            stage,
             change: QuotaChange::Retain(reason),
-            now_ms: 0,
+            ..Self::reschedule(scope, stage)
         }
+    }
+
+    /// The live instance of the checkpoint, which a synced retention detaches and releases.
+    pub fn with_instance(mut self, instance_id: u64) -> Self {
+        self.instance_id = Some(instance_id);
+        self
     }
 
     fn stage_move(&self) -> StageMoveOperation {
@@ -718,8 +727,32 @@ impl Operation for QuotaStageOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, VfsError> {
-        result.child::<(), VfsError>()??;
-        Ok(Next::Done(()))
+        let (QuotaChange::Retain(reason), Some(instance_id)) = (self.change, self.instance_id)
+        else {
+            result.child::<(), VfsError>()??;
+            return Ok(Next::Done(()));
+        };
+        match self.synced {
+            false => {
+                result.child::<(), VfsError>()??;
+                self.synced = true;
+                Ok(Next::Call(IoCall::Sync))
+            }
+            true => {
+                result.done()?;
+                let retain = VfsEffect::RetainInstance {
+                    scope: self.scope.clone(),
+                    instance_id,
+                    stage_id: self.stage.stage_id,
+                    generation: self.stage.generation,
+                    reason,
+                };
+                Ok(Next::Then {
+                    output: (),
+                    calls: vec![vfs_call(retain)],
+                })
+            }
+        }
     }
 
     fn stamp(&mut self, now_ms: u64) {
@@ -784,6 +817,8 @@ pub struct VfsCloseOperation {
     marker: Option<PutObjectConfig>,
     /// The authorized writer that takes the stage when its owner closes while it stays open.
     successor: Option<StageOwner>,
+    /// Why the stage was retained, which the synced move passes on to its instance.
+    reason: Option<DetachReason>,
 }
 
 impl VfsCloseOperation {
@@ -796,6 +831,7 @@ impl VfsCloseOperation {
             now_ms: 0,
             marker: None,
             successor: None,
+            reason: None,
         }
     }
 
@@ -965,6 +1001,7 @@ impl VfsCloseOperation {
         };
         let kept = retained(stage, reason, self.now_ms);
         let stage_id = kept.stage_id;
+        self.reason = Some(reason);
         self.change_stage(Some(kept), CloseOutcome::Retained(stage_id))
     }
 
@@ -1003,6 +1040,21 @@ impl VfsCloseOperation {
                     generation,
                 };
                 self.call(CloseStep::Removed, vfs_call(remove))
+            }
+            // The retained checkpoint leaves the instance, which drops it after its holders.
+            (false, Some(stage)) if matches!(outcome, CloseOutcome::Retained(_)) => {
+                let summary = self.summary.as_ref().ok_or(VfsError::Conflict)?;
+                let retain = VfsEffect::RetainInstance {
+                    scope: self.input.scope.clone(),
+                    instance_id: summary.instance_id,
+                    stage_id: stage.stage_id,
+                    generation: stage.generation,
+                    reason: self.reason.unwrap_or(DetachReason::LostLife),
+                };
+                Ok(Next::Then {
+                    output: outcome,
+                    calls: vec![vfs_call(retain)],
+                })
             }
             _ => Ok(Next::Done(outcome)),
         }

@@ -61,6 +61,8 @@ struct FileOpen {
     /// The committed version the base bytes come from; `None` for an unpublished name.
     version_id: Option<Ulid>,
     write: bool,
+    /// Opened with FILE_DELETE_ON_CLOSE, so its close may be the final delete.
+    delete_on_close: bool,
     owner: StageOwner,
     info: BucketInfo,
     opened_ms: u64,

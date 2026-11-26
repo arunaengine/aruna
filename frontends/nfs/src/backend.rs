@@ -133,6 +133,16 @@ pub struct DirectoryPage {
 pub struct ReadReply {
     pub data: Bytes,
     pub eof: bool,
+    /// The exact bytes a READ served, so a replay re-admits them and not the current head.
+    pub source: Option<ReadSource>,
+}
+
+/// The name, committed version and shared instance whose bytes one READ served.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadSource {
+    pub key: String,
+    pub version_id: Option<Ulid>,
+    pub instance_id: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -243,16 +253,21 @@ pub enum Revocation {
 }
 
 /// How one operation of a cached reply used an object.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReplayAccess {
     Head,
     List,
-    Read { offset: u64, length: u32 },
+    /// A READ of the exact bytes `source` names; `None` when the backend did not say.
+    Read {
+        offset: u64,
+        length: u32,
+        source: Option<ReadSource>,
+    },
     Write,
 }
 
 /// One object use of a cached reply, admitted again from live state before a replay.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplayCheck {
     pub object: ObjectRef,
     pub access: ReplayAccess,
@@ -368,6 +383,17 @@ pub trait NfsBackend: Send + Sync + 'static {
         object: ObjectRef,
         owner: &OwnerKey,
     ) -> impl Future<Output = Result<(), NfsStat4>> + Send;
+
+    /// Ends the open of a revoked, expired or purged stateid. An error means the backend still
+    /// holds the open, and the engine retries the release later.
+    fn release_open(
+        &self,
+        caller: &Caller,
+        object: ObjectRef,
+        owner: &OwnerKey,
+    ) -> impl Future<Output = Result<(), NfsStat4>> + Send {
+        self.close(caller, object, owner)
+    }
 
     fn read(
         &self,

@@ -9,9 +9,11 @@ use super::{
     STATE_PAGE, VfsError, head_of, live_life, name_reads, record_of, state_delete, state_key,
     state_read, state_row, token_of, unexpected, vfs_call, vfs_event,
 };
-use crate::s3::object::list::{ListBucketError, ListBucketInput, ListedObject};
+use crate::s3::object::list::{
+    ListBucketError, ListBucketInput, ListContinuationToken, ListedObject,
+};
 use crate::s3::object::visible::{
-    RecordSource, ShowRule, Shown, SnapshotWitness, VisibleError, VisiblePage,
+    NextPage, RecordSource, ShowRule, Shown, SnapshotWitness, VisibleError, VisiblePage,
     VisiblePageOperation, after_entry,
 };
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -911,6 +913,7 @@ enum ListStep {
     Staged,
     Page,
     Check,
+    Descendant,
 }
 
 /// A denial hides one entry; any other failure ends the listing.
@@ -940,6 +943,10 @@ pub struct VfsListOperation {
     checking: Option<VfsEntry>,
     kept: Vec<VfsEntry>,
     next: Option<ListNext>,
+    /// The staged keys below each directory that only staged names make, by its order key.
+    descendants: BTreeMap<String, Vec<String>>,
+    /// The staged keys still to try for the directory being checked.
+    probes: VecDeque<String>,
 }
 
 impl VfsListOperation {
@@ -956,6 +963,8 @@ impl VfsListOperation {
             checking: None,
             kept: Vec::new(),
             next: None,
+            descendants: BTreeMap::new(),
+            probes: VecDeque::new(),
         }
     }
 
@@ -983,6 +992,16 @@ impl VfsListOperation {
             .ok_or(VfsError::Denied)?
             .0;
         Ok(BucketScope::new(bucket, grant.incarnation))
+    }
+
+    /// The order key a committed page continues after.
+    fn token_name(&self, token: &ListContinuationToken) -> Result<String, VfsError> {
+        if let Some(group) = &token.last_common_prefix {
+            return self.relative(group);
+        }
+        let bucket = format!("{}/", self.scope()?.bucket);
+        let key = std::str::from_utf8(&token.last_key).map_err(|_| VfsError::BadCookie)?;
+        self.relative(key.strip_prefix(&bucket).ok_or(VfsError::BadCookie)?)
     }
 
     fn authorized(&mut self, result: IoResult) -> ListTurn {
@@ -1171,12 +1190,22 @@ impl VfsListOperation {
             found.remove(name);
             found.insert(marker_key(name), directory_entry(name, false));
         }
-        // Names past the last staged name read wait for the next page, which starts there.
-        if let Some(cap) = &self.staged_cap {
-            found.retain(|key, _| key <= cap);
-        }
-        let last = found.keys().next_back().cloned();
-        let more = page.next.is_some();
+        // Each truncated source stops at its last name read; the page ends at the earlier one,
+        // so neither source skips a name. A pause among hidden entries ends at its last shown.
+        let committed_end = match &page.next {
+            None => None,
+            Some(NextPage::After(token)) => Some(self.token_name(token)?),
+            Some(NextPage::Sealed(_)) => {
+                Some(found.keys().next_back().cloned().unwrap_or_default())
+            }
+        };
+        let horizon = match (committed_end.clone(), self.staged_cap.clone()) {
+            (Some(committed), Some(staged)) => Some(committed.min(staged)),
+            (committed, staged) => committed.or(staged),
+        };
+        let within = |key: &String| horizon.as_ref().is_none_or(|end| key <= end);
+        found.retain(|key, _| within(key));
+        self.descendants.clear();
         for staged in std::mem::take(&mut self.staged) {
             let Some(rest) = staged.key.strip_prefix(&prefix) else {
                 continue;
@@ -1194,16 +1223,19 @@ impl VfsListOperation {
             };
             let key = entry.order_key();
             let before = self.after.as_ref().is_some_and(|after| key <= *after);
-            let beyond = (more && last.as_ref().is_some_and(|last| key > *last))
-                || self.staged_cap.as_ref().is_some_and(|cap| key > *cap);
-            if rest.is_empty() || before || beyond || !representable(&entry.name, protocol, at_root)
-            {
+            if rest.is_empty() || before || !within(&key) {
+                continue;
+            }
+            if !representable(&entry.name, protocol, at_root) {
                 continue;
             }
             if entry.kind == HandleKind::Directory {
                 found.remove(&entry.name);
             }
-            found.entry(key).or_insert(entry);
+            let collapsed = rest.contains('/');
+            if found.entry(key.clone()).or_insert(entry).staged && collapsed {
+                self.descendants.entry(key).or_default().push(staged.key);
+            }
         }
         let mut entries: Vec<VfsEntry> = found.into_values().collect();
         let cut = entries.len() > self.request.max_entries.max(1);
@@ -1212,14 +1244,14 @@ impl VfsListOperation {
             Some(entry) => ListNext::After(entry.order_key()),
             None => ListNext::End,
         };
-        let next = match (&self.staged_cap, page.next) {
+        // Even a page whose every name was hidden continues after its horizon, never ends.
+        let next = match (page.next, horizon) {
             _ if cut => after_last(entries.as_slice()),
-            (Some(cap), _) => ListNext::After(cap.clone()),
-            (None, None) => ListNext::End,
-            (None, Some(crate::s3::object::visible::NextPage::Sealed(sealed))) => {
+            (Some(NextPage::Sealed(sealed)), end) if end == committed_end => {
                 ListNext::Sealed(sealed)
             }
-            (None, Some(_)) => after_last(entries.as_slice()),
+            (_, Some(end)) => ListNext::After(end),
+            (_, None) => ListNext::End,
         };
         self.next = Some(next);
         self.queue = entries.into();
@@ -1259,10 +1291,43 @@ impl VfsListOperation {
     fn checked(&mut self, result: IoResult) -> ListTurn {
         let entry = self.checking.take().ok_or(VfsError::Conflict)?;
         match grant_of(result) {
-            Ok(_) => self.kept.push(entry),
+            Ok(_) => match self.descendants.remove(&entry.order_key()) {
+                Some(keys) => {
+                    self.probes = keys.into();
+                    return self.next_probe(entry);
+                }
+                None => self.kept.push(entry),
+            },
             Err(error) => hidden(error)?,
         }
         self.check_next()
+    }
+
+    /// A directory only staged names make shows through one of them the caller may head.
+    fn next_probe(&mut self, entry: VfsEntry) -> ListTurn {
+        let Some(key) = self.probes.pop_front() else {
+            return self.check_next();
+        };
+        let bucket = self.scope()?.bucket;
+        let request = VfsRequest::new(VfsAccess::Head, &bucket, Some(&key));
+        self.checking = Some(entry);
+        let call = authorize_call(&self.request.context, request);
+        self.call(ListStep::Descendant, call)
+    }
+
+    fn descendant_checked(&mut self, result: IoResult) -> ListTurn {
+        let entry = self.checking.take().ok_or(VfsError::Conflict)?;
+        match grant_of(result) {
+            Ok(_) => {
+                self.probes.clear();
+                self.kept.push(entry);
+                self.check_next()
+            }
+            Err(error) => {
+                hidden(error)?;
+                self.next_probe(entry)
+            }
+        }
     }
 }
 
@@ -1299,6 +1364,7 @@ impl Operation for VfsListOperation {
             ListStep::Staged => self.staged_read(result),
             ListStep::Page => self.page_read(result),
             ListStep::Check => self.checked(result),
+            ListStep::Descendant => self.descendant_checked(result),
         }
     }
 }

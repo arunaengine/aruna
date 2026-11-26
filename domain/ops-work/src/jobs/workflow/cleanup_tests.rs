@@ -44,6 +44,7 @@ fn facts(home: [u8; 32]) -> IoResult {
         local_site: false,
         worker_location: None,
         run_as: NOBODY,
+        nfs_share: None,
     }))
 }
 
@@ -102,6 +103,20 @@ fn is_child(next: &Result<Next<()>, JobError>) -> bool {
     matches!(next, Ok(Next::Call(IoCall::Child(_))))
 }
 
+fn unbind_call() -> Next<()> {
+    let unbind = RevokeMountsOperation::new("key".to_string());
+    Next::Call(IoCall::child(unbind))
+}
+
+/// Answers the credential revoke with `reply`, then the revoke of the key's NFS bindings.
+fn revoke_answered(
+    cleanup: &mut TerminalCleanupOperation,
+    reply: IoResult,
+) -> Result<Next<()>, JobError> {
+    assert_eq!(cleanup.next(reply), Ok(unbind_call()));
+    cleanup.next(IoResult::Child(ChildOutcome::new(Ok::<usize, VfsError>(1))))
+}
+
 /// A cleanup that got its fence and waits for the answer to the backend fence.
 fn fenced() -> TerminalCleanupOperation {
     let mut cleanup = operation(Some(intent()));
@@ -125,7 +140,7 @@ fn moved_home_retries() {
     assert!(is_child(&cleanup.next(facts([9; 32]))));
     let message = "cleanup backend docker moved to another home since the attempt";
     assert_eq!(
-        cleanup.next(missing_key()),
+        revoke_answered(&mut cleanup, missing_key()),
         Err(JobError::retryable(message))
     );
 }
@@ -159,7 +174,7 @@ fn cleans_then_revokes() {
     };
     let stored = IoResult::Child(ChildOutcome::new(Ok::<_, JobMutationError>(control)));
     assert!(is_child(&cleanup.next(stored)));
-    assert_eq!(cleanup.next(revoked()), Ok(Next::Done(())));
+    assert_eq!(revoke_answered(&mut cleanup, revoked()), Ok(Next::Done(())));
 }
 
 fn serving() -> (NodeId, RealmId) {
@@ -220,7 +235,7 @@ fn stop_with_tombstone() {
     )));
     assert!(is_child(&cleanup.next(lost)));
     // A refused tombstone stored no stop, so nothing is offered.
-    assert!(cleanup.next(revoked()).is_err());
+    assert!(revoke_answered(&mut cleanup, revoked()).is_err());
 }
 
 // A run that never submitted writes its stop alone before the revoke.
@@ -229,9 +244,9 @@ fn unsubmitted_stop_written() {
     let mut cleanup = stop_built(None, stop_rows());
     assert_eq!(cleanup.step, CleanupStep::StopWrite);
     assert!(is_child(&cleanup.next(IoResult::Done)));
-    assert_eq!(cleanup.next(revoked()), drained());
+    assert_eq!(revoke_answered(&mut cleanup, revoked()), drained());
     let mut nothing = stop_built(None, Vec::new());
-    assert_eq!(nothing.next(revoked()), Ok(Next::Done(())));
+    assert_eq!(revoke_answered(&mut nothing, revoked()), Ok(Next::Done(())));
 }
 
 // Without an attempt only the credential is revoked; a key already gone is fine.
@@ -239,7 +254,10 @@ fn unsubmitted_stop_written() {
 fn attemptless_only_revokes() {
     let mut cleanup = operation(None);
     assert!(is_child(&cleanup.first()));
-    assert_eq!(cleanup.next(missing_key()), Ok(Next::Done(())));
+    assert_eq!(
+        revoke_answered(&mut cleanup, missing_key()),
+        Ok(Next::Done(()))
+    );
 }
 
 // An object the backend no longer holds still gets its tombstone.
@@ -263,7 +281,7 @@ fn backend_failure_revokes() {
     assert!(is_child(
         &cleanup.next(answer(ComputeAnswer::Done(Err(down))))
     ));
-    let error = cleanup.next(missing_key()).unwrap_err();
+    let error = revoke_answered(&mut cleanup, missing_key()).unwrap_err();
     assert_eq!(error.kind, JobErrorKind::Retryable);
     assert!(error.message.starts_with("backend cleanup failed"));
 }
@@ -277,7 +295,7 @@ fn permanent_cleanup_failure() {
     cleanup
         .next(answer(ComputeAnswer::Done(Err(invalid))))
         .unwrap();
-    let error = cleanup.next(revoked()).unwrap_err();
+    let error = revoke_answered(&mut cleanup, revoked()).unwrap_err();
     assert_eq!(error.kind, JobErrorKind::Permanent);
 }
 
@@ -294,7 +312,7 @@ fn missing_backend_retries() {
         let mut cleanup = fenced();
         assert!(is_child(&cleanup.next(answer(reply))));
         assert_eq!(
-            cleanup.next(missing_key()),
+            revoke_answered(&mut cleanup, missing_key()),
             Err(JobError::retryable(message))
         );
     }
@@ -315,7 +333,8 @@ fn fence_claim_failures() {
         cleanup.first().unwrap();
         let claim = IoResult::Child(ChildOutcome::new(Err::<FenceContext, _>(failure)));
         assert!(is_child(&cleanup.next(claim)));
-        assert_eq!(cleanup.next(missing_key()).unwrap_err().kind, kind);
+        let error = revoke_answered(&mut cleanup, missing_key()).unwrap_err();
+        assert_eq!(error.kind, kind);
     }
 }
 
@@ -328,7 +347,7 @@ fn identity_mismatch_stops() {
     cleanup.first().unwrap();
     assert!(is_child(&cleanup.next(authorized())));
     assert_eq!(
-        cleanup.next(missing_key()),
+        revoke_answered(&mut cleanup, missing_key()),
         Err(JobError::permanent("cleanup attempt identity mismatch"))
     );
 }
@@ -343,7 +362,7 @@ fn revoke_failure_joins() {
         .unwrap();
     let failed = RevokeUserError::StorageError(StorageError::Timeout);
     let reply = IoResult::Child(ChildOutcome::new(Err::<UserAccess, _>(failed)));
-    let error = cleanup.next(reply).unwrap_err();
+    let error = revoke_answered(&mut cleanup, reply).unwrap_err();
     assert_eq!(error.kind, JobErrorKind::Retryable);
     assert!(
         error
@@ -351,4 +370,25 @@ fn revoke_failure_joins() {
             .starts_with("workspace credential revoke failed")
     );
     assert!(error.message.contains("; backend fence failed"));
+}
+
+// A failed revoke of the key's NFS bindings retries the cleanup; a run without a key has none.
+#[test]
+fn mounts_revoke_retries() {
+    let mut cleanup = operation(None);
+    cleanup.first().unwrap();
+    assert_eq!(cleanup.next(revoked()), Ok(unbind_call()));
+    let down = Err::<usize, _>(VfsError::Unavailable("down".to_string()));
+    let error = cleanup
+        .next(IoResult::Child(ChildOutcome::new(down)))
+        .unwrap_err();
+    assert_eq!(error.kind, JobErrorKind::Retryable);
+    assert!(
+        error
+            .message
+            .starts_with("NFS mount bindings revoke failed")
+    );
+    let mut keyless = TerminalCleanupOperation::new(job(), Ulid::nil(), (None, ""), None);
+    keyless.first().unwrap();
+    assert_eq!(keyless.next(missing_key()), Ok(Next::Done(())));
 }

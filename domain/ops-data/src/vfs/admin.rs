@@ -116,6 +116,15 @@ fn owned_host(value: Option<&Value>, caller: UserId) -> Result<EnrolledHostRecor
     }
 }
 
+/// The host row of `host_id`, live and enrolled as a trusted worker pool.
+fn pool_host(value: Option<&Value>) -> Result<EnrolledHostRecord, VfsError> {
+    let host = record_of::<EnrolledHostRecord>(value)?.ok_or(VfsError::NotFound)?;
+    match host.worker_pool && host.revoked_at_ms.is_none() {
+        true => Ok(host),
+        false => Err(VfsError::Denied),
+    }
+}
+
 fn revoke_call(host_id: Option<Ulid>, mount_id: Option<Ulid>) -> IoCall {
     vfs_call(VfsEffect::RevokeGrant {
         host_id,
@@ -537,6 +546,8 @@ pub struct CreateMountOperation {
     ids: IdMint,
     now_ms: u64,
     binding: Option<NfsMountBinding>,
+    /// The host is a live trusted worker pool rather than one the caller owns.
+    worker_pool: bool,
 }
 
 impl CreateMountOperation {
@@ -547,7 +558,14 @@ impl CreateMountOperation {
             ids: IdMint::default(),
             now_ms: 0,
             binding: None,
+            worker_pool: false,
         }
+    }
+
+    /// Binds the mount to a live trusted worker pool host instead of one the caller owns.
+    pub fn for_worker_pool(mut self) -> Self {
+        self.worker_pool = true;
+        self
     }
 
     fn target(&self, incarnation: u128) -> Result<NfsMountTarget, VfsError> {
@@ -660,7 +678,10 @@ impl Operation for CreateMountOperation {
             }
             MountStep::Host => {
                 let [row] = aruna_core::rows::values::<1>(result)?;
-                owned_host(row.as_ref(), self.input.caller)?;
+                match self.worker_pool {
+                    true => pool_host(row.as_ref())?,
+                    false => owned_host(row.as_ref(), self.input.caller)?,
+                };
                 let binding = self.binding.as_ref().ok_or(VfsError::Conflict)?;
                 let write = state_row(&VfsKey::Mount(binding.mount_id), binding)?;
                 // The host row is read in the same transaction, so a revocation conflicts.
@@ -758,6 +779,80 @@ impl Operation for MountRowOperation {
             true => TransactionMode::Write,
             false => TransactionMode::None,
         }
+    }
+}
+
+/// Deletes every mount bound to one access key, as when that key is revoked, and revokes the
+/// live state of each one. The rows are read and deleted in one transaction.
+#[derive(Debug, PartialEq)]
+pub struct RevokeMountsOperation {
+    access_key: String,
+    after: Option<Key>,
+    found: Vec<Ulid>,
+    deleted: bool,
+}
+
+impl RevokeMountsOperation {
+    pub fn new(access_key: String) -> Self {
+        Self {
+            access_key,
+            after: None,
+            found: Vec::new(),
+            deleted: false,
+        }
+    }
+
+    fn page(&self) -> IoCall {
+        state_page(vec![MOUNT_TAG], self.after.clone(), STATE_PAGE)
+    }
+}
+
+impl Operation for RevokeMountsOperation {
+    type Output = usize;
+    type Error = VfsError;
+
+    fn first(&mut self) -> Result<Next<usize>, VfsError> {
+        Ok(Next::Call(self.page()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<usize>, VfsError> {
+        if self.deleted {
+            result.done()?;
+            let calls = self.found.iter().map(|id| revoke_call(None, Some(*id)));
+            return Ok(Next::Then {
+                output: self.found.len(),
+                calls: calls.collect(),
+            });
+        }
+        let (rows, next) = result.page()?;
+        let full = rows.len() >= STATE_PAGE;
+        for (key, value) in rows {
+            self.after = Some(key);
+            let Some(binding) = record_of::<NfsMountBinding>(Some(&value))? else {
+                continue;
+            };
+            if binding.access_key == self.access_key {
+                self.found.push(binding.mount_id);
+            }
+        }
+        if next.is_some() && full {
+            return Ok(Next::Call(self.page()));
+        }
+        if self.found.is_empty() {
+            return Ok(Next::Done(0));
+        }
+        let deletes = self
+            .found
+            .iter()
+            .map(|id| state_delete(&VfsKey::Mount(*id)));
+        self.deleted = true;
+        Ok(Next::Call(IoCall::Delete(
+            deletes.collect::<Result<_, _>>()?,
+        )))
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 

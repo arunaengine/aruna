@@ -124,6 +124,7 @@ pub(super) fn instance() -> InstanceSummary {
         base_version: Some(id(2)),
         edit_generation: 3,
         allows_delete: true,
+        sealed_edit: None,
     }
 }
 
@@ -518,9 +519,10 @@ fn staged_names_merge() {
         crate::s3::object::list::ListBucketError,
     >;
     let answer = IoResult::Child(ChildOutcome::new(Ok::<_, Failure>(page)));
-    // Each staged name and each directory is admitted on its own before it shows.
+    // Each staged name and each directory is admitted on its own before it shows; a directory
+    // only a staged name makes also needs that name to be visible.
     let mut turn = operation.next(answer);
-    for _ in 0..3 {
+    for _ in 0..4 {
         assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
         turn = operation.next(granted());
     }
@@ -618,7 +620,7 @@ fn staged_names_paged() {
     };
     operation.next(vfs(staged)).unwrap();
     let mut turn = page_with(&mut operation, &["d/z/"]);
-    for _ in 0..2 {
+    for _ in 0..3 {
         assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
         turn = operation.next(granted());
     }
@@ -632,4 +634,64 @@ fn staged_names_paged() {
         .collect();
     assert_eq!(names, ["k.txt", "m"]);
     assert_eq!(listed.next, ListNext::After("m/".to_string()));
+}
+
+#[test]
+fn hidden_child_hides() {
+    // A directory only a staged name makes stays hidden when that name is, even though the
+    // caller may list the directory's prefix.
+    let mut operation = listing(ListResume::Start);
+    operation.first().unwrap();
+    operation.next(granted()).unwrap();
+    let staged = VfsEvent::StagedList {
+        entries: vec![staged_file("d/sub/secret.txt")],
+        sequence: 4,
+        truncated: false,
+    };
+    operation.next(vfs(staged)).unwrap();
+    let turn = page_with(&mut operation, &[]);
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    let turn = operation.next(granted());
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    let Ok(Next::Done(listed)) = operation.next(denied()) else {
+        panic!("expected the listing");
+    };
+    assert!(listed.entries.is_empty());
+    assert_eq!(listed.next, ListNext::End);
+}
+
+#[test]
+fn committed_page_first() {
+    // A full committed page that ends before the last staged name read ends the listing page
+    // there, so the committed names after it come on the next page.
+    let mut operation = listing(ListResume::Start);
+    operation.first().unwrap();
+    operation.next(granted()).unwrap();
+    let staged = VfsEvent::StagedList {
+        entries: vec![staged_file("d/c.txt"), staged_file("d/m.txt")],
+        sequence: 4,
+        truncated: true,
+    };
+    operation.next(vfs(staged)).unwrap();
+    let next = crate::s3::object::visible::after_entry("bucket", "d/b/", true);
+    let page = crate::s3::object::visible::VisiblePage::<crate::s3::object::list::ListedObject> {
+        prefixes: vec!["d/a/".to_string(), "d/b/".to_string()],
+        next: Some(crate::s3::object::visible::NextPage::After(next)),
+        ..Default::default()
+    };
+    let mut turn = operation.next(IoResult::Child(ChildOutcome::new(Ok::<_, Failure>(page))));
+    for _ in 0..2 {
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        turn = operation.next(granted());
+    }
+    let Ok(Next::Done(listed)) = turn else {
+        panic!("expected the listing");
+    };
+    let names: Vec<_> = listed
+        .entries
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+    assert_eq!(names, ["a", "b"]);
+    assert_eq!(listed.next, ListNext::After("b/".to_string()));
 }

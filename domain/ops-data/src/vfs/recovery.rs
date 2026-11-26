@@ -6,16 +6,19 @@
 use super::handles::{advance_witness, rests_on};
 use super::mutate::{GuardedWriteOperation, MovePlan};
 use super::path::{ancestors, marker_key};
+use super::policy::{VfsAccess, VfsAccessContext, VfsRequest, authorize_call, grant_of};
 use super::publish::{StageMoveOperation, retained};
 use super::{
     STAGE_RETENTION_MS, STATE_PAGE, TOMBSTONE_RETENTION_MS, VfsError, head_key, head_of, record_of,
     state_delete, state_read, state_row, token_of, unexpected, vfs_call, vfs_event,
 };
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BUCKET_CREATION_KEYSPACE, NFS_STATE_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BucketInfo, incarnation};
 use aruna_core::structs::storage::vfs::{
     BucketScope, CookiePosition, DetachReason, DirectoryWitness, EnrolledHostRecord, FileIdentity,
@@ -25,7 +28,7 @@ use aruna_core::structs::storage::vfs::{
 };
 use aruna_core::types::{Key, Value};
 use aruna_core::vfs_effects::{
-    DiskStage, RebindRequest, RestoreRequest, VfsEffect, VfsEvent, WitnessUpdate,
+    DiskStage, RebindRequest, RestoreRequest, VfsEffect, VfsEvent, VfsProtocol, WitnessUpdate,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use ulid::Ulid;
@@ -435,6 +438,7 @@ enum ColdStep {
     Head,
     Mount,
     Host,
+    Admit,
     Stage,
     Restored,
     Orphan,
@@ -458,6 +462,11 @@ pub struct ColdStartOperation {
     current: Option<(VfsKey, NfsStageRecord)>,
     orphans: VecDeque<(Ulid, u64)>,
     now_ms: u64,
+    /// The realm and node a writer's credential is admitted on; without them no live stage
+    /// shows again.
+    admission: Option<(RealmId, NodeId)>,
+    /// The mount binding of the current stage's NFS writer.
+    binding: Option<NfsMountBinding>,
 }
 
 impl Default for ColdStartOperation {
@@ -480,7 +489,15 @@ impl ColdStartOperation {
             current: None,
             orphans: VecDeque::new(),
             now_ms: 0,
+            admission: None,
+            binding: None,
         }
+    }
+
+    /// The realm and node on which each live stage's writer is admitted again before it shows.
+    pub fn with_admission(mut self, realm_id: RealmId, node_id: NodeId) -> Self {
+        self.admission = Some((realm_id, node_id));
+        self
     }
 
     fn call(&mut self, step: ColdStep, call: IoCall) -> ColdTurn {
@@ -649,9 +666,13 @@ impl ColdStartOperation {
         if !holds {
             return self.retain_current();
         }
-        // A writer's stage shows again only while its mount binding and host still stand.
+        // A writer's stage shows again only while its binding, host and credential still stand.
         match record.owner.mount_id.is_nil() {
-            true => self.restore(key, record),
+            true => {
+                let scope = Self::scope_of(&key).ok_or(VfsError::CorruptStage)?;
+                let target = NfsMountTarget::for_bucket(&scope.bucket, scope.incarnation)?;
+                self.admit(target, VfsProtocol::Smb, false)
+            }
             false => {
                 let read = state_read(&[VfsKey::Mount(record.owner.mount_id)])?;
                 self.call(ColdStep::Mount, read)
@@ -677,10 +698,11 @@ impl ColdStartOperation {
             NfsMountTarget::JobInputView { .. } => false,
         });
         match bound {
-            Some(binding) => self.call(
-                ColdStep::Host,
-                state_read(&[VfsKey::Host(binding.host_id)])?,
-            ),
+            Some(binding) => {
+                let read = state_read(&[VfsKey::Host(binding.host_id)])?;
+                self.binding = Some(binding);
+                self.call(ColdStep::Host, read)
+            }
             None => self.retain_current(),
         }
     }
@@ -688,11 +710,53 @@ impl ColdStartOperation {
     fn host_read(&mut self, result: IoResult) -> ColdTurn {
         let [row] = aruna_core::rows::values::<1>(result)?;
         let host = record_of::<EnrolledHostRecord>(row.as_ref())?;
+        let binding = self.binding.take().ok_or(VfsError::Conflict)?;
         if !host.is_some_and(|host| host.revoked_at_ms.is_none()) {
             return self.retain_current();
         }
-        let (key, record) = self.current.clone().ok_or(VfsError::Conflict)?;
-        self.restore(key, record)
+        self.admit(binding.target, VfsProtocol::Nfs, binding.read_only)
+    }
+
+    /// The recorded writer's credential is admitted again to write the name at the stage's
+    /// size through its export, exactly as a new write would be.
+    fn admit(
+        &mut self,
+        target: NfsMountTarget,
+        protocol: VfsProtocol,
+        read_only: bool,
+    ) -> ColdTurn {
+        let Some((realm_id, node_id)) = self.admission else {
+            return self.retain_current();
+        };
+        let (key, record) = self.current.as_ref().ok_or(VfsError::Conflict)?;
+        let bucket = Self::scope_of(key)
+            .ok_or(VfsError::CorruptStage)?
+            .bucket
+            .clone();
+        let context = VfsAccessContext {
+            realm_id,
+            node_id,
+            access_key: record.owner.access_key.clone(),
+            protocol,
+            target,
+            read_only,
+            now_ms: self.now_ms,
+        };
+        let mut request = VfsRequest::new(VfsAccess::Put, &bucket, Some(&record.key));
+        request.length = Some(record.logical_size);
+        self.call(ColdStep::Admit, authorize_call(&context, request))
+    }
+
+    /// A refused writer keeps its bytes by stage id; a transient failure ends the start.
+    fn admitted(&mut self, result: IoResult) -> ColdTurn {
+        match grant_of(result) {
+            Ok(_) => {
+                let (key, record) = self.current.clone().ok_or(VfsError::Conflict)?;
+                self.restore(key, record)
+            }
+            Err(error @ (VfsError::Unavailable(_) | VfsError::Storage(_))) => Err(error),
+            Err(_) => self.retain_current(),
+        }
     }
 
     /// The live checkpoint that may not show again is kept by its stage id before anything else.
@@ -809,6 +873,7 @@ impl Operation for ColdStartOperation {
             ColdStep::Head => self.head_read(result),
             ColdStep::Mount => self.mount_read(result),
             ColdStep::Host => self.host_read(result),
+            ColdStep::Admit => self.admitted(result),
             ColdStep::Stage => {
                 result.child::<(), VfsError>()??;
                 self.current = None;

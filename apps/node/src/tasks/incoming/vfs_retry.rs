@@ -13,15 +13,18 @@ use aruna_core::id::NodeId;
 use aruna_core::stream::{BackendStream, ByteStream};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::vfs::{
-    BucketScope, DetachReason, NfsStageRecord, StageBase, StageDisposition,
+    BucketScope, DetachReason, NfsMountBinding, NfsMountTarget, NfsStageRecord, StageBase,
+    StageDisposition,
 };
-use aruna_core::vfs_effects::VfsProtocol;
+use aruna_core::vfs_effects::{InstanceSummary, VfsProtocol};
 use aruna_ops_data::s3::object::put::{PutObjectConfig, PutObjectInput};
 use aruna_ops_data::s3::realm_usage::{RealmUsageOperation, RealmUsageScope};
+use aruna_ops_data::vfs::io::CommitInput;
 use aruna_ops_data::vfs::publish::PublishInput;
 use aruna_ops_data::vfs::{
-    CHUNK_BYTES, InstanceTarget, LiveStageOperation, LookupInstanceOperation, LookupMountOperation,
-    QuotaStageOperation, ReadCheckpointOperation, VfsAccessContext, VfsError, VfsPublishOperation,
+    CHUNK_BYTES, GetHostOperation, InstanceTarget, LiveStageOperation, LookupInstanceOperation,
+    LookupMountOperation, QuotaStageOperation, ReadCheckpointOperation, VfsAccessContext,
+    VfsCommitOperation, VfsError, VfsPublishOperation,
 };
 use aruna_ops_identity::document_repository::GetConfigOperation;
 use aruna_ops_identity::groups::routing::{BucketRules, SnapshotOperation};
@@ -41,9 +44,22 @@ enum Ready {
     Full,
     /// No live instance carries the stage; it waits for a later retry.
     Later,
-    /// The owner's mount is gone, so the checkpoint leaves the namespace.
-    Lost,
+    /// The owner's admission is gone, so the checkpoint and its instance, if any, leave the name.
+    Lost(Option<u64>),
     /// A writer holds the stage again, or the instance no longer carries this generation.
+    Held,
+    /// Newer edits were sealed into the next generation, which the next sweep publishes.
+    Sealed,
+}
+
+/// How the live instance stands against the sealed checkpoint a retry streams.
+#[derive(Debug, PartialEq, Eq)]
+enum Seal {
+    /// The checkpoint holds every edit; publication is fenced at this edit.
+    Current(u64),
+    /// Edits after the seal live only in the overlay and are sealed before publication.
+    Stale,
+    /// A writer holds the instance, or it no longer carries this sealed generation.
     Held,
 }
 
@@ -106,12 +122,21 @@ async fn retry_stage(
             );
             reschedule(context, scope, stage).await;
         }
-        Ok(Ready::Lost) => retain(context, scope, stage, DetachReason::LostLife).await,
+        Ok(Ready::Lost(instance_id)) => {
+            retain(context, scope, stage, instance_id, DetachReason::LostLife).await
+        }
         Ok(Ready::Held) => {
             debug!(
                 bucket = %scope.bucket,
                 stage_id = %stage.stage_id,
                 "A writer holds the quota-blocked checkpoint"
+            );
+        }
+        Ok(Ready::Sealed) => {
+            debug!(
+                bucket = %scope.bucket,
+                stage_id = %stage.stage_id,
+                "Sealed newer edits of a quota-blocked checkpoint for the next sweep"
             );
         }
         Err(reason) => {
@@ -130,40 +155,33 @@ fn failed<E: Debug>(step: &'static str) -> impl FnOnce(E) -> String {
     move |error| format!("{step}: {error:?}")
 }
 
-/// Checks the owner's mount, the live instance and the group headroom, then prepares the write
-/// of the checkpoint image without reading it yet.
+/// Checks the owner's admission, the live instance and the group headroom, then prepares the
+/// write of the sealed checkpoint image without reading it yet.
 async fn prepare(
     context: &Arc<DriverContext>,
     (node_id, realm_id): (NodeId, RealmId),
     scope: &BucketScope,
     stage: &NfsStageRecord,
 ) -> Result<Ready, String> {
-    let mount = LookupMountOperation::new(stage.owner.mount_id);
-    let Some(binding) = drive(mount, context).await.map_err(failed("mount"))? else {
-        return Ok(Ready::Lost);
-    };
-    let access = VfsAccessContext {
-        realm_id,
-        node_id,
-        access_key: stage.owner.access_key.clone(),
-        protocol: VfsProtocol::Nfs,
-        target: binding.target,
-        read_only: binding.read_only,
-        now_ms: unix_timestamp_millis(),
-    };
-    if access.bucket_scope() != Some((scope.bucket.as_str(), scope.incarnation)) {
-        return Ok(Ready::Lost);
-    }
     let target = InstanceTarget::Handle(stage.handle_id);
     let lookup = LookupInstanceOperation::new(scope.clone(), target);
-    let Some(instance) = drive(lookup, context).await.map_err(failed("instance"))? else {
+    let instance = drive(lookup, context).await.map_err(failed("instance"))?;
+    let carried = instance.as_ref().map(|found| found.instance_id);
+    let binding = match stage.owner.mount_id.is_nil() {
+        true => None,
+        false => live_binding(context, stage.owner.mount_id).await?,
+    };
+    let Some(access) = owner_access((node_id, realm_id), scope, stage, binding.as_ref()) else {
+        return Ok(Ready::Lost(carried));
+    };
+    let Some(instance) = instance else {
         return Ok(Ready::Later);
     };
-    let bound =
-        instance.stage_id == Some(stage.stage_id) && instance.generation == stage.generation;
-    if instance.writer_count > 0 || !bound {
-        return Ok(Ready::Held);
-    }
+    let sealed_edit = match seal_state(&instance, stage) {
+        Seal::Held => return Ok(Ready::Held),
+        Seal::Current(edit) => Some(edit),
+        Seal::Stale => None,
+    };
     let bucket = GetBucketOperation::new(scope.bucket.clone());
     let info = drive(bucket, context).await.map_err(failed("bucket"))?;
     let config = GetConfigOperation::new(realm_id);
@@ -182,6 +200,9 @@ async fn prepare(
             return Ok(Ready::Full);
         }
     }
+    let Some(sealed_edit) = sealed_edit else {
+        return seal(context, access, instance.instance_id, stage).await;
+    };
     let rules = BucketRules::of(&info);
     let snapshot = SnapshotOperation::new(&node_routing(context), info.group_id, rules);
     let routing = drive(snapshot, context).await.map_err(failed("routing"))?;
@@ -215,10 +236,94 @@ async fn prepare(
         logical_size: stage.logical_size,
         attempt_id: Ulid::generate(),
         updates: Vec::new(),
-        expected_edit: Some(instance.edit_generation),
+        expected_edit: Some(sealed_edit),
         require_writerless: true,
     };
     Ok(Ready::Publish(Box::new((input, put))))
+}
+
+/// The owner's NFS mount while it and its enrolled host still serve; `None` once either is gone.
+async fn live_binding(
+    context: &Arc<DriverContext>,
+    mount_id: Ulid,
+) -> Result<Option<NfsMountBinding>, String> {
+    let mount = LookupMountOperation::new(mount_id);
+    let Some(binding) = drive(mount, context).await.map_err(failed("mount"))? else {
+        return Ok(None);
+    };
+    let host = GetHostOperation::new(binding.host_id, binding.owner);
+    match drive(host, context).await {
+        Ok(host) if host.revoked_at_ms.is_none() => Ok(Some(binding)),
+        Ok(_) | Err(VfsError::NotFound) => Ok(None),
+        Err(error) => Err(format!("host: {error:?}")),
+    }
+}
+
+/// The admission the owner wrote under: an SMB successor's bucket share by its access key, or
+/// the NFS mount `binding`; `None` when neither still admits this bucket incarnation.
+fn owner_access(
+    (node_id, realm_id): (NodeId, RealmId),
+    scope: &BucketScope,
+    stage: &NfsStageRecord,
+    binding: Option<&NfsMountBinding>,
+) -> Option<VfsAccessContext> {
+    let (protocol, target, read_only) = match binding {
+        Some(binding) => (VfsProtocol::Nfs, binding.target.clone(), binding.read_only),
+        None if stage.owner.mount_id.is_nil() => {
+            let target = NfsMountTarget::for_bucket(&scope.bucket, scope.incarnation).ok()?;
+            (VfsProtocol::Smb, target, false)
+        }
+        None => return None,
+    };
+    let access = VfsAccessContext {
+        realm_id,
+        node_id,
+        access_key: stage.owner.access_key.clone(),
+        protocol,
+        target,
+        read_only,
+        now_ms: unix_timestamp_millis(),
+    };
+    let admitted = access.bucket_scope() == Some((scope.bucket.as_str(), scope.incarnation));
+    admitted.then_some(access)
+}
+
+/// Whether the writerless instance still carries `stage` and holds no edit after its seal.
+fn seal_state(instance: &InstanceSummary, stage: &NfsStageRecord) -> Seal {
+    let bound =
+        instance.stage_id == Some(stage.stage_id) && instance.generation == stage.generation;
+    match instance.sealed_edit {
+        _ if instance.writer_count > 0 || !bound => Seal::Held,
+        Some(edit) if edit == instance.edit_generation => Seal::Current(edit),
+        Some(_) => Seal::Stale,
+        None => Seal::Held,
+    }
+}
+
+/// Seals the overlay's newer edits into the next generation, so the whole current image
+/// publishes; a lasting refusal retains the older acknowledged checkpoint instead.
+async fn seal(
+    context: &Arc<DriverContext>,
+    access: VfsAccessContext,
+    instance_id: u64,
+    stage: &NfsStageRecord,
+) -> Result<Ready, String> {
+    let mut record = stage.clone();
+    record.generation = stage.generation.saturating_add(1);
+    record.updated_at_ms = access.now_ms;
+    let input = CommitInput {
+        context: access,
+        instance_id,
+        record,
+        previous: Some(stage.clone()),
+    };
+    match drive(VfsCommitOperation::new(input), context).await {
+        Ok(_) => Ok(Ready::Sealed),
+        Err(VfsError::Denied | VfsError::ReadOnly | VfsError::VaultLocked) => {
+            Ok(Ready::Lost(Some(instance_id)))
+        }
+        Err(error) => Err(format!("seal: {error:?}")),
+    }
 }
 
 /// Publishes the checkpoint. A full group reschedules it, a lasting refusal retains it outside
@@ -229,6 +334,7 @@ async fn publish(
     stage: NfsStageRecord,
     (input, put): (PublishInput, PutObjectConfig),
 ) {
+    let instance_id = input.instance_id;
     let operation = VfsPublishOperation::new(input, put);
     match drive(operation, context).await {
         Ok(published) => info!(
@@ -269,7 +375,8 @@ async fn publish(
                 error = %error,
                 "A quota-blocked checkpoint can no longer publish; it is retained"
             );
-            retain(context, scope, stage, DetachReason::LostLife).await;
+            let carried = Some(instance_id);
+            retain(context, scope, stage, carried, DetachReason::LostLife).await;
         }
         Err(error) => warn!(
             bucket = %scope.bucket,
@@ -293,15 +400,20 @@ async fn reschedule(context: &Arc<DriverContext>, scope: BucketScope, stage: Nfs
     }
 }
 
-/// Keeps the acknowledged checkpoint outside the namespace by its stage id.
+/// Keeps the acknowledged checkpoint outside the namespace by its stage id, and detaches the
+/// runtime instance that carries it.
 async fn retain(
     context: &Arc<DriverContext>,
     scope: BucketScope,
     stage: NfsStageRecord,
+    instance_id: Option<u64>,
     reason: DetachReason,
 ) {
     let stage_id = stage.stage_id;
-    let operation = QuotaStageOperation::retain(scope, stage, reason);
+    let mut operation = QuotaStageOperation::retain(scope, stage, reason);
+    if let Some(instance_id) = instance_id {
+        operation = operation.with_instance(instance_id);
+    }
     if let Err(error) = drive(operation, context).await {
         warn!(stage_id = %stage_id, error = %error, "Failed to retain a quota-blocked checkpoint");
     }
@@ -364,4 +476,165 @@ fn checkpoint_body(context: Arc<DriverContext>, stage: &NfsStageRecord) -> ByteS
             Feed::Waiting(_) => Poll::Ready(None),
         }
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use aruna_core::structs::storage::vfs::{
+        FileIdentity, HandleIdentity, HandleKind, StageOwner, StageScope,
+    };
+    use aruna_core::user::id::UserId;
+
+    use super::*;
+
+    fn id(seed: u8) -> Ulid {
+        Ulid::from_bytes([seed; 16])
+    }
+
+    fn serving() -> (NodeId, RealmId) {
+        let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        (node_id, RealmId::from_bytes([1; 32]))
+    }
+
+    fn scope() -> BucketScope {
+        BucketScope::new("bucket", 7)
+    }
+
+    fn stage(mount_id: Ulid) -> NfsStageRecord {
+        let realm_id = serving().1;
+        NfsStageRecord {
+            stage_id: id(12),
+            handle_id: 4,
+            owner: StageOwner {
+                user: UserId::new(id(1), realm_id),
+                access_key: "KEY1".to_string(),
+                mount_id,
+                scope: StageScope::User,
+            },
+            key: "p/a".to_string(),
+            generation: 2,
+            checkpoint: "c-2".to_string(),
+            logical_size: 5,
+            base: StageBase::Unpublished {
+                token: id(6),
+                predecessor: None,
+            },
+            source_copies: Vec::new(),
+            source_policies: Vec::new(),
+            destination_copies: Vec::new(),
+            destination_policies: Vec::new(),
+            disposition: StageDisposition::Live,
+            quota_retry: None,
+            foreign_life: None,
+            updated_at_ms: 1,
+        }
+    }
+
+    fn binding(target: NfsMountTarget) -> NfsMountBinding {
+        NfsMountBinding {
+            mount_id: id(13),
+            host_id: id(14),
+            owner: UserId::new(id(1), serving().1),
+            access_key: "MOUNT".to_string(),
+            group_id: id(15),
+            target,
+            read_only: true,
+            allowed_networks: Vec::new(),
+            display_uid: 0,
+            display_gid: 0,
+            mode: 0o755,
+            created_at_ms: 1,
+        }
+    }
+
+    /// A writerless instance carrying generation 2 of `stage()`, sealed at edit 3.
+    fn instance() -> InstanceSummary {
+        InstanceSummary {
+            instance_id: 9,
+            key: "p/a".to_string(),
+            kind: HandleKind::File,
+            handle_id: Some(4),
+            identity: HandleIdentity::File(FileIdentity::Unpublished {
+                token: id(6),
+                predecessor: None,
+            }),
+            logical_size: 5,
+            base_limit: 0,
+            dirty: true,
+            delete_pending: false,
+            disposition_owner: None,
+            open_count: 0,
+            writer_count: 0,
+            detached: None,
+            stage_id: Some(id(12)),
+            generation: 2,
+            change: 0,
+            base_version: None,
+            edit_generation: 3,
+            allows_delete: true,
+            sealed_edit: Some(3),
+        }
+    }
+
+    #[test]
+    fn smb_owner_access() {
+        // An SMB successor names no mount: its bucket share is rebuilt from the access key.
+        let access = owner_access(serving(), &scope(), &stage(Ulid::nil()), None)
+            .expect("the SMB successor keeps its bucket share");
+        assert_eq!(access.protocol, VfsProtocol::Smb);
+        assert_eq!(access.access_key, "KEY1");
+        assert!(!access.read_only);
+        assert_eq!(access.bucket_scope(), Some(("bucket", 7)));
+    }
+
+    #[test]
+    fn nfs_owner_access() {
+        let mounted = binding(NfsMountTarget::for_bucket("bucket", 7).unwrap());
+        let nfs = stage(id(13));
+        let access = owner_access(serving(), &scope(), &nfs, Some(&mounted))
+            .expect("the NFS owner keeps its mount");
+        assert_eq!(access.protocol, VfsProtocol::Nfs);
+        assert_eq!(access.access_key, "KEY1");
+        assert!(
+            access.read_only,
+            "the binding's read-only flag carries over"
+        );
+        assert_eq!(access.target, mounted.target);
+        assert!(
+            owner_access(serving(), &scope(), &nfs, None).is_none(),
+            "a missing NFS mount admits nothing"
+        );
+        let other = binding(NfsMountTarget::for_bucket("bucket", 8).unwrap());
+        assert!(
+            owner_access(serving(), &scope(), &nfs, Some(&other)).is_none(),
+            "a mount of another bucket incarnation admits nothing"
+        );
+    }
+
+    #[test]
+    fn sealed_edit_gate() {
+        let record = stage(Ulid::nil());
+        assert_eq!(seal_state(&instance(), &record), Seal::Current(3));
+        let edited = InstanceSummary {
+            edit_generation: 4,
+            ..instance()
+        };
+        assert_eq!(seal_state(&edited, &record), Seal::Stale);
+        let writing = InstanceSummary {
+            writer_count: 1,
+            edit_generation: 4,
+            ..instance()
+        };
+        assert_eq!(seal_state(&writing, &record), Seal::Held);
+        let rebound = InstanceSummary {
+            generation: 3,
+            ..instance()
+        };
+        assert_eq!(seal_state(&rebound, &record), Seal::Held);
+        let unsealed = InstanceSummary {
+            sealed_edit: None,
+            ..instance()
+        };
+        assert_eq!(seal_state(&unsealed, &record), Seal::Held);
+    }
 }

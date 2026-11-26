@@ -17,15 +17,16 @@ pub use admin::{
     DeleteStageOperation, EnrollHostOperation, FindHostOperation, GetHostOperation,
     GetMountOperation, GetStageOperation, ListHostsOperation, ListMountsOperation,
     ListStagesOperation, LiveStageOperation, LookupMountOperation, LoopbackHostOperation,
-    PublishStageOperation, ReadCheckpointOperation, RevokeHostOperation, RotateHostOperation,
+    PublishStageOperation, ReadCheckpointOperation, RevokeHostOperation, RevokeMountsOperation,
+    RotateHostOperation,
 };
 pub use handles::{
     AllocateHandleOperation, ResolveHandleOperation, RetireHandleOperation, VfsListOperation,
 };
 pub use io::{
     ChangeSnapshot, DispositionInput, InstanceTarget, LookupInstanceOperation, ReadChangeOperation,
-    VfsCommitOperation, VfsDispositionOperation, VfsLockOperation, VfsOpenOperation,
-    VfsReadOperation, VfsTruncateOperation, VfsWriteOperation,
+    UpdateShareOperation, VfsCommitOperation, VfsDispositionOperation, VfsLockOperation,
+    VfsOpenOperation, VfsReadOperation, VfsTruncateOperation, VfsWriteOperation,
 };
 pub use mutate::{VfsMkdirOperation, VfsRemoveOperation, VfsRenameOperation};
 pub use path::{JobEntry, JobNodeKind, JobTree, JobTreeItem};

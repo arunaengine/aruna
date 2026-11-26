@@ -9,7 +9,9 @@ use aruna_core::structs::execution::job::local::credential_job_id;
 use aruna_core::structs::storage::vfs::{
     BucketScope, HandleIdentity, HandleKind, StageOwner, StageScope,
 };
-use aruna_core::vfs_effects::{ByteLock, InstanceSummary, ShareMode, VfsFailure, VfsProtocol};
+use aruna_core::vfs_effects::{
+    ByteLock, InstanceSummary, ReadLockCheck, ShareMode, VfsFailure, VfsProtocol,
+};
 use aruna_ops_data::vfs::io::{
     LockInput, LockOutcome, LockRequest, OpenInput, ReadInput, StageChange, WriteInput,
     WriteResult, WriteStable,
@@ -65,6 +67,18 @@ fn share_mode(granted: u32, share_access: u32) -> ShareMode {
         share_write: share_access & SHARE_WRITE != 0,
         share_delete: share_access & SHARE_DELETE != 0,
     }
+}
+
+/// `open` with the name, identity and base version its shared instance has now; another
+/// protocol may have published or renamed it since the open.
+pub(super) fn current_open(open: &FileOpen, summary: Option<&InstanceSummary>) -> FileOpen {
+    let mut open = open.clone();
+    if let Some(summary) = summary {
+        open.key = summary.key.clone();
+        open.identity = summary.identity.clone();
+        open.version_id = summary.base_version.or(open.version_id);
+    }
+    open
 }
 
 /// The time an object shows: its version's, else when it was opened.
@@ -243,6 +257,7 @@ impl ArunaSmbBackend {
             identity: opened.identity,
             version_id,
             write,
+            delete_on_close: request.delete_on_close,
             owner: StageOwner {
                 user: opened.grant.owner,
                 access_key: access_key.clone(),
@@ -282,15 +297,25 @@ impl ArunaSmbBackend {
         })
     }
 
-    /// The live shared instance of an open, if it is still the one the open joined.
+    /// The live or detached shared instance the open joined, found by its stable id.
     pub(super) async fn summary(
         &self,
         open: &FileOpen,
     ) -> Result<Option<InstanceSummary>, BackendError> {
         let scope = BucketScope::new(open.bucket.clone(), open.incarnation);
-        let lookup = LookupInstanceOperation::new(scope, InstanceTarget::Key(open.key.clone()));
+        let lookup =
+            LookupInstanceOperation::new(scope, InstanceTarget::Instance(open.instance_id));
         let found = drive(lookup, &self.driver).await.map_err(vfs_failure)?;
         Ok(found.filter(|summary| summary.instance_id == open.instance_id))
+    }
+
+    /// The open as its shared instance has it now, together with that instance.
+    pub(super) async fn current(
+        &self,
+        open: &FileOpen,
+    ) -> Result<(FileOpen, Option<InstanceSummary>), BackendError> {
+        let summary = self.summary(open).await?;
+        Ok((current_open(open, summary.as_ref()), summary))
     }
 
     pub(super) async fn read_file(
@@ -302,17 +327,17 @@ impl ArunaSmbBackend {
         if open.kind == HandleKind::Directory {
             return Err(BackendError::IsDirectory);
         }
-        // The shared instance names the base the other protocol last published or renamed to.
-        let summary = self.summary(open).await?;
-        let base = summary.as_ref().and_then(|summary| summary.base_version);
+        // The shared instance names the base the other protocol last published or renamed to;
+        // a detached instance still serves its existing opens.
+        let (open, _) = self.current(open).await?;
         let input = ReadInput {
-            context: self.open_context(open),
-            key: summary.map_or_else(|| open.key.clone(), |summary| summary.key),
+            context: self.open_context(&open),
+            key: open.key.clone(),
             instance_id: Some(open.instance_id),
-            version_id: base.or(open.version_id),
+            version_id: open.version_id,
             offset,
             length,
-            owner_id: Some(lock_owner(open.open_id)),
+            lock_check: ReadLockCheck::Owner(lock_owner(open.open_id)),
         };
         let read = drive(VfsReadOperation::new(input), &self.driver)
             .await
@@ -329,8 +354,9 @@ impl ArunaSmbBackend {
         if !open.write || open.kind == HandleKind::Directory {
             return Err(BackendError::Denied);
         }
+        let (open, _) = self.current(open).await?;
         let input = WriteInput {
-            context: self.open_context(open),
+            context: self.open_context(&open),
             key: open.key.clone(),
             instance_id: open.instance_id,
             owner_id: lock_owner(open.open_id),
@@ -392,20 +418,22 @@ impl ArunaSmbBackend {
         open: &FileOpen,
         _change: BasicChange,
     ) -> Result<(), BackendError> {
+        let (open, _) = self.current(open).await?;
         let head = VfsRequest::new(VfsAccess::Head, &open.bucket, Some(&open.key));
-        match self.allows(&self.open_context(open), head).await? {
+        match self.allows(&self.open_context(&open), head).await? {
             true => Ok(()),
             false => Err(BackendError::Denied),
         }
     }
 
     pub(super) async fn file_status(&self, open: &FileOpen) -> Result<FileInfo, BackendError> {
+        let (open, summary) = self.current(open).await?;
         let head = VfsRequest::new(VfsAccess::Head, &open.bucket, Some(&open.key));
-        if !self.allows(&self.open_context(open), head).await? {
+        if !self.allows(&self.open_context(&open), head).await? {
             return Err(BackendError::Denied);
         }
-        let summary = self.summary(open).await?.ok_or(BackendError::NotFound)?;
-        let time = shown_time(summary.base_version.or(open.version_id), open.opened_ms);
+        let summary = summary.ok_or(BackendError::NotFound)?;
+        let time = shown_time(open.version_id, open.opened_ms);
         let size = match open.kind {
             HandleKind::File => summary.logical_size,
             HandleKind::Directory => 0,
@@ -455,10 +483,11 @@ impl ArunaSmbBackend {
         open: &FileOpen,
         cursor: Option<String>,
     ) -> Result<ListPage, BackendError> {
+        let (open, _) = self.current(open).await?;
         let HandleIdentity::Directory(witness) = &open.identity else {
             return Err(BackendError::NotDirectory);
         };
-        let context = self.open_context(open);
+        let context = self.open_context(&open);
         let listing = self
             .list_slice(
                 &context,
@@ -512,7 +541,9 @@ impl ArunaSmbBackend {
                 locks: locks.clone(),
                 atomic: true,
             };
-            match self.lock_request(open, request).await {
+            // Each try admits the name the instance has now; another protocol may rename it.
+            let (live, _) = self.current(open).await?;
+            match self.lock_request(&live, request).await {
                 Ok(LockOutcome::Done | LockOutcome::Free) => return Ok(()),
                 Ok(LockOutcome::Conflict(_)) | Err(VfsError::LockConflict) if wait => {
                     tokio::time::sleep(pause).await;
@@ -532,6 +563,8 @@ impl ArunaSmbBackend {
         open: &FileOpen,
         ranges: Vec<LockRange>,
     ) -> Result<(), BackendError> {
+        let (open, _) = self.current(open).await?;
+        let open = &open;
         for range in &ranges {
             let lock = Self::byte_lock(open, range);
             let other = ByteLock {

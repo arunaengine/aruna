@@ -2,10 +2,17 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::compute::runtimes::{SESSION_TAG, SESSION_TAG_NOTEBOOK};
+use aruna_core::compute::NOBODY;
+use aruna_core::compute::runtimes::{
+    MOUNT_PATH_TAG, MOUNT_PREFIX_TAG, SESSION_TAG, SESSION_TAG_NOTEBOOK,
+};
 use aruna_core::structs::execution::job::input::ExecutionSpec;
+use aruna_core::structs::execution::job::local::JobErrorKind;
+use ulid::Ulid;
 
-use super::super::fixtures::{BUCKET, child, compute, facts, is_child, node, realm, record, spec};
+use super::super::fixtures::{
+    BUCKET, PINNED, child, compute, facts, is_child, job, node, realm, record, spec,
+};
 use super::*;
 
 const NOW: u64 = 17;
@@ -54,8 +61,12 @@ fn read_endpoint() -> Next<PreparedTask> {
 
 /// A preparation past its backend selection, about to read the endpoints.
 fn begun(prepare: &mut PrepareAttemptOperation) {
+    begun_on(prepare, facts());
+}
+
+fn begun_on(prepare: &mut PrepareAttemptOperation, facts: BackendFacts) {
     assert_eq!(prepare.first(), Ok(select_backend()));
-    let selected = compute(ComputeAnswer::Selected(Some(facts())));
+    let selected = compute(ComputeAnswer::Selected(Some(facts)));
     assert_eq!(prepare.next(selected), Ok(read_endpoint()));
 }
 
@@ -146,6 +157,7 @@ fn plain_run_prepared() {
         vault_env: BTreeMap::new(),
         staging: StagingMode::Files,
         workspace: None,
+        nfs_mounts: NfsBindings::default(),
     };
     assert_eq!(prepare.next(loaded()), Ok(Next::Done(expected)));
 }
@@ -275,4 +287,152 @@ fn task_checked_again() {
         crate::jobs::lifecycle::screen::tests::install(),
     ));
     assert!(matches!(pending.next(admitted), Ok(Next::Call(_))));
+}
+
+const HOST: Ulid = Ulid::from_parts(9, 9);
+
+/// A session whose `team/` folder is mounted, on a backend whose NFS host serves both shares.
+fn nfs_session() -> PrepareAttemptOperation {
+    let mut spec = session_spec();
+    spec.tags
+        .insert(MOUNT_PATH_TAG.to_string(), "/work".to_string());
+    spec.tags
+        .insert(MOUNT_PREFIX_TAG.to_string(), "team/".to_string());
+    let mut prepare = prepare_of(spec, record(), BUCKET, false);
+    let nfs_share = Some(NfsShareConfig {
+        host_id: HOST,
+        inputs: true,
+        sessions: true,
+    });
+    begun_on(
+        &mut prepare,
+        BackendFacts {
+            nfs_share,
+            ..facts()
+        },
+    );
+    prepare.next(address(Some("http://s3"), None)).unwrap();
+    assert!(is_child(&prepare.next(loaded())));
+    prepare
+}
+
+/// The worker-pool binding the test session asks for on `target`.
+fn share_create(target: NfsMountTarget) -> Next<PreparedTask> {
+    let job_id = match &target {
+        NfsMountTarget::JobInputView { job_id } => Some(*job_id),
+        _ => None,
+    };
+    let read_only = job_id.is_some();
+    let context = VfsAccessContext {
+        realm_id: realm(),
+        node_id: node(),
+        access_key: "access".to_string(),
+        protocol: VfsProtocol::Nfs,
+        target,
+        read_only,
+        now_ms: NOW,
+    };
+    let (bucket, prefix) = match read_only {
+        true => (String::new(), None),
+        false => (BUCKET.to_string(), Some("team/".to_string())),
+    };
+    let input = MountInput {
+        context,
+        caller: record().created_by,
+        host_id: HOST,
+        group_id: spec().group_id,
+        bucket,
+        prefix,
+        job_id,
+        read_only,
+        allowed_networks: Vec::new(),
+        display_uid: NOBODY.uid,
+        display_gid: NOBODY.gid,
+        mode: if read_only { 0o555 } else { 0o700 },
+    };
+    let create = CreateMountOperation::new(input).for_worker_pool();
+    Next::Call(IoCall::child(create))
+}
+
+fn bound(mount_id: Ulid) -> IoResult {
+    child(Ok::<_, VfsError>(NfsMountBinding {
+        mount_id,
+        host_id: HOST,
+        owner: record().created_by,
+        access_key: "access".to_string(),
+        group_id: spec().group_id,
+        target: NfsMountTarget::JobInputView { job_id: job() },
+        read_only: true,
+        allowed_networks: Vec::new(),
+        display_uid: NOBODY.uid,
+        display_gid: NOBODY.gid,
+        mode: 0o555,
+        created_at_ms: NOW,
+    }))
+}
+
+/// Answers the session's bucket scope and expects its folder binding.
+fn scope_read(prepare: &mut PrepareAttemptOperation) {
+    let scope = child(Ok::<_, VfsError>(BucketScope::new(BUCKET, 7)));
+    let folder = NfsMountTarget::for_bucket(BUCKET, 7).unwrap();
+    assert_eq!(prepare.next(scope), Ok(share_create(folder)));
+}
+
+// A session with mounted inputs binds its input view and its folder on the backend's NFS host,
+// each under its own id, and the task spec carries both.
+#[test]
+fn provisions_nfs_bindings() {
+    let mut prepare = nfs_session();
+    let mount = S3Mount {
+        bucket: view_bucket(job()),
+        key: "in".to_string(),
+        path: "/in".to_string(),
+        cached: false,
+    };
+    prepare.prepared.as_mut().unwrap().mounts.push(mount);
+    prepare.step = PrepareStep::SessionCredential { view: true };
+    let minted = child(Ok::<_, JobError>(credential()));
+    let view = NfsMountTarget::JobInputView { job_id: job() };
+    assert_eq!(prepare.next(minted), Ok(share_create(view)));
+    let scope = BucketScopeOperation::new(BUCKET);
+    let (input, session) = (Ulid::from_parts(1, 2), Ulid::from_parts(1, 3));
+    assert_eq!(
+        prepare.next(bound(input)),
+        Ok(Next::Call(IoCall::child(scope)))
+    );
+    scope_read(&mut prepare);
+    let Ok(Next::Done(task)) = prepare.next(bound(session)) else {
+        panic!("the session binding ends the preparation");
+    };
+    let bindings = NfsBindings {
+        input: Some(input.to_string()),
+        session: Some(session.to_string()),
+    };
+    assert_eq!(task.nfs_mounts, bindings);
+    let attempt = AttemptRef::new("job", 1);
+    let spec = build_task_spec(&session_spec(), &attempt, PINNED, task, NOBODY);
+    assert_eq!(spec.nfs_mounts, bindings);
+}
+
+// A refused binding fails the preparation for good before any submit; an unreachable host
+// retries it.
+#[test]
+fn refuses_nfs_host() {
+    let cases = [
+        (VfsError::Denied, JobErrorKind::Permanent),
+        (VfsError::NotFound, JobErrorKind::Permanent),
+        (
+            VfsError::Unavailable("down".to_string()),
+            JobErrorKind::Retryable,
+        ),
+    ];
+    for (refusal, kind) in cases {
+        let mut prepare = nfs_session();
+        assert!(is_child(
+            &prepare.next(child(Ok::<_, JobError>(credential())))
+        ));
+        scope_read(&mut prepare);
+        let refused = child(Err::<NfsMountBinding, _>(refusal));
+        assert_eq!(prepare.next(refused).unwrap_err().kind, kind);
+    }
 }

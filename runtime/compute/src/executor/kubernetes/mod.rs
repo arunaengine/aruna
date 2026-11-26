@@ -1145,6 +1145,7 @@ impl ExecutorBackend for KubernetesBackend {
             worker_site,
             limits: self.config.envelope,
             session: !self.config.s3_cidrs.is_empty(),
+            nfs_share: self.config.nfs_share(),
             ..BackendCaps::default()
         }
     }

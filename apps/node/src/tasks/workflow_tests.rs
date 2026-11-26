@@ -1835,6 +1835,7 @@ fn defaults_task_walltime() {
             vault_env: BTreeMap::new(),
             staging: StagingMode::Files,
             workspace: None,
+            nfs_mounts: Default::default(),
         },
         NOBODY,
     );
@@ -1863,6 +1864,7 @@ fn carries_backend_identity() {
             vault_env: BTreeMap::new(),
             staging: StagingMode::Files,
             workspace: None,
+            nfs_mounts: Default::default(),
         },
         run_as,
     );
@@ -1887,6 +1889,7 @@ fn carries_network_access() {
             vault_env: BTreeMap::new(),
             staging: StagingMode::Files,
             workspace: None,
+            nfs_mounts: Default::default(),
         },
         NOBODY,
     );

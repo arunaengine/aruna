@@ -553,7 +553,51 @@ impl<B: SmbBackend> Connection<B> {
         if work.is_empty() {
             return Ok(());
         }
+        let lock = Command::Lock.code();
+        if work.iter().any(|element| element.header.command == lock) {
+            self.spawn_compound(work, session_id);
+            return Ok(());
+        }
         self.run_compound(session_id, work).await
+    }
+
+    /// A compound with a LOCK runs on its own task, so the connection still reads CANCEL and
+    /// the end of the stream while the lock waits; each LOCK is cancellable by its MessageId.
+    fn spawn_compound(self: &Arc<Self>, elements: Vec<Element>, session_id: u64) {
+        let locks: Vec<u64> = elements
+            .iter()
+            .filter(|element| element.header.command == Command::Lock.code())
+            .map(|element| element.header.message_id)
+            .collect();
+        let mut state = self.state.lock();
+        for message_id in &locks {
+            let waiting = Waiting {
+                session_id,
+                async_id: None,
+                token: CancellationToken::new(),
+                lock: true,
+            };
+            state.waiting.insert(*message_id, waiting);
+        }
+        drop(state);
+        let connection = Arc::clone(self);
+        self.tasks.spawn(async move {
+            let abort = connection.abort.clone();
+            let result = tokio::select! {
+                biased;
+                _ = abort.cancelled() => Ok(()),
+                result = connection.run_compound(session_id, elements) => result,
+            };
+            let mut state = connection.state.lock();
+            for message_id in &locks {
+                state.waiting.remove(message_id);
+            }
+            drop(state);
+            if let Err(Fatal(reason)) = result {
+                debug!(reason, "closing SMB connection");
+                connection.closing.cancel();
+            }
+        });
     }
 
     /// Runs compound elements in order, propagating SessionId, TreeId and the created
@@ -574,7 +618,19 @@ impl<B: SmbBackend> Connection<B> {
                 if !related {
                     chain = Context::of(&element.header);
                 }
-                self.execute(element, chain).await
+                let token = {
+                    let state = self.state.lock();
+                    let waiting = state.waiting.get(&element.header.message_id);
+                    waiting.map(|waiting| waiting.token.clone())
+                };
+                match token {
+                    Some(token) => tokio::select! {
+                        biased;
+                        reply = self.execute(element, chain) => reply,
+                        _ = token.cancelled() => Reply::fail(status::CANCELLED),
+                    },
+                    None => self.execute(element, chain).await,
+                }
             };
             if reply.terminate {
                 return Err(Fatal("client view of the negotiation differs"));

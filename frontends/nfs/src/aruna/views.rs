@@ -331,6 +331,7 @@ impl ArunaNfsBackend {
             return Ok(ReadReply {
                 data: Bytes::new(),
                 eof: true,
+                source: None,
             });
         }
         let creator = view.creator.clone();
@@ -346,9 +347,11 @@ impl ArunaNfsBackend {
             data.extend_from_slice(&chunk.map_err(|_| NfsStat4::Io)?);
         }
         let eof = offset + data.len() as u64 >= size;
+        // A replay reads the captured entry of the view again, never a source of its own.
         Ok(ReadReply {
             data: data.into(),
             eof,
+            source: None,
         })
     }
 

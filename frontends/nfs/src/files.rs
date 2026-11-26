@@ -27,8 +27,6 @@ use crate::xdr::XdrWriter;
 const PSEUDO_FSID: (u64, u64) = (0, 1);
 /// Bytes of a READDIR reply besides its entries: verifier, list end and eof.
 const READDIR_MINIMUM: usize = 16;
-/// Room a READ keeps for the rest of the reply.
-const READ_RESERVE: usize = 512;
 /// Most entries one READDIR asks the backend for.
 const PAGE_LIMIT: usize = 1024;
 
@@ -416,10 +414,7 @@ impl<B: NfsBackend> Engine<B> {
             return Err(NfsStat4::IsDirectory.into());
         };
         let state = self.io_state(ctx, stateid, object, share::READ)?;
-        let budget = ctx.reply_limit().saturating_sub(out.len() + READ_RESERVE);
-        let count = count
-            .min(IO_LIMIT)
-            .min(u32::try_from(budget).unwrap_or(u32::MAX));
+        let count = ctx.read_room(out.len(), count.min(IO_LIMIT))?;
         let caller = ctx.caller(&export);
         let reply = self
             .backend
@@ -428,6 +423,7 @@ impl<B: NfsBackend> Engine<B> {
         let read = ReplayAccess::Read {
             offset,
             length: count,
+            source: reply.source.clone(),
         };
         ctx.grant.record(object, read);
         out.put_bool(reply.eof);

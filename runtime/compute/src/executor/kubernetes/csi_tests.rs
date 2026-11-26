@@ -375,6 +375,7 @@ fn mounts_smb_session() {
 #[test]
 fn mounts_nfs_inputs() {
     let config = share_config(ShareDriver::Nfs {
+        host_id: ulid::Ulid::from_bytes([9; 16]),
         inputs: true,
         sessions: false,
     });
@@ -437,6 +438,7 @@ fn checks_share_config() {
         );
     }
     let nfs = share_config(ShareDriver::Nfs {
+        host_id: ulid::Ulid::from_bytes([9; 16]),
         inputs: true,
         sessions: true,
     });
@@ -474,6 +476,7 @@ fn nfs_volume(
 #[test]
 fn isolates_nfs_attempts() {
     let config = share_config(ShareDriver::Nfs {
+        host_id: ulid::Ulid::from_bytes([9; 16]),
         inputs: true,
         sessions: true,
     });
@@ -509,6 +512,7 @@ fn isolates_nfs_attempts() {
 #[test]
 fn refuses_unbound_nfs() {
     let config = share_config(ShareDriver::Nfs {
+        host_id: ulid::Ulid::from_bytes([9; 16]),
         inputs: true,
         sessions: true,
     });
