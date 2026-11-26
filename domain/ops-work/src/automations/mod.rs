@@ -6,10 +6,12 @@
 pub mod change;
 pub mod check;
 pub mod diff;
+pub mod firing_reads;
 pub mod identity;
 pub mod lifecycle;
 pub mod limits;
 pub mod reads;
+pub mod upkeep;
 
 use aruna_core::automation::keys::{active_prefix, firing_key, record_key, record_prefix};
 use aruna_core::automation::record::{Automation, Lifecycle};
