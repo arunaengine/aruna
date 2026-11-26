@@ -1024,4 +1024,26 @@ async fn binds_replica_owner() {
     )
     .await;
     assert_eq!(err, Err(CatalogError::Forbidden));
+
+    // A brand-new incremental run referencing an existing workflow cannot claim another group.
+    let mut cross_group = copy_of(&own, owner);
+    cross_group.run_id = Ulid::from_bytes([99; 16]);
+    cross_group.lineage = cross_group.run_id;
+    cross_group.group_id = runs.fixture.group_b;
+    let err = drive(
+        WriteReplicaOperation {
+            peer: owner,
+            local: here,
+            run: Box::new(cross_group),
+            first_page: 0,
+            pages: Vec::new(),
+            workflow: None,
+            now_ms: 0,
+            step: WriteStep::Read,
+            kept: 0,
+        },
+        context,
+    )
+    .await;
+    assert_eq!(err, Err(CatalogError::Forbidden));
 }

@@ -172,6 +172,7 @@ fn stub_run(run: &WorkflowRunRecord) -> WorkflowRunRecord {
         secrets: Default::default(),
         path_restrictions: None,
         captured_remote: Vec::new(),
+        directory_pins: Vec::new(),
         used_tools: Vec::new(),
     }
 }
@@ -1828,6 +1829,13 @@ impl Operation for WriteReplicaOperation {
                     ver
                 }
             };
+            if let Some(existing) = wf_row.as_deref() {
+                let wf =
+                    WorkflowRecord::from_bytes(existing).map_err(|_| CatalogError::Forbidden)?;
+                if wf.workflow_id != self.run.workflow_id || wf.group_id != self.run.group_id {
+                    return Err(CatalogError::Forbidden);
+                }
+            }
             if let Some(bytes) = pending_wf {
                 store_workflow(&bytes, wf_row.as_deref(), &self.run, &mut writes)?;
             }
