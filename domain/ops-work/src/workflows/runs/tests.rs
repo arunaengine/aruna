@@ -1786,6 +1786,54 @@ async fn resumes_directory_values() {
             if bucket == "results" && key == "folder/a.txt" && version_id.as_deref() == Some(&ver_a.to_string())
     )));
 
+    // A precaptured remote link keeps its original pin identity in `task_spec` for grant lookup.
+    let link_ver = Ulid::from_bytes([64; 16]);
+    let real_ver = Ulid::from_bytes([65; 16]);
+    let mut linked = resumed.clone();
+    let target_sel = InputSelection {
+        source: InputSource::S3 {
+            bucket: "results".into(),
+            key: "folder/real.txt".into(),
+            version_id: Some(real_ver.to_string()),
+        },
+        source_node_id: Some(origin),
+        dest_key: "results/folder/alias.link".into(),
+        mode: InputMode::Snapshot,
+        container_path: None,
+        name: None,
+        description: None,
+    };
+    let mut cap = crate::tests::records::captured_input(&target_sel, origin);
+    cap.version_id = real_ver;
+    linked.captured_remote.push(
+        aruna_core::structs::execution::workflow_run::PrecapturedInput {
+            pin_node_id: origin,
+            pin_bucket: "results".into(),
+            pin_key: "folder/alias.link".into(),
+            pin_version_id: link_ver,
+            resolved: target_sel,
+            captured: cap,
+        },
+    );
+    let mut link_task = start_task();
+    link_task.direct_inputs.push(DirectInput {
+        path: "alias.link".into(),
+        address: format!("aruna://results/folder/alias.link?version={link_ver}&node={origin}"),
+        digest: "sha256:00".into(),
+        size: 4,
+        executable: false,
+        aruna_id: None,
+        endpoints: Vec::new(),
+    });
+    let link_spec = task_spec(&linked, &link_task, "k").unwrap();
+    assert!(link_spec.inputs.iter().any(|i| matches!(
+        &i.source,
+        InputSource::S3 { bucket, key, version_id }
+            if bucket == "results"
+                && key == "folder/alias.link"
+                && version_id.as_deref() == Some(&link_ver.to_string())
+    )));
+
     // An uncaptured remote directory prefix is still refused.
     let other_target = resolve(&resumed, &format!("s3://results/other/?node={origin}")).unwrap();
     let mut refused = RemoteReadOperation::new(
@@ -1800,4 +1848,141 @@ async fn resumes_directory_values() {
         refused.first().unwrap(),
         Next::Done(HostRpcResult::Failed(_))
     ));
+}
+
+// Admission explicitly rejects directory inputs whose readable file count exceeds the cap.
+#[tokio::test]
+async fn rejects_oversized_dir() {
+    let runs = runs().await;
+    seed_object(&runs, "results", "many/a.txt", Ulid::from_bytes([71; 16])).await;
+    seed_object(&runs, "results", "many/b.txt", Ulid::from_bytes([72; 16])).await;
+    seed_object(&runs, "results", "many/c.txt", Ulid::from_bytes([73; 16])).await;
+
+    let req = runs.request(None, json!({ "dir": "s3://results/many/" }));
+    let over = drive(
+        StartRunOperation::new(&runs.fixture.alice, runs.serving(), req.clone()).with_dir_limit(2),
+        &runs.fixture.context,
+    )
+    .await;
+    assert!(matches!(over, Err(CatalogError::Invalid(_))), "{over:?}");
+
+    let exact = drive(
+        StartRunOperation::new(&runs.fixture.alice, runs.serving(), req).with_dir_limit(3),
+        &runs.fixture.context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(exact.record.directory_pins.len(), 3);
+}
+
+// Same-node resume retains local directory pins, serves captured membership on list, and pins
+// child reads to the original versions even after objects are overwritten or added.
+#[tokio::test]
+async fn retains_local_pins() {
+    use super::control::{Follow, FollowRunOperation};
+    use super::data::{DataCall, ReadDataOperation};
+    use aruna_core::keyspaces::WORKFLOW_RUN_KEYSPACE;
+
+    let runs = runs().await;
+    let ver_old = Ulid::from_bytes([81; 16]);
+    let ver_new = Ulid::from_bytes([82; 16]);
+    let ver_extra = Ulid::from_bytes([83; 16]);
+    seed_object(&runs, "results", "snap/a.txt", ver_old).await;
+
+    let req = runs.request(None, json!({ "dir": "s3://results/snap/" }));
+    let mut started = runs.start(&runs.fixture.alice, req).await.unwrap().record;
+    assert_eq!(started.directory_pins.len(), 1);
+    assert_eq!(started.directory_pins[0].version_id, ver_old);
+
+    // Replace `a.txt` with a newer head and upload a new sibling before resuming on this node.
+    seed_object(&runs, "results", "snap/a.txt", ver_new).await;
+    seed_object(&runs, "results", "snap/extra.txt", ver_extra).await;
+    started.state = RunState::Failed;
+    write(
+        &runs.fixture.context,
+        WORKFLOW_RUN_KEYSPACE,
+        super::run_key(started.run_id).to_vec(),
+        started.to_bytes().unwrap(),
+    )
+    .await;
+
+    let resumed = drive(
+        FollowRunOperation::new(
+            &runs.fixture.alice,
+            runs.serving(),
+            started.run_id,
+            Follow::Resume,
+        ),
+        &runs.fixture.context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        resumed.directory_pins.len(),
+        1,
+        "{:?}",
+        resumed.directory_pins
+    );
+    assert_eq!(resumed.directory_pins[0].key, "snap/a.txt");
+    assert_eq!(resumed.directory_pins[0].version_id, ver_old);
+    assert_eq!(resumed.directory_pins[0].source_node_id, None);
+
+    // Local listing returns only the captured membership, omitting `extra.txt`.
+    let listed = drive(
+        ReadDataOperation::new(
+            resumed.clone(),
+            runs.fixture.node,
+            DataCall::List {
+                address: "s3://results/snap/".into(),
+            },
+        ),
+        &runs.fixture.context,
+    )
+    .await
+    .unwrap();
+    match listed {
+        HostRpcResult::StorageList { entries } => {
+            assert_eq!(entries.len(), 1, "{entries:?}");
+            assert_eq!(entries[0].name, "a.txt");
+        }
+        other => panic!("expected captured local listing, got {other:?}"),
+    }
+
+    // Local stat and task_spec resolve the unversioned child to `ver_old`, not `ver_new`.
+    let statted = drive(
+        ReadDataOperation::new(
+            resumed.clone(),
+            runs.fixture.node,
+            DataCall::Stat {
+                address: "s3://results/snap/a.txt".into(),
+            },
+        ),
+        &runs.fixture.context,
+    )
+    .await
+    .unwrap();
+    match statted {
+        HostRpcResult::StorageStat { entry: Some(entry) } => {
+            assert_eq!(entry.version.as_deref(), Some(ver_old.to_string().as_str()));
+        }
+        other => panic!("expected pinned stat, got {other:?}"),
+    }
+    let mut task = start_task();
+    task.direct_inputs.push(DirectInput {
+        path: "a.txt".into(),
+        address: "s3://results/snap/a.txt".into(),
+        digest: "sha256:00".into(),
+        size: 4,
+        executable: false,
+        aruna_id: None,
+        endpoints: Vec::new(),
+    });
+    let spec = task_spec(&resumed, &task, "k").unwrap();
+    assert!(spec.inputs.iter().any(|i| matches!(
+        &i.source,
+        InputSource::S3 { bucket, key, version_id }
+            if bucket == "results"
+                && key == "snap/a.txt"
+                && version_id.as_deref() == Some(&ver_old.to_string())
+    )));
 }
