@@ -79,6 +79,7 @@ async fn matcher_and_replay() {
         version_id: sub_id,
         pseudonym: "vis-1".into(),
         guest: true,
+        outside_input: true,
         bucket: "uploads".into(),
         key: "in/vis-1/sub.json".into(),
         files: Vec::new(),
@@ -131,6 +132,7 @@ async fn matcher_and_replay() {
         firing_id: Ulid::from_bytes([91; 16]),
         stage: "run".into(),
         applet_id: None,
+        outside_input: false,
         depth: 0,
     };
     let self_run = env.sample_run(self_run_id, wf_id, RunState::Succeeded, Some(self_origin));
@@ -159,6 +161,7 @@ async fn matcher_and_replay() {
         firing_id: Ulid::from_bytes([93; 16]),
         stage: "run".into(),
         applet_id: None,
+        outside_input: false,
         depth: 1,
     };
     let run = env.sample_run(run_id, wf_id, RunState::Succeeded, Some(origin));
@@ -186,4 +189,149 @@ async fn matcher_and_replay() {
         .unwrap();
     assert_eq!(paused.lifecycle, Lifecycle::Paused);
     assert_eq!(paused.pause_reason, Some(PauseReason::ChainDepth));
+}
+
+#[tokio::test]
+async fn out_of_order() {
+    use aruna_core::structs::execution::workflow_run::AppletOrigin;
+    use aruna_core::structs::identity::features::Feature;
+    use std::collections::BTreeSet;
+
+    let env = Env::new().await;
+    let applet_id = Ulid::from_bytes([51; 16]);
+    let wf_id = Ulid::from_bytes([61; 16]);
+    let mut spec = env.base_spec();
+    spec.triggers = vec![
+        Trigger::DataUploaded {
+            bucket: "raw".into(),
+            prefix: "in/".into(),
+            pattern: Some("*.csv".into()),
+        },
+        Trigger::RunFinished {
+            workflow_id: wf_id,
+            status: Some(aruna_core::automation::record::RunStatus::Succeeded),
+            applet_id: Some(applet_id),
+        },
+    ];
+    let auto = env.create_active(spec).await;
+    let loc = (env.realm, env.group, env.node);
+
+    // Later-stamped event commits and is matched first; slower earlier event still matches.
+    let later = SourceEvent::data_uploaded(
+        loc,
+        ("raw", "in/late.csv"),
+        Ulid::from_bytes([73; 16]),
+        Some(env.owner.user_id),
+        200,
+    );
+    env.journal(&later).await;
+    let rep1 = drive(MatchEventsOperation::new(env.realm), &env.ctx)
+        .await
+        .unwrap();
+    assert_eq!((rep1.scanned, rep1.fired), (1, 1));
+
+    let earlier = SourceEvent::data_uploaded(
+        loc,
+        ("raw", "in/early.csv"),
+        Ulid::from_bytes([74; 16]),
+        Some(env.owner.user_id),
+        100,
+    );
+    env.journal(&earlier).await;
+    let rep2 = drive(MatchEventsOperation::new(env.realm), &env.ctx)
+        .await
+        .unwrap();
+    assert_eq!((rep2.scanned, rep2.fired), (1, 1));
+
+    // Node-disabled Automations keeps events even when realm enables Automations.
+    let blocked = SourceEvent::data_uploaded(
+        loc,
+        ("raw", "in/disabled.csv"),
+        Ulid::from_bytes([75; 16]),
+        Some(env.owner.user_id),
+        300,
+    );
+    env.journal(&blocked).await;
+    let disabled = BTreeSet::from([Feature::Automations]);
+    let rep3 = drive(
+        MatchEventsOperation::new(env.realm).with_disabled_features(disabled),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!((rep3.fired, rep3.kept), (0, 1));
+
+    // Duplicate IDs and repeat replay requests resolve idempotently to the same firing.
+    let kept = drive(
+        ListEventsOperation::new(&env.owner, auto.automation_id, env.node, 10),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(kept.len(), 1);
+    let eid = kept[0].event_id;
+    let first = drive(
+        StartEventsOperation::new(&env.owner, auto.automation_id, env.node, vec![eid, eid]),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.len(), 1);
+    let again = drive(
+        StartEventsOperation::new(&env.owner, auto.automation_id, env.node, vec![eid]),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(again.len(), 1);
+    assert_eq!(again[0].firing_id, first[0].firing_id);
+
+    // Direct applet workflow run matches applet-filtered run_finished and propagates outside_input.
+    let direct_id = Ulid::from_bytes([88; 16]);
+    let mut direct_run = env.sample_run(direct_id, wf_id, RunState::Succeeded, None);
+    direct_run.applet = Some(AppletOrigin {
+        applet_id,
+        outside_input: true,
+    });
+    env.write_row(
+        WORKFLOW_RUN_KEYSPACE,
+        run_key(direct_id),
+        direct_run.to_bytes().unwrap(),
+    )
+    .await;
+    let path = group_permission_path(env.realm, env.group, env.node);
+    let fin = SourceEvent::run_finished(
+        (env.group, path),
+        (wf_id, direct_id),
+        "succeeded",
+        env.owner.user_id,
+        400,
+    );
+    env.journal(&fin).await;
+    let rep4 = drive(MatchEventsOperation::new(env.realm), &env.ctx)
+        .await
+        .unwrap();
+    assert_eq!(rep4.fired, 1);
+    let firings = drive(
+        super::firing_reads::ListFiringsOperation::new(
+            &env.owner,
+            (None, Some(auto.automation_id)),
+            None,
+            env.node,
+            None,
+            10,
+        ),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    assert!(firings.items.iter().any(|f| matches!(
+        &f.trigger,
+        TriggerPayload::RunFinished {
+            run_id,
+            applet_id: Some(aid),
+            outside_input: true,
+            ..
+        } if *run_id == direct_id && *aid == applet_id
+    )));
 }
