@@ -11,7 +11,10 @@ use aruna_workflow_contract::host::StorageEntry;
 use aruna_workflow_contract::{ContractError, DATA_CHUNK_BYTES, HostRpcRequest, HostRpcResult};
 use executor::BoxFuture;
 use sha2::{Digest as _, Sha256};
-use storage::{Details, DirectRef, Entry, Metadata, StorageError, StorageProvider, UploadReceipt};
+use storage::{
+    Details, DirectRef, Entry, Metadata, StorageError, StorageProvider, TreeFile, TreeManifest,
+    UploadReceipt,
+};
 
 use crate::protocol::RpcClient;
 
@@ -47,24 +50,26 @@ impl StorageProvider for CoordinatorStorage {
         address: &'a str,
     ) -> BoxFuture<'a, Result<Option<Details>, StorageError>> {
         Box::pin(async move {
+            let normalized = normalize_address(address);
             let request = HostRpcRequest::StorageStat {
-                address: address.to_owned(),
+                address: normalized.clone(),
             };
             match self.rpc.call(request).await {
                 Ok(HostRpcResult::StorageStat { entry }) => {
-                    Ok(entry.map(|entry| details(address, entry)))
+                    Ok(entry.map(|entry| details(&normalized, entry)))
                 }
-                Ok(other) => Err(unexpected("stat", address, &other)),
+                Ok(other) => Err(unexpected("stat", &normalized, &other)),
                 Err(ContractError::NotFound { .. }) => Ok(None),
-                Err(error) => Err(failed("stat", address, error)),
+                Err(error) => Err(failed("stat", &normalized, error)),
             }
         })
     }
 
     fn list<'a>(&'a self, address: &'a str) -> BoxFuture<'a, Result<Vec<Entry>, StorageError>> {
         Box::pin(async move {
+            let normalized = normalize_address(address);
             let request = HostRpcRequest::StorageList {
-                address: address.to_owned(),
+                address: normalized.clone(),
             };
             match self.rpc.call(request).await {
                 Ok(HostRpcResult::StorageList { entries }) => Ok((entries.into_iter())
@@ -73,9 +78,72 @@ impl StorageProvider for CoordinatorStorage {
                         directory: entry.directory,
                     })
                     .collect()),
-                Ok(other) => Err(unexpected("list", address, &other)),
-                Err(error) => Err(failed("list", address, error)),
+                Ok(other) => Err(unexpected("list", &normalized, &other)),
+                Err(error) => Err(failed("list", &normalized, error)),
             }
+        })
+    }
+
+    fn tree_manifest<'a>(
+        &'a self,
+        address: &'a str,
+    ) -> BoxFuture<'a, Result<TreeManifest, StorageError>> {
+        Box::pin(async move {
+            let root = normalize_address(address);
+            let mut manifest = TreeManifest::default();
+            let mut pending = vec![String::new()];
+            while let Some(relative) = pending.pop() {
+                let folder = join_address(&root, &relative, true);
+                let entries = self.list(&folder).await?;
+                if entries.is_empty() && !relative.is_empty() {
+                    manifest.empty.push(relative.clone());
+                }
+                for entry in entries {
+                    let name = entry.name.trim_end_matches('/');
+                    if name.is_empty()
+                        || name == "."
+                        || name == ".."
+                        || name.contains(['/', '\\'])
+                        || name.chars().any(char::is_control)
+                    {
+                        return Err(StorageError::Failed {
+                            action: "list",
+                            address: storage::address::redacted(&folder),
+                            provider: self.name().to_owned(),
+                            message: format!("the listing names an invalid entry {:?}", entry.name),
+                            retryable: false,
+                        });
+                    }
+                    let path = match relative.is_empty() {
+                        true => name.to_owned(),
+                        false => format!("{relative}/{name}"),
+                    };
+                    if entry.directory {
+                        pending.push(path);
+                        continue;
+                    }
+                    let child = join_address(&root, &path, false);
+                    let found = self
+                        .stat(&child)
+                        .await?
+                        .ok_or_else(|| StorageError::Missing {
+                            address: storage::address::redacted(&child),
+                            provider: self.name().to_owned(),
+                        })?;
+                    manifest.files.push(TreeFile {
+                        path,
+                        size: found.metadata.size,
+                        executable: false,
+                        digest: found.verified().map(str::to_owned),
+                        direct: found.direct,
+                    });
+                }
+            }
+            manifest
+                .files
+                .sort_by(|first, second| first.path.cmp(&second.path));
+            manifest.empty.sort();
+            Ok(manifest)
         })
     }
 
@@ -85,9 +153,10 @@ impl StorageProvider for CoordinatorStorage {
         target: &'a Path,
     ) -> BoxFuture<'a, Result<Option<String>, StorageError>> {
         Box::pin(async move {
-            download_file(&self.rpc, address, target)
+            let normalized = normalize_address(address);
+            download_file(&self.rpc, &normalized, target)
                 .await
-                .map_err(|error| failed("read", address, error))
+                .map_err(|error| failed("read", &normalized, error))
         })
     }
 
@@ -97,9 +166,10 @@ impl StorageProvider for CoordinatorStorage {
         address: &'a str,
     ) -> BoxFuture<'a, Result<UploadReceipt, StorageError>> {
         Box::pin(async move {
-            let receipt = upload_file(&self.rpc, source, address)
+            let normalized = normalize_address(address);
+            let receipt = upload_file(&self.rpc, source, &normalized)
                 .await
-                .map_err(|error| failed("write", address, error))?;
+                .map_err(|error| failed("write", &normalized, error))?;
             Ok(UploadReceipt {
                 address: receipt.address,
                 size: receipt.size,
@@ -115,10 +185,11 @@ impl StorageProvider for CoordinatorStorage {
         address: &'a str,
     ) -> BoxFuture<'a, Result<Option<UploadReceipt>, StorageError>> {
         Box::pin(async move {
-            if self.stat(address).await?.is_some() {
+            let normalized = normalize_address(address);
+            if self.stat(&normalized).await?.is_some() {
                 return Ok(None);
             }
-            self.upload(source, address).await.map(Some)
+            self.upload(source, &normalized).await.map(Some)
         })
     }
 }
@@ -145,6 +216,60 @@ fn details(address: &str, entry: StorageEntry) -> Details {
         digest: entry.sha256,
         endpoints: entry.endpoints,
         direct,
+    }
+}
+
+/// Whether `query` contains only Aruna `version=` or `node=` query pairs.
+fn is_aruna_query(query: &str) -> bool {
+    !query.is_empty()
+        && query.split('&').all(|pair| {
+            matches!(
+                pair.split_once('='),
+                Some(("version" | "node", val)) if !val.is_empty()
+            )
+        })
+}
+
+/// Moves child segments appended after an Aruna `?query` back into the object key.
+pub(crate) fn normalize_address(address: &str) -> String {
+    if !served(address) {
+        return address.to_owned();
+    }
+    let Some((head, tail)) = address.split_once('?') else {
+        return address.to_owned();
+    };
+    let Some((query, suffix)) = tail.split_once('/') else {
+        return address.to_owned();
+    };
+    if !is_aruna_query(query) {
+        return address.to_owned();
+    }
+    let base = head.trim_end_matches('/');
+    if suffix.is_empty() {
+        return format!("{base}/?{query}");
+    }
+    let encoded = aruna_workflow_contract::host::encode_key(suffix);
+    format!("{base}/{encoded}?{query}")
+}
+
+/// Joins a relative child path onto a root address while keeping any Aruna `?query` at the end.
+pub(crate) fn join_address(root: &str, relative: &str, folder: bool) -> String {
+    let (head, query) = match root.split_once('?') {
+        Some((head, q)) if is_aruna_query(q) => (head, Some(q)),
+        _ => (root, None),
+    };
+    let base = head.trim_end_matches('/');
+    let rel = relative.trim_matches('/');
+    let mut joined = match rel.is_empty() {
+        true => base.to_owned(),
+        false => format!("{base}/{}", aruna_workflow_contract::host::encode_key(rel)),
+    };
+    if folder {
+        joined.push('/');
+    }
+    match query {
+        Some(q) => format!("{joined}?{q}"),
+        None => joined,
     }
 }
 
@@ -379,6 +504,47 @@ mod tests {
         assert_eq!(
             pin_version("aruna-staging://x/0", "v1"),
             "aruna-staging://x/0"
+        );
+    }
+
+    #[test]
+    fn normalizes_query_paths() {
+        assert_eq!(
+            normalize_address("s3://results/folder/?node=abc/"),
+            "s3://results/folder/?node=abc"
+        );
+        assert_eq!(
+            normalize_address("s3://results/folder?node=abc/"),
+            "s3://results/folder/?node=abc"
+        );
+        assert_eq!(
+            normalize_address("s3://results/folder/?node=abc/sub/"),
+            "s3://results/folder/sub/?node=abc"
+        );
+        assert_eq!(
+            normalize_address("s3://results/folder/?node=abc/sub/b.txt"),
+            "s3://results/folder/sub/b.txt?node=abc"
+        );
+        assert_eq!(
+            normalize_address("s3://results/folder/?node=abc/a?1.txt"),
+            "s3://results/folder/a%3F1.txt?node=abc"
+        );
+        // Non-query literal `?` in a local directory path is left untouched.
+        assert_eq!(
+            normalize_address("s3://results/dir?1/a.txt"),
+            "s3://results/dir?1/a.txt"
+        );
+        assert_eq!(
+            join_address("s3://results/folder/?node=abc", "", true),
+            "s3://results/folder/?node=abc"
+        );
+        assert_eq!(
+            join_address("s3://results/folder/?node=abc", "sub/b.txt", false),
+            "s3://results/folder/sub/b.txt?node=abc"
+        );
+        assert_eq!(
+            join_address("s3://results/folder/?node=abc", "sub", true),
+            "s3://results/folder/sub/?node=abc"
         );
     }
 

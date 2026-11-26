@@ -28,6 +28,7 @@ pub fn snakemake_start() -> RunStartPayload {
         max_pending: Some(4),
         prior_log_pages: Vec::new(),
         step_settings: BTreeMap::new(),
+        output_prefix: Some("aruna://delivered".into()),
     }
 }
 
@@ -303,4 +304,80 @@ async fn delivers_declared_outputs() {
     assert!(error.contains("output bucket denied"), "{error}");
     assert!(host.receive().await.is_none());
     host.finished().await.expect("a clean end");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stages_remote_directory() {
+    let tool = r#"cwlVersion: v1.2
+class: CommandLineTool
+baseCommand: [ls]
+requirements:
+  DockerRequirement:
+    dockerPull: debian:stable-slim
+inputs:
+  folder:
+    type: Directory
+    inputBinding:
+      position: 1
+outputs:
+  done:
+    type: File
+    outputBinding:
+      glob: done.txt
+"#;
+    let remote = "s3://results/folder/?node=node-remote";
+    let start = || {
+        let mut s = snakemake_start();
+        s.source = source(&[("tool.cwl", tool)]);
+        s.entrypoint = "tool.cwl".into();
+        s.language = Some(WorkflowLanguage::Cwl);
+        s.inputs = json!({
+            "folder": {
+                "class": "Directory",
+                "location": remote,
+            }
+        });
+        s
+    };
+
+    // Direct-staged remote directory: UWE walks and stages query-bearing child URIs cleanly.
+    let mut direct_node = MockNode::new(TaskMode::Succeed);
+    direct_node.files.insert(
+        "s3://results/folder/a.txt?node=node-remote".into(),
+        b"alpha\n".to_vec(),
+    );
+    direct_node.files.insert(
+        "s3://results/folder/sub/b.txt?node=node-remote".into(),
+        b"beta\n".to_vec(),
+    );
+    let direct_node = finished_run("run-dir-direct", start(), direct_node).await;
+    assert_eq!(direct_node.tasks.len(), 1);
+    let addrs: Vec<&str> = direct_node.tasks[0]
+        .direct_inputs
+        .iter()
+        .map(|d| d.address.as_str())
+        .collect();
+    assert!(
+        addrs.contains(&"s3://results/folder/a.txt?node=node-remote"),
+        "{addrs:?}"
+    );
+    assert!(
+        addrs.contains(&"s3://results/folder/sub/b.txt?node=node-remote"),
+        "{addrs:?}"
+    );
+
+    // Download-staged remote directory: UWE fetches each child via query-aware StorageDownload.
+    let mut fetch_node = MockNode::new(TaskMode::Succeed);
+    fetch_node.omit_sha256 = true;
+    fetch_node.files.insert(
+        "s3://results/folder/a.txt?node=node-remote".into(),
+        b"alpha\n".to_vec(),
+    );
+    fetch_node.files.insert(
+        "s3://results/folder/sub/b.txt?node=node-remote".into(),
+        b"beta\n".to_vec(),
+    );
+    let fetch_node = finished_run("run-dir-fetch", start(), fetch_node).await;
+    assert_eq!(fetch_node.tasks.len(), 1);
+    assert!(!fetch_node.tasks[0].staged_files.is_empty());
 }

@@ -169,7 +169,7 @@ impl CoordinatorBackend {
         let direct_inputs = (job.staging.direct.iter())
             .map(|direct| DirectInput {
                 path: direct.path.clone(),
-                address: direct.source.clone(),
+                address: storage::normalize_address(&direct.source),
                 digest: direct.digest.to_string(),
                 size: direct.size,
                 executable: direct.executable,

@@ -171,6 +171,7 @@ pub struct MockNode {
     pub pinned: Vec<String>,
     pub delivered: Vec<(String, String)>,
     pub fail_delivery: Option<String>,
+    pub omit_sha256: bool,
     pub events: Vec<LiveWorkflowEvent>,
     pub event_seqs: Vec<u64>,
 }
@@ -188,6 +189,7 @@ impl MockNode {
             pinned: Vec::new(),
             delivered: Vec::new(),
             fail_delivery: None,
+            omit_sha256: false,
             events: Vec::new(),
             event_seqs: Vec::new(),
         }
@@ -230,28 +232,68 @@ impl MockNode {
                     stopped: self.cancelled.clone(),
                 }
             }
-            HostRpcRequest::StorageStat { address } => match self.files.get(&address) {
-                Some(bytes) => HostRpcResult::StorageStat {
-                    entry: Some(StorageEntry {
-                        directory: false,
-                        size: bytes.len() as u64,
-                        modified_ms: Some(1_700_000_000_000),
-                        version: Some("v1".into()),
-                        sha256: Some(task_model::Digest::sha256(bytes).hex().to_owned()),
-                        aruna_id: Some(address.rsplit('/').next().unwrap_or_default().into()),
-                        endpoints: vec!["node-a".into()],
-                    }),
-                },
-                None => HostRpcResult::StorageStat { entry: None },
-            },
-            HostRpcRequest::StorageList { address } => {
-                let prefix = address.trim_end_matches('/').to_owned() + "/";
-                let mut entries: BTreeMap<String, bool> = BTreeMap::new();
-                for path in self
-                    .files
-                    .keys()
-                    .filter_map(|key| key.strip_prefix(&prefix))
+            HostRpcRequest::StorageStat { address } => {
+                if address
+                    .split_once('?')
+                    .is_some_and(|(_, q)| q.contains('/'))
                 {
+                    return Some(HostRpcResult::Failed(ContractError::invalid(format!(
+                        "malformed query in {address}"
+                    ))));
+                }
+                match self.files.get(&address) {
+                    Some(bytes) => HostRpcResult::StorageStat {
+                        entry: Some(StorageEntry {
+                            directory: false,
+                            size: bytes.len() as u64,
+                            modified_ms: Some(1_700_000_000_000),
+                            version: Some("v1".into()),
+                            sha256: (!self.omit_sha256)
+                                .then(|| task_model::Digest::sha256(bytes).hex().to_owned()),
+                            aruna_id: Some(address.rsplit('/').next().unwrap_or_default().into()),
+                            endpoints: vec!["node-a".into()],
+                        }),
+                    },
+                    None => {
+                        let (base, query) = address.split_once('?').unwrap_or((&address, ""));
+                        let prefix = base.trim_end_matches('/').to_owned() + "/";
+                        let is_dir = self.files.keys().any(|key| {
+                            let (kbase, kquery) = key.split_once('?').unwrap_or((key, ""));
+                            kquery == query && kbase.starts_with(&prefix)
+                        });
+                        let entry = is_dir.then(|| StorageEntry {
+                            directory: true,
+                            size: 0,
+                            modified_ms: None,
+                            version: None,
+                            sha256: None,
+                            aruna_id: None,
+                            endpoints: Vec::new(),
+                        });
+                        HostRpcResult::StorageStat { entry }
+                    }
+                }
+            }
+            HostRpcRequest::StorageList { address } => {
+                if address
+                    .split_once('?')
+                    .is_some_and(|(_, q)| q.contains('/'))
+                {
+                    return Some(HostRpcResult::Failed(ContractError::invalid(format!(
+                        "malformed query in {address}"
+                    ))));
+                }
+                let (base, query) = address.split_once('?').unwrap_or((&address, ""));
+                let prefix = base.trim_end_matches('/').to_owned() + "/";
+                let mut entries: BTreeMap<String, bool> = BTreeMap::new();
+                for key in self.files.keys() {
+                    let (kbase, kquery) = key.split_once('?').unwrap_or((key, ""));
+                    if kquery != query {
+                        continue;
+                    }
+                    let Some(path) = kbase.strip_prefix(&prefix) else {
+                        continue;
+                    };
                     match path.split_once('/') {
                         Some((folder, _)) => entries.insert(folder.into(), true),
                         None => entries.insert(path.into(), false),
@@ -264,6 +306,14 @@ impl MockNode {
                 }
             }
             HostRpcRequest::StorageDownload { address, offset } => {
+                if address
+                    .split_once('?')
+                    .is_some_and(|(_, q)| q.contains('/'))
+                {
+                    return Some(HostRpcResult::Failed(ContractError::invalid(format!(
+                        "malformed query in {address}"
+                    ))));
+                }
                 let Some(bytes) = self.files.get(&address) else {
                     let message = format!("no file {address}");
                     return Some(HostRpcResult::Failed(ContractError::NotFound { message }));
@@ -339,6 +389,9 @@ impl MockNode {
     fn finish(&mut self, task: &StartTask) -> TaskFinished {
         let mut outputs = Vec::new();
         for (index, expected) in task.expected_outputs.iter().enumerate() {
+            if expected.pattern == "cwl.output.json" {
+                continue;
+            }
             let address = format!("aruna://object/{}-{index}", task.name);
             let content = format!("output {} of {}\n", expected.pattern, task.step_id);
             self.files
