@@ -352,7 +352,7 @@ pub enum DataCall {
 }
 
 impl DataCall {
-    fn address(&self) -> &str {
+    pub(super) fn address(&self) -> &str {
         match self {
             Self::Stat { address } | Self::List { address } | Self::Download { address, .. } => {
                 address
@@ -373,6 +373,10 @@ struct ListState {
 
 #[derive(Debug, PartialEq)]
 enum ReadStep {
+    PinRemote(Target),
+    PinAccess(Target, Target),
+    PinEncrypt(Target, Target),
+    PinHead(Target),
     Access(Target),
     Encryption(Target, Box<BucketInfo>),
     Head(Target, Box<BucketInfo>),
@@ -780,40 +784,15 @@ impl ReadDataOperation {
             version,
         }))
     }
-    /// Resolves `(requested_pin, resolved_target)` so remote and local link reads preserve the
+    /// Resolves `(admitted_pin, resolved_target)` so remote and local link reads preserve the
     /// admitted pin version on responses while reading bytes from the resolved target.
+    #[cfg(test)]
     pub(super) fn prepare_read(&self) -> Result<(Target, Target), ContractError> {
-        let requested = remote::pin_directory_child(
-            &self.run,
-            resolve(&self.run, self.call.address())?,
-            self.node_id,
-        );
-        let target = remote::resolve_precaptured(&self.run, requested.clone(), self.node_id);
-        Ok((requested, target))
+        let raw = resolve(&self.run, self.call.address())?;
+        Ok(remote::resolve_pin(&self.run, raw, self.node_id))
     }
-}
 
-impl Operation for ReadDataOperation {
-    type Output = HostRpcResult;
-    type Error = CatalogError;
-
-    fn first(&mut self) -> ReadNext {
-        let (requested, target) = match self.prepare_read() {
-            Ok(pair) => pair,
-            Err(error) => return Self::failed(error),
-        };
-        if let Some(node) = target.remote(self.node_id) {
-            let read =
-                RemoteReadOperation::new(self.run.clone(), requested, node, self.call.clone());
-            self.step = Some(ReadStep::Remote);
-            return Ok(Next::Call(IoCall::child(read)));
-        }
-        if requested.key != target.key
-            || requested.bucket != target.bucket
-            || requested.version != target.version
-        {
-            self.reported_version = requested.version;
-        }
+    fn access_target(&mut self, target: Target) -> ReadNext {
         let access = ObjectAccessOperation::new(
             &creator_auth(&self.run),
             self.node_id,
@@ -825,8 +804,122 @@ impl Operation for ReadDataOperation {
         Ok(Next::Call(IoCall::child(access)))
     }
 
+    fn head_pin(&mut self, pin: Target, target: Target) -> ReadNext {
+        let head = HeadObjectOperation::new(HeadObjectInput {
+            bucket: pin.bucket,
+            key: pin.key,
+            version_id: pin.version,
+        });
+        self.step = Some(ReadStep::PinHead(target));
+        Ok(Next::Call(IoCall::child(head)))
+    }
+}
+
+impl Operation for ReadDataOperation {
+    type Output = HostRpcResult;
+    type Error = CatalogError;
+
+    fn first(&mut self) -> ReadNext {
+        let raw = match resolve(&self.run, self.call.address()) {
+            Ok(target) => target,
+            Err(error) => return Self::failed(error),
+        };
+        let (pin, target) = remote::resolve_pin(&self.run, raw.clone(), self.node_id);
+        if let Some(node) = target.remote(self.node_id) {
+            let read = RemoteReadOperation::new(self.run.clone(), raw, node, self.call.clone());
+            self.step = Some(ReadStep::Remote);
+            return Ok(Next::Call(IoCall::child(read)));
+        }
+        if remote::is_link_alias(&pin, &target, self.node_id) {
+            self.reported_version = pin.version;
+            if let Some(holder) = pin.remote(self.node_id) {
+                let Some(check) = remote::link_check(&self.run, holder, &pin) else {
+                    return Self::failed(ContractError::invalid(
+                        "an object on another node is read by its exact version",
+                    ));
+                };
+                self.step = Some(ReadStep::PinRemote(target));
+                return Ok(Next::Call(check));
+            }
+            let access = ObjectAccessOperation::new(
+                &creator_auth(&self.run),
+                self.node_id,
+                (&pin.bucket, &pin.key),
+                Permission::READ,
+            )
+            .owned(pin.owned);
+            self.step = Some(ReadStep::PinAccess(pin, target));
+            return Ok(Next::Call(IoCall::child(access)));
+        }
+        self.access_target(target)
+    }
+
     fn next(&mut self, result: IoResult) -> ReadNext {
         match self.step.take().ok_or(IoError::Unfinished)? {
+            ReadStep::PinRemote(target) => {
+                use aruna_core::replication_protocol::BaoReadRefusal;
+                use aruna_ops_data::replication::bao_read::BaoReadError;
+                match result.child::<BaoReadOutput, BaoReadError>()? {
+                    Ok(BaoReadOutput::Authorized) => self.access_target(target),
+                    Ok(_) => Err(IoError::Unfinished.into()),
+                    Err(BaoReadError::Refused(BaoReadRefusal::NotFound))
+                        if matches!(self.call, DataCall::Stat { .. }) =>
+                    {
+                        Ok(Next::Done(HostRpcResult::StorageStat { entry: None }))
+                    }
+                    Err(BaoReadError::Refused(refusal)) => {
+                        Self::failed(remote::refusal_error(refusal))
+                    }
+                    Err(error) => Self::failed(ContractError::internal(error.to_string())),
+                }
+            }
+            ReadStep::PinAccess(pin, target) => match bucket_answer(result) {
+                Ok(_) if !self.run.protected && !pin.owned => {
+                    let key = aruna_core::types::Key::from(pin.bucket.as_bytes().to_vec());
+                    self.step = Some(ReadStep::PinEncrypt(pin, target));
+                    Ok(Next::Call(IoCall::Read(vec![(
+                        aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+                        key,
+                    )])))
+                }
+                Ok(_) => self.head_pin(pin, target),
+                Err(CatalogError::NotFound) if matches!(self.call, DataCall::Stat { .. }) => {
+                    Ok(Next::Done(HostRpcResult::StorageStat { entry: None }))
+                }
+                Err(error) => Self::failed(refusal(error, self.call.address())?),
+            },
+            ReadStep::PinEncrypt(pin, target) => {
+                let row = result.value()?;
+                let settings =
+                    aruna_core::structs::storage::encryption::BucketEncryption::from_row(
+                        row.as_deref(),
+                    )
+                    .map_err(|error| CatalogError::Storage(error.to_string()))?;
+                if settings.is_encrypted() {
+                    return Self::failed(denied(
+                        "encrypted inputs require a protected workflow run",
+                    ));
+                }
+                self.head_pin(pin, target)
+            }
+            ReadStep::PinHead(target) => {
+                match result.child::<HeadObjectResult, HeadObjectError>()? {
+                    Ok(_) => self.access_target(target),
+                    Err(
+                        HeadObjectError::NoSuchKey
+                        | HeadObjectError::NoSuchVersion
+                        | HeadObjectError::DeleteMarker,
+                    ) if matches!(self.call, DataCall::Stat { .. }) => {
+                        Ok(Next::Done(HostRpcResult::StorageStat { entry: None }))
+                    }
+                    Err(
+                        HeadObjectError::NoSuchKey
+                        | HeadObjectError::NoSuchVersion
+                        | HeadObjectError::DeleteMarker,
+                    ) => Self::failed(not_found(format!("{} does not exist", self.call.address()))),
+                    Err(error) => Err(CatalogError::Storage(error.to_string())),
+                }
+            }
             ReadStep::Access(target) => match bucket_answer(result) {
                 Ok(info) if !self.run.protected && !target.owned => {
                     let key = aruna_core::types::Key::from(target.bucket.as_bytes().to_vec());
@@ -1268,7 +1361,9 @@ impl Operation for WriteObjectOperation {
                     self.stream = Some((blob, size));
                     self.put(*parts)
                 }
-                Ok(BaoReadOutput::Metadata { .. }) => Err(IoError::Unfinished.into()),
+                Ok(BaoReadOutput::Metadata { .. } | BaoReadOutput::Authorized) => {
+                    Err(IoError::Unfinished.into())
+                }
                 Err(error) => Self::failed(error),
             },
             WriteStep::Put => {

@@ -1974,8 +1974,16 @@ async fn resumes_directory_values() {
             offset: 0,
         },
     );
+    let ok_auth = || {
+        IoResult::Child(ChildOutcome::new(Ok::<BaoReadOutput, BaoReadError>(
+            BaoReadOutput::Authorized,
+        )))
+    };
+    let pin1 = rem1.first().unwrap();
+    assert!(format!("{pin1:?}").contains("LinkAccess"));
+    assert!(format!("{pin1:?}").contains("folder/alias.link"));
     assert!(matches!(
-        rem1.first().unwrap(),
+        rem1.next(ok_auth()).unwrap(),
         Next::Call(IoCall::Child(_))
     ));
     let total_size = (DATA_CHUNK_BYTES + 4) as u64;
@@ -2045,8 +2053,10 @@ async fn resumes_directory_values() {
             offset: DATA_CHUNK_BYTES as u64,
         },
     );
+    let pin2 = rem2.first().unwrap();
+    assert!(format!("{pin2:?}").contains("LinkAccess"));
     assert!(matches!(
-        rem2.first().unwrap(),
+        rem2.next(ok_auth()).unwrap(),
         Next::Call(IoCall::Child(_))
     ));
     let meta_large2 = IoResult::Child(ChildOutcome::new(Ok::<BaoReadOutput, BaoReadError>(
@@ -2516,20 +2526,26 @@ async fn delivers_empty_dir() {
     }
 }
 
-// Local empty-file reads of a precaptured link report the admitted link version on InvalidRange.
+// Local empty-file reads of a standalone precaptured link check the link pin and keep its version.
 #[test]
 fn keeps_empty_link() {
     use super::data::{DataCall, ReadDataOperation};
     use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
     use aruna_core::operation::Operation;
+    use aruna_core::replication_protocol::BaoReadRefusal;
     use aruna_core::structs::execution::job::input::{InputMode, InputSelection, InputSource};
     use aruna_core::structs::execution::workflow_run::{
-        CacheScope, DirectoryPin, PrecapturedInput, RunState, WorkflowRunRecord,
+        CacheScope, PrecapturedInput, RunState, WorkflowRunRecord,
     };
     use aruna_core::structs::storage::blob::BucketInfo;
+    use aruna_core::structs::storage::multipart::MultipartChecksumType;
+    use aruna_ops_data::replication::bao_read::{BaoReadError, BaoReadOutput};
     use aruna_ops_data::s3::object::get::{GetObjectError, GetObjectResult};
+    use aruna_ops_data::s3::object::head::{HeadObjectError, HeadObjectResult};
+    use aruna_workflow_contract::ContractError;
 
     let local = crate::tests::records::node(1);
+    let remote_node = crate::tests::records::node(2);
     let link_ver = Ulid::from_parts(8, 1);
     let target_ver = Ulid::from_parts(9, 1);
     let sel = InputSelection {
@@ -2547,7 +2563,7 @@ fn keeps_empty_link() {
     };
     let mut cap = crate::tests::records::captured_input(&sel, local);
     cap.version_id = target_ver;
-    let run = WorkflowRunRecord {
+    let make_run = |pin_node| WorkflowRunRecord {
         run_id: Ulid::from_parts(1, 1),
         lineage: Ulid::from_parts(1, 1),
         group_id: aruna_core::types::GroupId::from_bytes([1; 16]),
@@ -2584,35 +2600,18 @@ fn keeps_empty_link() {
         secrets: Default::default(),
         path_restrictions: None,
         captured_remote: vec![PrecapturedInput {
-            pin_node_id: local,
+            pin_node_id: pin_node,
             pin_bucket: "results".into(),
             pin_key: "folder/empty.link".into(),
             pin_version_id: link_ver,
-            resolved: sel,
-            captured: cap,
+            resolved: sel.clone(),
+            captured: cap.clone(),
         }],
-        directory_pins: vec![DirectoryPin {
-            bucket: "results".into(),
-            key: "folder/empty.link".into(),
-            version_id: link_ver,
-            source_node_id: Some(local),
-        }],
+        directory_pins: Vec::new(),
         directory_roots: Vec::new(),
         used_tools: Vec::new(),
     };
-    let mut read = ReadDataOperation::new(
-        run,
-        local,
-        DataCall::Download {
-            address: "s3://results/folder/empty.link".into(),
-            offset: 0,
-        },
-    );
-    assert!(matches!(
-        read.first().unwrap(),
-        Next::Call(IoCall::Child(_))
-    ));
-    let info = BucketInfo {
+    let info = || BucketInfo {
         group_id: aruna_core::types::GroupId::from_bytes([1; 16]),
         created_at: std::time::UNIX_EPOCH,
         created_by: crate::tests::records::user(),
@@ -2623,9 +2622,51 @@ fn keeps_empty_link() {
         compression: Default::default(),
         distribution: None,
     };
+    let head = HeadObjectResult {
+        location: None,
+        metadata: Default::default(),
+        source_metadata: None,
+        last_refresh: None,
+        version_created_at: None,
+        version_id: Some(link_ver),
+        resolved_version_id: Some(link_ver),
+        checksum_type: MultipartChecksumType::FullObject,
+        composite_hashes: Default::default(),
+        part_count: None,
+        source_policies: Vec::new(),
+        source_binding: None,
+    };
+
+    // Unversioned standalone local link checks original pin READ first, then keeps link_ver on EOF.
+    let local_run = make_run(local);
+    let mut read = ReadDataOperation::new(
+        local_run.clone(),
+        local,
+        DataCall::Download {
+            address: "s3://results/folder/empty.link".into(),
+            offset: 0,
+        },
+    );
+    let pin_access = read.first().unwrap();
+    assert!(format!("{pin_access:?}").contains("folder/empty.link"));
     assert!(matches!(
         read.next(IoResult::Child(ChildOutcome::new(Ok::<_, CatalogError>(
-            info
+            info()
+        ))))
+        .unwrap(),
+        Next::Call(IoCall::Read(_))
+    ));
+    let pin_head = read.next(IoResult::Values(vec![None])).unwrap();
+    assert!(format!("{pin_head:?}").contains("folder/empty.link"));
+    let target_access = read
+        .next(IoResult::Child(ChildOutcome::new(
+            Ok::<_, HeadObjectError>(head),
+        )))
+        .unwrap();
+    assert!(format!("{target_access:?}").contains("folder/empty.dat"));
+    assert!(matches!(
+        read.next(IoResult::Child(ChildOutcome::new(Ok::<_, CatalogError>(
+            info()
         ))))
         .unwrap(),
         Next::Call(IoCall::Read(_))
@@ -2648,4 +2689,53 @@ fn keeps_empty_link() {
             version: Some(link_ver.to_string()),
         })
     );
+
+    // Revoked READ on the local link fails immediately without checking the target.
+    let mut denied = ReadDataOperation::new(
+        local_run,
+        local,
+        DataCall::Download {
+            address: "s3://results/folder/empty.link".into(),
+            offset: 0,
+        },
+    );
+    assert!(matches!(
+        denied.first().unwrap(),
+        Next::Call(IoCall::Child(_))
+    ));
+    assert!(matches!(
+        denied
+            .next(IoResult::Child(ChildOutcome::new(Err::<
+                BucketInfo,
+                CatalogError,
+            >(
+                CatalogError::Forbidden
+            ))))
+            .unwrap(),
+        Next::Done(HostRpcResult::Failed(ContractError::Denied { .. }))
+    ));
+
+    // A remote link resolving to a local target checks LinkAccess at the remote holder first.
+    let mut remote_link = ReadDataOperation::new(
+        make_run(remote_node),
+        local,
+        DataCall::Download {
+            address: format!("s3://{remote_node}@results/folder/empty.link"),
+            offset: 0,
+        },
+    );
+    let pin_call = remote_link.first().unwrap();
+    assert!(format!("{pin_call:?}").contains("LinkAccess"));
+    assert!(format!("{pin_call:?}").contains("folder/empty.link"));
+    assert!(matches!(
+        remote_link
+            .next(IoResult::Child(ChildOutcome::new(Err::<
+                BaoReadOutput,
+                BaoReadError,
+            >(
+                BaoReadError::Refused(BaoReadRefusal::ReadDenied)
+            ))))
+            .unwrap(),
+        Next::Done(HostRpcResult::Failed(ContractError::Denied { .. }))
+    ));
 }

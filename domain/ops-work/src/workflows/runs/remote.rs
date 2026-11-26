@@ -50,31 +50,32 @@ pub fn pin_directory_child(run: &WorkflowRunRecord, mut target: Target, local: N
     target
 }
 
-/// Rewrites a precaptured link or captured directory child to its resolved versioned object so
-/// coordinator reads work both locally and after cross-node resume.
-pub fn resolve_precaptured(run: &WorkflowRunRecord, target: Target, local: NodeId) -> Target {
-    let mut target = pin_directory_child(run, target, local);
-    let holder = target.node.unwrap_or(local);
-    if target.version.is_none()
+/// Resolves a precaptured link or directory child, returning `(admitted_pin, resolved_target)`.
+/// `admitted_pin` keeps the original `(node, bucket, key)` with its admitted `pin_version_id`.
+pub fn resolve_pin(run: &WorkflowRunRecord, target: Target, local: NodeId) -> (Target, Target) {
+    let mut pin = pin_directory_child(run, target, local);
+    let holder = pin.node.unwrap_or(local);
+    if pin.version.is_none()
         && let Some(entry) = run.captured_remote.iter().find(|entry| {
             entry.pin_node_id == holder
-                && entry.pin_bucket == target.bucket
-                && entry.pin_key == target.key
+                && entry.pin_bucket == pin.bucket
+                && entry.pin_key == pin.key
         })
     {
-        target.version = Some(entry.pin_version_id);
+        pin.version = Some(entry.pin_version_id);
     }
-    let Some(version) = target.version else {
-        return target;
+    let Some(version) = pin.version else {
+        return (pin.clone(), pin);
     };
     let Some(entry) = run.captured_remote.iter().find(|entry| {
         entry.pin_node_id == holder
-            && entry.pin_bucket == target.bucket
-            && entry.pin_key == target.key
+            && entry.pin_bucket == pin.bucket
+            && entry.pin_key == pin.key
             && entry.pin_version_id == version
     }) else {
-        return target;
+        return (pin.clone(), pin);
     };
+    let mut resolved = pin.clone();
     if let InputSource::S3 {
         bucket,
         key,
@@ -84,13 +85,29 @@ pub fn resolve_precaptured(run: &WorkflowRunRecord, target: Target, local: NodeI
             .as_deref()
             .and_then(|v| Ulid::from_string(v).ok())
     {
-        target.bucket = bucket.clone();
-        target.key = key.clone();
-        target.version = Some(resolved_ver);
-        target.node = entry.resolved.source_node_id.or(Some(holder));
-        target.owned = false;
+        resolved.bucket = bucket.clone();
+        resolved.key = key.clone();
+        resolved.version = Some(resolved_ver);
+        resolved.node = entry.resolved.source_node_id.or(Some(holder));
+        resolved.owned = false;
     }
-    target
+    (pin, resolved)
+}
+
+/// Rewrites a precaptured link or captured directory child to its resolved versioned object so
+/// coordinator reads work both locally and after cross-node resume.
+pub fn resolve_precaptured(run: &WorkflowRunRecord, target: Target, local: NodeId) -> Target {
+    resolve_pin(run, target, local).1
+}
+
+/// Whether `resolved` points to a different `(holder, bucket, key, version)` than `pin`.
+pub(super) fn is_link_alias(pin: &Target, resolved: &Target, local: NodeId) -> bool {
+    let pin_node = pin.node.unwrap_or(local);
+    let resolved_node = resolved.node.unwrap_or(local);
+    resolved_node != pin_node
+        || resolved.bucket != pin.bucket
+        || resolved.key != pin.key
+        || resolved.version != pin.version
 }
 
 /// Whether `(holder, bucket, key)` lies under an admitted directory root or has captured pins.
@@ -278,6 +295,28 @@ fn exact_read(
     Some(IoCall::child(ManagedReadOperation::new(holder, request)))
 }
 
+/// Checks READ on an exact link version at `holder` via `BaoReadTarget::LinkAccess`.
+pub(super) fn link_check(run: &WorkflowRunRecord, holder: NodeId, pin: &Target) -> Option<IoCall> {
+    let request = BaoReadRequest {
+        auth_context: creator_auth(run),
+        realm_id: run.realm_id,
+        target: BaoReadTarget::LinkAccess(VersionedObjectArn {
+            realm_id: run.realm_id,
+            node_id: holder,
+            bucket: pin.bucket.clone(),
+            key: pin.key.clone(),
+            version: pin.version?,
+        }),
+        expected_blake3: None,
+        metadata_only: true,
+        destination: None,
+        known_refs: Vec::new(),
+        range: None,
+        disallow_encrypted: !run.protected,
+    };
+    Some(IoCall::child(ManagedReadOperation::new(holder, request)))
+}
+
 /// The read of an exact version `node` holds, as the run's creator; `None` without a version.
 pub fn read_call(
     run: &WorkflowRunRecord,
@@ -291,7 +330,7 @@ pub fn read_call(
 }
 
 /// Maps a holder refusal onto the coordinator error class without hiding backend faults.
-fn refusal_error(refusal: BaoReadRefusal) -> ContractError {
+pub(super) fn refusal_error(refusal: BaoReadRefusal) -> ContractError {
     let message = format!("the holder refused the read: {refusal:?}");
     match refusal {
         BaoReadRefusal::ReadDenied | BaoReadRefusal::BucketLocked(_) => {
@@ -317,6 +356,7 @@ pub fn read_answer(result: IoResult) -> Result<Result<BaoReadOutput, ContractErr
 
 #[derive(Debug, PartialEq)]
 enum CheckPhase {
+    LinkPin,
     Remote,
     LocalAccess(Target),
     LocalEncrypt(Target),
@@ -342,7 +382,16 @@ struct AuthDir {
 }
 
 #[derive(Debug, PartialEq)]
+enum PinPhase {
+    Remote,
+    LocalAccess(Target),
+    LocalEncrypt(Target),
+    LocalHead,
+}
+
+#[derive(Debug, PartialEq)]
 enum RemoteStep {
+    PinCheck(PinPhase),
     Head,
     Read,
     Collect,
@@ -354,6 +403,8 @@ enum RemoteStep {
 pub struct RemoteReadOperation {
     run: WorkflowRunRecord,
     target: Target,
+    /// Original link pin that must pass READ before reading a resolved target.
+    link_pin: Option<Target>,
     /// Requested directory `(holder, bucket, key)` kept before resolving precaptured markers.
     dir_target: Option<(NodeId, String, String)>,
     /// Admitted version of the requested address (preserves link version across multi-chunk reads).
@@ -382,12 +433,14 @@ impl RemoteReadOperation {
             )),
             _ => None,
         };
-        let reported_version = pinned.version;
-        let target = resolve_precaptured(&run, pinned, run.node_id);
+        let (pin, target) = resolve_pin(&run, pinned, run.node_id);
+        let reported_version = pin.version;
+        let link_pin = is_link_alias(&pin, &target, run.node_id).then_some(pin);
         let node = target.node.unwrap_or(node);
         Self {
             run,
             target,
+            link_pin,
             dir_target,
             reported_version,
             node,
@@ -395,6 +448,26 @@ impl RemoteReadOperation {
             size: 0,
             step: RemoteStep::Head,
         }
+    }
+
+    fn start_head(&mut self) -> RemoteNext {
+        let Some(head) = exact_read(&self.run, self.node, self.target.clone(), (true, None)) else {
+            return Self::failed(ContractError::invalid(
+                "an object on another node is read by its exact version",
+            ));
+        };
+        self.step = RemoteStep::Head;
+        Ok(Next::Call(head))
+    }
+
+    fn head_pin(&mut self, pin: Target) -> RemoteNext {
+        let head = HeadObjectOperation::new(HeadObjectInput {
+            bucket: pin.bucket,
+            key: pin.key,
+            version_id: pin.version,
+        });
+        self.step = RemoteStep::PinCheck(PinPhase::LocalHead);
+        Ok(Next::Call(IoCall::child(head)))
     }
 
     fn failed(error: ContractError) -> RemoteNext {
@@ -459,18 +532,23 @@ impl RemoteReadOperation {
                 node: Some(state.holder),
             };
             let resolved = resolve_precaptured(&self.run, pin.clone(), self.run.node_id);
-            let resolved_node = resolved.node.unwrap_or(state.holder);
-            let is_alias = resolved_node != state.holder
-                || resolved.bucket != pin.bucket
-                || resolved.key != pin.key
-                || resolved.version != pin.version;
+            let is_alias = is_link_alias(&pin, &resolved, self.run.node_id);
             // Check READ on the original pin at its holder before accepting any link target.
-            let call = exact_read(&self.run, state.holder, pin, (true, None))
-                .ok_or(IoError::Unfinished)?;
+            let (call, phase) = match is_alias {
+                true => (
+                    link_check(&self.run, state.holder, &pin).ok_or(IoError::Unfinished)?,
+                    CheckPhase::LinkPin,
+                ),
+                false => (
+                    exact_read(&self.run, state.holder, pin, (true, None))
+                        .ok_or(IoError::Unfinished)?,
+                    CheckPhase::Remote,
+                ),
+            };
             state.checking = Some(DirCheck {
                 entry,
                 follow_up: is_alias.then_some(resolved),
-                phase: CheckPhase::Remote,
+                phase,
             });
             self.step = RemoteStep::AuthList(Box::new(state));
             return Ok(Next::Call(call));
@@ -606,20 +684,94 @@ impl Operation for RemoteReadOperation {
                 });
             }
         }
-        let Some(head) = read_call(&self.run, &self.target, self.node, (true, None)) else {
-            return Self::failed(ContractError::invalid(
-                "an object on another node is read by its exact version",
-            ));
-        };
-        self.step = RemoteStep::Head;
-        Ok(Next::Call(head))
+        if let Some(pin) = self.link_pin.clone() {
+            let holder = pin.node.unwrap_or(self.run.node_id);
+            if holder == self.run.node_id {
+                let access = ObjectAccessOperation::new(
+                    &creator_auth(&self.run),
+                    self.run.node_id,
+                    (&pin.bucket, &pin.key),
+                    Permission::READ,
+                )
+                .owned(pin.owned);
+                self.step = RemoteStep::PinCheck(PinPhase::LocalAccess(pin));
+                return Ok(Next::Call(IoCall::child(access)));
+            }
+            let Some(check) = link_check(&self.run, holder, &pin) else {
+                return Self::failed(ContractError::invalid(
+                    "an object on another node is read by its exact version",
+                ));
+            };
+            self.step = RemoteStep::PinCheck(PinPhase::Remote);
+            return Ok(Next::Call(check));
+        }
+        self.start_head()
     }
 
     fn next(&mut self, result: IoResult) -> RemoteNext {
         match std::mem::replace(&mut self.step, RemoteStep::Head) {
+            RemoteStep::PinCheck(phase) => match phase {
+                PinPhase::Remote => match result.child::<BaoReadOutput, BaoReadError>()? {
+                    Ok(BaoReadOutput::Authorized) => self.start_head(),
+                    Ok(_) => Err(IoError::Unfinished.into()),
+                    Err(BaoReadError::Refused(BaoReadRefusal::NotFound))
+                        if matches!(self.call, DataCall::Stat { .. }) =>
+                    {
+                        Ok(Next::Done(HostRpcResult::StorageStat { entry: None }))
+                    }
+                    Err(BaoReadError::Refused(refusal)) => Self::failed(refusal_error(refusal)),
+                    Err(error) => Self::failed(ContractError::internal(error.to_string())),
+                },
+                PinPhase::LocalAccess(pin) => match bucket_answer(result) {
+                    Ok(_) if !self.run.protected && !pin.owned => {
+                        let key = Key::from(pin.bucket.as_bytes().to_vec());
+                        self.step = RemoteStep::PinCheck(PinPhase::LocalEncrypt(pin));
+                        Ok(Next::Call(IoCall::Read(vec![(
+                            BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+                            key,
+                        )])))
+                    }
+                    Ok(_) => self.head_pin(pin),
+                    Err(CatalogError::NotFound) if matches!(self.call, DataCall::Stat { .. }) => {
+                        Ok(Next::Done(HostRpcResult::StorageStat { entry: None }))
+                    }
+                    Err(error) => Self::failed(super::data::refusal(error, self.call.address())?),
+                },
+                PinPhase::LocalEncrypt(pin) => {
+                    let row = result.value()?;
+                    let settings = BucketEncryption::from_row(row.as_deref())
+                        .map_err(|error| CatalogError::Storage(error.to_string()))?;
+                    if settings.is_encrypted() {
+                        Self::failed(ContractError::Denied {
+                            message: "encrypted inputs require a protected workflow run".into(),
+                        })
+                    } else {
+                        self.head_pin(pin)
+                    }
+                }
+                PinPhase::LocalHead => match result.child::<HeadObjectResult, HeadObjectError>()? {
+                    Ok(_) => self.start_head(),
+                    Err(
+                        HeadObjectError::NoSuchKey
+                        | HeadObjectError::NoSuchVersion
+                        | HeadObjectError::DeleteMarker,
+                    ) if matches!(self.call, DataCall::Stat { .. }) => {
+                        Ok(Next::Done(HostRpcResult::StorageStat { entry: None }))
+                    }
+                    Err(
+                        HeadObjectError::NoSuchKey
+                        | HeadObjectError::NoSuchVersion
+                        | HeadObjectError::DeleteMarker,
+                    ) => Self::failed(ContractError::NotFound {
+                        message: format!("{} does not exist", self.call.address()),
+                    }),
+                    Err(error) => Err(CatalogError::Storage(error.to_string())),
+                },
+            },
             RemoteStep::Head => match read_answer(result)? {
                 Ok(BaoReadOutput::Metadata { size, hashes, .. })
                 | Ok(BaoReadOutput::Stream { size, hashes, .. }) => self.headed(size, &hashes),
+                Ok(BaoReadOutput::Authorized) => Err(IoError::Unfinished.into()),
                 Err(error) => Self::failed(error),
             },
             RemoteStep::Read => match read_answer(result)? {
@@ -631,7 +783,9 @@ impl Operation for RemoteReadOperation {
                     self.step = RemoteStep::Collect;
                     Ok(Next::Call(IoCall::Effect(Box::new(Effect::Job(collect)))))
                 }
-                Ok(BaoReadOutput::Metadata { .. }) => Err(IoError::Unfinished.into()),
+                Ok(BaoReadOutput::Metadata { .. } | BaoReadOutput::Authorized) => {
+                    Err(IoError::Unfinished.into())
+                }
                 Err(error) => Self::failed(error),
             },
             RemoteStep::Collect => {
@@ -656,6 +810,18 @@ impl Operation for RemoteReadOperation {
             RemoteStep::AuthList(mut state) => {
                 let check = state.checking.take().ok_or(IoError::Unfinished)?;
                 match check.phase {
+                    CheckPhase::LinkPin => match result.child::<BaoReadOutput, BaoReadError>()? {
+                        Ok(BaoReadOutput::Authorized) => match check.follow_up {
+                            Some(target) => self.check_target(*state, check.entry, target),
+                            None => self.accept_entry(*state, check.entry),
+                        },
+                        Ok(_) => Err(IoError::Unfinished.into()),
+                        Err(BaoReadError::Refused(BaoReadRefusal::ReadDenied)) => {
+                            self.next_dir_auth(*state)
+                        }
+                        Err(BaoReadError::Refused(refusal)) => Self::failed(refusal_error(refusal)),
+                        Err(error) => Self::failed(ContractError::internal(error.to_string())),
+                    },
                     CheckPhase::Remote => match result.child::<BaoReadOutput, BaoReadError>()? {
                         Ok(BaoReadOutput::Metadata { .. }) | Ok(BaoReadOutput::Stream { .. }) => {
                             match check.follow_up {
@@ -663,6 +829,7 @@ impl Operation for RemoteReadOperation {
                                 None => self.accept_entry(*state, check.entry),
                             }
                         }
+                        Ok(BaoReadOutput::Authorized) => Err(IoError::Unfinished.into()),
                         Err(BaoReadError::Refused(BaoReadRefusal::ReadDenied)) => {
                             self.next_dir_auth(*state)
                         }
@@ -1056,6 +1223,15 @@ mod tests {
         )))
     }
 
+    fn ok_auth() -> IoResult {
+        IoResult::Child(aruna_core::calls::ChildOutcome::new(Ok::<
+            BaoReadOutput,
+            BaoReadError,
+        >(
+            BaoReadOutput::Authorized,
+        )))
+    }
+
     fn refused_meta(reason: aruna_core::replication_protocol::BaoReadRefusal) -> IoResult {
         IoResult::Child(aruna_core::calls::ChildOutcome::new(Err::<
             BaoReadOutput,
@@ -1128,6 +1304,7 @@ mod tests {
             },
         );
         let first = list.first().unwrap();
+        assert!(format!("{first:?}").contains("LinkAccess"));
         assert!(format!("{first:?}").contains("folder/alias.link"));
         assert!(matches!(
             list.next(refused_meta(BaoReadRefusal::ReadDenied)).unwrap(),
@@ -1143,6 +1320,7 @@ mod tests {
             },
         );
         let first = stat.first().unwrap();
+        assert!(format!("{first:?}").contains("LinkAccess"));
         assert!(format!("{first:?}").contains("folder/alias.link"));
         assert_eq!(
             stat.next(refused_meta(BaoReadRefusal::ReadDenied)).unwrap(),
@@ -1162,7 +1340,7 @@ mod tests {
             list.first().unwrap(),
             Next::Call(IoCall::Child(_))
         ));
-        let second = list.next(ok_meta()).unwrap();
+        let second = list.next(ok_auth()).unwrap();
         assert!(format!("{second:?}").contains("real.txt"));
         assert!(matches!(
             list.next(refused_meta(BaoReadRefusal::ReadDenied)).unwrap(),
@@ -1183,7 +1361,7 @@ mod tests {
             Next::Call(IoCall::Child(_))
         ));
         assert!(matches!(
-            list.next(ok_meta()).unwrap(),
+            list.next(ok_auth()).unwrap(),
             Next::Call(IoCall::Child(_))
         ));
         assert_eq!(
@@ -1207,8 +1385,9 @@ mod tests {
             },
         );
         let first = list.first().unwrap();
+        assert!(format!("{first:?}").contains("LinkAccess"));
         assert!(format!("{first:?}").contains("folder/alias.link"));
-        let second = list.next(ok_meta()).unwrap();
+        let second = list.next(ok_auth()).unwrap();
         assert!(format!("{second:?}").contains("ObjectAccessOperation"));
         let info = BucketInfo {
             group_id: aruna_core::types::GroupId::from_bytes([1; 16]),
@@ -1255,6 +1434,131 @@ mod tests {
                 }],
             })
         );
+    }
+
+    // Direct remote file stat/download checks READ on the original link pin before the target.
+    #[test]
+    fn checks_direct_link() {
+        use aruna_core::calls::ChildOutcome;
+        use aruna_core::structs::storage::blob::BucketInfo;
+
+        let link_ver = Ulid::from_parts(2, 1);
+        let real_ver = Ulid::from_parts(3, 1);
+        let make_run = |pin_node: NodeId| {
+            let sel = InputSelection {
+                source: InputSource::S3 {
+                    bucket: "other".into(),
+                    key: "real.txt".into(),
+                    version_id: Some(real_ver.to_string()),
+                },
+                source_node_id: Some(node(3)),
+                dest_key: "data/standalone.link".into(),
+                mode: InputMode::Snapshot,
+                container_path: None,
+                name: None,
+                description: None,
+            };
+            let mut cap = captured_input(&sel, node(3));
+            cap.version_id = real_ver;
+            let mut run = base_run();
+            run.captured_remote.push(PrecapturedInput {
+                pin_node_id: pin_node,
+                pin_bucket: "data".into(),
+                pin_key: "standalone.link".into(),
+                pin_version_id: link_ver,
+                resolved: sel,
+                captured: cap,
+            });
+            run
+        };
+
+        // Standalone unversioned remote link preserves pin_version_id and checks LinkAccess first.
+        let run = make_run(node(2));
+        let req_target = Target {
+            bucket: "data".into(),
+            key: "standalone.link".into(),
+            version: None,
+            owned: false,
+            node: Some(node(2)),
+        };
+        let mut denied = RemoteReadOperation::new(
+            run.clone(),
+            req_target.clone(),
+            node(3),
+            DataCall::Stat {
+                address: "s3://data/standalone.link".into(),
+            },
+        );
+        assert_eq!(
+            denied.version().as_deref(),
+            Some(link_ver.to_string().as_str())
+        );
+        let first = denied.first().unwrap();
+        assert!(format!("{first:?}").contains("LinkAccess"));
+        assert!(format!("{first:?}").contains("standalone.link"));
+        assert!(matches!(
+            denied
+                .next(refused_meta(BaoReadRefusal::ReadDenied))
+                .unwrap(),
+            Next::Done(HostRpcResult::Failed(ContractError::Denied { .. }))
+        ));
+
+        let mut allowed = RemoteReadOperation::new(
+            run,
+            req_target,
+            node(3),
+            DataCall::Stat {
+                address: "s3://data/standalone.link".into(),
+            },
+        );
+        assert!(matches!(
+            allowed.first().unwrap(),
+            Next::Call(IoCall::Child(_))
+        ));
+        let head = allowed.next(ok_auth()).unwrap();
+        assert!(format!("{head:?}").contains("ExactVersion"));
+        assert!(format!("{head:?}").contains("real.txt"));
+        match allowed.next(ok_meta()).unwrap() {
+            Next::Done(HostRpcResult::StorageStat { entry: Some(entry) }) => {
+                assert_eq!(
+                    entry.version.as_deref(),
+                    Some(link_ver.to_string().as_str())
+                );
+            }
+            other => panic!("expected file stat, got {other:?}"),
+        }
+
+        // Local link resolving to a remote target checks local ObjectAccess before remote Head.
+        let local_run = make_run(node(1));
+        let local_target = Target {
+            bucket: "data".into(),
+            key: "standalone.link".into(),
+            version: None,
+            owned: false,
+            node: None,
+        };
+        let mut local_denied = RemoteReadOperation::new(
+            local_run,
+            local_target,
+            node(3),
+            DataCall::Stat {
+                address: "s3://data/standalone.link".into(),
+            },
+        );
+        let first = local_denied.first().unwrap();
+        assert!(format!("{first:?}").contains("ObjectAccessOperation"));
+        assert!(format!("{first:?}").contains("standalone.link"));
+        assert!(matches!(
+            local_denied
+                .next(IoResult::Child(ChildOutcome::new(Err::<
+                    BucketInfo,
+                    CatalogError,
+                >(
+                    CatalogError::Forbidden
+                ))))
+                .unwrap(),
+            Next::Done(HostRpcResult::Failed(ContractError::Denied { .. }))
+        ));
     }
 
     // Non-permission holder refusals fail remote directory listings instead of dropping files.
