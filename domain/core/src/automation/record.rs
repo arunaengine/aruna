@@ -8,7 +8,16 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use super::scope::{Audience, Scope};
+use crate::errors::ConversionError;
+use crate::id::NodeId;
+use crate::permission_path::escape_permission_path;
+use crate::plugin_runs::SourceEvent;
+use crate::structs::execution::workflow::workflow_permission_path;
 use crate::structs::execution::workflow_run::WorkflowSecretBinding;
+use crate::structs::identity::auth::Permission;
+use crate::structs::identity::realm::RealmId;
+use crate::types::{GroupId, RoleId};
+use crate::user::id::UserId;
 
 /// Default expiry window for an approval stage: 7 days.
 pub const DEFAULT_APPROVAL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
@@ -177,5 +186,103 @@ impl Spec {
         self.stages
             .iter()
             .any(|stage| matches!(stage.kind, StageKind::Run { .. }))
+    }
+}
+
+/// A proposed definition waiting for a human group admin's approval.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingChange {
+    pub spec: Spec,
+    pub requested_by: UserId,
+    pub requested_at_ms: u64,
+}
+
+/// Node-local automation record, kept outside `RealmConfigDocument`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Automation {
+    pub automation_id: Ulid,
+    pub group_id: GroupId,
+    pub name: String,
+    pub description: String,
+    pub host_node: NodeId,
+    pub lifecycle: Lifecycle,
+    pub pause_reason: Option<PauseReason>,
+    pub spec: Spec,
+    pub pending: Option<PendingChange>,
+    pub account: Option<UserId>,
+    pub role_id: Option<RoleId>,
+    pub approved_by: Option<UserId>,
+    pub approved_at_ms: Option<u64>,
+    pub created_by: UserId,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub revision: u64,
+}
+
+impl Automation {
+    /// Whether this automation should hold an active service account and role right now.
+    pub fn wants_account(&self) -> bool {
+        self.lifecycle == Lifecycle::Active && self.approved_by.is_some()
+    }
+
+    /// The human admin whose authority manages the service account and role.
+    pub fn granter(&self) -> Option<UserId> {
+        self.approved_by
+    }
+
+    /// Permission paths granted to the automation's service account role.
+    pub fn role_paths(&self, realm_id: RealmId, node: NodeId) -> Vec<(String, Permission)> {
+        let mut paths = Vec::new();
+        for pattern in &self.spec.scope.read {
+            paths.push((pattern.clone(), Permission::READ));
+        }
+        for pattern in &self.spec.scope.write {
+            paths.push((pattern.clone(), Permission::WRITE));
+        }
+        let meta_root = format!("/{realm_id}/g/{}/meta", self.group_id);
+        for prefix in &self.spec.scope.metadata {
+            let trimmed = prefix.trim_matches('/');
+            let full = match trimmed.is_empty() {
+                true => meta_root.clone(),
+                false => format!("{meta_root}/{}", escape_permission_path(trimmed)),
+            };
+            paths.push((format!("{full}/**"), Permission::WRITE));
+        }
+        if !self.spec.scope.workflows.is_empty() || self.spec.has_runs() {
+            paths.push((
+                workflow_permission_path(realm_id, self.group_id),
+                Permission::WRITE,
+            ));
+        }
+        let _ = node;
+        paths
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+/// Matched event stored while an automation is paused, awaiting approval or throttled.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeptEvent {
+    pub event_id: Ulid,
+    pub automation_id: Ulid,
+    pub event: SourceEvent,
+    pub reason: String,
+    pub kept_at_ms: u64,
+}
+
+impl KeptEvent {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
     }
 }
