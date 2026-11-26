@@ -4,6 +4,7 @@
 
 pub mod dag;
 pub mod diff;
+pub mod firing;
 pub mod glob;
 pub mod graph;
 pub mod keys;
