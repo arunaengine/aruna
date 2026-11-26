@@ -276,6 +276,7 @@ struct OutputDir {
     raw_target: String,
     canonical: PathBuf,
     parent_scope: Option<String>,
+    listing_scope: Option<String>,
     basename: Option<String>,
     target_path: String,
     leaf_empty: bool,
@@ -373,20 +374,23 @@ fn plan_outputs(
                 &mut sub_dirs,
             )?;
             let target_base = Path::new(&item.source);
+            let copy_scope = Some(target_path.clone());
             for (local, rel) in entries {
                 check_path(&rel)?;
                 let parent_dir = rel
                     .rsplit_once('/')
                     .map(|(parent, _)| parent.to_owned())
                     .or_else(|| Some(target_path.clone()));
+                // Scope all descendants to this walked copy root so secondaryFiles resolve
+                // across subdirectories without mixing receipts between duplicate copies.
                 let mut raw_targets = vec![ReceiptKey {
-                    scope: parent_dir.clone(),
+                    scope: copy_scope.clone(),
                     basename: None,
                     path: local.to_string_lossy().into_owned(),
                 }];
                 if let Ok(inner) = local.strip_prefix(&source) {
                     let joined = ReceiptKey {
-                        scope: parent_dir.clone(),
+                        scope: copy_scope.clone(),
                         basename: None,
                         path: target_base.join(inner).to_string_lossy().into_owned(),
                     };
@@ -411,15 +415,12 @@ fn plan_outputs(
                     .strip_prefix(&source)
                     .map(|inner| target_base.join(inner).to_string_lossy().into_owned())
                     .unwrap_or_else(|_| sub_canon.to_string_lossy().into_owned());
-                let sub_parent = sub_rel
-                    .rsplit_once('/')
-                    .map(|(parent, _)| parent.to_owned())
-                    .or_else(|| Some(target_path.clone()));
                 let leaf_empty = is_empty_dir(&sub_canon);
                 dirs.push(OutputDir {
                     raw_target: raw_sub,
                     canonical: sub_canon,
-                    parent_scope: sub_parent,
+                    parent_scope: copy_scope.clone(),
+                    listing_scope: None,
                     basename: None,
                     target_path: sub_rel,
                     leaf_empty,
@@ -430,6 +431,7 @@ fn plan_outputs(
                 raw_target: item.source,
                 canonical: source,
                 parent_scope: item.parent_dir,
+                listing_scope: copy_scope,
                 basename: item.basename,
                 target_path,
                 leaf_empty,
@@ -527,9 +529,11 @@ fn register_dir(dir: OutputDir, prefix: String, receipts: &mut Receipts) {
         path: dir.canonical.to_string_lossy().into_owned(),
     };
     receipts.insert(raw_key.clone(), prefix.clone());
-    receipts.insert_scope(raw_key, dir.target_path.clone());
     receipts.insert(canon_key.clone(), prefix);
-    receipts.insert_scope(canon_key, dir.target_path);
+    if let Some(scope) = dir.listing_scope {
+        receipts.insert_scope(raw_key, scope.clone());
+        receipts.insert_scope(canon_key, scope);
+    }
 }
 
 /// Populates missing-directory receipts only from children actually delivered beneath each prefix.
@@ -1569,7 +1573,13 @@ mod tests {
                 "location": format!("file://{}", shared.display()),
                 "basename": name,
                 "listing": [
-                    {"class": "File", "location": format!("file://{}", f_path.display())},
+                    {
+                        "class": "File",
+                        "location": format!("file://{}", f_path.display()),
+                        "secondaryFiles": [
+                            {"class": "File", "location": format!("file://{}", g_path.display())},
+                        ],
+                    },
                     {
                         "class": "Directory",
                         "location": format!("file://{}", nested.display()),
@@ -1581,6 +1591,19 @@ mod tests {
             })
         };
         let outputs = json!({
+            "bundle": {
+                "class": "Directory",
+                "location": format!("file://{}", shared.display()),
+                "listing": [
+                    {
+                        "class": "File",
+                        "location": format!("file://{}", f_path.display()),
+                        "secondaryFiles": [
+                            {"class": "File", "location": format!("file://{}", g_path.display())},
+                        ],
+                    },
+                ],
+            },
             "missing_parent": {
                 "class": "Directory",
                 "location": format!("file://{}", absent.display()),
@@ -1596,6 +1619,8 @@ mod tests {
                 "absent/left/nested/g.txt",
                 "absent/right/f.txt",
                 "absent/right/nested/g.txt",
+                "shared/f.txt",
+                "shared/nested/g.txt",
             ]
         );
         let mut receipts = Receipts::default();
@@ -1621,6 +1646,18 @@ mod tests {
         let mut rewritten = outputs;
         rewrite_locations(&mut rewritten, &receipts, None);
         assert_eq!(
+            rewritten["bundle"]["location"],
+            "aruna://results/run/shared/"
+        );
+        assert_eq!(
+            rewritten["bundle"]["listing"][0]["location"],
+            "aruna://results/run/shared/f.txt?version=v4"
+        );
+        assert_eq!(
+            rewritten["bundle"]["listing"][0]["secondaryFiles"][0]["location"],
+            "aruna://results/run/shared/nested/g.txt?version=v5"
+        );
+        assert_eq!(
             rewritten["missing_parent"]["location"],
             "aruna://results/run/absent/"
         );
@@ -1630,6 +1667,10 @@ mod tests {
         assert_eq!(
             left["listing"][0]["location"],
             "aruna://results/run/absent/left/f.txt?version=v0"
+        );
+        assert_eq!(
+            left["listing"][0]["secondaryFiles"][0]["location"],
+            "aruna://results/run/absent/left/nested/g.txt?version=v1"
         );
         assert_eq!(
             left["listing"][1]["location"],
@@ -1643,6 +1684,10 @@ mod tests {
         assert_eq!(
             right["listing"][0]["location"],
             "aruna://results/run/absent/right/f.txt?version=v2"
+        );
+        assert_eq!(
+            right["listing"][0]["secondaryFiles"][0]["location"],
+            "aruna://results/run/absent/right/nested/g.txt?version=v3"
         );
         assert_eq!(
             right["listing"][1]["location"],
