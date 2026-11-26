@@ -263,7 +263,8 @@ pub fn copy_error(error: CopyObjectError) -> JobError {
         CopyObjectError::Get(_)
         | CopyObjectError::Put(_)
         | CopyObjectError::Reference(_)
-        | CopyObjectError::PreconditionFailed => JobError::permanent(error.to_string()),
+        | CopyObjectError::PreconditionFailed
+        | CopyObjectError::EncryptionDowngrade => JobError::permanent(error.to_string()),
     }
 }
 
