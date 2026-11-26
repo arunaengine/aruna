@@ -167,14 +167,20 @@ impl CoordinatorBackend {
             apply_settings(settings, &mut resources, &mut site, &mut network_allowed);
         }
         let direct_inputs = (job.staging.direct.iter())
-            .map(|direct| DirectInput {
-                path: direct.path.clone(),
-                address: storage::normalize_address(&direct.source),
-                digest: direct.digest.to_string(),
-                size: direct.size,
-                executable: direct.executable,
-                aruna_id: direct.reference.aruna_id.clone(),
-                endpoints: direct.endpoints.clone(),
+            .map(|direct| {
+                let raw = match direct.reference.url.is_empty() {
+                    false => direct.reference.url.as_str(),
+                    true => direct.source.as_str(),
+                };
+                DirectInput {
+                    path: direct.path.clone(),
+                    address: storage::normalize_address(raw),
+                    digest: direct.digest.to_string(),
+                    size: direct.size,
+                    executable: direct.executable,
+                    aruna_id: direct.reference.aruna_id.clone(),
+                    endpoints: direct.endpoints.clone(),
+                }
             })
             .collect();
         let staged_files = self.stage_inputs(job).await?;

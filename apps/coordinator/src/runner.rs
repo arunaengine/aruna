@@ -184,6 +184,7 @@ struct OutputDir {
     raw_target: String,
     canonical: PathBuf,
     target_path: String,
+    leaf_empty: bool,
 }
 
 /// Delivers every declared workflow output written into the coordinator workspace to the host and
@@ -288,16 +289,20 @@ async fn deliver_outputs(
                     .strip_prefix(&source)
                     .map(|inner| target_base.join(inner).to_string_lossy().into_owned())
                     .unwrap_or_else(|_| sub_canon.to_string_lossy().into_owned());
+                let leaf_empty = is_empty_dir(&sub_canon);
                 dirs.push(OutputDir {
                     raw_target: raw_sub,
                     canonical: sub_canon,
                     target_path: sub_rel,
+                    leaf_empty,
                 });
             }
+            let leaf_empty = is_empty_dir(&source);
             dirs.push(OutputDir {
                 raw_target: target,
                 canonical: source,
                 target_path,
+                leaf_empty,
             });
         } else if meta.is_file() {
             check_path(&target_path)?;
@@ -361,15 +366,38 @@ async fn deliver_outputs(
         }
     }
     for dir in dirs {
-        let prefix = output_base
-            .map(|base| prefix_for(base, &dir.target_path))
-            .or_else(|| {
-                dir_sample
-                    .get(&dir.target_path)
-                    .or(any_sample.as_ref())
-                    .and_then(|(rel, loc)| output_prefix(loc, rel, &dir.target_path))
-            })
-            .unwrap_or_else(|| format!("{}/", dir.target_path.trim_end_matches('/')));
+        let prefix = if dir.leaf_empty {
+            if rpc.cancel_token().is_cancelled() {
+                return Ok(());
+            }
+            let call = HostRpcRequest::DeliverOutput {
+                source_ref: String::new(),
+                target_path: format!("{}/", dir.target_path.trim_end_matches('/')),
+            };
+            match rpc.call(call).await? {
+                HostRpcResult::Delivered { location } => {
+                    if any_sample.is_none() {
+                        any_sample = Some((dir.target_path.clone(), location.clone()));
+                    }
+                    location
+                }
+                other => {
+                    return Err(ContractError::invalid(format!(
+                        "unexpected delivery answer {other:?}"
+                    )));
+                }
+            }
+        } else {
+            output_base
+                .map(|base| prefix_for(base, &dir.target_path))
+                .or_else(|| {
+                    dir_sample
+                        .get(&dir.target_path)
+                        .or(any_sample.as_ref())
+                        .and_then(|(rel, loc)| output_prefix(loc, rel, &dir.target_path))
+                })
+                .unwrap_or_else(|| format!("{}/", dir.target_path.trim_end_matches('/')))
+        };
         receipts.insert(dir.raw_target, prefix.clone());
         receipts.insert(dir.canonical.to_string_lossy().into_owned(), prefix);
     }
@@ -377,6 +405,13 @@ async fn deliver_outputs(
         rewrite_locations(value, &receipts);
     }
     Ok(())
+}
+
+fn is_empty_dir(path: &Path) -> bool {
+    std::fs::read_dir(path)
+        .ok()
+        .and_then(|mut iter| iter.next())
+        .is_none()
 }
 
 /// Formats a delivered directory URI beneath the run's configured output base.
@@ -436,7 +471,17 @@ fn collect_output_paths(value: &Value, root: &Path, canonical_root: &Path, out: 
                 && entry_path
                     .as_deref()
                     .is_some_and(|p| !served(p) && Path::new(p).is_dir());
-            if let Some(path) = entry_path {
+            let has_listing = class == Some("Directory")
+                && map
+                    .get("listing")
+                    .and_then(Value::as_array)
+                    .is_some_and(|items| !items.is_empty());
+            let push_entry = match (class, entry_path.as_deref()) {
+                (Some("Directory"), Some(_)) if !walked_dir && has_listing => false,
+                (_, Some(_)) => true,
+                _ => false,
+            };
+            if push_entry && let Some(path) = entry_path {
                 out.push(path);
             }
             for (key, item) in map {
@@ -970,6 +1015,14 @@ mod tests {
                     "path": extra.to_string_lossy(),
                 }],
             },
+            "missing_parent": {
+                "class": "Directory",
+                "location": format!("file://{}", out_dir.join("absent").display()),
+                "listing": [{
+                    "class": "File",
+                    "path": extra.to_string_lossy(),
+                }],
+            },
         });
         let mut found = Vec::new();
         collect_output_paths(&outputs, root, &canon, &mut found);
@@ -978,6 +1031,7 @@ mod tests {
             vec![
                 main.to_string_lossy().into_owned(),
                 idx.to_string_lossy().into_owned(),
+                extra.to_string_lossy().into_owned(),
                 extra.to_string_lossy().into_owned(),
             ]
         );

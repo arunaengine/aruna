@@ -170,6 +170,8 @@ pub struct MockNode {
     pub stopped_runs: Vec<String>,
     pub pinned: Vec<String>,
     pub delivered: Vec<(String, String)>,
+    pub downloads: Vec<String>,
+    pub listed: Vec<String>,
     pub fail_delivery: Option<String>,
     pub omit_sha256: bool,
     pub events: Vec<LiveWorkflowEvent>,
@@ -188,6 +190,8 @@ impl MockNode {
             stopped_runs: Vec::new(),
             pinned: Vec::new(),
             delivered: Vec::new(),
+            downloads: Vec::new(),
+            listed: Vec::new(),
             fail_delivery: None,
             omit_sha256: false,
             events: Vec::new(),
@@ -241,7 +245,12 @@ impl MockNode {
                         "malformed query in {address}"
                     ))));
                 }
-                match self.files.get(&address) {
+                let Some(decoded) = decode_addr(&address) else {
+                    return Some(HostRpcResult::Failed(ContractError::invalid(format!(
+                        "malformed escape in {address}"
+                    ))));
+                };
+                match self.files.get(&decoded) {
                     Some(bytes) => HostRpcResult::StorageStat {
                         entry: Some(StorageEntry {
                             directory: false,
@@ -250,12 +259,12 @@ impl MockNode {
                             version: Some("v1".into()),
                             sha256: (!self.omit_sha256)
                                 .then(|| task_model::Digest::sha256(bytes).hex().to_owned()),
-                            aruna_id: Some(address.rsplit('/').next().unwrap_or_default().into()),
+                            aruna_id: Some(decoded.rsplit('/').next().unwrap_or_default().into()),
                             endpoints: vec!["node-a".into()],
                         }),
                     },
                     None => {
-                        let (base, query) = address.split_once('?').unwrap_or((&address, ""));
+                        let (base, query) = decoded.split_once('?').unwrap_or((&decoded, ""));
                         let prefix = base.trim_end_matches('/').to_owned() + "/";
                         let is_dir = self.files.keys().any(|key| {
                             let (kbase, kquery) = key.split_once('?').unwrap_or((key, ""));
@@ -283,7 +292,13 @@ impl MockNode {
                         "malformed query in {address}"
                     ))));
                 }
-                let (base, query) = address.split_once('?').unwrap_or((&address, ""));
+                self.listed.push(address.clone());
+                let Some(decoded) = decode_addr(&address) else {
+                    return Some(HostRpcResult::Failed(ContractError::invalid(format!(
+                        "malformed escape in {address}"
+                    ))));
+                };
+                let (base, query) = decoded.split_once('?').unwrap_or((&decoded, ""));
                 let prefix = base.trim_end_matches('/').to_owned() + "/";
                 let mut entries: BTreeMap<String, bool> = BTreeMap::new();
                 for key in self.files.keys() {
@@ -314,7 +329,13 @@ impl MockNode {
                         "malformed query in {address}"
                     ))));
                 }
-                let Some(bytes) = self.files.get(&address) else {
+                self.downloads.push(address.clone());
+                let Some(decoded) = decode_addr(&address) else {
+                    return Some(HostRpcResult::Failed(ContractError::invalid(format!(
+                        "malformed escape in {address}"
+                    ))));
+                };
+                let Some(bytes) = self.files.get(&decoded) else {
                     let message = format!("no file {address}");
                     return Some(HostRpcResult::Failed(ContractError::NotFound { message }));
                 };
@@ -415,6 +436,15 @@ impl MockNode {
             ..TaskFinished::default()
         }
     }
+}
+
+fn decode_addr(address: &str) -> Option<String> {
+    let (path, query) = address.split_once('?').unwrap_or((address, ""));
+    let decoded = aruna_workflow_contract::host::decode_key(path)?;
+    Some(match query.is_empty() {
+        true => decoded,
+        false => format!("{decoded}?{query}"),
+    })
 }
 
 /// Drives a run session to its end: answers every call of the coordinator, records the

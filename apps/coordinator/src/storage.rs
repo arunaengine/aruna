@@ -3,8 +3,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use aruna_workflow_contract::host::StorageEntry;
@@ -23,11 +25,44 @@ pub const SCHEMES: [&str; 2] = ["aruna://", "s3://"];
 
 pub struct CoordinatorStorage {
     rpc: RpcClient,
+    /// Maps unencoded child URIs synthesized by uwe back to the provider's encoded child URI.
+    tree_children: Mutex<HashMap<String, String>>,
 }
 
 impl CoordinatorStorage {
     pub fn new(rpc: RpcClient) -> CoordinatorStorage {
-        CoordinatorStorage { rpc }
+        CoordinatorStorage {
+            rpc,
+            tree_children: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn resolve_address(&self, address: &str) -> String {
+        if let Some(encoded) = self
+            .tree_children
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(address)
+            .cloned()
+        {
+            return encoded;
+        }
+        normalize_address(address)
+    }
+
+    fn record_child(&self, raw_root: &str, norm_root: &str, path: &str, encoded: &str) {
+        let mut guard = self
+            .tree_children
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        guard.insert(
+            format!("{}/{path}", raw_root.trim_end_matches('/')),
+            encoded.to_owned(),
+        );
+        guard.insert(
+            format!("{}/{path}", norm_root.trim_end_matches('/')),
+            encoded.to_owned(),
+        );
     }
 }
 
@@ -50,7 +85,7 @@ impl StorageProvider for CoordinatorStorage {
         address: &'a str,
     ) -> BoxFuture<'a, Result<Option<Details>, StorageError>> {
         Box::pin(async move {
-            let normalized = normalize_address(address);
+            let normalized = self.resolve_address(address);
             let request = HostRpcRequest::StorageStat {
                 address: normalized.clone(),
             };
@@ -130,6 +165,7 @@ impl StorageProvider for CoordinatorStorage {
                             address: storage::address::redacted(&child),
                             provider: self.name().to_owned(),
                         })?;
+                    self.record_child(address, &root, &path, &child);
                     manifest.files.push(TreeFile {
                         path,
                         size: found.metadata.size,
@@ -153,7 +189,7 @@ impl StorageProvider for CoordinatorStorage {
         target: &'a Path,
     ) -> BoxFuture<'a, Result<Option<String>, StorageError>> {
         Box::pin(async move {
-            let normalized = normalize_address(address);
+            let normalized = self.resolve_address(address);
             download_file(&self.rpc, &normalized, target)
                 .await
                 .map_err(|error| failed("read", &normalized, error))

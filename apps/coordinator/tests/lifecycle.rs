@@ -380,4 +380,149 @@ outputs:
     let fetch_node = finished_run("run-dir-fetch", start(), fetch_node).await;
     assert_eq!(fetch_node.tasks.len(), 1);
     assert!(!fetch_node.tasks[0].staged_files.is_empty());
+
+    // CWL deep loadListing preserves RFC 3986 `node@bucket` authority across nested subdirs.
+    let deep_tool = r#"cwlVersion: v1.2
+class: CommandLineTool
+baseCommand: [ls]
+requirements:
+  DockerRequirement:
+    dockerPull: debian:stable-slim
+  LoadListingRequirement:
+    loadListing: deep_listing
+inputs:
+  folder:
+    type: Directory
+    inputBinding:
+      position: 1
+outputs:
+  done:
+    type: File
+    outputBinding:
+      glob: done.txt
+"#;
+    let mut deep_start = snakemake_start();
+    deep_start.source = source(&[("tool.cwl", deep_tool)]);
+    deep_start.entrypoint = "tool.cwl".into();
+    deep_start.language = Some(WorkflowLanguage::Cwl);
+    deep_start.inputs = json!({
+        "folder": {
+            "class": "Directory",
+            "location": "s3://node-remote@results/folder/",
+        }
+    });
+    let mut deep_node = MockNode::new(TaskMode::Succeed);
+    deep_node.files.insert(
+        "s3://node-remote@results/folder/a.txt".into(),
+        b"remote-alpha\n".to_vec(),
+    );
+    deep_node.files.insert(
+        "s3://node-remote@results/folder/sub/b.txt".into(),
+        b"remote-beta\n".to_vec(),
+    );
+    // Decoy local files under the same bucket/key must never be listed by deep loadListing.
+    deep_node.files.insert(
+        "s3://results/folder/sub/decoy.txt".into(),
+        b"local-decoy\n".to_vec(),
+    );
+    let deep_node = finished_run("run-dir-deep", deep_start, deep_node).await;
+    assert!(
+        deep_node
+            .listed
+            .iter()
+            .any(|addr| addr.starts_with("s3://node-remote@results/folder/sub")),
+        "{:?}",
+        deep_node.listed
+    );
+    assert!(
+        deep_node
+            .listed
+            .iter()
+            .all(|addr| addr.starts_with("s3://node-remote@results/")),
+        "deep loadListing leaked onto local coordinator: {:?}",
+        deep_node.listed
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stages_percent_children() {
+    let tool = r#"cwlVersion: v1.2
+class: CommandLineTool
+baseCommand: [ls]
+requirements:
+  DockerRequirement:
+    dockerPull: debian:stable-slim
+inputs:
+  folder:
+    type: Directory
+    inputBinding:
+      position: 1
+outputs:
+  done:
+    type: File
+    outputBinding:
+      glob: done.txt
+"#;
+    let start = || {
+        let mut s = snakemake_start();
+        s.source = source(&[("tool.cwl", tool)]);
+        s.entrypoint = "tool.cwl".into();
+        s.language = Some(WorkflowLanguage::Cwl);
+        s.inputs = json!({
+            "folder": {
+                "class": "Directory",
+                "location": "s3://results/folder/",
+            }
+        });
+        s
+    };
+
+    // Both `a%20b` (literal percent escape) and `a b` (space) coexist without confusion.
+    let mut direct_node = MockNode::new(TaskMode::Succeed);
+    direct_node
+        .files
+        .insert("s3://results/folder/a%20b".into(), b"percent".to_vec());
+    direct_node
+        .files
+        .insert("s3://results/folder/a b".into(), b"space".to_vec());
+    let direct_node = finished_run("run-pct-direct", start(), direct_node).await;
+    let addrs: Vec<&str> = direct_node.tasks[0]
+        .direct_inputs
+        .iter()
+        .map(|d| d.address.as_str())
+        .collect();
+    assert!(
+        addrs.contains(&"s3://results/folder/a%2520b"),
+        "expected encoded percent child in direct inputs: {addrs:?}"
+    );
+    assert!(
+        addrs.contains(&"s3://results/folder/a b"),
+        "expected space child in direct inputs: {addrs:?}"
+    );
+
+    let mut fetch_node = MockNode::new(TaskMode::Succeed);
+    fetch_node.omit_sha256 = true;
+    fetch_node
+        .files
+        .insert("s3://results/folder/a%20b".into(), b"percent".to_vec());
+    fetch_node
+        .files
+        .insert("s3://results/folder/a b".into(), b"space".to_vec());
+    let fetch_node = finished_run("run-pct-fetch", start(), fetch_node).await;
+    assert!(
+        fetch_node
+            .downloads
+            .iter()
+            .any(|addr| addr == "s3://results/folder/a%2520b"),
+        "download fallback must request encoded percent child: {:?}",
+        fetch_node.downloads
+    );
+    assert!(
+        fetch_node
+            .downloads
+            .iter()
+            .any(|addr| addr == "s3://results/folder/a b"),
+        "download fallback must request space child: {:?}",
+        fetch_node.downloads
+    );
 }
