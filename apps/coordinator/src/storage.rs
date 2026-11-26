@@ -148,19 +148,25 @@ fn details(address: &str, entry: StorageEntry) -> Details {
     }
 }
 
+/// Whether `address` already pins an explicit `version=` query parameter.
+pub(crate) fn has_version(address: &str) -> bool {
+    address.split_once('?').is_some_and(|(_, query)| {
+        query.split('&').any(|pair| {
+            pair.split_once('=')
+                .is_some_and(|(key, val)| key == "version" && !val.is_empty())
+        })
+    })
+}
+
 /// Pins an unversioned `aruna://` or `s3://` address to `version` for later chunks.
-fn pin_version(address: &str, version: &str) -> String {
+pub(crate) fn pin_version(address: &str, version: &str) -> String {
     if !served(address) || version.is_empty() || version.contains(['&', '?', '#']) {
         return address.to_owned();
     }
     let Some((_, query)) = address.split_once('?') else {
         return format!("{address}?version={version}");
     };
-    let pinned = query.split('&').any(|pair| {
-        pair.split_once('=')
-            .is_some_and(|(key, _)| key == "version")
-    });
-    match pinned {
+    match has_version(address) {
         true => address.to_owned(),
         false if query.is_empty() => format!("{address}version={version}"),
         false => format!("{address}&version={version}"),

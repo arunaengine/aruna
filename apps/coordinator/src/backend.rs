@@ -77,8 +77,11 @@ impl CoordinatorBackend {
     }
 
     fn note_fetched(&self, done: &storage::Downloaded, address: &str) {
+        let Some(immutable) = pinned_address(address, done.version.as_deref()) else {
+            return;
+        };
         let mut guard = self.fetched.lock().unwrap_or_else(PoisonError::into_inner);
-        guard.insert((done.size, done.sha256), address.to_owned());
+        guard.insert((done.size, done.sha256), immutable);
     }
 
     async fn run_attempt(
@@ -626,6 +629,16 @@ fn folder_list_address(folder: &str) -> String {
     }
 }
 
+/// Returns an immutable version-pinned address for `address`, or `None` if no version is known.
+fn pinned_address(address: &str, version: Option<&str>) -> Option<String> {
+    if storage::has_version(address) {
+        return Some(address.to_owned());
+    }
+    let ver = version?;
+    let pinned = storage::pin_version(address, ver);
+    storage::has_version(&pinned).then_some(pinned)
+}
+
 /// Joins one listed child name onto a folder address, percent-encoding special key characters
 /// while leaving any query suffix intact.
 fn child_address(folder: &str, name: &str) -> String {
@@ -820,5 +833,19 @@ mod tests {
         );
         assert_eq!(output_local_path(root, "/"), None);
         assert_eq!(output_local_path(root, "../escape"), None);
+    }
+
+    #[test]
+    fn pins_fetched_addresses() {
+        assert_eq!(
+            pinned_address("aruna://results/dir/a.txt", Some("v1")).as_deref(),
+            Some("aruna://results/dir/a.txt?version=v1")
+        );
+        assert_eq!(
+            pinned_address("aruna://results/dir/a.txt?version=v0", Some("v1")).as_deref(),
+            Some("aruna://results/dir/a.txt?version=v0")
+        );
+        assert_eq!(pinned_address("aruna://results/dir/a.txt", None), None);
+        assert_eq!(pinned_address("aruna-staging://x/0", Some("v1")), None);
     }
 }

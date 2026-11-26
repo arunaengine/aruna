@@ -172,9 +172,17 @@ async fn prepare_and_run(
 /// One local file to deliver to the host under `target_path`.
 struct PendingFile {
     local: PathBuf,
-    raw_target: String,
+    raw_targets: Vec<String>,
+    parent_dir: Option<String>,
     target_path: String,
     remote_hint: Option<String>,
+}
+
+/// One declared output directory tracked so its summary location gets the output prefix.
+struct OutputDir {
+    raw_target: String,
+    canonical: PathBuf,
+    target_path: String,
 }
 
 /// Delivers every declared workflow output written into the coordinator workspace to the host and
@@ -194,8 +202,9 @@ async fn deliver_outputs(
         .map_err(|error| ContractError::internal(format!("read deliveries: {error}")))?;
     let mut delivery_sources: HashMap<String, String> = HashMap::new();
     for item in &deliveries {
-        delivery_sources.insert(item.target.clone(), item.location.clone());
-        if let Ok(canon) = std::fs::canonicalize(&item.target) {
+        let key = local_location(&item.target).unwrap_or_else(|| item.target.clone());
+        delivery_sources.insert(key.clone(), item.location.clone());
+        if let Ok(canon) = std::fs::canonicalize(&key) {
             delivery_sources.insert(canon.to_string_lossy().into_owned(), item.location.clone());
         }
     }
@@ -221,42 +230,67 @@ async fn deliver_outputs(
         true => deliveries
             .into_iter()
             .filter(|item| !served(&item.target))
-            .map(|item| (item.target, Some(item.location)))
+            .map(|item| {
+                let target = local_location(&item.target).unwrap_or(item.target);
+                (target, Some(item.location))
+            })
             .collect(),
     };
     let mut by_target: BTreeMap<String, PendingFile> = BTreeMap::new();
+    let mut dirs: Vec<OutputDir> = Vec::new();
     for (target, location) in raw {
         let target_path = relative_target(&target, root, &canonical_root)?;
         let remote_hint = location
             .as_deref()
-            .filter(|loc| served(loc))
+            .filter(|loc| served(loc) && storage::has_version(loc))
             .map(str::to_owned);
         let source = resolve_source(&target, location.as_deref(), &canonical_root)?;
         let meta = std::fs::metadata(&source).map_err(|error| {
             ContractError::internal(format!("cannot read output {target_path}: {error}"))
         })?;
         if meta.is_dir() {
+            check_path(&target_path)?;
             let mut entries = Vec::new();
             walk_output(&source, &target_path, &canonical_root, &mut entries)?;
+            let target_base = Path::new(&target);
             for (local, rel) in entries {
                 check_path(&rel)?;
+                let mut raw_targets = vec![local.to_string_lossy().into_owned()];
+                if let Ok(inner) = local.strip_prefix(&source) {
+                    let joined = target_base.join(inner).to_string_lossy().into_owned();
+                    if !raw_targets.contains(&joined) {
+                        raw_targets.push(joined);
+                    }
+                }
                 by_target.insert(
                     rel.clone(),
                     PendingFile {
                         local,
-                        raw_target: target.clone(),
+                        raw_targets,
+                        parent_dir: Some(target_path.clone()),
                         target_path: rel,
                         remote_hint: None,
                     },
                 );
             }
+            dirs.push(OutputDir {
+                raw_target: target,
+                canonical: source,
+                target_path,
+            });
         } else if meta.is_file() {
             check_path(&target_path)?;
+            let mut raw_targets = vec![target];
+            let canon = source.to_string_lossy().into_owned();
+            if !raw_targets.contains(&canon) {
+                raw_targets.push(canon);
+            }
             by_target.insert(
                 target_path.clone(),
                 PendingFile {
                     local: source,
-                    raw_target: target,
+                    raw_targets,
+                    parent_dir: None,
                     target_path,
                     remote_hint,
                 },
@@ -264,6 +298,8 @@ async fn deliver_outputs(
         }
     }
     let mut receipts: HashMap<String, String> = HashMap::new();
+    let mut dir_sample: HashMap<String, (String, String)> = HashMap::new();
+    let mut any_sample: Option<(String, String)> = None;
     for (index, item) in by_target.into_values().enumerate() {
         if rpc.cancel_token().is_cancelled() {
             return Ok(());
@@ -291,7 +327,26 @@ async fn deliver_outputs(
                 )));
             }
         };
-        receipts.insert(item.raw_target, location);
+        if any_sample.is_none() {
+            any_sample = Some((item.target_path.clone(), location.clone()));
+        }
+        if let Some(parent) = item.parent_dir {
+            dir_sample
+                .entry(parent)
+                .or_insert_with(|| (item.target_path.clone(), location.clone()));
+        }
+        for raw_key in item.raw_targets {
+            receipts.insert(raw_key, location.clone());
+        }
+    }
+    for dir in dirs {
+        let prefix = dir_sample
+            .get(&dir.target_path)
+            .or(any_sample.as_ref())
+            .and_then(|(rel, loc)| output_prefix(loc, rel, &dir.target_path))
+            .unwrap_or_else(|| format!("{}/", dir.target_path.trim_end_matches('/')));
+        receipts.insert(dir.raw_target, prefix.clone());
+        receipts.insert(dir.canonical.to_string_lossy().into_owned(), prefix);
     }
     if let Some(value) = outputs {
         rewrite_locations(value, &receipts);
@@ -299,36 +354,68 @@ async fn deliver_outputs(
     Ok(())
 }
 
-/// Collects file and directory output paths from `run.outputs` JSON values.
+/// Derives the delivered output prefix for `dir_path` from one delivered file receipt.
+fn output_prefix(location: &str, delivered_rel: &str, dir_path: &str) -> Option<String> {
+    let without_query = location.split_once('?').map_or(location, |(head, _)| head);
+    let encoded_rel = aruna_workflow_contract::host::encode_key(delivered_rel);
+    let base = without_query
+        .strip_suffix(&format!("/{encoded_rel}"))
+        .or_else(|| without_query.strip_suffix(&format!("/{delivered_rel}")))?;
+    let encoded_dir = aruna_workflow_contract::host::encode_key(dir_path.trim_end_matches('/'));
+    Some(format!("{base}/{encoded_dir}/"))
+}
+
+/// Converts a `file://` URI (percent-decoding UTF-8) or plain local path into a filesystem path.
+fn local_location(loc: &str) -> Option<String> {
+    if let Some(rest) = loc.strip_prefix("file://") {
+        let path = rest
+            .strip_prefix("localhost")
+            .filter(|p| p.starts_with('/'))
+            .unwrap_or(rest);
+        let decoded = aruna_workflow_contract::host::decode_key(path)?;
+        return (!decoded.contains('\0')).then_some(decoded);
+    }
+    Some(loc.to_owned())
+}
+
+/// Collects file and directory output paths (including `secondaryFiles`) from `run.outputs`.
 fn collect_output_paths(value: &Value, root: &Path, canonical_root: &Path, out: &mut Vec<String>) {
     match value {
         Value::Array(items) => items
             .iter()
             .for_each(|item| collect_output_paths(item, root, canonical_root, out)),
         Value::Object(map) => {
-            if matches!(
-                map.get("class").and_then(Value::as_str),
-                Some("File" | "Directory")
-            ) && let Some(loc) = map.get("location").and_then(Value::as_str)
+            let class = map.get("class").and_then(Value::as_str);
+            let is_entry = matches!(class, Some("File" | "Directory"));
+            if is_entry
+                && let Some(loc) = map.get("location").and_then(Value::as_str)
                 && !loc.is_empty()
                 && !loc.starts_with("_:")
+                && let Some(path) = local_location(loc)
             {
-                let path = loc.strip_prefix("file://").unwrap_or(loc);
-                out.push(path.to_owned());
-                return;
+                out.push(path);
             }
-            map.values()
-                .for_each(|item| collect_output_paths(item, root, canonical_root, out));
+            for (key, item) in map {
+                if is_entry && matches!(key.as_str(), "location" | "path") {
+                    continue;
+                }
+                if class == Some("Directory") && key == "listing" {
+                    continue;
+                }
+                collect_output_paths(item, root, canonical_root, out);
+            }
         }
         Value::String(text) => {
-            let path = text.strip_prefix("file://").unwrap_or(text);
-            let candidate = Path::new(path);
+            let Some(path) = local_location(text) else {
+                return;
+            };
+            let candidate = Path::new(&path);
             if candidate.is_absolute()
-                && !served(path)
-                && relative_target(path, root, canonical_root).is_ok()
+                && !served(&path)
+                && relative_target(&path, root, canonical_root).is_ok()
                 && candidate.exists()
             {
-                out.push(path.to_owned());
+                out.push(path);
             }
         }
         _ => {}
@@ -336,24 +423,31 @@ fn collect_output_paths(value: &Value, root: &Path, canonical_root: &Path, out: 
 }
 
 fn rewrite_locations(value: &mut Value, receipts: &HashMap<String, String>) {
+    let lookup = |loc: &str| -> Option<String> {
+        let raw = local_location(loc)?;
+        if let Some(delivered) = receipts.get(&raw) {
+            return Some(delivered.clone());
+        }
+        std::fs::canonicalize(&raw)
+            .ok()
+            .and_then(|canon| receipts.get(&canon.to_string_lossy().into_owned()).cloned())
+    };
     match value {
         Value::Array(items) => items
             .iter_mut()
             .for_each(|item| rewrite_locations(item, receipts)),
         Value::Object(map) => {
-            if let Some(loc) = map.get("location").and_then(Value::as_str) {
-                let raw = loc.strip_prefix("file://").unwrap_or(loc);
-                if let Some(delivered) = receipts.get(raw) {
-                    map.insert("location".into(), Value::String(delivered.clone()));
-                }
+            if let Some(loc) = map.get("location").and_then(Value::as_str)
+                && let Some(delivered) = lookup(loc)
+            {
+                map.insert("location".into(), Value::String(delivered));
             }
             map.values_mut()
                 .for_each(|item| rewrite_locations(item, receipts));
         }
         Value::String(text) => {
-            let raw = text.strip_prefix("file://").unwrap_or(text);
-            if let Some(delivered) = receipts.get(raw) {
-                *text = delivered.clone();
+            if let Some(delivered) = lookup(text) {
+                *text = delivered;
             }
         }
         _ => {}
@@ -682,5 +776,121 @@ mod tests {
             stopped: 1,
         };
         assert_eq!(counts, expected);
+    }
+
+    #[test]
+    fn collects_secondary_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("outputs");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let bam = out_dir.join("sample 1.bam");
+        let bai = out_dir.join("sample 1.bam.bai");
+        std::fs::write(&bam, b"bam").unwrap();
+        std::fs::write(&bai, b"bai").unwrap();
+        let root = dir.path();
+        let canon = std::fs::canonicalize(root).unwrap();
+        let encoded_bam = format!("file://{}/sample%201.bam", out_dir.display());
+        let encoded_bai = format!("file://{}/sample%201.bam.bai", out_dir.display());
+        let mut outputs = json!({
+            "aligned": {
+                "class": "File",
+                "location": encoded_bam,
+                "secondaryFiles": [{
+                    "class": "File",
+                    "location": encoded_bai,
+                }],
+            }
+        });
+        let mut found = Vec::new();
+        collect_output_paths(&outputs, root, &canon, &mut found);
+        assert_eq!(
+            found,
+            vec![
+                bam.to_string_lossy().into_owned(),
+                bai.to_string_lossy().into_owned(),
+            ]
+        );
+        let receipts = HashMap::from([
+            (
+                bam.to_string_lossy().into_owned(),
+                "aruna://results/run/sample 1.bam?version=v1".to_owned(),
+            ),
+            (
+                bai.to_string_lossy().into_owned(),
+                "aruna://results/run/sample 1.bam.bai?version=v2".to_owned(),
+            ),
+        ]);
+        rewrite_locations(&mut outputs, &receipts);
+        assert_eq!(
+            outputs["aligned"]["location"],
+            "aruna://results/run/sample 1.bam?version=v1"
+        );
+        assert_eq!(
+            outputs["aligned"]["secondaryFiles"][0]["location"],
+            "aruna://results/run/sample 1.bam.bai?version=v2"
+        );
+    }
+
+    #[test]
+    fn derives_directory_prefixes() {
+        let loc = "aruna://results/prefix/out_dir/a.txt?version=01J1";
+        assert_eq!(
+            output_prefix(loc, "out_dir/a.txt", "out_dir").as_deref(),
+            Some("aruna://results/prefix/out_dir/")
+        );
+        assert_eq!(
+            output_prefix(loc, "out_dir/a.txt", "empty_dir").as_deref(),
+            Some("aruna://results/prefix/empty_dir/")
+        );
+        let mut value = json!({
+            "bundle": {
+                "class": "Directory",
+                "location": "file:///work/outputs/out_dir",
+                "listing": [
+                    {"class": "File", "location": "file:///work/outputs/out_dir/a.txt"},
+                    {"class": "File", "location": "file:///work/outputs/out_dir/b.txt"},
+                ]
+            },
+            "empty": {
+                "class": "Directory",
+                "location": "file:///work/outputs/empty_dir",
+                "listing": []
+            }
+        });
+        let receipts = HashMap::from([
+            (
+                "/work/outputs/out_dir/a.txt".to_owned(),
+                "aruna://results/prefix/out_dir/a.txt?version=v1".to_owned(),
+            ),
+            (
+                "/work/outputs/out_dir/b.txt".to_owned(),
+                "aruna://results/prefix/out_dir/b.txt?version=v2".to_owned(),
+            ),
+            (
+                "/work/outputs/out_dir".to_owned(),
+                "aruna://results/prefix/out_dir/".to_owned(),
+            ),
+            (
+                "/work/outputs/empty_dir".to_owned(),
+                "aruna://results/prefix/empty_dir/".to_owned(),
+            ),
+        ]);
+        rewrite_locations(&mut value, &receipts);
+        assert_eq!(
+            value["bundle"]["location"],
+            "aruna://results/prefix/out_dir/"
+        );
+        assert_eq!(
+            value["bundle"]["listing"][0]["location"],
+            "aruna://results/prefix/out_dir/a.txt?version=v1"
+        );
+        assert_eq!(
+            value["bundle"]["listing"][1]["location"],
+            "aruna://results/prefix/out_dir/b.txt?version=v2"
+        );
+        assert_eq!(
+            value["empty"]["location"],
+            "aruna://results/prefix/empty_dir/"
+        );
     }
 }
