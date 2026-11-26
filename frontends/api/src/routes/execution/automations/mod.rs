@@ -2,18 +2,18 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-
 pub mod events;
 pub mod lifecycle;
 pub mod records;
 #[cfg(test)]
 mod route_tests;
+#[cfg(test)]
+mod run_tests;
 pub mod run_wire;
 pub mod runs;
 pub mod spec_wire;
 pub mod stage_wire;
 pub mod wire;
-
 
 use std::sync::Arc;
 
