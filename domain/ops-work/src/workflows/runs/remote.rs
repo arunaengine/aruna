@@ -420,22 +420,30 @@ type RemoteNext = Result<Next<HostRpcResult>, CatalogError>;
 impl RemoteReadOperation {
     pub fn new(run: WorkflowRunRecord, target: Target, node: NodeId, call: DataCall) -> Self {
         let pinned = pin_directory_child(&run, target, run.node_id);
+        let (pin, target) = resolve_pin(&run, pinned.clone(), run.node_id);
+        let is_alias = is_link_alias(&pin, &target, run.node_id);
+        // A resolved standalone file or link takes precedence over folder fallback on unversioned
+        // Stat, while explicit trailing-slash directory markers stay on the folder auth path.
         let dir_target = match &call {
             DataCall::List { .. } => Some((
                 pinned.node.unwrap_or(node),
                 pinned.bucket.clone(),
                 pinned.key.clone(),
             )),
-            DataCall::Stat { .. } if pinned.version.is_none() => Some((
-                pinned.node.unwrap_or(node),
-                pinned.bucket.clone(),
-                pinned.key.clone(),
-            )),
+            DataCall::Stat { .. }
+                if pinned.version.is_none()
+                    && (pinned.key.ends_with('/') || pin.version.is_none()) =>
+            {
+                Some((
+                    pinned.node.unwrap_or(node),
+                    pinned.bucket.clone(),
+                    pinned.key.clone(),
+                ))
+            }
             _ => None,
         };
-        let (pin, target) = resolve_pin(&run, pinned, run.node_id);
         let reported_version = pin.version;
-        let link_pin = is_link_alias(&pin, &target, run.node_id).then_some(pin);
+        let link_pin = (dir_target.is_none() && is_alias).then_some(pin);
         let node = target.node.unwrap_or(node);
         Self {
             run,
@@ -1559,6 +1567,141 @@ mod tests {
                 .unwrap(),
             Next::Done(HostRpcResult::Failed(ContractError::Denied { .. }))
         ));
+    }
+
+    // Unversioned Stat on a standalone link runs LinkAccess before any folder-child fallback.
+    #[test]
+    fn prefers_link_stat() {
+        use aruna_core::structs::execution::workflow_run::DirectoryPin;
+
+        let link_ver = Ulid::from_parts(2, 1);
+        let real_ver = Ulid::from_parts(3, 1);
+        let idx_ver = Ulid::from_parts(4, 1);
+        let sel = InputSelection {
+            source: InputSource::S3 {
+                bucket: "other".into(),
+                key: "real.txt".into(),
+                version_id: Some(real_ver.to_string()),
+            },
+            source_node_id: Some(node(2)),
+            dest_key: "data/sample".into(),
+            mode: InputMode::Snapshot,
+            container_path: None,
+            name: None,
+            description: None,
+        };
+        let mut cap = captured_input(&sel, node(2));
+        cap.version_id = real_ver;
+        let mut run = base_run();
+        run.captured_remote.push(PrecapturedInput {
+            pin_node_id: node(2),
+            pin_bucket: "data".into(),
+            pin_key: "sample".into(),
+            pin_version_id: link_ver,
+            resolved: sel,
+            captured: cap,
+        });
+        run.directory_pins.push(DirectoryPin {
+            bucket: "data".into(),
+            key: "sample/index".into(),
+            version_id: idx_ver,
+            source_node_id: Some(node(2)),
+        });
+
+        let file_target = Target {
+            bucket: "data".into(),
+            key: "sample".into(),
+            version: None,
+            owned: false,
+            node: Some(node(2)),
+        };
+        let mut denied = RemoteReadOperation::new(
+            run.clone(),
+            file_target.clone(),
+            node(2),
+            DataCall::Stat {
+                address: "s3://data/sample".into(),
+            },
+        );
+        let first = denied.first().unwrap();
+        assert!(format!("{first:?}").contains("LinkAccess"));
+        assert!(format!("{first:?}").contains("\"sample\""));
+        assert!(matches!(
+            denied
+                .next(refused_meta(BaoReadRefusal::ReadDenied))
+                .unwrap(),
+            Next::Done(HostRpcResult::Failed(ContractError::Denied { .. }))
+        ));
+
+        let mut allowed = RemoteReadOperation::new(
+            run.clone(),
+            file_target.clone(),
+            node(2),
+            DataCall::Stat {
+                address: "s3://data/sample".into(),
+            },
+        );
+        assert!(matches!(
+            allowed.first().unwrap(),
+            Next::Call(IoCall::Child(_))
+        ));
+        let head = allowed.next(ok_auth()).unwrap();
+        assert!(format!("{head:?}").contains("real.txt"));
+        match allowed.next(ok_meta()).unwrap() {
+            Next::Done(HostRpcResult::StorageStat { entry: Some(entry) }) => {
+                assert!(!entry.directory);
+                assert_eq!(
+                    entry.version.as_deref(),
+                    Some(link_ver.to_string().as_str())
+                );
+            }
+            other => panic!("expected file stat, got {other:?}"),
+        }
+
+        // Trailing-slash Stat and List still resolve the folder children under `sample/`.
+        let slash_target = Target {
+            bucket: "data".into(),
+            key: "sample/".into(),
+            version: None,
+            owned: false,
+            node: Some(node(2)),
+        };
+        let mut dir_stat = RemoteReadOperation::new(
+            run.clone(),
+            slash_target,
+            node(2),
+            DataCall::Stat {
+                address: "s3://data/sample/".into(),
+            },
+        );
+        let first = dir_stat.first().unwrap();
+        assert!(format!("{first:?}").contains("sample/index"));
+        match dir_stat.next(ok_meta()).unwrap() {
+            Next::Done(HostRpcResult::StorageStat { entry: Some(entry) }) => {
+                assert!(entry.directory);
+            }
+            other => panic!("expected folder stat, got {other:?}"),
+        }
+
+        let mut list = RemoteReadOperation::new(
+            run,
+            file_target,
+            node(2),
+            DataCall::List {
+                address: "s3://data/sample".into(),
+            },
+        );
+        let first = list.first().unwrap();
+        assert!(format!("{first:?}").contains("sample/index"));
+        assert_eq!(
+            list.next(ok_meta()).unwrap(),
+            Next::Done(HostRpcResult::StorageList {
+                entries: vec![ListEntry {
+                    name: "index".into(),
+                    directory: false,
+                }],
+            })
+        );
     }
 
     // Non-permission holder refusals fail remote directory listings instead of dropping files.
