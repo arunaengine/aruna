@@ -957,3 +957,71 @@ async fn chunks_large_replicas() {
         assert_eq!(rejected, Err(CatalogError::Forbidden));
     }
 }
+
+// Existing remote run copies stay bound to their original coordinator node and group_id.
+#[tokio::test]
+async fn binds_replica_owner() {
+    let runs = runs().await;
+    let context = &runs.fixture.context;
+    let here = runs.fixture.node;
+    let owner = aruna_ops_identity::testing::node(9);
+    let spoof = aruna_ops_identity::testing::node(10);
+    let own = runs.started().await;
+    let copy = copy_of(&own, owner);
+    drive(
+        WriteReplicaOperation {
+            peer: owner,
+            local: here,
+            run: Box::new(copy.clone()),
+            first_page: 0,
+            pages: Vec::new(),
+            workflow: None,
+            now_ms: 0,
+            step: WriteStep::Read,
+            kept: 0,
+        },
+        context,
+    )
+    .await
+    .unwrap();
+
+    // Another peer claiming to own the run cannot hijack or overwrite the stored copy.
+    let mut hijacked = copy.clone();
+    hijacked.node_id = spoof;
+    let err = drive(
+        WriteReplicaOperation {
+            peer: spoof,
+            local: here,
+            run: Box::new(hijacked),
+            first_page: 0,
+            pages: Vec::new(),
+            workflow: None,
+            now_ms: 0,
+            step: WriteStep::Read,
+            kept: 0,
+        },
+        context,
+    )
+    .await;
+    assert_eq!(err, Err(CatalogError::Forbidden));
+
+    // Even the original coordinator cannot move an existing run copy into another group.
+    let mut moved = copy.clone();
+    moved.group_id = runs.fixture.group_b;
+    let err = drive(
+        WriteReplicaOperation {
+            peer: owner,
+            local: here,
+            run: Box::new(moved),
+            first_page: 0,
+            pages: Vec::new(),
+            workflow: None,
+            now_ms: 0,
+            step: WriteStep::Read,
+            kept: 0,
+        },
+        context,
+    )
+    .await;
+    assert_eq!(err, Err(CatalogError::Forbidden));
+}

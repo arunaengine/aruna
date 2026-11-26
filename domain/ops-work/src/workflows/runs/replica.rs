@@ -1220,6 +1220,9 @@ impl Operation for WriteReplicaOperation {
     }
 
     fn first(&mut self) -> Result<Next<u32>, CatalogError> {
+        if self.run.node_id != self.peer || self.run.node_id == self.local {
+            return Err(CatalogError::Forbidden);
+        }
         let wf_key = workflow_key(self.run.workflow_id);
         let ver_key = version_key(self.run.workflow_id, self.run.version);
         let run_id = self.run.run_id;
@@ -1429,7 +1432,11 @@ impl Operation for WriteReplicaOperation {
         let stored = (values.next().flatten())
             .map(|value| WorkflowRunRecord::from_bytes(&value))
             .transpose()?;
-        if stored.as_ref().is_some_and(|old| old.node_id == self.local) {
+        if let Some(old) = &stored
+            && (old.node_id == self.local
+                || old.node_id != self.peer
+                || old.group_id != self.run.group_id)
+        {
             return Err(CatalogError::Forbidden);
         }
         let mut head = (values.next().flatten())
@@ -1488,6 +1495,10 @@ impl Operation for WriteReplicaOperation {
             match wf_row {
                 Some(existing_bytes) => {
                     let mut existing = WorkflowRecord::from_bytes(existing_bytes)?;
+                    if existing.workflow_id != run.workflow_id || existing.group_id != run.group_id
+                    {
+                        return Err(CatalogError::Forbidden);
+                    }
                     if existing.version_count < min_count {
                         existing.version_count = min_count;
                         writes.push((

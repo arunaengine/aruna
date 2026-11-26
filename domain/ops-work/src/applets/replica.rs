@@ -155,6 +155,7 @@ impl Operation for StoreAppletOperation {
         }
         let seed = applet.applet_id.to_bytes();
         let write = WriteCopyOperation {
+            peer: self.peer,
             local: self.local.0,
             applet,
             stale: Vec::new(),
@@ -181,6 +182,7 @@ enum CopyStep {
 /// copy is as new. A host row naming another applet is left alone.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WriteCopyOperation {
+    peer: NodeId,
     local: NodeId,
     applet: Box<Applet>,
     stale: Vec<String>,
@@ -201,6 +203,9 @@ impl Operation for WriteCopyOperation {
     }
 
     fn first(&mut self) -> Result<Next<u64>, AppletError> {
+        if self.applet.host_node != self.peer || self.applet.host_node == self.local {
+            return Err(AppletError::Forbidden);
+        }
         let rows = std::iter::once((
             APPLETS_KEYSPACE.to_string(),
             applet_key(self.applet.applet_id),
@@ -250,7 +255,10 @@ impl Operation for WriteCopyOperation {
                 let mut values = result.values()?.into_iter();
                 let stored = applet_answer(IoResult::Values(vec![values.next().flatten()]))?;
                 if let Some(stored) = &stored {
-                    if stored.host_node == self.local {
+                    if stored.host_node == self.local
+                        || stored.host_node != self.peer
+                        || stored.group_id != self.applet.group_id
+                    {
                         return Err(AppletError::Forbidden);
                     }
                     if stored.revision >= revision {
@@ -303,8 +311,9 @@ mod tests {
     use aruna_core::applet::record::CustomDomain;
     use byteview::ByteView;
 
-    fn copy(applet: &Applet, local: NodeId) -> WriteCopyOperation {
+    fn copy(applet: &Applet, peer: NodeId, local: NodeId) -> WriteCopyOperation {
         WriteCopyOperation {
+            peer,
             local,
             applet: Box::new(applet.clone()),
             stale: Vec::new(),
@@ -339,7 +348,7 @@ mod tests {
         )
         .unwrap()
         .2;
-        let mut write = copy(&new, holder);
+        let mut write = copy(&new, old.host_node, holder);
         write.first().unwrap();
         let check = write
             .next(IoResult::Values(vec![stored.clone(), None]))
@@ -365,7 +374,7 @@ mod tests {
         )
         .unwrap()
         .2;
-        let mut keep_other = copy(&new, holder);
+        let mut keep_other = copy(&new, old.host_node, holder);
         keep_other.first().unwrap();
         keep_other
             .next(IoResult::Values(vec![stored.clone(), None]))
@@ -379,7 +388,7 @@ mod tests {
             Next::Done(new.revision)
         );
 
-        let mut stale = copy(&old, holder);
+        let mut stale = copy(&old, old.host_node, holder);
         stale.first().unwrap();
         let newer = Some(ByteView::from(new.to_bytes().unwrap()));
         let kept = stale
@@ -387,9 +396,34 @@ mod tests {
             .unwrap();
         assert_eq!(kept, Next::Done(new.revision));
 
-        let mut own = copy(&new, new.host_node);
-        own.first().unwrap();
-        let refused = own.next(IoResult::Values(vec![stored, None]));
-        assert_eq!(refused, Err(AppletError::Forbidden));
+        let mut own = copy(&new, new.host_node, new.host_node);
+        assert_eq!(own.first(), Err(AppletError::Forbidden));
+
+        // A different peer cannot overwrite this node's own applet or hijack a remote copy.
+        let spoof = iroh::SecretKey::from_bytes(&[10; 32]).public();
+        let mut spoofed = new.clone();
+        spoofed.host_node = spoof;
+        let mut overwrite_own = copy(&spoofed, spoof, new.host_node);
+        overwrite_own.first().unwrap();
+        assert_eq!(
+            overwrite_own.next(IoResult::Values(vec![stored.clone(), None])),
+            Err(AppletError::Forbidden)
+        );
+        let mut hijack = copy(&spoofed, spoof, holder);
+        hijack.first().unwrap();
+        assert_eq!(
+            hijack.next(IoResult::Values(vec![stored.clone(), None])),
+            Err(AppletError::Forbidden)
+        );
+
+        // Even the original host cannot reassign the existing copy's group_id.
+        let mut regro = new.clone();
+        regro.group_id = ulid::Ulid::from_bytes([88; 16]);
+        let mut mismatch = copy(&regro, old.host_node, holder);
+        mismatch.first().unwrap();
+        assert_eq!(
+            mismatch.next(IoResult::Values(vec![stored, None])),
+            Err(AppletError::Forbidden)
+        );
     }
 }
