@@ -88,7 +88,7 @@ the applet's host node.
     responses(
         (status = 200, description = "The applet with its pending approval", body = AppletBody, example = json!({
             "applet_id": "01K8W1B3D5F7H9KMQ1S3V5X7Z2", "group_id": "01JABCDEF0123456789ABCDEFG",
-            "name": "Bakta web", "slug": "bakta", "host": "bakta.apps.example.org", "repository": null,
+            "name": "Bakta web", "slug": "bakta", "host": "bakta.apps.example.net", "repository": null,
             "host_node": "f3a1b2c3d4e5f60718293a4b5c6d7e8f9091a2b3c4d5e6f708192a3b4c5d6e7f",
             "lifecycle": "waiting_for_approval", "access": "private", "serving": "preview", "live_version": null,
             "versions": [], "grants": {"read": [], "references": [], "start": null, "submissions": null,

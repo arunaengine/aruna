@@ -61,7 +61,7 @@ pub struct BuildingBody {
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
 #[schema(example = json!({
-    "hosting": {"applet_domain": "apps.example.org", "custom_domains": true, "guests": false,
+    "hosting": {"applet_domain": "apps.example.net", "custom_domains": true, "guests": false,
         "embedding": true, "max_origins": 8, "portal_origin": "https://portal.example.org"},
     "building": {"backend": "k8s-build", "image": "harbor.example/aruna/applet-builder@sha256:0d5c2f4e6a8b0c1d3e5f7a9b1c3d5e7f9a1b3c5d7e9f1a3b5c7d9e1f3a5b7c9d",
         "mirror": false, "max_drafts": 6, "draft_ttl_hours": 24,

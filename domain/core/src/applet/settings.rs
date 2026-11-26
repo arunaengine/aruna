@@ -20,6 +20,9 @@ pub struct HostingSettings {
     pub max_origins: usize,
     /// The exact portal origin allowed to frame private previews; never caller supplied.
     pub portal_origin: Option<String>,
+    /// Normalized hosts of the portal, API, S3 and sign-in services; applets never share a site.
+    #[serde(default)]
+    pub protected_hosts: Vec<String>,
 }
 
 /// Building: the curated builder image runs as a batch job on `backend`.
@@ -138,13 +141,14 @@ mod tests {
     #[test]
     fn edge_key_matches() {
         let hosting = HostingSettings {
-            applet_domain: "apps.example.org".into(),
+            applet_domain: "apps.example.net".into(),
             edge_key_sha256: sha2::Sha256::digest(b"edge-secret").into(),
             custom_domains: false,
             guests: false,
             embedding: false,
             max_origins: DEFAULT_ORIGINS,
             portal_origin: None,
+            protected_hosts: Vec::new(),
         };
         assert!(hosting.edge_key_valid("edge-secret"));
         assert!(!hosting.edge_key_valid("edge-secreT"));

@@ -406,6 +406,7 @@ pub fn read_settings_from(env: &dyn SettingsEnv) -> Result<Settings, SetupError>
         https: None,
     };
     settings.https = https_env(env, &mut settings)?;
+    check_applets(&mut settings)?;
     Ok(settings)
 }
 
@@ -608,6 +609,9 @@ fn applets_env(
                 .map(|value| value.trim().parse::<usize>())
                 .transpose()?
                 .unwrap_or(DEFAULT_ORIGINS);
+            let portal_origin = optional_nonempty_env(env, "APPLETS_PORTAL_ORIGIN")?
+                .map(|raw| applet_portal_origin(&raw))
+                .transpose()?;
             Some(HostingSettings {
                 applet_domain,
                 edge_key_sha256,
@@ -615,7 +619,8 @@ fn applets_env(
                 guests: flag("APPLETS_GUESTS")?,
                 embedding: flag("APPLETS_EMBEDDING")?,
                 max_origins,
-                portal_origin: optional_nonempty_env(env, "APPLETS_PORTAL_ORIGIN")?,
+                portal_origin,
+                protected_hosts: Vec::new(),
             })
         }
         None => None,
@@ -658,6 +663,85 @@ fn applets_env(
         None => None,
     };
     Ok(AppletSettings { hosting, building })
+}
+
+/// Exact HTTPS origin (or loopback HTTP for local development) for `APPLETS_PORTAL_ORIGIN`.
+fn applet_portal_origin(raw: &str) -> Result<String, SetupError> {
+    const KEY: &str = "APPLETS_PORTAL_ORIGIN";
+    let trimmed = raw.trim();
+    let url =
+        reqwest::Url::parse(trimmed).map_err(|error| invalid_config_value(KEY, trimmed, error))?;
+    let loopback = url.host_str().is_some_and(|host| {
+        let bare = host.trim_start_matches('[').trim_end_matches(']');
+        bare.eq_ignore_ascii_case("localhost")
+            || bare
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    });
+    let secure = url.scheme() == "https" || (url.scheme() == "http" && loopback);
+    let exact = secure
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && matches!(url.path(), "" | "/")
+        && url.query().is_none()
+        && url.fragment().is_none();
+    if !exact {
+        return Err(invalid_config_value(
+            KEY,
+            trimmed,
+            "expected an HTTPS origin (or loopback HTTP) with no path, query or user",
+        ));
+    }
+    Ok(url.origin().ascii_serialization())
+}
+
+/// Refuses startup when `APPLETS_DOMAIN` shares a registered domain with the portal, API, S3 or
+/// OIDC hosts, and records those normalized hosts for custom-domain checks.
+fn check_applets(settings: &mut Settings) -> Result<(), SetupError> {
+    let Some(hosting) = settings.applets.hosting.as_mut() else {
+        return Ok(());
+    };
+    let mut named: Vec<(&str, String)> = Vec::new();
+    let mut add_url = |label: &'static str, raw: Option<&str>| {
+        let Some(host) = raw
+            .and_then(|value| reqwest::Url::parse(value.trim()).ok())
+            .and_then(|url| url.host_str().map(str::to_string))
+        else {
+            return;
+        };
+        if let Ok(host) = aruna_core::applet::hosts::normalize_host(&host) {
+            named.push((label, host));
+        }
+    };
+    add_url("APPLETS_PORTAL_ORIGIN", hosting.portal_origin.as_deref());
+    add_url("PORTAL_PUBLIC_URL", settings.portal_public_url.as_deref());
+    add_url("API_PUBLIC_URL", settings.api_public_url.as_deref());
+    add_url("S3_PUBLIC_URL", settings.s3_public_url.as_deref());
+    for provider in &settings.oidc_providers {
+        add_url("OIDC issuer", Some(provider.issuer.as_str()));
+        add_url("OIDC discovery URL", Some(provider.discovery_url.as_str()));
+    }
+    if let Some(s3_host) = settings.s3_host.as_deref() {
+        let bare = s3_host.split(':').next().unwrap_or_default();
+        if let Ok(host) = aruna_core::applet::hosts::normalize_host(bare) {
+            named.push(("S3_HOST", host));
+        }
+    }
+    for (label, host) in &named {
+        if aruna_core::applet::hosts::same_site(&hosting.applet_domain, host) {
+            return Err(invalid_config_value(
+                "APPLETS_DOMAIN",
+                hosting.applet_domain.as_str(),
+                format!("must use its own registered domain separate from {label} ({host})"),
+            ));
+        }
+    }
+    let mut protected: Vec<String> = named.into_iter().map(|(_, host)| host).collect();
+    protected.sort();
+    protected.dedup();
+    hosting.protected_hosts = protected;
+    Ok(())
 }
 
 fn rocrate_limits_env(env: &dyn SettingsEnv) -> Result<RoCrateLimits, SetupError> {
@@ -2112,5 +2196,68 @@ mod tests {
                 "{value}"
             );
         }
+    }
+
+    #[test]
+    fn applets_domain_isolated() {
+        let hash = "a".repeat(64);
+        let base = |extra: &[(&str, &str)]| {
+            let mut pairs = vec![
+                ("APPLETS_DOMAIN", "apps.example.net"),
+                ("APPLETS_EDGE_KEY_SHA256", hash.as_str()),
+                ("APPLETS_PORTAL_ORIGIN", "https://portal.example.org/"),
+                ("API_PUBLIC_URL", "https://api.example.org"),
+                ("S3_PUBLIC_URL", "https://s3.example.org"),
+                ("OIDC_PROVIDER_IDS", "main"),
+                ("OIDC_MAIN_ISSUER", "https://id.example.org/realms/aruna"),
+                ("OIDC_MAIN_AUDIENCE", "aruna"),
+                (
+                    "OIDC_MAIN_DISCOVERY_URL",
+                    "https://id.example.org/realms/aruna/.well-known/openid-configuration",
+                ),
+            ];
+            pairs.extend_from_slice(extra);
+            parse(&pairs)
+        };
+        let ok = base(&[]).unwrap();
+        let hosting = ok.applets.hosting.unwrap();
+        assert_eq!(
+            hosting.portal_origin.as_deref(),
+            Some("https://portal.example.org")
+        );
+        assert!(
+            hosting
+                .protected_hosts
+                .contains(&"portal.example.org".to_string())
+        );
+        assert!(
+            hosting
+                .protected_hosts
+                .contains(&"id.example.org".to_string())
+        );
+        for clash in [
+            ("APPLETS_DOMAIN", "apps.example.org"),
+            ("APPLETS_PORTAL_ORIGIN", "https://portal.example.net"),
+            ("PORTAL_PUBLIC_URL", "https://portal.example.net"),
+            ("API_PUBLIC_URL", "https://api.example.net"),
+            ("S3_PUBLIC_URL", "https://s3.example.net"),
+            ("OIDC_MAIN_ISSUER", "https://id.example.net/realms/aruna"),
+        ] {
+            let err = base(&[clash]).unwrap_err();
+            assert_eq!(invalid_key(err), "APPLETS_DOMAIN", "{clash:?}");
+        }
+        assert_eq!(
+            invalid_key(
+                base(&[("APPLETS_PORTAL_ORIGIN", "http://portal.example.org")]).unwrap_err()
+            ),
+            "APPLETS_PORTAL_ORIGIN"
+        );
+        assert_eq!(
+            invalid_key(
+                base(&[("APPLETS_PORTAL_ORIGIN", "https://portal.example.org/p")]).unwrap_err()
+            ),
+            "APPLETS_PORTAL_ORIGIN"
+        );
+        assert!(base(&[("APPLETS_PORTAL_ORIGIN", "http://localhost:5173")]).is_ok());
     }
 }

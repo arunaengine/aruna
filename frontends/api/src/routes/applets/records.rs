@@ -46,7 +46,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         (status = 200, description = "One page of applets", body = AppletPageBody, example = json!({
             "items": [{
                 "applet_id": "01K8W1B3D5F7H9KMQ1S3V5X7Z2", "group_id": "01JABCDEF0123456789ABCDEFG",
-                "name": "Bakta web", "slug": "bakta", "host": "bakta.apps.example.org",
+                "name": "Bakta web", "slug": "bakta", "host": "bakta.apps.example.net",
                 "repository": null, "host_node": "f3a1b2c3d4e5f60718293a4b5c6d7e8f9091a2b3c4d5e6f708192a3b4c5d6e7f",
                 "lifecycle": "private", "access": "private", "serving": "gone", "live_version": null,
                 "versions": [], "grants": {"read": [], "references": [], "start": null, "submissions": null,
@@ -111,7 +111,7 @@ this node.
     responses(
         (status = 201, description = "The new private applet", body = AppletBody, example = json!({
             "applet_id": "01K8W1B3D5F7H9KMQ1S3V5X7Z2", "group_id": "01JABCDEF0123456789ABCDEFG",
-            "name": "Bakta web", "slug": "bakta", "host": "bakta.apps.example.org",
+            "name": "Bakta web", "slug": "bakta", "host": "bakta.apps.example.net",
             "repository": "01K8W1C0000000000000000000",
             "host_node": "f3a1b2c3d4e5f60718293a4b5c6d7e8f9091a2b3c4d5e6f708192a3b4c5d6e7f",
             "lifecycle": "private", "access": "private", "serving": "gone", "live_version": null,
@@ -176,7 +176,7 @@ pub async fn create_applet(
     responses(
         (status = 200, description = "The applet", body = AppletBody, example = json!({
             "applet_id": "01K8W1B3D5F7H9KMQ1S3V5X7Z2", "group_id": "01JABCDEF0123456789ABCDEFG",
-            "name": "Bakta web", "slug": "bakta", "host": "bakta.apps.example.org", "repository": null,
+            "name": "Bakta web", "slug": "bakta", "host": "bakta.apps.example.net", "repository": null,
             "host_node": "f3a1b2c3d4e5f60718293a4b5c6d7e8f9091a2b3c4d5e6f708192a3b4c5d6e7f",
             "lifecycle": "live", "access": "public", "serving": "live", "live_version": 1,
             "versions": [{"version": 1, "commit": "4b825dc642cb6eb9a060e54bf8d69288fbee4904",

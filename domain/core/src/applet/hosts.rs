@@ -68,6 +68,27 @@ pub fn normalize_host(raw: &str) -> Result<String, HostError> {
     Ok(host)
 }
 
+/// Whether two DNS hosts share their last two labels; stricter than a public suffix list on
+/// multi-label suffixes like `ac.uk`, and never misses a shared registered domain.
+pub fn same_site(left: &str, right: &str) -> bool {
+    let (Some(left), Some(right)) = (site_suffix(left), site_suffix(right)) else {
+        return false;
+    };
+    left == right
+}
+
+fn site_suffix(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_end_matches('.');
+    if trimmed.parse::<IpAddr>().is_ok() {
+        return None;
+    }
+    let host = normalize_host(trimmed).ok()?;
+    let mut parts = host.rsplit('.');
+    let tld = parts.next()?;
+    let second = parts.next()?;
+    Some(format!("{second}.{tld}"))
+}
+
 /// The applet's own host: its slug as one label below the node's applet domain.
 pub fn applet_host(slug: &str, applet_domain: &str) -> Result<String, HostError> {
     if slug.len() > MAX_SLUG || !label_valid(slug) {
@@ -224,5 +245,16 @@ mod tests {
         );
         let twice = vec!["https://a.org".to_string(), "https://A.org".to_string()];
         assert_eq!(embedding_origins(&twice, &own, 1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn same_site_checks() {
+        assert!(same_site("apps.example.org", "portal.example.org"));
+        assert!(same_site("example.org", "sub.apps.example.org."));
+        assert!(same_site("apps.rdm.uni.de", "id.uni.de"));
+        assert!(!same_site("apps.example.net", "portal.example.org"));
+        assert!(!same_site("apps.test", "portal.test"));
+        assert!(!same_site("apps.test", "localhost"));
+        assert!(!same_site("127.0.0.1", "10.0.0.1"));
     }
 }

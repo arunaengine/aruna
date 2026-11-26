@@ -54,7 +54,7 @@ pub struct NoticeBody {
 #[schema(as = AppletNotices, example = json!({
     "cursor": "02000001936f2a1c00.9f86d081884c7d65", "reset": false,
     "notices": [{"applet_id": "01K8W1B3D5F7H9KMQ1S3V5X7Z2",
-        "hosts": ["bakta.apps.example.org", "bakta.lab.example.org"]}]
+        "hosts": ["bakta.apps.example.net", "bakta.lab.example.org"]}]
 }))]
 pub struct NoticesBody {
     /// Send it back as `after`; it also carries the feature policy the edge decided under.

@@ -100,7 +100,7 @@ pub struct SigninInfoQuery {
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
 #[schema(example = json!({
-    "name": "Bakta web", "slug": "bakta", "host": "bakta.apps.example.org",
+    "name": "Bakta web", "slug": "bakta", "host": "bakta.apps.example.net",
     "host_node": "f3a1b2c3d4e5f60718293a4b5c6d7e8f9091a2b3c4d5e6f708192a3b4c5d6e7f",
     "group_id": "01JABCDEF0123456789ABCDEFG", "group_name": "Lab A", "access": "public",
     "published_by": "Ada Lovelace",
@@ -246,7 +246,7 @@ pub async fn signin_info(
 }
 
 #[derive(Clone, Debug, Deserialize, ToSchema)]
-#[schema(example = json!({"host": "bakta.apps.example.org", "preview": false}))]
+#[schema(example = json!({"host": "bakta.apps.example.net", "preview": false}))]
 pub struct CodeRequest {
     /// The applet's own host the code is for; custom domains never sign in.
     pub host: String,
@@ -329,7 +329,7 @@ pub async fn signin_code(
 
 #[derive(Clone, Debug, Deserialize, ToSchema)]
 #[schema(example = json!({"code": "6f1c0e3b8a2d4c5e9f7a1b3c5d7e9f0a2b4c6d8e0f1a3b5c7d9e1f3a5b7c9d1e",
-    "host": "bakta.apps.example.org"}))]
+    "host": "bakta.apps.example.net"}))]
 pub struct RedeemRequest {
     pub code: String,
     pub host: String,
