@@ -557,8 +557,16 @@ jobs:
             echo "$TAG is not the newest eligible release; floating tags stay unchanged"
             exit 0
           fi
+          manifest="$(mktemp)"
           meta="$(mktemp)"
-          trap 'rm -f "$meta"' EXIT
+          trap 'rm -f "$manifest" "$meta"' EXIT
+          gh release download "$TAG" --pattern release-images.json \
+            --output "$manifest" --clobber --repo "$GITHUB_REPOSITORY"
+          current_digest="$(jq -er '.images[] | select(.name == "aruna") | .digest' "$manifest")"
+          if [ "$current_digest" != "$NODE_DIGEST" ]; then
+            echo "node digest $NODE_DIGEST was superseded by $current_digest in release $TAG; floating tags stay unchanged"
+            exit 0
+          fi
           args=(buildx imagetools create --prefer-index=false --metadata-file "$meta")
           for tag in "${promote_tags[@]}"; do
             args+=(-t "ghcr.io/arunaengine/aruna:$tag")
