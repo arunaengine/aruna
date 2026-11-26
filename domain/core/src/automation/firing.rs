@@ -500,3 +500,7 @@ impl Firing {
         Ok(postcard::from_bytes(bytes)?)
     }
 }
+
+#[cfg(test)]
+#[path = "firing_tests.rs"]
+mod tests;
