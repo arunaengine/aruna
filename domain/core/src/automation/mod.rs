@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod dag;
+pub mod diff;
 pub mod glob;
+pub mod graph;
 pub mod keys;
 pub mod record;
 pub mod scope;
