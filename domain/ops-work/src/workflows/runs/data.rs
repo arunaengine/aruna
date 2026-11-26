@@ -38,7 +38,7 @@ use aruna_ops_data::s3::object::list::{
 use aruna_ops_data::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
-use aruna_ops_identity::auth::error::AuthorizeError;
+use aruna_ops_identity::auth::error::{AuthorizeError, PolicyEnforcementError};
 use aruna_ops_identity::auth::request_authorization::AuthorizeOperation;
 use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 use aruna_ops_identity::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
@@ -602,7 +602,10 @@ impl ReadDataOperation {
                     self.entries.push(entry);
                 }
             }
-            Err(AuthorizeError::PermissionDenied | AuthorizeError::Policy(_)) => {}
+            Err(
+                AuthorizeError::PermissionDenied
+                | AuthorizeError::Policy(PolicyEnforcementError::Denied { .. }),
+            ) => {}
             Err(error) => return Err(CatalogError::Storage(error.to_string())),
         }
         self.check_next(state)

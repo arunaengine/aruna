@@ -20,6 +20,7 @@ pub const MAX_RESTRICTIONS_BYTES: usize = 16 * 1024;
 pub fn compile_permission_matcher(pattern: &str) -> Result<GlobMatcher, globset::Error> {
     Ok(globset::GlobBuilder::new(pattern)
         .literal_separator(true)
+        .backslash_escape(true)
         .build()?
         .compile_matcher())
 }
@@ -65,9 +66,9 @@ pub fn escape_permission_path(path: &str) -> String {
 }
 
 /// Whether `pattern` can match any path at or below `subtree_root` (fail-closed on globs and
-/// backslash escapes, which `globset` interprets at match time).
+/// malformed patterns).
 pub fn pattern_overlaps_subtree(pattern: &str, subtree_root: &str) -> bool {
-    if pattern.contains('\\') || compile_permission_matcher(pattern).is_err() {
+    if compile_permission_matcher(pattern).is_err() {
         return true;
     }
     let bound = bind_wildcards(pattern, subtree_root);
@@ -166,8 +167,8 @@ fn literal_prefix(pattern: &str) -> (String, bool) {
             '[' => {
                 let mut look = chars.clone();
                 if let (Some(escaped), Some(']')) = (look.next(), look.next())
-                    && escaped != '!'
-                    && escaped != '^'
+                    && escaped.is_ascii()
+                    && !matches!(escaped, '!' | '^' | '-' | '\\' | '/')
                 {
                     chars = look;
                     literal.push(escaped);
@@ -658,18 +659,47 @@ mod tests {
             "/r/g/G/data/n1/uploads/bak*/**",
             "/r/g/G/data/n1/uploads/bakta/**",
             "/r/g/G/data/n1/uploads/b\\akta/**",
+            "/r/g/G/data/n1/uploads/[é]/**",
+            "/r/g/G/data/n1/uploads/bak[é]/**",
+            "/r/g/G/data/n1/uploads/other\\",
             "/r/g/G/data/n1/uploads/bakta/cd/**",
             "/r/g/G/data/n1/uploads/bakta",
         ] {
             assert!(pattern_overlaps_subtree(overlapping, sub), "{overlapping}");
         }
+        let escaped_ref = format!(
+            "{}/**",
+            super::escape_permission_path("/r/g/G/data/n1/uploads/team\\west/ref")
+        );
         for disjoint in [
             "/r/g/G/data/n1/uploads/ref/**",
             "/r/g/G/data/n1/uploads/bakta_ref/**",
             "/r/g/G/data/*/other/**",
             "/r/g/G/data/n2/uploads/**",
+            escaped_ref.as_str(),
         ] {
             assert!(!pattern_overlaps_subtree(disjoint, sub), "{disjoint}");
         }
+        // Non-ASCII bracket classes stay wildcards for DENY coverage and derived roots too.
+        assert!(!super::restrictions_cover_subtree(
+            [
+                ("/r/g/G/data/**", &Permission::READ),
+                ("/r/g/G/data/n1/uploads/[é]/**", &Permission::DENY),
+            ],
+            sub,
+            &Permission::READ
+        ));
+        let non_ascii_grant = [PathRestriction {
+            pattern: "/r/g/G/data/n1/uploads/[é]/**".to_string(),
+            permission: Permission::READ,
+        }];
+        assert!(
+            readable_roots(
+                &granted(&[("/r/g/G/data/**", Permission::READ)]),
+                Some(&non_ascii_grant),
+                "/r/g/G/data/n1/uploads",
+            )
+            .is_empty()
+        );
     }
 }

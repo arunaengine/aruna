@@ -491,4 +491,56 @@ async fn hides_denied_listing() {
             },
         ]
     );
+
+    // Policy unavailability during listing must fail the call instead of silently dropping items.
+    use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
+    use aruna_core::operation::Operation;
+    use aruna_ops_identity::auth::error::{AuthorizeError, PolicyEnforcementError};
+    let mut op = super::data::ReadDataOperation::new(
+        record,
+        node,
+        super::data::DataCall::List {
+            address: "aruna://reads/dir/".into(),
+        },
+    );
+    let Next::Call(IoCall::Child(_)) = op.first().unwrap() else {
+        panic!("expected bucket access");
+    };
+    let bucket_info = aruna_core::structs::storage::blob::BucketInfo {
+        group_id: group,
+        created_at: std::time::UNIX_EPOCH,
+        created_by: owner,
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: Default::default(),
+        distribution: None,
+    };
+    let _ = op
+        .next(IoResult::Child(ChildOutcome::new(Ok::<_, CatalogError>(
+            bucket_info,
+        ))))
+        .unwrap();
+    let _ = op.next(IoResult::Values(vec![None])).unwrap();
+    let listed_page = aruna_ops_data::s3::object::list::ListBucketResult {
+        objects: Vec::new(),
+        common_prefixes: vec!["dir/open/".into()],
+        continuation_token: None,
+    };
+    let Next::Call(IoCall::Child(_)) = op
+        .next(IoResult::Child(ChildOutcome::new(Ok::<
+            _,
+            aruna_ops_data::s3::object::list::ListBucketError,
+        >(listed_page))))
+        .unwrap()
+    else {
+        panic!("expected entry authorize check");
+    };
+    let unavailable = op.next(IoResult::Child(ChildOutcome::new(
+        Err::<(), AuthorizeError>(AuthorizeError::Policy(PolicyEnforcementError::Unavailable(
+            "policy store down".into(),
+        ))),
+    )));
+    assert!(matches!(unavailable, Err(CatalogError::Storage(_))));
 }
