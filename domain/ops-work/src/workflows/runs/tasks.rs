@@ -160,6 +160,10 @@ fn container_path(work: &str, path: &str) -> String {
     }
 }
 
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
 fn input(path: String, source: InputSource) -> InputSelection {
     InputSelection {
         source,
@@ -236,25 +240,68 @@ pub fn task_spec(
         .ok_or_else(|| ContractError::unsupported("the run names no output bucket"))?;
     let folders = &request.folders;
     let control = folders.control.trim_end_matches('/');
-    let script = match control.rsplit_once('/') {
-        Some((parent, _)) if !parent.is_empty() => format!("{parent}/task.sh"),
-        _ => "/task.sh".to_owned(),
+    let (script, wrapper) = match control.rsplit_once('/') {
+        Some((parent, _)) if !parent.is_empty() => {
+            (format!("{parent}/task.sh"), format!("{parent}/wrapper.sh"))
+        }
+        _ => ("/task.sh".to_owned(), "/wrapper.sh".to_owned()),
     };
-    let mut inputs = vec![input(
-        script.clone(),
-        InputSource::Inline {
-            bytes: request.command_wrapper_bytes.clone(),
-        },
-    )];
     let mut sources = Vec::new();
     for direct in &request.direct_inputs {
         sources.push((container_path(&folders.work, &direct.path), &direct.address));
     }
+    let mut dirs = Vec::new();
     for staged in &request.staged_files {
-        if let Some(address) = &staged.address {
-            sources.push((container_path(&folders.work, &staged.path), address));
+        let target = container_path(&folders.work, &staged.path);
+        match (&staged.address, staged.directory) {
+            (Some(address), _) => sources.push((target, address)),
+            (None, true) => {
+                if staged.path.contains('\0') || staged.path.split('/').any(|part| part == "..") {
+                    return Err(ContractError::invalid(format!(
+                        "staged directory `{}` is not valid",
+                        staged.path
+                    )));
+                }
+                dirs.push(target);
+            }
+            (None, false) => {
+                return Err(ContractError::invalid(format!(
+                    "staged file `{}` has no address",
+                    staged.path
+                )));
+            }
         }
     }
+    let mut inputs = match dirs.is_empty() {
+        true => vec![input(
+            script.clone(),
+            InputSource::Inline {
+                bytes: request.command_wrapper_bytes.clone(),
+            },
+        )],
+        false => {
+            let quoted: Vec<String> = dirs.iter().map(|dir| shell_quote(dir)).collect();
+            let launcher = format!(
+                "#!/bin/sh\nmkdir -p -- {} || exit 1\nexec /bin/sh {}\n",
+                quoted.join(" "),
+                shell_quote(&wrapper)
+            );
+            vec![
+                input(
+                    script.clone(),
+                    InputSource::Inline {
+                        bytes: launcher.into_bytes(),
+                    },
+                ),
+                input(
+                    wrapper,
+                    InputSource::Inline {
+                        bytes: request.command_wrapper_bytes.clone(),
+                    },
+                ),
+            ]
+        }
+    };
     for (path, address) in sources {
         let target = resolve(record, address)?;
         let source = InputSource::S3 {

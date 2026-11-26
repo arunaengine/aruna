@@ -95,19 +95,30 @@ pub fn area_of(record: &WorkflowRunRecord) -> Option<(String, String)> {
 
 /// The address the node gives the coordinator for a stored object version.
 pub fn address_of(bucket: &str, key: &str, version: Option<Ulid>) -> String {
-    let key = aruna_workflow_contract::host::encode_key(key);
-    match version {
-        Some(version) => format!("aruna://{bucket}/{key}?version={version}"),
-        None => format!("aruna://{bucket}/{key}"),
-    }
+    format_address("aruna://", bucket, key, version, None)
 }
 
 /// The address of an object that `node` holds, like a task output in its run area there.
 pub fn address_on(bucket: &str, key: &str, version: Option<Ulid>, node: NodeId) -> String {
+    format_address("aruna://", bucket, key, version, Some(node))
+}
+
+/// Formats an `aruna://` or `s3://` address with percent-encoded key and optional query tags.
+pub(crate) fn format_address(
+    scheme: &str,
+    bucket: &str,
+    key: &str,
+    version: Option<Ulid>,
+    node: Option<NodeId>,
+) -> String {
     let key = aruna_workflow_contract::host::encode_key(key);
-    match version {
-        Some(version) => format!("aruna://{bucket}/{key}?version={version}&node={node}"),
-        None => format!("aruna://{bucket}/{key}?node={node}"),
+    match (version, node) {
+        (Some(version), Some(node)) => {
+            format!("{scheme}{bucket}/{key}?version={version}&node={node}")
+        }
+        (Some(version), None) => format!("{scheme}{bucket}/{key}?version={version}"),
+        (None, Some(node)) => format!("{scheme}{bucket}/{key}?node={node}"),
+        (None, None) => format!("{scheme}{bucket}/{key}"),
     }
 }
 
@@ -752,8 +763,17 @@ pub enum WriteBody {
 }
 
 /// Where an upload goes, resolved and checked before its chunks arrive.
-pub fn upload_target(record: &WorkflowRunRecord, address: &str) -> Result<Target, ContractError> {
+pub fn upload_target(
+    record: &WorkflowRunRecord,
+    local: NodeId,
+    address: &str,
+) -> Result<Target, ContractError> {
     let target = resolve(record, address)?;
+    if let Some(node) = target.remote(local) {
+        return Err(ContractError::unsupported(format!(
+            "uploads cannot target remote node {node}"
+        )));
+    }
     if target.version.is_some() || target.key.is_empty() || target.key.ends_with('/') {
         return Err(ContractError::invalid(format!(
             "{address} names no new object"
@@ -986,6 +1006,11 @@ impl Operation for WriteObjectOperation {
     }
 
     fn first(&mut self) -> WriteNext {
+        if let Some(node) = self.target.remote(self.node_id) {
+            return Self::failed(ContractError::unsupported(format!(
+                "writes cannot target remote node {node}"
+            )));
+        }
         self.step = WriteStep::Target;
         Ok(Next::Call(self.access(&self.target, Permission::WRITE)))
     }

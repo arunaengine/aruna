@@ -283,7 +283,7 @@ pub(super) fn filter_tools(
 }
 
 /// Splits prior log pages into bounded batches so long lineages never exceed one frame.
-fn replay_chunks(pages: &[RunLogPage]) -> Vec<Vec<RunLogPage>> {
+pub(super) fn replay_chunks(pages: &[RunLogPage]) -> Vec<Vec<RunLogPage>> {
     let mut chunks: Vec<Vec<RunLogPage>> = Vec::new();
     let mut current: Vec<RunLogPage> = Vec::new();
     let mut bytes = 0usize;
@@ -879,6 +879,7 @@ impl Operation for AnswerCallOperation {
 #[derive(Debug, PartialEq)]
 pub struct OpenUploadOperation {
     run: WorkflowRunRecord,
+    local: NodeId,
     call_id: u64,
     address: String,
     target: Option<Target>,
@@ -886,9 +887,10 @@ pub struct OpenUploadOperation {
 }
 
 impl OpenUploadOperation {
-    pub fn new(run: WorkflowRunRecord, call_id: u64, address: String) -> Self {
+    pub fn new(run: WorkflowRunRecord, local: NodeId, call_id: u64, address: String) -> Self {
         Self {
             run,
+            local,
             call_id,
             address,
             target: None,
@@ -908,7 +910,7 @@ impl Operation for OpenUploadOperation {
     type Error = CatalogError;
 
     fn first(&mut self) -> Result<Next<Option<Target>>, CatalogError> {
-        let result = match upload_target(&self.run, &self.address) {
+        let result = match upload_target(&self.run, self.local, &self.address) {
             Ok(target) => {
                 self.target = Some(target);
                 HostRpcResult::UploadStarted {

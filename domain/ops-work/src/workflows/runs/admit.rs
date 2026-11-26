@@ -28,6 +28,9 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::types::{GroupId, Key};
+use aruna_ops_data::s3::object::head::{
+    HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
+};
 use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 use aruna_ops_identity::realm::mutate_placement::node_kind;
 use byteview::ByteView;
@@ -150,6 +153,39 @@ fn value_refs(
     Ok(())
 }
 
+/// Rewrites local unversioned file addresses in `value` with their resolved head versions.
+fn pin_versions(value: &mut Value, local: NodeId, versions: &BTreeMap<(String, String), Ulid>) {
+    match value {
+        Value::String(text) => {
+            let scheme = if text.starts_with("aruna://") {
+                Some("aruna://")
+            } else if text.starts_with("s3://") {
+                Some("s3://")
+            } else {
+                None
+            };
+            if let Some(scheme) = scheme
+                && let Ok((bucket, key, None, node)) = super::data::parse_address(text)
+                && node.is_none_or(|n| n == local)
+                && let Some(&version) = versions.get(&(bucket.clone(), key.clone()))
+            {
+                *text = super::data::format_address(scheme, &bucket, &key, Some(version), node);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                pin_versions(item, local, versions);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values_mut() {
+                pin_versions(item, local, versions);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Where a new run stands in a lineage: the run it resumes or repeats, and its cache scope.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Lineage {
@@ -178,6 +214,7 @@ enum AdmitStep {
     Key(Box<VersionView>),
     Existing(Box<VersionView>, [u8; 32]),
     Inputs(Box<VersionView>),
+    Head(Box<VersionView>, String, String),
     Output(Box<VersionView>),
     Encryption(Box<VersionView>),
     Config(Box<VersionView>, bool),
@@ -198,6 +235,9 @@ pub struct StartRunOperation {
     lineage: Lineage,
     bad_address: Option<String>,
     pending: Vec<PinnedInput>,
+    value_heads: Vec<(String, String)>,
+    value_versions: BTreeMap<(String, String), Ulid>,
+    resolved_values: Value,
     pub(super) remote: BTreeMap<NodeId, Vec<(PinnedInput, InputSelection)>>,
     asked: Vec<PinnedInput>,
     pub(super) captured: Vec<PrecapturedInput>,
@@ -213,7 +253,16 @@ impl StartRunOperation {
         let mut pending = request.inputs.clone();
         let mut refs = Vec::new();
         let bad_address = value_refs(&request.values, &mut refs).err();
+        let mut value_heads = Vec::new();
         for (bucket, key, version, source_node_id) in refs {
+            if version.is_none()
+                && source_node_id.is_none_or(|n| n == node.0)
+                && !key.is_empty()
+                && !key.ends_with('/')
+                && !value_heads.iter().any(|(b, k)| b == &bucket && k == &key)
+            {
+                value_heads.push((bucket.clone(), key.clone()));
+            }
             pending.push(PinnedInput {
                 name: String::new(),
                 bucket,
@@ -222,11 +271,15 @@ impl StartRunOperation {
                 source_node_id,
             });
         }
+        let resolved_values = request.values.clone();
         Self {
             auth: auth.clone(),
             token: None,
             node,
             pending,
+            value_heads,
+            value_versions: BTreeMap::new(),
+            resolved_values,
             request,
             lineage: Lineage::default(),
             bad_address,
@@ -295,6 +348,25 @@ impl StartRunOperation {
             self.step = AdmitStep::Inputs(Box::new(view));
             return Ok(Next::Call(IoCall::child(access)));
         }
+        self.next_head(view)
+    }
+
+    /// Resolves head versions of local unversioned file parameters so cross-node resumes keep
+    /// exact object identities.
+    fn next_head(&mut self, view: VersionView) -> AdmitNext {
+        if let Some((bucket, key)) = self.value_heads.pop() {
+            let head = HeadObjectOperation::new(HeadObjectInput {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: None,
+            });
+            self.step = AdmitStep::Head(Box::new(view), bucket, key);
+            return Ok(Next::Call(IoCall::child(head)));
+        }
+        if !self.value_versions.is_empty() {
+            pin_versions(&mut self.resolved_values, self.node.0, &self.value_versions);
+        }
+        let local = self.node.0;
         let Some(output) = self.request.output.clone() else {
             return self.encryption(view);
         };
@@ -377,7 +449,7 @@ impl StartRunOperation {
             created_at_ms: self.now_ms,
             finished_at_ms: None,
             error: None,
-            values_json: request.values.to_string(),
+            values_json: self.resolved_values.to_string(),
             inputs_json: request.inputs_json.clone(),
             output: request.output.clone(),
             outputs: Vec::new(),
@@ -668,6 +740,22 @@ impl Operation for StartRunOperation {
                 })?;
                 self.next_input(*view)
             }
+            AdmitStep::Head(view, bucket, key) => {
+                match result.child::<HeadObjectResult, HeadObjectError>()? {
+                    Ok(head) => {
+                        if let Some(version) = head.resolved_version_id.or(head.version_id) {
+                            self.value_versions.insert((bucket, key), version);
+                        }
+                    }
+                    Err(
+                        HeadObjectError::NoSuchKey
+                        | HeadObjectError::NoSuchVersion
+                        | HeadObjectError::DeleteMarker,
+                    ) => {}
+                    Err(error) => return Err(CatalogError::Storage(error.to_string())),
+                }
+                self.next_head(*view)
+            }
             AdmitStep::Output(view) => {
                 super::data::bucket_answer(result).map_err(|error| match error {
                     CatalogError::NotFound => {
@@ -800,6 +888,7 @@ impl Operation for StartRunOperation {
 pub struct RecordRunOperation {
     record: WorkflowRunRecord,
     key: Option<(Key, [u8; 32])>,
+    found_digest: Option<[u8; 32]>,
     stage: u8,
 }
 
@@ -808,6 +897,7 @@ impl RecordRunOperation {
         Self {
             record,
             key,
+            found_digest: None,
             stage: 0,
         }
     }
@@ -859,22 +949,22 @@ impl Operation for RecordRunOperation {
                     return self.write();
                 };
                 let known = RunKeyRecord::from_bytes(&value)?;
-                let digest = self.key.as_ref().map(|(_, digest)| *digest);
-                if Some(known.request_digest) != digest {
-                    return Err(CatalogError::Conflict(
-                        "the idempotency key started another run with other values".into(),
-                    ));
-                }
+                self.found_digest = Some(known.request_digest);
                 self.stage = 2;
                 Ok(Next::Call(super::read_run(known.run_id)))
             }
-            2 => {
-                let record = super::run_answer(result)?.ok_or(CatalogError::NotFound)?;
-                Ok(Next::Done(AdmittedRun {
-                    record,
-                    created: false,
-                }))
-            }
+            2 => match super::run_answer(result)? {
+                Some(record) if self.found_digest == self.key.as_ref().map(|(_, d)| *d) => {
+                    Ok(Next::Done(AdmittedRun {
+                        record,
+                        created: false,
+                    }))
+                }
+                Some(_) => Err(CatalogError::Conflict(
+                    "the idempotency key started another run with other values".into(),
+                )),
+                None => self.write(),
+            },
             _ => {
                 result.done()?;
                 Ok(Next::Done(AdmittedRun {

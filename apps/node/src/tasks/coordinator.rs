@@ -288,7 +288,12 @@ impl<'a> Session<'a> {
                 self.spawn(answer);
             }
             Inbound::UploadStart { call_id, address } => {
-                let open = OpenUploadOperation::new(self.run.clone(), call_id, address);
+                let open = OpenUploadOperation::new(
+                    self.run.clone(),
+                    self.ctx.owner_node_id,
+                    call_id,
+                    address,
+                );
                 match drive(open, &self.ctx.driver).await {
                     Ok(Some(target)) => self.uploads.open(call_id, target),
                     Ok(None) => {}

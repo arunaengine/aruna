@@ -125,6 +125,12 @@ impl Operation for CancelRunOperation {
         match std::mem::replace(&mut self.step, CancelStep::Cancelling) {
             CancelStep::Access => {
                 let (record, _) = access_of(result)?;
+                if record.node_id != self.serving.0 {
+                    return Err(CatalogError::Conflict(format!(
+                        "the run is coordinated on node {}; cancel it there",
+                        record.node_id
+                    )));
+                }
                 if record.state.is_terminal() {
                     return Err(CatalogError::Conflict(format!(
                         "the run already ended as {}",

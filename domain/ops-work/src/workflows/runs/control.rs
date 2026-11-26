@@ -106,7 +106,10 @@ impl FollowRunOperation {
     }
 
     fn start(&self, source: &WorkflowRunRecord) -> Result<StartRunOperation, CatalogError> {
-        let values: Value = crate::workflows::from_text(&source.values_json)?;
+        let mut values: Value = crate::workflows::from_text(&source.values_json)?;
+        if source.node_id != self.node.0 {
+            values_held_by(&mut values, source.node_id);
+        }
         let mut inputs_json = source.inputs_json.clone();
         // Pins the run's own node held name it once the run continues on another node.
         if let Some(text) = inputs_json
@@ -176,6 +179,37 @@ impl FollowRunOperation {
             start = start.with_captured(source.captured_remote.clone());
         }
         Ok(start)
+    }
+}
+
+/// Names `node` on every `aruna://` or `s3://` file address in `values` that names no node.
+pub(super) fn values_held_by(value: &mut Value, node: NodeId) {
+    match value {
+        Value::String(text) => {
+            let scheme = if text.starts_with("aruna://") {
+                Some("aruna://")
+            } else if text.starts_with("s3://") {
+                Some("s3://")
+            } else {
+                None
+            };
+            if let Some(scheme) = scheme
+                && let Ok((bucket, key, version, None)) = super::data::parse_address(text)
+            {
+                *text = super::data::format_address(scheme, &bucket, &key, version, Some(node));
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                values_held_by(item, node);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values_mut() {
+                values_held_by(item, node);
+            }
+        }
+        _ => {}
     }
 }
 
