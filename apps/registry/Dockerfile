@@ -1,5 +1,5 @@
 # Builds the registry image: a Cargo release build, then a distroless runtime stage.
-# Image: harbor.computational.bio.uni-giessen.de/aruna/aruna-registry
+# Image: ghcr.io/arunaengine/aruna-registry
 # Copyright (c) 2026 The Aruna Contributors
 # SPDX-License-Identifier: MIT or Apache-2.0
 

@@ -74,11 +74,11 @@ without giving it to a central service.
 
 ### Run with Docker: single node
 
-You need Docker. The node image is published on Harbor for linux/amd64. It contains `aruna`,
+You need Docker. The node image is published on the GitHub Container Registry for linux/amd64. It contains `aruna`,
 `aruna-doctor` and the web portal:
 
 ```bash
-IMAGE=harbor.computational.bio.uni-giessen.de/aruna/aruna-v3:v3
+IMAGE=ghcr.io/arunaengine/aruna:v3
 docker pull "$IMAGE"
 ```
 

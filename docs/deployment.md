@@ -30,10 +30,10 @@ see [`.env.example`](../.env.example).
 ## Releases and image tags
 
 Aruna v3 is currently in public alpha (`v3.0.0-alpha.*`). Pre-built Linux (`linux/amd64`) container
-images are published on Harbor:
+images are published on the GitHub Container Registry:
 
 ```text
-harbor.computational.bio.uni-giessen.de/aruna/aruna-v3:<tag>
+ghcr.io/arunaengine/aruna:<tag>
 ```
 
 Each published image uses a distroless Debian 13 runtime (no shell inside the container) and
@@ -195,7 +195,7 @@ S3_HOST=s3.rdm.example.org
 PORTAL_PUBLIC_URL=https://rdm.example.org
 CORS_ALLOWED_ORIGINS=https://rdm.example.org
 
-# Web portal (uses embedded /run/portal from the published Harbor image)
+# Web portal (uses embedded /run/portal from the published image)
 PORTAL_MODE=artifact
 PORTAL_LANDING=enabled
 
@@ -223,7 +223,7 @@ Create `/srv/aruna/compose.yaml`:
 ```yaml
 services:
   aruna:
-    image: harbor.computational.bio.uni-giessen.de/aruna/aruna-v3:v3.0.0-alpha.208
+    image: ghcr.io/arunaengine/aruna:v3.0.0-alpha.208
     container_name: aruna
     restart: unless-stopped
     stop_grace_period: 30s
@@ -592,7 +592,7 @@ docker compose start aruna
    ```bash
    docker run --rm \
      -v /srv/aruna:/srv/aruna \
-     harbor.computational.bio.uni-giessen.de/aruna/aruna-v3:v3.0.0-alpha.208 \
+     ghcr.io/arunaengine/aruna:v3.0.0-alpha.208 \
      /run/aruna-doctor restore /srv/aruna/backups/aruna-<timestamp>.bak /srv/aruna/data-restored
    ```
 
@@ -618,7 +618,7 @@ Always follow this sequence when moving from one pinned tag to another:
 3. **Pull the new pinned image** and update the tag in `/srv/aruna/compose.yaml`:
 
    ```bash
-   NEW_IMAGE=harbor.computational.bio.uni-giessen.de/aruna/aruna-v3:<new-tag>
+   NEW_IMAGE=ghcr.io/arunaengine/aruna:<new-tag>
    docker pull "$NEW_IMAGE"
    ```
 
@@ -688,7 +688,7 @@ a realm administrator in the portal (or API):
 
 Before opening a new deployment to users, verify each item:
 
-- [ ] Pinned Harbor image tag set in `compose.yaml` (not floating `v3`).
+- [ ] Pinned image tag set in `compose.yaml` (not floating `v3`).
 - [ ] Host clock synchronized with NTP.
 - [ ] `ARUNA_FJALL_PERSIST_MODE=sync_all` and an appropriate `ARUNA_FJALL_CACHE_MIB` configured.
 - [ ] DNS records and valid TLS certificates in place for Portal, API and S3 (plus `*.s3.*` if

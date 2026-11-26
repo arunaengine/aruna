@@ -7,6 +7,6 @@ set -eu
 
 repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 version=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$repo_root/Cargo.toml" | head -n 1)
-image=${ARUNA_REGISTRY_IMAGE:-harbor.computational.bio.uni-giessen.de/aruna/aruna-registry:$version}
+image=${ARUNA_REGISTRY_IMAGE:-ghcr.io/arunaengine/aruna-registry:v$version}
 
 docker build -f "$repo_root/apps/registry/Dockerfile" -t "$image" "$repo_root"
