@@ -11,6 +11,7 @@ pub mod identity;
 pub mod lifecycle;
 pub mod limits;
 pub mod reads;
+pub mod start;
 pub mod upkeep;
 
 use aruna_core::automation::keys::{active_prefix, firing_key, record_key, record_prefix};
