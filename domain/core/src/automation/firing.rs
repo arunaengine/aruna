@@ -287,7 +287,7 @@ impl Firing {
             } else {
                 match spec.stages[index].when {
                     When::Passed => upstreams.iter().all(|&s| s == StageState::Succeeded),
-                    When::Failed => upstreams.iter().any(|&s| s == StageState::Failed),
+                    When::Failed => upstreams.contains(&StageState::Failed),
                     When::Always => upstreams
                         .iter()
                         .any(|&s| matches!(s, StageState::Succeeded | StageState::Failed)),
@@ -470,10 +470,10 @@ impl Firing {
                 }
                 StageState::Running | StageState::Cancelling => {
                     stage.state = StageState::Cancelling;
-                    if matches!(spec.stages[index].kind, StageKind::Run { .. }) {
-                        if let Some(run_id) = stage.receipt.workflow_run_id {
-                            child_runs.push(run_id);
-                        }
+                    if matches!(spec.stages[index].kind, StageKind::Run { .. })
+                        && let Some(run_id) = stage.receipt.workflow_run_id
+                    {
+                        child_runs.push(run_id);
                     }
                 }
                 _ => {}

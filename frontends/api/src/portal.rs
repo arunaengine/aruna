@@ -604,7 +604,7 @@ mod tests {
         let config: serde_json::Value = serde_json::from_slice(&body).unwrap();
         // Realm level feature flags only; no group's state reaches this unauthenticated file.
         let features = serde_json::json!({
-            "applets": false, "builder": false, "compute": true, "runs": true, "workflows": false
+            "applets": false, "automations": false, "builder": false, "compute": true, "runs": true, "workflows": false
         });
         assert_eq!(
             config,

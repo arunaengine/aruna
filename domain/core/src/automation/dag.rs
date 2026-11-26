@@ -116,10 +116,10 @@ fn check_triggers(triggers: &[Trigger]) -> Result<(), String> {
             if prefix.starts_with('/') || prefix.contains("..") {
                 return Err("data_uploaded prefix must be relative without `..`".into());
             }
-            if let Some(pat) = pattern {
-                if pat.is_empty() || pat.contains('/') {
-                    return Err("data_uploaded filename pattern must not contain `/`".into());
-                }
+            if let Some(pat) = pattern
+                && (pat.is_empty() || pat.contains('/'))
+            {
+                return Err("data_uploaded filename pattern must not contain `/`".into());
             }
         }
     }

@@ -142,12 +142,10 @@ fn check_pair(
                     }
                 }
             }
-            Trigger::RunFinished { workflow_id, .. } => {
-                if workflows.contains(workflow_id) {
-                    warnings.push(format!(
-                        "{source_name} runs workflow `{workflow_id}` which matches a run_finished trigger on {target_name}"
-                    ));
-                }
+            Trigger::RunFinished { workflow_id, .. } if workflows.contains(workflow_id) => {
+                warnings.push(format!(
+                    "{source_name} runs workflow `{workflow_id}` which matches a run_finished trigger on {target_name}"
+                ));
             }
             _ => {}
         }
