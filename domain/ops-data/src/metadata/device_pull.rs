@@ -666,7 +666,7 @@ impl Operation for CommitPullOperation {
                     }
                     // A metadata-only answer to a full read is a broken exchange, not an absent
                     // object: parking the upload on it would lose the file.
-                    Ok(Ok(BaoReadOutput::Metadata { .. })) | Err(_) => {
+                    Ok(Ok(BaoReadOutput::Metadata { .. } | BaoReadOutput::Authorized)) | Err(_) => {
                         return self.failed(SyncRefusal::Unavailable);
                     }
                     Ok(Err(error)) => {

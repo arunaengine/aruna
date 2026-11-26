@@ -259,6 +259,7 @@ fn device_serves_file() {
 #[test]
 fn probes_authorized_link() {
     use aruna_core::structs::execution::source_access::SourceMetadata;
+    use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode};
     use aruna_core::structs::storage::link::LinkTarget;
     use aruna_core::structs::storage::replication::VersionedObjectArn;
 
@@ -286,35 +287,80 @@ fn probes_authorized_link() {
     );
     let value: byteview::ByteView = version.to_bytes().unwrap().into();
 
-    let mut req = read_request(local, [0u8; 32]);
-    req.expected_blake3 = None;
-    req.metadata_only = true;
-    req.disallow_encrypted = true;
-    let mut allowed = IncomingBaoOperation::new(peer, local, realm, Ulid::from(8u128), req.clone());
+    // Ordinary ExactVersion metadata requests must never synthesize a zero BLAKE3 for a link.
+    let mut exact_req = read_request(local, [0u8; 32]);
+    exact_req.expected_blake3 = None;
+    exact_req.metadata_only = true;
+    let mut exact =
+        IncomingBaoOperation::new(peer, local, realm, Ulid::from(7u128), exact_req.clone());
+    exact.policy_allowed = true;
+    let turn = exact.handle_exact_version(Some(value.clone()));
+    assert_eq!(refusal_from(&turn), BaoReadRefusal::NotFound);
+
+    let link_arn =
+        VersionedObjectArn::new(realm, local, "bucket", "path/file.txt", Ulid::from(4u128))
+            .unwrap();
+    let mut link_req = exact_req.clone();
+    link_req.target = BaoReadTarget::LinkAccess(link_arn);
+    link_req.disallow_encrypted = true;
+    let mut allowed =
+        IncomingBaoOperation::new(peer, local, realm, Ulid::from(8u128), link_req.clone());
     allowed.policy_allowed = true;
     let turn = allowed.handle_exact_version(Some(value.clone()));
     assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
     let accepted = allowed.next(row(None));
     let Some(BlobEffect::SendMessage { payload, .. }) = asked(&accepted).as_blob() else {
-        panic!("expected accepted probe frame");
+        panic!("expected authorized probe frame");
     };
-    assert!(matches!(
+    assert_eq!(
         VersionReplicationMessage::from_bytes(payload).unwrap(),
-        VersionReplicationMessage::BaoReadAccepted { size: 12, .. }
+        VersionReplicationMessage::BaoReadAuthorized
+    );
+
+    // Client decodes BaoReadAuthorized into BaoReadOutput::Authorized only for LinkAccess.
+    let mut client = BaoReadOperation::new(local, link_req.clone());
+    let close = client.response(Ulid::from(8u128), payload).unwrap();
+    assert!(matches!(close, Next::Call(IoCall::Effect(_))));
+    assert_eq!(client.metadata, Some(BaoReadOutput::Authorized));
+    let mut exact_client = BaoReadOperation::new(local, exact_req);
+    assert!(matches!(
+        exact_client.response(Ulid::from(7u128), payload),
+        Err(BaoReadError::Unexpected { .. })
     ));
 
-    let mut denied = IncomingBaoOperation::new(peer, local, realm, Ulid::from(9u128), req.clone());
+    // Encrypted bucket refuses LinkAccess when disallow_encrypted is set.
+    let mut enc =
+        IncomingBaoOperation::new(peer, local, realm, Ulid::from(11u128), link_req.clone());
+    enc.policy_allowed = true;
+    assert!(matches!(
+        enc.handle_exact_version(Some(value.clone())),
+        Ok(Next::Call(IoCall::Read(_)))
+    ));
+    let enc_row: byteview::ByteView = BucketEncryption {
+        mode: EncryptionMode::VaultLocked,
+        bucket_id: Some(Ulid::from(12u128)),
+        key_generation: 1,
+        ..Default::default()
+    }
+    .to_bytes()
+    .unwrap()
+    .into();
+    let refused = enc.next(row(Some(enc_row)));
+    assert_eq!(refusal_from(&refused), BaoReadRefusal::ReadDenied);
+
+    let mut denied =
+        IncomingBaoOperation::new(peer, local, realm, Ulid::from(9u128), link_req.clone());
     denied.policy_allowed = false;
     let turn = denied.handle_exact_version(Some(value.clone()));
     assert_eq!(refusal_from(&turn), BaoReadRefusal::ReadDenied);
 
-    let mut bytes_req = req;
+    let mut bytes_req = link_req;
     bytes_req.metadata_only = false;
     let mut stream_read =
         IncomingBaoOperation::new(peer, local, realm, Ulid::from(10u128), bytes_req);
     stream_read.policy_allowed = true;
     let turn = stream_read.handle_exact_version(Some(value));
-    assert_eq!(refusal_from(&turn), BaoReadRefusal::NotFound);
+    assert_eq!(refusal_from(&turn), BaoReadRefusal::InvalidTarget);
 }
 
 #[test]

@@ -1045,7 +1045,7 @@ impl HolderFailures {
     ) -> Option<BaoReadOutput> {
         match result {
             Ok(output @ BaoReadOutput::Stream { .. }) => Some(output),
-            Ok(BaoReadOutput::Metadata { .. }) => {
+            Ok(BaoReadOutput::Metadata { .. } | BaoReadOutput::Authorized) => {
                 self.contacted = true;
                 self.metadata_only = true;
                 None
@@ -1148,7 +1148,7 @@ impl HolderReadOperation {
                     let info = routed_info(self.read()?, size, etag, hashes, summary);
                     Ok(Next::Done(HolderRead::Info(Box::new(info))))
                 }
-                Ok(BaoReadOutput::Stream { .. }) => {
+                Ok(BaoReadOutput::Stream { .. } | BaoReadOutput::Authorized) => {
                     self.failures.unavailable = true;
                     self.next_holder()
                 }

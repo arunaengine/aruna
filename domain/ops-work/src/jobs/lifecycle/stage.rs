@@ -198,7 +198,7 @@ impl Operation for StageInputOperation {
                 debug!(peer = %holder, "Input staged from a remote holder");
                 Ok(Next::Done(StagedInput { blob, size }))
             }
-            Ok(BaoReadOutput::Metadata { .. }) => self.next_read(),
+            Ok(BaoReadOutput::Metadata { .. } | BaoReadOutput::Authorized) => self.next_read(),
             Err(error) => {
                 warn!(peer = %holder, error = %error, "Remote input read failed");
                 self.last = Some(error);

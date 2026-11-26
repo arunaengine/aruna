@@ -196,9 +196,9 @@ impl WriteArchiveOperation {
             }
             CandidateOpen::Opened(BaoReadOutput::Stream { .. })
             | CandidateOpen::Status(OpenStatus::Corrupt) => return Err(self.corrupt()),
-            CandidateOpen::Opened(BaoReadOutput::Metadata { .. }) => {
+            CandidateOpen::Opened(BaoReadOutput::Metadata { .. } | BaoReadOutput::Authorized) => {
                 return Err(ExportFailure::Retryable(
-                    "source open unexpectedly returned metadata".to_string(),
+                    "source open unexpectedly returned no stream".to_string(),
                 ));
             }
             CandidateOpen::Status(status) => {

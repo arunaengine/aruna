@@ -114,7 +114,7 @@ impl Operation for FetchRemoteOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<Blob>, FetchError> {
         match result.child::<BaoReadOutput, BaoReadError>()? {
             Ok(BaoReadOutput::Stream { blob, .. }) => Ok(Next::Done(blob)),
-            Ok(BaoReadOutput::Metadata { .. }) => Err(FetchError(
+            Ok(BaoReadOutput::Metadata { .. } | BaoReadOutput::Authorized) => Err(FetchError(
                 "the remote version returned no bytes".to_string(),
             )),
             Err(BaoReadError::Refused(BaoReadRefusal::HeldBy { holder, set_id }))

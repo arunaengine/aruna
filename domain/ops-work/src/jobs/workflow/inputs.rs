@@ -390,9 +390,9 @@ impl Operation for InputSourceOperation {
                         size: Some(size),
                         served_source: None,
                     })),
-                    Ok(BaoReadOutput::Metadata { .. }) => Err(JobError::retryable(format!(
-                        "staging {bucket}/{key} received no bytes"
-                    ))),
+                    Ok(BaoReadOutput::Metadata { .. } | BaoReadOutput::Authorized) => Err(
+                        JobError::retryable(format!("staging {bucket}/{key} received no bytes")),
+                    ),
                     Err(error) => Err(device_read_error(&bucket, &key, error)),
                 }
             }
