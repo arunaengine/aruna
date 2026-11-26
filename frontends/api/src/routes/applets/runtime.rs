@@ -509,7 +509,11 @@ pub async fn start_run(
   delivery targets outside the visitor's folder are never exposed."#,
     params(("applet_id" = String, Path, description = "Applet id; an unparseable id is 404")),
     responses(
-        (status = 200, description = "The visitor's runs, newest first", body = Vec<RunBody>),
+        (status = 200, description = "The visitor's runs, newest first", body = Vec<RunBody>,
+            example = json!([{
+                "run_id": "01K8W2A0000000000000000000", "state": "running",
+                "created_at": "2026-11-24T08:00:00+00:00", "finished_at": null, "error": null
+            }])),
         (status = 401, description = "No valid edge key, or neither visitor nor allowed guest", body = ErrorResponse),
         (status = 403, description = "The visitor may not use this applet", body = ErrorResponse),
         (status = 404, description = "No such applet", body = ErrorResponse),

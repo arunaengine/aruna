@@ -102,7 +102,21 @@ pub struct ResolutionBody {
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
-#[schema(as = AutomationRun)]
+#[schema(as = AutomationRun, example = json!({
+    "firing_id": "01K8W4A0000000000000000000",
+    "automation_id": "01K8W3A0000000000000000000",
+    "group_id": "01JABCDEF0123456789ABCDEFG",
+    "revision": 2,
+    "attempt": 1,
+    "state": "running",
+    "trigger_kind": "manual",
+    "stages": [],
+    "resolutions": [],
+    "created_at": "2026-11-26T12:05:00+00:00",
+    "updated_at": "2026-11-26T12:05:00+00:00",
+    "finished_at": null,
+    "error": null
+}))]
 pub struct FiringBody {
     pub firing_id: String,
     pub automation_id: String,
@@ -154,7 +168,24 @@ impl FiringBody {
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
-#[schema(as = AutomationRunPage)]
+#[schema(as = AutomationRunPage, example = json!({
+    "items": [{
+        "firing_id": "01K8W4A0000000000000000000",
+        "automation_id": "01K8W3A0000000000000000000",
+        "group_id": "01JABCDEF0123456789ABCDEFG",
+        "revision": 2,
+        "attempt": 1,
+        "state": "succeeded",
+        "trigger_kind": "manual",
+        "stages": [],
+        "resolutions": [],
+        "created_at": "2026-11-26T12:05:00+00:00",
+        "updated_at": "2026-11-26T12:05:10+00:00",
+        "finished_at": "2026-11-26T12:05:10+00:00",
+        "error": null
+    }],
+    "next_cursor": null
+}))]
 pub struct FiringPageBody {
     pub items: Vec<FiringBody>,
     pub next_cursor: Option<String>,
@@ -163,23 +194,28 @@ pub struct FiringPageBody {
 #[derive(Clone, Debug, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct FiringQuery {
+    /// Optional group ULID filter.
     pub group_id: Option<String>,
+    /// Optional automation ULID filter.
     pub automation_id: Option<String>,
+    /// Optional firing state filter (`running`, `waiting_for_approval`, `needs_attention`, `cancelling`, `succeeded`, `failed`, `cancelled`).
     pub state: Option<String>,
+    /// Pagination cursor returned by the previous page.
     pub cursor: Option<String>,
+    /// Maximum items to return (1 to 500).
     pub limit: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, ToSchema)]
 #[serde(default)]
-#[schema(as = StartAutomationRequest)]
+#[schema(as = StartAutomationRequest, example = json!({"values": {"sample": "s1"}}))]
 pub struct StartRequest {
     #[schema(value_type = Option<Object>)]
     pub values: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, ToSchema)]
-#[schema(as = ResolveStageRequest)]
+#[schema(as = ResolveStageRequest, example = json!({"stage": "copy_out", "done": true, "note": "Verified destination object"}))]
 pub struct ResolveRequest {
     pub stage: String,
     pub done: bool,
@@ -189,13 +225,20 @@ pub struct ResolveRequest {
 
 #[derive(Clone, Debug, Default, Deserialize, ToSchema)]
 #[serde(default)]
-#[schema(as = DecideStageRequest)]
+#[schema(as = DecideStageRequest, example = json!({"note": "Approved after reviewing preview"}))]
 pub struct DecideRequest {
     pub note: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
-#[schema(as = AutomationKeptEvent)]
+#[schema(as = AutomationKeptEvent, example = json!({
+    "event_id": "01K8W4B0000000000000000000",
+    "kind": "data_uploaded",
+    "resource": "reads/run1/a.fastq",
+    "revision": "01K8W1C0000000000000000000",
+    "reason": "automation paused",
+    "kept_at": "2026-11-26T12:04:00+00:00"
+}))]
 pub struct KeptEventBody {
     pub event_id: String,
     pub kind: String,
@@ -219,7 +262,7 @@ impl KeptEventBody {
 }
 
 #[derive(Clone, Debug, Deserialize, ToSchema)]
-#[schema(as = StartKeptEventsRequest)]
+#[schema(as = StartKeptEventsRequest, example = json!({"event_ids": ["01K8W4B0000000000000000000"]}))]
 pub struct StartEventsRequest {
     pub event_ids: Vec<String>,
 }

@@ -64,7 +64,10 @@ async fn apply_change(
     post,
     path = "/compute/automations/{automation_id}/request-approval",
     tag = "automations",
-    summary = "Submit a draft or pending change for human group admin approval",
+    summary = "Submit an automation for approval",
+    description = r#"Submits a draft automation or pending widening change for human group admin approval.
+
+**Authentication**: unrestricted realm bearer token with WRITE on the automation's group."#,
     params(("automation_id" = String, Path, description = "Automation ULID")),
     request_body = RevisionBody,
     responses(
@@ -96,7 +99,10 @@ pub async fn request_approval(
     post,
     path = "/compute/automations/{automation_id}/approve",
     tag = "automations",
-    summary = "Approve an automation or its pending change as a human group admin",
+    summary = "Approve a workflow automation",
+    description = r#"Approves a workflow automation or its pending change and activates its scoped service account.
+
+**Authentication**: unrestricted human group admin bearer token."#,
     params(("automation_id" = String, Path, description = "Automation ULID")),
     request_body = RevisionBody,
     responses(
@@ -128,7 +134,10 @@ pub async fn approve_automation(
     post,
     path = "/compute/automations/{automation_id}/reject",
     tag = "automations",
-    summary = "Reject a pending automation approval as a human group admin",
+    summary = "Reject a pending automation approval",
+    description = r#"Rejects a pending automation approval request and keeps the prior approved specification unchanged.
+
+**Authentication**: unrestricted human group admin bearer token."#,
     params(("automation_id" = String, Path, description = "Automation ULID")),
     request_body = RevisionBody,
     responses(
@@ -160,6 +169,9 @@ pub async fn reject_automation(
     path = "/compute/automations/{automation_id}/pause",
     tag = "automations",
     summary = "Pause an active workflow automation",
+    description = r#"Pauses an active workflow automation so matched events are held without starting new firings.
+
+**Authentication**: unrestricted realm bearer token with WRITE on the automation's group."#,
     params(("automation_id" = String, Path, description = "Automation ULID")),
     request_body = RevisionBody,
     responses(
@@ -191,7 +203,10 @@ pub async fn pause_automation(
     post,
     path = "/compute/automations/{automation_id}/resume",
     tag = "automations",
-    summary = "Resume a paused approved workflow automation",
+    summary = "Resume a paused workflow automation",
+    description = r#"Resumes a paused approved workflow automation so future matching events start firings again.
+
+**Authentication**: unrestricted realm bearer token with WRITE on the automation's group."#,
     params(("automation_id" = String, Path, description = "Automation ULID")),
     request_body = RevisionBody,
     responses(
@@ -223,7 +238,10 @@ pub async fn resume_automation(
     get,
     path = "/compute/automations/{automation_id}/diff",
     tag = "automations",
-    summary = "Review approval diff, loop warnings, outside-input and sandbox flags",
+    summary = "Read automation approval diff",
+    description = r#"Computes the permission, trigger and stage diff along with loop and sandbox warnings.
+
+**Authentication**: realm bearer token with READ on the automation's group."#,
     params(("automation_id" = String, Path, description = "Automation ULID")),
     responses(
         (status = 200, description = "Approval diff and warnings", body = DiffBody),
@@ -246,7 +264,10 @@ pub async fn diff_automation(
     post,
     path = "/compute/automations/{automation_id}/check",
     tag = "automations",
-    summary = "Dry-run validate an automation DAG, workflow forms, copy targets and sandbox",
+    summary = "Dry-run validate an automation",
+    description = r#"Validates the automation DAG, pinned workflows, copy templates and sandbox flags without running stages.
+
+**Authentication**: realm bearer token with READ on the automation's group."#,
     params(("automation_id" = String, Path, description = "Automation ULID")),
     request_body = CheckRequest,
     responses(
@@ -271,10 +292,17 @@ pub async fn check_automation(
     get,
     path = "/compute/automations/{automation_id}/graph",
     tag = "automations",
-    summary = "Return the static trigger-and-stage DAG in WorkflowGraphBody format",
+    summary = "Read automation static DAG",
+    description = r#"Returns the static trigger and stage DAG of an automation in workflow graph format.
+
+**Authentication**: realm bearer token with READ on the automation's group."#,
     params(("automation_id" = String, Path, description = "Automation ULID")),
     responses(
-        (status = 200, description = "Static automation DAG", body = WorkflowGraphBody),
+        (status = 200, description = "Static automation DAG", body = WorkflowGraphBody, example = json!({
+            "nodes": [{"id": "trigger:0", "kind": "input", "label": "manual", "tool": null, "version": null}],
+            "edges": [{"from": {"node": "trigger:0", "port": "out"}, "to": {"node": "stage:alert", "port": "in"}, "scatter": null, "fit": null}],
+            "complete": true
+        })),
         (status = 404, description = "Not found", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))

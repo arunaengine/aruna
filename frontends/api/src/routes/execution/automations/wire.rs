@@ -38,7 +38,32 @@ impl PendingBody {
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
-#[schema(as = Automation)]
+#[schema(as = Automation, example = json!({
+    "automation_id": "01K8W3A0000000000000000000",
+    "group_id": "01JABCDEF0123456789ABCDEFG",
+    "name": "ingest",
+    "description": "Notify admins when triggered",
+    "host_node": "4f0c9d1e2b3a495867788990aabbccddeeff00112233445566778899aabbccdd",
+    "lifecycle": "draft",
+    "pause_reason": null,
+    "spec": {
+        "triggers": [{"kind": "manual"}],
+        "stages": [{"name": "alert", "kind": "notify", "audience": "group_admins", "message": "Done"}],
+        "scope": {
+            "read": [], "write": [], "metadata": [], "workflows": [],
+            "audiences": ["group_admins"], "secrets": [], "allow_downgrade": false,
+            "limits": {"max_active_firings": 4}
+        }
+    },
+    "pending": null,
+    "account": null,
+    "approved_by": null,
+    "approved_at": null,
+    "created_by": "01K8W1A0000000000000000000",
+    "created_at": "2026-11-26T12:00:00+00:00",
+    "updated_at": "2026-11-26T12:00:00+00:00",
+    "revision": 1
+}))]
 pub struct AutomationBody {
     pub automation_id: String,
     pub group_id: String,
@@ -82,7 +107,35 @@ impl AutomationBody {
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
-#[schema(as = AutomationPage)]
+#[schema(as = AutomationPage, example = json!({
+    "items": [{
+        "automation_id": "01K8W3A0000000000000000000",
+        "group_id": "01JABCDEF0123456789ABCDEFG",
+        "name": "ingest",
+        "description": "Notify admins when triggered",
+        "host_node": "4f0c9d1e2b3a495867788990aabbccddeeff00112233445566778899aabbccdd",
+        "lifecycle": "active",
+        "pause_reason": null,
+        "spec": {
+            "triggers": [{"kind": "manual"}],
+            "stages": [{"name": "alert", "kind": "notify", "audience": "group_admins", "message": "Done"}],
+            "scope": {
+                "read": [], "write": [], "metadata": [], "workflows": [],
+                "audiences": ["group_admins"], "secrets": [], "allow_downgrade": false,
+                "limits": {"max_active_firings": 4}
+            }
+        },
+        "pending": null,
+        "account": "01K8W3B0000000000000000000",
+        "approved_by": "01K8W1A0000000000000000000",
+        "approved_at": "2026-11-26T12:01:00+00:00",
+        "created_by": "01K8W1A0000000000000000000",
+        "created_at": "2026-11-26T12:00:00+00:00",
+        "updated_at": "2026-11-26T12:01:00+00:00",
+        "revision": 2
+    }],
+    "next_cursor": null
+}))]
 pub struct AutomationPage {
     pub items: Vec<AutomationBody>,
     pub next_cursor: Option<String>,
@@ -91,14 +144,31 @@ pub struct AutomationPage {
 #[derive(Clone, Debug, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct ListAutoQuery {
+    /// Group ULID whose automations are listed.
     pub group_id: String,
+    /// Optional lifecycle filter (`draft`, `waiting_for_approval`, `active`, `paused`, `removed`).
     pub lifecycle: Option<String>,
+    /// Pagination cursor returned by the previous page.
     pub cursor: Option<String>,
+    /// Maximum items to return (1 to 500).
     pub limit: Option<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize, ToSchema)]
-#[schema(as = CreateAutomationRequest)]
+#[schema(as = CreateAutomationRequest, example = json!({
+    "group_id": "01JABCDEF0123456789ABCDEFG",
+    "name": "ingest",
+    "description": "Notify admins when triggered",
+    "spec": {
+        "triggers": [{"kind": "manual"}],
+        "stages": [{"name": "alert", "kind": "notify", "audience": "group_admins", "message": "Done"}],
+        "scope": {
+            "read": [], "write": [], "metadata": [], "workflows": [],
+            "audiences": ["group_admins"], "secrets": [], "allow_downgrade": false,
+            "limits": {"max_active_firings": 4}
+        }
+    }
+}))]
 pub struct CreateAutoRequest {
     pub group_id: String,
     pub name: String,
@@ -108,7 +178,11 @@ pub struct CreateAutoRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, ToSchema)]
-#[schema(as = UpdateAutomationRequest)]
+#[schema(as = UpdateAutomationRequest, example = json!({
+    "expected_revision": 1,
+    "name": "ingest-v2",
+    "description": "Updated automation description"
+}))]
 pub struct UpdateAutoRequest {
     pub expected_revision: u64,
     #[serde(default)]
@@ -121,13 +195,41 @@ pub struct UpdateAutoRequest {
 
 #[derive(Clone, Debug, Default, Deserialize, ToSchema)]
 #[serde(default)]
-#[schema(as = AutomationRevisionRequest)]
+#[schema(as = AutomationRevisionRequest, example = json!({"expected_revision": 1}))]
 pub struct RevisionBody {
     pub expected_revision: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
-#[schema(as = AutomationDiff)]
+#[schema(as = AutomationDiff, example = json!({
+    "pending": true,
+    "revision": 2,
+    "triggers_added": [{"kind": "manual"}],
+    "triggers_removed": [],
+    "read_added": [],
+    "read_removed": [],
+    "write_added": [],
+    "write_removed": [],
+    "metadata_added": [],
+    "metadata_removed": [],
+    "workflows_added": [],
+    "workflows_removed": [],
+    "audiences_added": ["group_admins"],
+    "audiences_removed": [],
+    "secrets_added": [],
+    "secrets_removed": [],
+    "allow_downgrade_before": false,
+    "allow_downgrade_after": false,
+    "stages_added": ["alert"],
+    "stages_removed": [],
+    "stages_changed": [],
+    "limits_before": null,
+    "limits_after": {"max_active_firings": 4},
+    "outside_input": false,
+    "unsandboxed": false,
+    "loop_warnings": [],
+    "applet_warnings": []
+}))]
 pub struct DiffBody {
     pub pending: bool,
     pub revision: u64,
@@ -219,7 +321,7 @@ impl DiffBody {
 
 #[derive(Clone, Debug, Default, Deserialize, ToSchema)]
 #[serde(default)]
-#[schema(as = AutomationCheckRequest)]
+#[schema(as = AutomationCheckRequest, example = json!({"sample_values": {"bucket": "reads", "key": "run1/a.fastq"}}))]
 pub struct CheckRequest {
     #[schema(value_type = Option<Object>)]
     pub sample_values: Option<Value>,
@@ -235,7 +337,14 @@ pub struct CopyPreviewBody {
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
-#[schema(as = AutomationCheckReport)]
+#[schema(as = AutomationCheckReport, example = json!({
+    "ok": true,
+    "diagnostics": [],
+    "outside_input": false,
+    "unsandboxed": false,
+    "copy_previews": [],
+    "workflows_checked": 1
+}))]
 pub struct CheckBody {
     pub ok: bool,
     pub diagnostics: Vec<String>,

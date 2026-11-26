@@ -37,7 +37,10 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     get,
     path = "/compute/automation-runs",
     tag = "automations",
-    summary = "List automation runs for a group or automation",
+    summary = "List automation runs",
+    description = r#"Lists automation runs filtered by group, automation or firing state, newest first.
+
+**Authentication**: realm bearer token with READ on the target group or automation."#,
     params(FiringQuery),
     responses(
         (status = 200, description = "One page of automation runs", body = FiringPageBody),
@@ -86,7 +89,10 @@ pub async fn list_firings(
     get,
     path = "/compute/automation-runs/{firing_id}",
     tag = "automations",
-    summary = "Read one automation run with stage states, receipts and resolutions",
+    summary = "Read one automation run",
+    description = r#"Returns one automation run with its stage states, committed receipts and human resolutions.
+
+**Authentication**: realm bearer token with READ on the automation's group."#,
     params(("firing_id" = String, Path, description = "Firing ULID")),
     responses(
         (status = 200, description = "The automation run", body = FiringBody),
@@ -109,7 +115,10 @@ pub async fn get_firing(
     post,
     path = "/compute/automation-runs/{firing_id}/cancel",
     tag = "automations",
-    summary = "Asynchronously cancel an active automation run and its child workflow runs",
+    summary = "Cancel an automation run",
+    description = r#"Cancels an active automation run and requests cancellation of its child workflow runs.
+
+**Authentication**: unrestricted realm bearer token with WRITE on the automation's group."#,
     params(("firing_id" = String, Path, description = "Firing ULID")),
     responses(
         (status = 200, description = "Cancelling or cancelled automation run", body = FiringBody),
@@ -134,7 +143,10 @@ pub async fn cancel_firing(
     post,
     path = "/compute/automation-runs/{firing_id}/resolve",
     tag = "automations",
-    summary = "Record an audited human resolution for a needs_attention stage",
+    summary = "Resolve a needs_attention automation stage",
+    description = r#"Records an audited human resolution for a stage parked in `needs_attention`.
+
+**Authentication**: unrestricted realm bearer token with WRITE on the automation's group."#,
     params(("firing_id" = String, Path, description = "Firing ULID")),
     request_body = ResolveRequest,
     responses(
@@ -168,7 +180,10 @@ pub async fn resolve_stage(
     post,
     path = "/compute/automation-runs/{firing_id}/resume",
     tag = "automations",
-    summary = "Resume a failed automation run while preserving committed receipts",
+    summary = "Resume a failed automation run",
+    description = r#"Resumes a failed automation run while preserving receipts from already completed stages.
+
+**Authentication**: unrestricted realm bearer token with WRITE on the automation's group."#,
     params(("firing_id" = String, Path, description = "Firing ULID")),
     responses(
         (status = 200, description = "Resumed automation run", body = FiringBody),
@@ -222,7 +237,10 @@ async fn decide_stage(
     post,
     path = "/compute/automation-runs/{firing_id}/stages/{stage}/approve",
     tag = "automations",
-    summary = "Approve a waiting approval stage as a human group admin",
+    summary = "Approve a waiting automation stage",
+    description = r#"Approves a stage waiting on human approval so downstream stages can run.
+
+**Authentication**: unrestricted human group admin bearer token."#,
     params(
         ("firing_id" = String, Path, description = "Firing ULID"),
         ("stage" = String, Path, description = "Approval stage name")
@@ -249,7 +267,10 @@ pub async fn approve_stage(
     post,
     path = "/compute/automation-runs/{firing_id}/stages/{stage}/reject",
     tag = "automations",
-    summary = "Reject a waiting approval stage as a human group admin",
+    summary = "Reject a waiting automation stage",
+    description = r#"Rejects a stage waiting on human approval and marks the stage as rejected.
+
+**Authentication**: unrestricted human group admin bearer token."#,
     params(
         ("firing_id" = String, Path, description = "Firing ULID"),
         ("stage" = String, Path, description = "Approval stage name")

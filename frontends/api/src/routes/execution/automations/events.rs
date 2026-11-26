@@ -31,7 +31,12 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     post,
     path = "/compute/automations/{automation_id}/start",
     tag = "automations",
-    summary = "Manually start an active automation that declares a manual trigger",
+    summary = "Manually start an automation",
+    description = r#"Starts one firing of an active automation that declares a manual trigger.
+
+**Authentication**: unrestricted realm bearer token with WRITE on the automation's group.
+
+**Limits**: returns 429 when rate or active-firing limits are reached."#,
     params(("automation_id" = String, Path, description = "Automation ULID")),
     request_body = StartRequest,
     responses(
@@ -39,8 +44,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         (status = 400, description = "Automation has no manual trigger", body = ErrorResponse),
         (status = 403, description = "Permission denied", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "Automation not active or feature disabled", body = ErrorResponse),
-        (status = 429, description = "Rate or active-firing cap reached", body = ErrorResponse)
+        (status = 409, description = "Automation not active or feature disabled", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -71,10 +75,20 @@ pub async fn start_automation(
     get,
     path = "/compute/automations/{automation_id}/events",
     tag = "automations",
-    summary = "List kept matched events waiting to be started for an automation",
+    summary = "List kept automation events",
+    description = r#"Lists matched events held while the automation was paused or capped, newest first.
+
+**Authentication**: realm bearer token with READ on the automation's group."#,
     params(("automation_id" = String, Path, description = "Automation ULID")),
     responses(
-        (status = 200, description = "Kept matched events, newest first", body = Vec<KeptEventBody>),
+        (status = 200, description = "Kept matched events, newest first", body = Vec<KeptEventBody>, example = json!([{
+            "event_id": "01K8W4B0000000000000000000",
+            "kind": "data_uploaded",
+            "resource": "reads/run1/a.fastq",
+            "revision": "01K8W1C0000000000000000000",
+            "reason": "automation paused",
+            "kept_at": "2026-11-26T12:04:00+00:00"
+        }])),
         (status = 404, description = "Not found", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -96,16 +110,34 @@ pub async fn list_events(
     post,
     path = "/compute/automations/{automation_id}/events/start",
     tag = "automations",
-    summary = "Start firings for chosen kept matched events",
+    summary = "Start firings for kept matched events",
+    description = r#"Starts firings for the chosen kept matched events of an active automation.
+
+**Authentication**: unrestricted realm bearer token with WRITE on the automation's group.
+
+**Limits**: returns 429 when rate or active-firing limits are reached."#,
     params(("automation_id" = String, Path, description = "Automation ULID")),
     request_body = StartEventsRequest,
     responses(
-        (status = 202, description = "Started firings", body = Vec<FiringBody>),
+        (status = 202, description = "Started firings", body = Vec<FiringBody>, example = json!([{
+            "firing_id": "01K8W4A0000000000000000000",
+            "automation_id": "01K8W3A0000000000000000000",
+            "group_id": "01JABCDEF0123456789ABCDEFG",
+            "revision": 2,
+            "attempt": 1,
+            "state": "running",
+            "trigger_kind": "data_uploaded",
+            "stages": [],
+            "resolutions": [],
+            "created_at": "2026-11-26T12:05:00+00:00",
+            "updated_at": "2026-11-26T12:05:00+00:00",
+            "finished_at": null,
+            "error": null
+        }])),
         (status = 400, description = "Invalid event ids", body = ErrorResponse),
         (status = 403, description = "Permission denied", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "Automation not active or feature disabled", body = ErrorResponse),
-        (status = 429, description = "Rate or active-firing cap reached", body = ErrorResponse)
+        (status = 409, description = "Automation not active or feature disabled", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]

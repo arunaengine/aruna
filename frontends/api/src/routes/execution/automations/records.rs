@@ -39,6 +39,9 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     path = "/compute/automations",
     tag = "automations",
     summary = "List workflow automations of a group",
+    description = r#"Lists workflow automations belonging to a group, optionally filtered by lifecycle state.
+
+**Authentication**: realm bearer token with READ on the group."#,
     params(ListAutoQuery),
     responses(
         (status = 200, description = "One page of automations", body = AutomationPage),
@@ -82,6 +85,9 @@ pub async fn list_automations(
     path = "/compute/automations",
     tag = "automations",
     summary = "Create a draft workflow automation",
+    description = r#"Creates a new draft workflow automation after validating its DAG, triggers and scope.
+
+**Authentication**: unrestricted realm bearer token with WRITE on the group."#,
     request_body = CreateAutoRequest,
     responses(
         (status = 201, description = "Created draft automation", body = AutomationBody),
@@ -118,6 +124,9 @@ pub async fn create_automation(
     path = "/compute/automations/{automation_id}",
     tag = "automations",
     summary = "Read one workflow automation",
+    description = r#"Returns the current specification, lifecycle state and pending changes of one workflow automation.
+
+**Authentication**: realm bearer token with READ on the automation's group."#,
     params(("automation_id" = String, Path, description = "Automation ULID")),
     responses(
         (status = 200, description = "The automation record", body = AutomationBody),
@@ -140,7 +149,10 @@ pub async fn get_automation(
     patch,
     path = "/compute/automations/{automation_id}",
     tag = "automations",
-    summary = "Update a workflow automation with optimistic revision check",
+    summary = "Update a workflow automation",
+    description = r#"Updates a workflow automation under optimistic revision checking, queueing widening edits for approval.
+
+**Authentication**: unrestricted realm bearer token with WRITE on the automation's group."#,
     params(("automation_id" = String, Path, description = "Automation ULID")),
     request_body = UpdateAutoRequest,
     responses(
@@ -189,7 +201,10 @@ pub async fn update_automation(
     delete,
     path = "/compute/automations/{automation_id}",
     tag = "automations",
-    summary = "Delete a workflow automation and revoke its service account",
+    summary = "Delete a workflow automation",
+    description = r#"Marks a workflow automation as removed and revokes its dedicated service account.
+
+**Authentication**: unrestricted realm bearer token with WRITE on the automation's group."#,
     params(("automation_id" = String, Path, description = "Automation ULID")),
     responses(
         (status = 204, description = "Automation removed"),
