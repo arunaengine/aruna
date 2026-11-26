@@ -182,7 +182,7 @@ impl Bucket {
         }
     }
 
-    fn detach(&mut self, instance_id: u64, reason: DetachReason) {
+    pub(crate) fn detach(&mut self, instance_id: u64, reason: DetachReason) {
         self.unname(instance_id);
         if let Some(instance) = self.instances.get_mut(&instance_id) {
             instance.detached = Some(reason);
@@ -357,7 +357,14 @@ impl VfsHandle {
         })
     }
 
-    pub(crate) async fn close_open(&self, scope: &BucketScope, open_id: Ulid) -> Answer {
+    /// Removes one open; with `detach_unstable` the last writer of a dirty instance with no
+    /// durable checkpoint also takes it off its name under the same lock.
+    pub(crate) async fn close_open(
+        &self,
+        scope: &BucketScope,
+        open_id: Ulid,
+        detach_unstable: bool,
+    ) -> Answer {
         let (summary, unused) = {
             let mut state = self.shared.state.lock();
             let bucket = state.buckets.get_mut(scope).ok_or(VfsFailure::NotFound)?;
@@ -391,6 +398,21 @@ impl VfsHandle {
                 instance.generation = 0;
                 instance.stage.sealed = None;
             }
+            if detach_unstable
+                && instance.writers() == 0
+                && instance.dirty
+                && instance.stage_id.is_none()
+                && instance.detached.is_none()
+            {
+                let key = instance.key.clone();
+                bucket.detach(instance_id, DetachReason::LostLife);
+                if let Some(instance) = bucket.instances.get_mut(&instance_id)
+                    && let Ok(change) = self.shared.changes.touch(&scope.bucket, &key, true)
+                {
+                    instance.change = change;
+                }
+            }
+            let instance = (bucket.instances.get(&instance_id)).ok_or(VfsFailure::NotFound)?;
             let summary = instance.close_summary();
             let unused = match instance.idle() {
                 true => reclaim(&mut state, scope, instance_id),
@@ -725,6 +747,52 @@ impl VfsHandle {
             }
         }
         Ok(VfsEvent::Instance(Some(instance.summary())))
+    }
+
+    /// Clears a delete disposition that outlived every open once deletion was refused, and
+    /// reclaims the instance when nothing else keeps it. Unstable dirty bytes with no checkpoint
+    /// are detached too so they cannot linger unnamed or block vault fencing.
+    pub(crate) async fn clear_disposition(&self, scope: &BucketScope, instance_id: u64) -> Answer {
+        let unused = {
+            let mut state = self.shared.state.lock();
+            let Some(bucket) = state.buckets.get_mut(scope) else {
+                return Ok(VfsEvent::Done);
+            };
+            let Some(instance) = bucket.instances.get_mut(&instance_id) else {
+                return Ok(VfsEvent::Done);
+            };
+            if !instance.opens.is_empty() {
+                return Ok(VfsEvent::Done);
+            }
+            instance.delete_pending = false;
+            instance.disposition_owner = None;
+            if instance.dirty && instance.stage_id.is_none() && instance.detached.is_none() {
+                let key = instance.key.clone();
+                bucket.detach(instance_id, DetachReason::LostLife);
+                if let Some(instance) = bucket.instances.get_mut(&instance_id)
+                    && let Ok(change) = self.shared.changes.touch(&scope.bucket, &key, true)
+                {
+                    instance.change = change;
+                }
+            }
+            let idle = bucket
+                .instances
+                .get(&instance_id)
+                .is_some_and(Instance::idle);
+            match idle {
+                true => reclaim(&mut state, scope, instance_id),
+                false => None,
+            }
+        };
+        if let Some(name) = unused {
+            let path = self.path(&name);
+            crate::blocking(move || {
+                crate::remove_quietly(&path);
+                Ok(())
+            })
+            .await?;
+        }
+        Ok(VfsEvent::Done)
     }
 
     /// Replaces the share reservation of one open if every other open of its instance admits it.

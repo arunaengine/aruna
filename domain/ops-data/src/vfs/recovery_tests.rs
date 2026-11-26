@@ -512,7 +512,7 @@ fn overwritten_base_retained() {
     retained_report(&mut operation, turn);
 }
 
-fn binding() -> NfsMountBinding {
+pub(super) fn binding() -> NfsMountBinding {
     NfsMountBinding {
         mount_id: id(13),
         host_id: id(30),
@@ -526,10 +526,11 @@ fn binding() -> NfsMountBinding {
         display_gid: 1000,
         mode: 0o750,
         created_at_ms: 1,
+        revoked_at_ms: None,
     }
 }
 
-fn host(revoked_at_ms: Option<u64>) -> EnrolledHostRecord {
+pub(super) fn host(revoked_at_ms: Option<u64>) -> EnrolledHostRecord {
     EnrolledHostRecord {
         host_id: id(30),
         owner: user(),

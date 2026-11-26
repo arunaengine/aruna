@@ -625,7 +625,11 @@ impl Operation for VfsOpenOperation {
             && let Ok(scope) = self.scope()
         {
             let open_id = self.input.open_id;
-            calls.push(vfs_call(VfsEffect::CloseOpen { scope, open_id }));
+            calls.push(vfs_call(VfsEffect::CloseOpen {
+                scope,
+                open_id,
+                detach_unstable: false,
+            }));
         }
         calls.extend(self.held.release());
         calls
@@ -1252,6 +1256,7 @@ enum CommitStep {
     Guard,
     Wait,
     Instance,
+    ReconcileSync,
     Reconcile,
     Reconciled,
     Authorize,
@@ -1391,7 +1396,7 @@ impl VfsCommitOperation {
     }
 
     /// A claim left by an earlier request whose row write had an unknown outcome is settled
-    /// against both durable rows before a new generation starts; the guard keeps it stable.
+    /// against both durable rows, synced first, before a new generation starts.
     fn reconcile(
         &mut self,
         summary: &InstanceSummary,
@@ -1403,6 +1408,13 @@ impl VfsCommitOperation {
         }
         let old = (summary.stage_id).filter(|id| *id == stage_id);
         self.draft = Some((stage_id, generation, old.map(|_| summary.generation)));
+        self.call(CommitStep::ReconcileSync, IoCall::Sync)
+    }
+
+    /// Reads both rows only after the sync, so an unsynced row write is never promoted.
+    fn reconcile_synced(&mut self, result: IoResult) -> CommitTurn {
+        result.done()?;
+        let stage_id = self.draft.as_ref().ok_or(VfsError::Conflict)?.0;
         let scope = self.scope()?;
         let live = VfsKey::LiveStage(scope.clone(), self.input.record.handle_id);
         let retained = VfsKey::RetainedStage(scope, stage_id);
@@ -1600,17 +1612,21 @@ impl VfsCommitOperation {
 
     /// The live row names this generation only if the uncertain write committed; a retained
     /// row naming it means the write committed and the stage moved on, so its file stays.
+    /// Rows match by stage and generation, since a writer handoff rewrites the owner.
     fn row_checked(&mut self, result: IoResult) -> CommitTurn {
         let [live, retained] = aruna_core::rows::values::<2>(result)?;
         let live = record_of::<NfsStageRecord>(live.as_ref())?;
         let retained = record_of::<NfsStageRecord>(retained.as_ref())?;
         // The synced rows are read back, so the outcome is known either way.
         self.row_uncertain = false;
-        if live.as_ref() == Some(&self.input.record) {
+        let record = &self.input.record;
+        let referenced = live.as_ref().is_some_and(|row| {
+            row.stage_id == record.stage_id && row.generation == record.generation
+        });
+        if referenced {
             self.written = true;
             return self.promote();
         }
-        let record = &self.input.record;
         let moved = (retained.as_ref()).is_some_and(|row| {
             (row.stage_id, row.generation) == (record.stage_id, record.generation)
         });
@@ -1660,6 +1676,7 @@ impl Operation for VfsCommitOperation {
                 self.guard()
             }
             CommitStep::Instance => self.instance_read(result),
+            CommitStep::ReconcileSync => self.reconcile_synced(result),
             CommitStep::Reconcile => self.reconcile_read(result),
             CommitStep::Reconciled => {
                 vfs_event(result)?;

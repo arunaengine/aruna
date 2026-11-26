@@ -7,7 +7,7 @@ use aruna_core::structs::storage::vfs::{
     BucketScope, DetachReason, FileIdentity, HandleIdentity, HeadChangeObserver,
 };
 use aruna_core::vfs_effects::{
-    ByteRange, DiskStage, InstanceSummary, OpenRequest, ReadLockCheck, RebindRequest,
+    ByteRange, CloseSummary, DiskStage, InstanceSummary, OpenRequest, ReadLockCheck, RebindRequest,
     RestoreRequest, ShareMode, StageSlice, VfsEffect, VfsEvent, VfsFailure, VfsProtocol,
 };
 use aruna_vfs::{VfsConfig, VfsHandle};
@@ -116,9 +116,23 @@ async fn close(handle: &VfsHandle, open_id: Ulid) {
     let close = VfsEffect::CloseOpen {
         scope: scope(),
         open_id,
+        detach_unstable: false,
     };
     let answer = handle.execute(close).await;
     assert!(matches!(answer, VfsEvent::Closed(_)), "{answer:?}");
+}
+
+/// Closes an open whose binding was revoked, so an unstable last write leaves its name.
+async fn revoked_close(handle: &VfsHandle, open_id: Ulid) -> CloseSummary {
+    let close = VfsEffect::CloseOpen {
+        scope: scope(),
+        open_id,
+        detach_unstable: true,
+    };
+    match handle.execute(close).await {
+        VfsEvent::Closed(summary) => summary,
+        other => panic!("unexpected answer {other:?}"),
+    }
 }
 
 async fn write(handle: &VfsHandle, instance_id: u64, offset: u64, data: &[u8]) -> VfsEvent {
@@ -843,13 +857,11 @@ async fn boot_counter_monotonic() {
     assert_eq!(exhausted, VfsEvent::Failed(VfsFailure::CounterExhausted));
 }
 
-#[tokio::test]
-async fn release_draft_keeps() {
-    let (folder, handle) = booted(MIB).await;
-    let stage_id = Ulid::generate();
-    let instance_id = opened(&handle, "d.txt", unpublished(), 0).await;
-    write(&handle, instance_id, 0, b"draft").await;
-    let plan = begin(&handle, instance_id, stage_id, 1).await;
+/// Opens `d.txt`, writes to it and seals a first draft generation that is never promoted.
+async fn sealed_draft(handle: &VfsHandle, stage_id: Ulid) -> (u64, Ulid) {
+    let (instance_id, open_id) = open_request(handle, "d.txt", unpublished(), 0).await;
+    write(handle, instance_id, 0, b"draft").await;
+    let plan = begin(handle, instance_id, stage_id, 1).await;
     assert!(matches!(plan, VfsEvent::CheckpointPlan { .. }));
     let seal = VfsEffect::SealCheckpoint {
         scope: scope(),
@@ -860,22 +872,31 @@ async fn release_draft_keeps() {
     let sealed = handle.execute(seal).await;
     assert!(matches!(sealed, VfsEvent::CheckpointWritten { .. }));
     assert_eq!(
-        by_id(&handle, instance_id).await.unwrap().draft,
+        by_id(handle, instance_id).await.unwrap().draft,
         Some((stage_id, 1))
     );
-    let release = VfsEffect::ReleaseDraft {
+    (instance_id, open_id)
+}
+
+fn release(instance_id: u64, stage_id: Ulid) -> VfsEffect {
+    VfsEffect::ReleaseDraft {
         scope: scope(),
         instance_id,
         stage_id,
         generation: 1,
-    };
-    assert_eq!(handle.execute(release.clone()).await, VfsEvent::Done);
-    assert_eq!(handle.execute(release).await, VfsEvent::Done);
-    assert_eq!(by_id(&handle, instance_id).await.unwrap().draft, None);
-    let file = folder
-        .path()
-        .join("stage")
-        .join(format!("chk-{stage_id}-1.bin"));
+    }
+}
+
+fn lookup_draft() -> VfsEffect {
+    VfsEffect::LookupInstance {
+        scope: scope(),
+        key: "d.txt".to_string(),
+    }
+}
+
+/// Checks that the sealed draft file, its inventory entry and its checkpoint entry survive.
+async fn assert_sealed(handle: &VfsHandle, folder: &Path, stage_id: Ulid) {
+    let file = folder.join("stage").join(format!("chk-{stage_id}-1.bin"));
     assert!(file.exists(), "the sealed file was removed");
     let inventory = handle.execute(VfsEffect::ScanStages).await;
     let files = vec![DiskStage {
@@ -885,11 +906,61 @@ async fn release_draft_keeps() {
         corrupt: false,
     }];
     assert_eq!(inventory, VfsEvent::StageInventory { files });
-    let reused = begin(&handle, instance_id, stage_id, 1).await;
+    let instance_id = opened(handle, "e.txt", unpublished(), 0).await;
+    let reused = begin(handle, instance_id, stage_id, 1).await;
     assert_eq!(reused, VfsEvent::Failed(VfsFailure::Conflict));
-    let next = begin(&handle, instance_id, stage_id, 2).await;
-    assert!(matches!(next, VfsEvent::CheckpointPlan { .. }), "{next:?}");
-    assert!(file.exists(), "the sealed file was removed");
+}
+
+#[tokio::test]
+async fn release_draft_keeps() {
+    let (folder, handle) = booted(MIB).await;
+    let stage_id = Ulid::generate();
+    let (instance_id, open_id) = sealed_draft(&handle, stage_id).await;
+    let release = release(instance_id, stage_id);
+    assert_eq!(handle.execute(release.clone()).await, VfsEvent::Done);
+    assert_eq!(handle.execute(release).await, VfsEvent::Done);
+    let summary = by_id(&handle, instance_id).await.unwrap();
+    assert_eq!(summary.draft, None);
+    assert_eq!(summary.detached, Some(DetachReason::LostLife));
+    assert_eq!(
+        handle.execute(lookup_draft()).await,
+        VfsEvent::Instance(None)
+    );
+    let (joined, _) = open_request(&handle, "d.txt", unpublished(), 0).await;
+    assert_ne!(joined, instance_id, "a new open joined the dirty instance");
+    assert_eq!(
+        read(&handle, instance_id, 0, 16).await,
+        vec![written(0, b"draft")]
+    );
+    let volatile = (folder.path().join("stage")).join(format!("vol-{instance_id}.tmp"));
+    close(&handle, open_id).await;
+    assert_eq!(by_id(&handle, instance_id).await, None);
+    assert!(!volatile.exists(), "the volatile file was kept");
+    assert_sealed(&handle, folder.path(), stage_id).await;
+}
+
+#[tokio::test]
+async fn release_draft_reclaims() {
+    let (folder, handle) = booted(12).await;
+    let stage_id = Ulid::generate();
+    let (instance_id, open_id) = sealed_draft(&handle, stage_id).await;
+    close(&handle, open_id).await;
+    let volatile = (folder.path().join("stage")).join(format!("vol-{instance_id}.tmp"));
+    assert!(volatile.exists(), "the unstable write has no file");
+    let answer = handle.execute(release(instance_id, stage_id)).await;
+    assert_eq!(answer, VfsEvent::Done);
+    assert_eq!(
+        handle.execute(lookup_draft()).await,
+        VfsEvent::Instance(None)
+    );
+    assert_eq!(by_id(&handle, instance_id).await, None);
+    assert!(!volatile.exists(), "the volatile file was kept");
+    assert_sealed(&handle, folder.path(), stage_id).await;
+    let other = opened(&handle, "f.txt", unpublished(), 0).await;
+    let refused = write(&handle, other, 0, &[1; 8]).await;
+    assert_eq!(refused, VfsEvent::Failed(VfsFailure::NoSpace));
+    let fits = write(&handle, other, 0, &[1; 7]).await;
+    assert!(matches!(fits, VfsEvent::StageWritten { .. }), "{fits:?}");
 }
 
 #[tokio::test]
@@ -923,4 +994,40 @@ async fn detach_reclaims_idle() {
         .execute(VfsEffect::FenceVault { scope: scope() })
         .await;
     assert!(matches!(fence, VfsEvent::VaultFenced { .. }), "{fence:?}");
+}
+
+#[tokio::test]
+async fn revoked_close_detaches() {
+    let (folder, handle) = booted(MIB).await;
+    let (instance_id, open_id) = open_request(&handle, "k.txt", committed(), 0).await;
+    write(&handle, instance_id, 0, b"dirty").await;
+    let volatile = (folder.path().join("stage")).join(format!("vol-{instance_id}.tmp"));
+    assert!(volatile.exists(), "the unstable write has no file");
+    let summary = revoked_close(&handle, open_id).await;
+    assert_eq!(summary.detached, Some(DetachReason::LostLife));
+    assert_eq!(handle.execute(lookup_key()).await, VfsEvent::Instance(None));
+    assert_eq!(by_id(&handle, instance_id).await, None);
+    assert!(!volatile.exists(), "the volatile file was kept");
+    let fence = handle
+        .execute(VfsEffect::FenceVault { scope: scope() })
+        .await;
+    assert!(matches!(fence, VfsEvent::VaultFenced { .. }), "{fence:?}");
+}
+
+#[tokio::test]
+async fn revoked_close_shared() {
+    let (_folder, handle) = booted(MIB).await;
+    let (instance_id, first) = open_request(&handle, "k.txt", committed(), 0).await;
+    let (joined, _second) = open_request(&handle, "k.txt", committed(), 0).await;
+    assert_eq!(joined, instance_id);
+    write(&handle, instance_id, 0, b"dirty").await;
+    let summary = revoked_close(&handle, first).await;
+    assert_eq!(summary.detached, None);
+    assert_eq!(summary.remaining_writers, 1);
+    let answer = handle.execute(lookup_key()).await;
+    let VfsEvent::Instance(Some(named)) = answer else {
+        panic!("unexpected answer {answer:?}");
+    };
+    assert_eq!(named.instance_id, instance_id);
+    assert!(named.dirty && named.detached.is_none());
 }

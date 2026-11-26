@@ -6,6 +6,7 @@
 use super::handles::{Held, advance_witness, rests_on};
 use super::io::stage_key;
 use super::mutate::{RemoveInput, VfsRemoveOperation};
+use super::path::export_holds;
 use super::policy::{VfsAccess, VfsAccessContext, VfsGrant, VfsRequest, authorize_call, grant_of};
 use super::recovery::{ReceiptInput, ReceiptOutcome, VfsReceiptOperation};
 use super::{
@@ -22,12 +23,15 @@ use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, NFS_STATE_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::storage::vfs::{
-    BucketScope, DetachReason, DirectoryWitness, FileIdentity, HandleIdentity, NfsStageRecord,
-    QuotaRetry, ReceiptChange, StageBase, StageDisposition, StageOwner, StageScope, VfsHandleRow,
-    VfsKey, VfsReceipt, encode_handle_id, encode_token,
+    BucketScope, DetachReason, DirectoryWitness, EnrolledHostRecord, FileIdentity, HandleIdentity,
+    NfsMountBinding, NfsMountTarget, NfsStageRecord, QuotaRetry, ReceiptChange, StageBase,
+    StageDisposition, StageOwner, StageScope, VfsHandleRow, VfsKey, VfsReceipt, encode_handle_id,
+    encode_token,
 };
 use aruna_core::types::{Key, Value};
-use aruna_core::vfs_effects::{CloseSummary, VfsEffect, VfsEvent, WitnessUpdate};
+use aruna_core::vfs_effects::{
+    CloseSummary, VfsEffect, VfsEvent, VfsFailure, VfsProtocol, WitnessUpdate,
+};
 use ulid::Ulid;
 
 /// First wait of a quota-blocked checkpoint; each retry doubles it up to [`QUOTA_WAIT_MAX`].
@@ -793,9 +797,13 @@ pub struct CloseInput {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CloseStep {
     Close,
+    Lookup,
     Successor,
     Publish,
+    OwnerMount,
+    OwnerHost,
     Remove,
+    Cleared,
     Stage,
     Synced,
     Removed,
@@ -819,6 +827,14 @@ pub struct VfsCloseOperation {
     successor: Option<StageOwner>,
     /// Why the stage was retained, which the synced move passes on to its instance.
     reason: Option<DetachReason>,
+    /// Detaches an uncheckpointed dirty instance when this close leaves it without writers.
+    detach_unstable: bool,
+    /// The instance a retried close finds again once its open is already gone.
+    instance_id: Option<u64>,
+    /// The definitive final delete refusal the close reports after clearing the disposition.
+    failure: Option<VfsError>,
+    /// The disposition owner's live mount binding, checked before its host.
+    owner_binding: Option<NfsMountBinding>,
 }
 
 impl VfsCloseOperation {
@@ -832,7 +848,25 @@ impl VfsCloseOperation {
             marker: None,
             successor: None,
             reason: None,
+            detach_unstable: false,
+            instance_id: None,
+            failure: None,
+            owner_binding: None,
         }
+    }
+
+    /// Detaches the instance when it stays dirty without a checkpoint and loses its last
+    /// writer, as when a revoked binding withholds publication.
+    pub fn with_detach_unstable(mut self) -> Self {
+        self.detach_unstable = true;
+        self
+    }
+
+    /// The instance of the open, so a retried close can finish a final delete the first
+    /// attempt left pending after its open was gone.
+    pub fn with_instance(mut self, instance_id: u64) -> Self {
+        self.instance_id = Some(instance_id);
+        self
     }
 
     /// The zero-length write of the parent marker, used when a final delete removes the last
@@ -901,7 +935,16 @@ impl VfsCloseOperation {
     }
 
     fn closed(&mut self, result: IoResult) -> CloseTurn {
-        let summary = match vfs_event(result)? {
+        let event = match (vfs_event(result), self.instance_id) {
+            // A retried close whose open is already gone looks for its pending delete.
+            (Err(VfsError::Vfs(VfsFailure::NotFound)), Some(instance_id)) => {
+                let scope = self.input.scope.clone();
+                let effect = VfsEffect::LookupById { scope, instance_id };
+                return self.call(CloseStep::Lookup, vfs_call(effect));
+            }
+            (event, _) => event?,
+        };
+        let summary = match event {
             VfsEvent::Closed(summary) => summary,
             other => return Err(unexpected(&other)),
         };
@@ -919,14 +962,103 @@ impl VfsCloseOperation {
         }
     }
 
-    /// The fenced delete runs as the disposition owner; the dirty stage is never published.
+    /// Only an instance with no opens left and its delete still pending is finished again.
+    fn looked_up(&mut self, result: IoResult) -> CloseTurn {
+        let found = match vfs_event(result)? {
+            VfsEvent::Instance(Some(found)) if found.open_count == 0 && found.delete_pending => {
+                found
+            }
+            VfsEvent::Instance(_) => return Err(VfsError::Vfs(VfsFailure::NotFound)),
+            other => return Err(unexpected(&other)),
+        };
+        self.summary = Some(CloseSummary {
+            instance_id: found.instance_id,
+            key: found.key,
+            kind: found.kind,
+            remaining_opens: 0,
+            remaining_writers: 0,
+            delete_pending: found.delete_pending,
+            dirty: found.dirty,
+            detached: found.detached,
+            disposition_owner: found.disposition_owner,
+            stage_id: found.stage_id,
+            generation: found.generation,
+            logical_size: found.logical_size,
+            handle_id: found.handle_id,
+            identity: found.identity,
+            base_version: found.base_version,
+            edit_generation: found.edit_generation,
+            successor_owner: None,
+        });
+        self.final_delete()
+    }
+
+    /// The fenced delete runs as the disposition owner through that owner's own export, never
+    /// the closing open's; the dirty stage is never published.
     fn final_delete(&mut self) -> CloseTurn {
         let summary = self.summary.as_ref().ok_or(VfsError::Conflict)?;
-        let Some(owner) = summary.disposition_owner.clone() else {
-            return self.retain(DetachReason::LostLife);
+        let Some(owner) = summary.disposition_owner.as_ref() else {
+            return self.clear_disposition(VfsError::Denied);
         };
-        let mut context = self.input.context.clone();
-        context.access_key = owner.access_key;
+        if !owner.mount_id.is_nil() {
+            let read = state_read(&[VfsKey::Mount(owner.mount_id)])?;
+            return self.call(CloseStep::OwnerMount, read);
+        }
+        let scope = &self.input.scope;
+        let target = NfsMountTarget::for_bucket(&scope.bucket, scope.incarnation)?;
+        self.remove_as(target, VfsProtocol::Smb)
+    }
+
+    /// An NFS owner deletes only through a live writable binding of its own credential whose
+    /// export still holds the name.
+    fn owner_mount(&mut self, result: IoResult) -> CloseTurn {
+        let [row] = aruna_core::rows::values::<1>(result)?;
+        let binding = record_of::<NfsMountBinding>(row.as_ref())?;
+        let summary = self.summary.as_ref().ok_or(VfsError::Conflict)?;
+        let owner = (summary.disposition_owner.as_ref()).ok_or(VfsError::Conflict)?;
+        let scope = &self.input.scope;
+        let held = binding.filter(|binding| {
+            binding.revoked_at_ms.is_none()
+                && !binding.read_only
+                && binding.access_key == owner.access_key
+                && binding.owner == owner.user
+                && scope_matches(&binding.target, scope)
+                && export_holds(&binding.target, &scope.bucket, &summary.key)
+        });
+        let Some(binding) = held else {
+            return self.clear_disposition(VfsError::Denied);
+        };
+        let read = state_read(&[VfsKey::Host(binding.host_id)])?;
+        self.owner_binding = Some(binding);
+        self.call(CloseStep::OwnerHost, read)
+    }
+
+    /// The binding's host must still stand; a trusted worker pool serves other owners too.
+    fn owner_host(&mut self, result: IoResult) -> CloseTurn {
+        let [row] = aruna_core::rows::values::<1>(result)?;
+        let host = record_of::<EnrolledHostRecord>(row.as_ref())?;
+        let binding = self.owner_binding.take().ok_or(VfsError::Conflict)?;
+        let live = host.is_some_and(|host| {
+            host.revoked_at_ms.is_none() && (binding.owner == host.owner || host.worker_pool)
+        });
+        if !live {
+            return self.clear_disposition(VfsError::Denied);
+        }
+        self.remove_as(binding.target, VfsProtocol::Nfs)
+    }
+
+    fn remove_as(&mut self, target: NfsMountTarget, protocol: VfsProtocol) -> CloseTurn {
+        let summary = self.summary.as_ref().ok_or(VfsError::Conflict)?;
+        let owner = (summary.disposition_owner.as_ref()).ok_or(VfsError::Conflict)?;
+        let context = VfsAccessContext {
+            realm_id: self.input.context.realm_id,
+            node_id: self.input.context.node_id,
+            access_key: owner.access_key.clone(),
+            protocol,
+            target,
+            read_only: false,
+            now_ms: self.input.context.now_ms,
+        };
         let remove = RemoveInput {
             context,
             key: summary.key.clone(),
@@ -946,13 +1078,30 @@ impl VfsCloseOperation {
     fn removed(&mut self, result: IoResult) -> CloseTurn {
         match result.child::<(), VfsError>()? {
             Ok(()) => self.discard_as(CloseOutcome::Deleted),
-            // With no durable checkpoint to keep, the failed delete is the close's error.
-            Err(error) if self.input.stage.is_none() => Err(error),
-            // A lapsed delete authority or a new life leaves the name and keeps the bytes.
-            Err(VfsError::Denied | VfsError::StaleHandle | VfsError::Conflict) => {
-                self.retain(DetachReason::LostLife)
+            // A transient failure keeps the pending delete, which a retried close finishes.
+            Err(error @ (VfsError::Unavailable(_) | VfsError::Storage(_) | VfsError::Vfs(_))) => {
+                Err(error)
             }
-            Err(error) => Err(error),
+            // A definitive refusal clears the disposition, so the name never stays wedged.
+            Err(error) => self.clear_disposition(error),
+        }
+    }
+
+    fn clear_disposition(&mut self, error: VfsError) -> CloseTurn {
+        let instance_id = self.summary.as_ref().ok_or(VfsError::Conflict)?.instance_id;
+        self.failure = Some(error);
+        let scope = self.input.scope.clone();
+        let effect = VfsEffect::ClearDisposition { scope, instance_id };
+        self.call(CloseStep::Cleared, vfs_call(effect))
+    }
+
+    /// A durable checkpoint is kept for recovery; without one the refusal is the close's error.
+    fn cleared(&mut self, result: IoResult) -> CloseTurn {
+        vfs_event(result)?;
+        let error = self.failure.take().ok_or(VfsError::Conflict)?;
+        match self.input.stage.is_some() {
+            true => self.retain(DetachReason::LostLife),
+            false => Err(error),
         }
     }
 
@@ -1069,18 +1218,25 @@ impl Operation for VfsCloseOperation {
 
     fn first(&mut self) -> CloseTurn {
         let (scope, open_id) = (self.input.scope.clone(), self.input.open_id);
-        self.call(
-            CloseStep::Close,
-            vfs_call(VfsEffect::CloseOpen { scope, open_id }),
-        )
+        let detach_unstable = self.detach_unstable;
+        let effect = VfsEffect::CloseOpen {
+            scope,
+            open_id,
+            detach_unstable,
+        };
+        self.call(CloseStep::Close, vfs_call(effect))
     }
 
     fn next(&mut self, result: IoResult) -> CloseTurn {
         match self.step {
             CloseStep::Close => self.closed(result),
+            CloseStep::Lookup => self.looked_up(result),
             CloseStep::Successor => self.successor_admitted(result),
             CloseStep::Publish => self.published(result),
+            CloseStep::OwnerMount => self.owner_mount(result),
+            CloseStep::OwnerHost => self.owner_host(result),
             CloseStep::Remove => self.removed(result),
+            CloseStep::Cleared => self.cleared(result),
             CloseStep::Stage => self.stage_changed(result),
             CloseStep::Synced => self.synced(result),
             CloseStep::Removed => {
@@ -1095,6 +1251,22 @@ impl Operation for VfsCloseOperation {
 
     fn stamp(&mut self, now_ms: u64) {
         self.now_ms = now_ms;
+    }
+}
+
+/// The bucket and incarnation of a bucket or folder export match the closing scope.
+fn scope_matches(target: &NfsMountTarget, scope: &BucketScope) -> bool {
+    match target {
+        NfsMountTarget::Bucket {
+            bucket,
+            bucket_incarnation,
+        }
+        | NfsMountTarget::Folder {
+            bucket,
+            bucket_incarnation,
+            ..
+        } => *bucket == scope.bucket && *bucket_incarnation == scope.incarnation,
+        NfsMountTarget::JobInputView { .. } => false,
     }
 }
 

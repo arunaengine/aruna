@@ -448,6 +448,10 @@ pub trait OwnedRow: aruna_core::structs::storage::vfs::VfsRecord {
     fn owner(&self) -> UserId;
     fn host(&self) -> Ulid;
     fn row_id(&self) -> Ulid;
+    /// A revoked row stays as a tombstone and is never listed.
+    fn active(&self) -> bool {
+        true
+    }
 }
 
 impl OwnedRow for EnrolledHostRecord {
@@ -473,6 +477,9 @@ impl OwnedRow for NfsMountBinding {
     }
     fn row_id(&self) -> Ulid {
         self.mount_id
+    }
+    fn active(&self) -> bool {
+        self.revoked_at_ms.is_none()
     }
 }
 
@@ -517,7 +524,7 @@ where
             };
             self.after = Some(row.row_id());
             let host = self.host_id.is_none_or(|host_id| row.host() == host_id);
-            if row.owner() == self.caller && host {
+            if row.active() && row.owner() == self.caller && host {
                 self.found.push(row);
             }
         }
@@ -631,6 +638,7 @@ impl CreateMountOperation {
             display_gid: self.input.display_gid,
             mode: self.input.mode,
             created_at_ms: self.now_ms,
+            revoked_at_ms: None,
         });
         self.step = MountStep::Host;
         let mut keys = vec![VfsKey::Host(self.input.host_id)];
@@ -727,6 +735,10 @@ impl Operation for CreateMountOperation {
                 let binding = self.binding.as_ref().ok_or(VfsError::Conflict)?;
                 let stored = rows.next().flatten();
                 if let Some(mut existing) = record_of::<NfsMountBinding>(stored.as_ref())? {
+                    // A revoked mount id is never bound again, also not by a retried create.
+                    if existing.revoked_at_ms.is_some() {
+                        return Err(VfsError::Denied);
+                    }
                     // Every field but the creation time must match for the create to repeat.
                     let created_at_ms = existing.created_at_ms;
                     existing.created_at_ms = binding.created_at_ms;
@@ -767,12 +779,14 @@ impl Operation for CreateMountOperation {
     }
 }
 
-/// Reads or deletes one mount of its owner; a deletion revokes the mount's live state only.
+/// Reads or deletes one mount of its owner; a deletion keeps the row as a revoked tombstone
+/// and revokes the mount's live state.
 #[derive(Debug, PartialEq)]
 pub struct MountRowOperation {
     mount_id: Ulid,
     caller: UserId,
     delete: bool,
+    now_ms: u64,
     found: Option<NfsMountBinding>,
 }
 
@@ -787,6 +801,7 @@ impl MountRowOperation {
             mount_id,
             caller,
             delete: false,
+            now_ms: 0,
             found: None,
         }
     }
@@ -816,16 +831,17 @@ impl Operation for MountRowOperation {
             });
         }
         let [row] = aruna_core::rows::values::<1>(result)?;
-        let binding = record_of::<NfsMountBinding>(row.as_ref())?.ok_or(VfsError::NotFound)?;
-        if binding.owner != self.caller {
+        let mut binding = record_of::<NfsMountBinding>(row.as_ref())?.ok_or(VfsError::NotFound)?;
+        if binding.revoked_at_ms.is_some() || binding.owner != self.caller {
             return Err(VfsError::NotFound);
         }
         if !self.delete {
             return Ok(Next::Done(binding));
         }
-        let delete = state_delete(&VfsKey::Mount(self.mount_id))?;
+        binding.revoked_at_ms = Some(self.now_ms.max(1));
+        let write = state_row(&VfsKey::Mount(self.mount_id), &binding)?;
         self.found = Some(binding);
-        Ok(Next::Call(IoCall::Delete(vec![delete])))
+        Ok(Next::Call(IoCall::Write(vec![write])))
     }
 
     fn transaction(&self) -> TransactionMode {
@@ -834,15 +850,20 @@ impl Operation for MountRowOperation {
             false => TransactionMode::None,
         }
     }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 }
 
-/// Deletes every mount bound to one access key, as when that key is revoked, and revokes the
-/// live state of each one. The rows are read and deleted in one transaction.
+/// Revokes every mount bound to one access key, as when that key is revoked, and the live
+/// state of each one. The rows are read and kept as revoked tombstones in one transaction.
 #[derive(Debug, PartialEq)]
 pub struct RevokeMountsOperation {
     access_key: String,
     after: Option<Key>,
-    found: Vec<Ulid>,
+    now_ms: u64,
+    found: Vec<NfsMountBinding>,
     deleted: bool,
 }
 
@@ -851,6 +872,7 @@ impl RevokeMountsOperation {
         Self {
             access_key,
             after: None,
+            now_ms: 0,
             found: Vec::new(),
             deleted: false,
         }
@@ -872,7 +894,8 @@ impl Operation for RevokeMountsOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<usize>, VfsError> {
         if self.deleted {
             result.done()?;
-            let calls = self.found.iter().map(|id| revoke_call(None, Some(*id)));
+            let calls =
+                (self.found.iter()).map(|binding| revoke_call(None, Some(binding.mount_id)));
             return Ok(Next::Then {
                 output: self.found.len(),
                 calls: calls.collect(),
@@ -882,11 +905,12 @@ impl Operation for RevokeMountsOperation {
         let full = rows.len() >= STATE_PAGE;
         for (key, value) in rows {
             self.after = Some(key);
-            let Some(binding) = record_of::<NfsMountBinding>(Some(&value))? else {
+            let Some(mut binding) = record_of::<NfsMountBinding>(Some(&value))? else {
                 continue;
             };
-            if binding.access_key == self.access_key {
-                self.found.push(binding.mount_id);
+            if binding.revoked_at_ms.is_none() && binding.access_key == self.access_key {
+                binding.revoked_at_ms = Some(self.now_ms.max(1));
+                self.found.push(binding);
             }
         }
         if next.is_some() && full {
@@ -895,18 +919,18 @@ impl Operation for RevokeMountsOperation {
         if self.found.is_empty() {
             return Ok(Next::Done(0));
         }
-        let deletes = self
-            .found
-            .iter()
-            .map(|id| state_delete(&VfsKey::Mount(*id)));
+        let writes =
+            (self.found.iter()).map(|binding| state_row(&VfsKey::Mount(binding.mount_id), binding));
         self.deleted = true;
-        Ok(Next::Call(IoCall::Delete(
-            deletes.collect::<Result<_, _>>()?,
-        )))
+        Ok(Next::Call(IoCall::Write(writes.collect::<Result<_, _>>()?)))
     }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
     }
 }
 
@@ -1544,7 +1568,9 @@ impl Operation for LookupMountOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<Option<NfsMountBinding>>, VfsError> {
         let [row] = aruna_core::rows::values::<1>(result)?;
-        Ok(Next::Done(record_of::<NfsMountBinding>(row.as_ref())?))
+        let binding = record_of::<NfsMountBinding>(row.as_ref())?;
+        let live = binding.filter(|binding| binding.revoked_at_ms.is_none());
+        Ok(Next::Done(live))
     }
 }
 

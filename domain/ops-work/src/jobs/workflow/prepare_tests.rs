@@ -369,6 +369,7 @@ fn bound(mount_id: Ulid) -> IoResult {
         display_gid: NOBODY.gid,
         mode: 0o555,
         created_at_ms: NOW,
+        revoked_at_ms: None,
     }))
 }
 

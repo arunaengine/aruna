@@ -672,8 +672,8 @@ fn retained_readback_keeps() {
 
 #[test]
 fn stale_draft_reconciles() {
-    // A claim an earlier request left behind is settled against the live and retained rows
-    // before a new generation starts: promoted when the live row names it, else aborted.
+    // A claim an earlier request left behind is settled against the synced live and retained
+    // rows before a new generation starts: promoted when the live row names it, else aborted.
     let drafted = InstanceSummary {
         stage_id: Some(id(12)),
         generation: 5,
@@ -682,6 +682,8 @@ fn stale_draft_reconciles() {
     };
     let mut live = committing();
     let turn = live.next(vfs(VfsEvent::Instance(Some(drafted.clone()))));
+    assert_eq!(turn, Ok(Next::Call(IoCall::Sync)));
+    let turn = live.next(IoResult::Done);
     assert!(matches!(turn, Ok(Next::Call(IoCall::Read(ref reads))) if reads.len() == 2));
     let row = |generation| {
         let record = NfsStageRecord {
@@ -717,6 +719,7 @@ fn stale_draft_reconciles() {
     absent
         .next(vfs(VfsEvent::Instance(Some(drafted.clone()))))
         .unwrap();
+    absent.next(IoResult::Done).unwrap();
     let turn = absent.next(IoResult::Values(vec![row(5), None]));
     let abort = VfsEffect::AbortCheckpoint {
         scope: scope(),
@@ -730,6 +733,48 @@ fn stale_draft_reconciles() {
     let turn = absent.next(vfs(VfsEvent::Instance(Some(drafted))));
     assert_eq!(turn, Err(VfsError::Conflict));
     assert_eq!(absent.abort(), vec![release()]);
+}
+
+#[test]
+fn reconcile_sync_fails() {
+    // A failed sync before the reconcile read fails closed and settles nothing.
+    let drafted = InstanceSummary {
+        stage_id: Some(id(12)),
+        generation: 5,
+        draft: Some((id(12), 6)),
+        ..instance()
+    };
+    let mut operation = committing();
+    let turn = operation.next(vfs(VfsEvent::Instance(Some(drafted))));
+    assert_eq!(turn, Ok(Next::Call(IoCall::Sync)));
+    assert!(operation.next(IoResult::Woke).is_err());
+    assert_eq!(operation.abort(), vec![release()]);
+}
+
+#[test]
+fn handed_off_readback() {
+    // A live row a writer handoff rewrote still names this generation, so it is promoted and
+    // the sealed file stays.
+    let mut operation = uncertain();
+    operation.next(IoResult::Done).unwrap();
+    let handed = NfsStageRecord {
+        generation: 6,
+        checkpoint: "c-6".to_string(),
+        owner: aruna_core::structs::storage::vfs::StageOwner {
+            access_key: "KEY2".to_string(),
+            ..dirty_stage().owner
+        },
+        updated_at_ms: 99,
+        ..dirty_stage()
+    };
+    let row = Value::from(handed.to_bytes().unwrap());
+    let turn = operation.next(IoResult::Values(vec![Some(row), None]));
+    assert!(matches!(
+        asked(&turn),
+        VfsEffect::PromoteCheckpoint { generation: 6, .. }
+    ));
+    // The abort only releases the guard: no checkpoint is dropped.
+    assert_eq!(operation.abort(), vec![release()]);
 }
 
 #[test]

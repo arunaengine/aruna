@@ -150,6 +150,7 @@ fn binding(owner: UserId, mount: u8) -> NfsMountBinding {
         display_gid: 1000,
         mode: 0o750,
         created_at_ms: 1,
+        revoked_at_ms: None,
     }
 }
 
@@ -164,12 +165,55 @@ fn mount_delete_revokes() {
     assert_eq!(operation.transaction(), TransactionMode::Write);
     operation.first().unwrap();
     let turn = operation.next(IoResult::Values(vec![row(&binding(user(), 50))]));
-    assert!(matches!(turn, Ok(Next::Call(IoCall::Delete(_)))));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Write(_)))));
     let Ok(Next::Then { output, calls }) = operation.next(IoResult::Done) else {
         panic!("expected the revocation of the mount's state");
     };
     assert_eq!(output.mount_id, id(50));
     assert_eq!(calls.len(), 1);
+}
+
+#[test]
+fn revoked_mount_stays() {
+    // A deleted mount stays as a revoked row that reads as absent and is never bound again.
+    let mut delete = MountRowOperation::delete(id(60), user());
+    delete.stamp(42);
+    delete.first().unwrap();
+    let live = NfsMountBinding {
+        target: NfsMountTarget::for_bucket("bucket", 7).unwrap(),
+        ..binding(user(), 60)
+    };
+    let turn = delete.next(IoResult::Values(vec![row(&live)]));
+    let Ok(Next::Call(IoCall::Write(writes))) = turn else {
+        panic!("expected the tombstone write");
+    };
+    let revoked = NfsMountBinding::from_bytes(&writes[0].2).unwrap();
+    assert_eq!(revoked.revoked_at_ms, Some(42));
+    let Ok(Next::Then { output, calls }) = delete.next(IoResult::Done) else {
+        panic!("expected the revocation of the mount's state");
+    };
+    assert_eq!((output.revoked_at_ms, calls.len()), (Some(42), 1));
+
+    let mut get = MountRowOperation::get(id(60), user());
+    get.first().unwrap();
+    let turn = get.next(IoResult::Values(vec![row(&revoked)]));
+    assert_eq!(turn, Err(VfsError::NotFound));
+    let mut lookup = LookupMountOperation::new(id(60));
+    lookup.first().unwrap();
+    let turn = lookup.next(IoResult::Values(vec![row(&revoked)]));
+    assert_eq!(turn, Ok(Next::Done(None)));
+    let key = Key::from([&[2u8][..], &id(60).to_bytes()].concat());
+    let rows = vec![(key, row(&revoked).unwrap())];
+    let mut list = ListMountsOperation::new(user(), None, None, 10);
+    list.first().unwrap();
+    let Ok(Next::Done(page)) = list.next(IoResult::Page { rows, next: None }) else {
+        panic!("expected one page");
+    };
+    assert!(page.items.is_empty());
+
+    let rows = vec![row(&host(user())), row(&revoked)];
+    let turn = fixed_mount().next(IoResult::Values(rows));
+    assert_eq!(turn, Err(VfsError::Denied));
 }
 
 #[test]
@@ -476,18 +520,23 @@ fn revoked_key_unmounts() {
         (key(52), row(&binding(stranger(), 52)).unwrap()),
     ];
     let mut operation = RevokeMountsOperation::new("KEY1".to_string());
+    operation.stamp(42);
     assert_eq!(operation.transaction(), TransactionMode::Write);
     assert!(matches!(
         operation.first(),
         Ok(Next::Call(IoCall::Page { .. }))
     ));
     let turn = operation.next(IoResult::Page { rows, next: None });
-    let Ok(Next::Call(IoCall::Delete(deletes))) = turn else {
-        panic!("expected the mount deletes");
+    let Ok(Next::Call(IoCall::Write(writes))) = turn else {
+        panic!("expected the mount tombstones");
     };
-    let deleted: Vec<_> = deletes.iter().map(|(_, key)| key.clone()).collect();
+    let revoked: Vec<_> = writes.iter().map(|(_, key, _)| key.clone()).collect();
     let state = |mount| super::state_key(&VfsKey::Mount(id(mount))).unwrap();
-    assert_eq!(deleted, vec![state(50), state(52)]);
+    assert_eq!(revoked, vec![state(50), state(52)]);
+    assert!(writes.iter().all(|(_, _, value)| {
+        let binding = NfsMountBinding::from_bytes(value).unwrap();
+        binding.revoked_at_ms == Some(42)
+    }));
     let Ok(Next::Then { output, calls }) = operation.next(IoResult::Done) else {
         panic!("expected the count with the revocations");
     };

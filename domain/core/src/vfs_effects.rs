@@ -233,7 +233,13 @@ pub enum VfsEffect {
     /// Registers a new protocol open on a live link, checking share modes and delete-pending.
     OpenInstance(OpenRequest),
     /// Removes one open handle and reports whether writers, opens, dirty data or deletion remain.
-    CloseOpen { scope: BucketScope, open_id: Ulid },
+    CloseOpen {
+        scope: BucketScope,
+        open_id: Ulid,
+        /// Detaches an uncheckpointed dirty instance under the close lock if this was its last
+        /// writer, used when a revoked binding withholds publication.
+        detach_unstable: bool,
+    },
     /// Looks up a live shared instance by exact object or directory key.
     LookupInstance { scope: BucketScope, key: String },
     /// Looks up a live or detached shared instance by durable NFS handle id.
@@ -281,6 +287,12 @@ pub enum VfsEffect {
         open_id: Ulid,
         pending: bool,
         owner: Option<StageOwner>,
+    },
+    /// Clears a pending delete disposition once no opens remain and deletion was definitively
+    /// refused, reclaiming the instance if nothing else holds it.
+    ClearDisposition {
+        scope: BucketScope,
+        instance_id: u64,
     },
     /// Atomically updates the share reservation of an existing open after checking other opens.
     UpdateShare {

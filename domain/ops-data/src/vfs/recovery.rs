@@ -685,7 +685,8 @@ impl ColdStartOperation {
         let (key, _) = self.current.as_ref().ok_or(VfsError::Conflict)?;
         let scope = Self::scope_of(key).ok_or(VfsError::CorruptStage)?;
         let binding = record_of::<NfsMountBinding>(row.as_ref())?;
-        let bound = binding.filter(|binding| match &binding.target {
+        let live = binding.filter(|binding| binding.revoked_at_ms.is_none());
+        let bound = live.filter(|binding| match &binding.target {
             NfsMountTarget::Bucket {
                 bucket,
                 bucket_incarnation,

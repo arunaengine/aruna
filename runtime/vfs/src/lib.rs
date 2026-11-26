@@ -199,7 +199,11 @@ impl VfsHandle {
             VfsEffect::WaitAttempt { attempt_id } => self.wait_attempt(attempt_id).await,
             VfsEffect::ActiveAttempts { scope } => self.active_attempts(&scope),
             VfsEffect::OpenInstance(request) => self.open_instance(request),
-            VfsEffect::CloseOpen { scope, open_id } => self.close_open(&scope, open_id).await,
+            VfsEffect::CloseOpen {
+                scope,
+                open_id,
+                detach_unstable,
+            } => self.close_open(&scope, open_id, detach_unstable).await,
             VfsEffect::LookupInstance { scope, key } => self.lookup_instance(&scope, &key),
             VfsEffect::LookupHandle { scope, handle_id } => self.lookup_handle(&scope, handle_id),
             VfsEffect::LookupById { scope, instance_id } => self.lookup_by_id(&scope, instance_id),
@@ -237,6 +241,9 @@ impl VfsHandle {
                 pending,
                 owner,
             } => self.set_disposition(&scope, instance_id, open_id, pending, owner),
+            VfsEffect::ClearDisposition { scope, instance_id } => {
+                self.clear_disposition(&scope, instance_id).await
+            }
             VfsEffect::UpdateShare {
                 scope,
                 open_id,
@@ -352,7 +359,10 @@ impl VfsHandle {
                 instance_id,
                 stage_id,
                 generation,
-            } => self.release_draft(&scope, instance_id, stage_id, generation),
+            } => {
+                self.release_draft(&scope, instance_id, stage_id, generation)
+                    .await
+            }
             VfsEffect::ReadCheckpoint {
                 stage_id,
                 generation,

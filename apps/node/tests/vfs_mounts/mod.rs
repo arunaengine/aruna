@@ -321,9 +321,23 @@ impl Mounts {
         format!("{}/api/v1/data/nfs/{path}", self.seed.base_url)
     }
 
-    /// Enrolls `host` for the loopback network and binds the whole bucket to it writable,
-    /// checking that both list routes show the new rows.
+    /// Enrolls `host` for the loopback network and binds the whole bucket to it writable.
     pub(crate) async fn bind_host(&self, host: &HostKey) -> TestResult<(HostView, MountView)> {
+        self.bind_host_mode(host, false).await
+    }
+
+    /// Enrolls `host` for the loopback network and binds the whole bucket to it read-only.
+    pub(crate) async fn bind_ro_host(&self, host: &HostKey) -> TestResult<(HostView, MountView)> {
+        self.bind_host_mode(host, true).await
+    }
+
+    /// Enrolls `host` and binds the whole bucket with `read_only`, checking that both list
+    /// routes show the new rows.
+    async fn bind_host_mode(
+        &self,
+        host: &HostKey,
+        read_only: bool,
+    ) -> TestResult<(HostView, MountView)> {
         let http = reqwest::Client::new();
         let fingerprint = host.fingerprint()?;
         let challenge = format!(
@@ -351,7 +365,7 @@ impl Mounts {
             "access_key": self.keys.access_key_id,
             "group_id": self.group_id,
             "bucket": BUCKET,
-            "read_only": false,
+            "read_only": read_only,
             "allowed_networks": [LOOPBACK],
             "display_uid": 1000,
             "display_gid": 1000,
@@ -366,7 +380,10 @@ impl Mounts {
             mounts.items.contains(&mount),
             "GET /data/nfs/mounts lists the binding"
         );
-        assert_eq!((mount.kind.as_str(), mount.read_only), ("bucket", false));
+        assert_eq!(
+            (mount.kind.as_str(), mount.read_only),
+            ("bucket", read_only)
+        );
         Ok((created, mount))
     }
 

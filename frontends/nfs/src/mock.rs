@@ -515,6 +515,7 @@ impl NfsBackend for MockBackend {
                 version_id: None,
                 instance_id: Some(object.object_id),
                 base_ranges: Vec::new(),
+                returned: u32::try_from(end - start).unwrap_or(u32::MAX),
             }),
         })
     }

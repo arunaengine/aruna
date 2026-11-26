@@ -18,7 +18,7 @@ use aruna_runner::testing::memory_context;
 
 use super::admit::{host_allows, owner_allows};
 use super::exports::{holds, resume_after, root_key};
-use super::writes::{covers, lock_check, owner_number, stage_owner};
+use super::writes::{covers, lock_check, owner_number, replay_reads, stage_owner};
 use super::*;
 use crate::backend::{ReadSource, ReplayAccess, ReplayCheck};
 use crate::rpc::RpcPrincipal;
@@ -56,6 +56,7 @@ fn binding(target: NfsMountTarget) -> NfsMountBinding {
         display_gid: 1000,
         mode: 0o755,
         created_at_ms: 1,
+        revoked_at_ms: None,
     }
 }
 
@@ -560,6 +561,7 @@ async fn replay_needs_source() {
         version_id: None,
         instance_id: None,
         base_ranges: Vec::new(),
+        returned: 0,
     };
     let unpinned = backend.recheck_live(&bucket, &read(Some(unpinned))).await;
     assert_eq!(unpinned, Err(NfsStat4::Access));
@@ -568,6 +570,7 @@ async fn replay_needs_source() {
         version_id: Some(Ulid::from_parts(7, 7)),
         instance_id: None,
         base_ranges: Vec::new(),
+        returned: 0,
     };
     let folder = binding(NfsMountTarget::for_folder("data", 7, "team").expect("a folder"));
     let confined = backend
@@ -724,6 +727,7 @@ async fn replay_rereads_base() {
         version_id: None,
         instance_id: Some(3),
         base_ranges: base_ranges.clone(),
+        returned: 4,
     };
     let unversioned = backend.recheck_live(&bucket, &read(unversioned)).await;
     assert_eq!(unversioned, Err(NfsStat4::Access));
@@ -732,9 +736,66 @@ async fn replay_rereads_base() {
         version_id: Some(Ulid::from_parts(7, 7)),
         instance_id: Some(3),
         base_ranges,
+        returned: 4,
     };
     let overlaid = backend.recheck_live(&bucket, &read(overlaid)).await;
     assert!(overlaid.is_err(), "a missing base version refuses");
+}
+
+// A short committed read at the end of the file, and an empty one past it, replay on their
+// version alone, so a CLOSE in the same compound that ended the instance never fails them; a
+// version the node cannot serve, or a key outside the binding, still refuses.
+#[tokio::test]
+async fn short_eof_replays() {
+    let version_id = Ulid::from_parts(7, 7);
+    let short = ReadSource {
+        key: "a".to_string(),
+        version_id: Some(version_id),
+        instance_id: Some(3),
+        base_ranges: vec![ByteRange {
+            offset: 0,
+            length: 5,
+        }],
+        returned: 5,
+    };
+    let base = (None, Some(version_id));
+    let reads = replay_reads(&short, (0, 4096));
+    assert_eq!(reads, Ok(vec![(base, (0, 5)), (base, (0, 4096))]));
+    let empty = ReadSource {
+        base_ranges: Vec::new(),
+        returned: 0,
+        ..short.clone()
+    };
+    assert_eq!(replay_reads(&empty, (5, 4096)), Ok(vec![(base, (5, 4096))]));
+    // Bytes the overlay served past the committed ones still need the instance.
+    let mixed = ReadSource {
+        returned: 8,
+        ..short.clone()
+    };
+    let served = (Some(3), Some(version_id));
+    let reads = replay_reads(&mixed, (0, 8));
+    assert_eq!(reads, Ok(vec![(base, (0, 5)), (served, (0, 8))]));
+    let backend = backend();
+    let object = ObjectRef {
+        mount_id: bucket_binding().mount_id,
+        object_id: 5,
+    };
+    let read = ReplayCheck {
+        object,
+        access: ReplayAccess::Read {
+            offset: 0,
+            length: 4096,
+            source: Some(short),
+        },
+    };
+    let withdrawn = backend.recheck_live(&bucket_binding(), &read).await;
+    assert!(
+        withdrawn.is_err(),
+        "a version the node cannot serve refuses"
+    );
+    let folder = binding(NfsMountTarget::for_folder("data", 7, "team").expect("a folder"));
+    let confined = backend.recheck_live(&folder, &read).await;
+    assert_eq!(confined, Err(NfsStat4::Access));
 }
 
 // Base ranges skip the overlay read only when together they cover the whole read.

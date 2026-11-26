@@ -276,6 +276,48 @@ async fn finish_steps(mounts: &Mounts) -> TestResult<()> {
 }
 
 #[tokio::test]
+async fn ro_nfs_deletes() -> TestResult<()> {
+    let mounts = Mounts::start(true, Some(loopback_tls())).await?;
+    let result = ro_steps(&mounts).await;
+    mounts.shutdown().await;
+    result
+}
+
+/// An SMB delete-on-close waits for a reader on a read-only NFS mount, and that reader's final
+/// close completes the authorized delete while preserving the implicit parent marker.
+async fn ro_steps(mounts: &Mounts) -> TestResult<()> {
+    let smb_address = mounts.smb.ok_or("no SMB listener")?;
+    let nfs_address = mounts.nfs.ok_or("no NFS listener")?;
+    mounts.put("implicit/ro.txt", b"delete from ro nfs").await?;
+    let (_, mount) = mounts.bind_ro_host(&HostKey::generate()?).await?;
+    let mut nfs = nfs_client::plain(nfs_address).await?;
+    let root = nfs.export_root(&mount.mount_id).await?;
+    let dir = nfs.lookup(&root, "implicit").await?;
+    let (reader, file) = nfs.open(&dir, "ro.txt", READER).await?;
+    let mut smb = SmbClient::login(smb_address, &mounts.keys, BUCKET).await?;
+    let access = DELETE | READ_ATTRIBUTES;
+    let options = NOT_DIRECTORY | DELETE_ON_CLOSE;
+    let doomed = smb
+        .open("implicit\\ro.txt", access, FILE_OPEN, options)
+        .await?;
+    smb.close(doomed).await?;
+    assert!(
+        mounts.exists("implicit/ro.txt").await,
+        "the open read-only NFS reader keeps the object"
+    );
+    nfs.close(&file, &reader).await?;
+    assert!(
+        mounts.missing("implicit/ro.txt").await,
+        "the final read-only NFS close completed the SMB delete"
+    );
+    assert!(
+        mounts.exists("implicit/").await,
+        "the final read-only NFS close preserved the implicit parent marker"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn cold_start_recovery() -> TestResult<()> {
     let mounts = Mounts::start(false, Some(loopback_tls())).await?;
     let result = recovery_steps(&mounts).await;

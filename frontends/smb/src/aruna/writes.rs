@@ -321,7 +321,7 @@ impl ArunaSmbBackend {
     ) -> Result<(), BackendError> {
         parts.stage = self.live_stage(open, summary).await?;
         let deleting = summary.delete_pending || open.delete_on_close;
-        if deleting && summary.open_count <= 1 {
+        if deleting {
             let owner = summary.disposition_owner.as_ref().unwrap_or(&open.owner);
             parts.marker = self.parent_marker(open, &summary.key, owner.user).await?;
         }
@@ -359,7 +359,7 @@ impl ArunaSmbBackend {
             publish: parts.publish,
             stage: parts.stage,
         };
-        let mut close = VfsCloseOperation::new(input);
+        let mut close = VfsCloseOperation::new(input).with_instance(open.instance_id);
         if let Some(put) = parts.marker {
             close = close.with_parent_marker(put);
         }

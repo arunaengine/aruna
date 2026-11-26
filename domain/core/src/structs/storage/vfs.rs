@@ -379,6 +379,8 @@ pub struct NfsMountBinding {
     pub display_gid: u32,
     pub mode: u32,
     pub created_at_ms: u64,
+    /// Set when the binding is deleted or revoked so a fixed mount id is never recreated.
+    pub revoked_at_ms: Option<u64>,
 }
 
 impl VfsRecord for NfsMountBinding {}

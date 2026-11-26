@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::structs::storage::vfs::BucketScope;
+use aruna_core::structs::storage::vfs::{BucketScope, DetachReason};
 use aruna_core::types::GroupId;
 use aruna_core::vfs_effects::{ByteRange, DiskStage, RestoreRequest, VfsEvent, VfsFailure};
 use std::fs::{File, OpenOptions};
@@ -417,19 +417,47 @@ impl VfsHandle {
     }
 
     /// Ends the draft claim of an instance on `stage_id` at `generation` but keeps its sealed
-    /// file and accounting, since a durable retained row already names that generation.
-    pub(crate) fn release_draft(
+    /// file and accounting, since a durable retained row already names that generation. The
+    /// dirty instance leaves its name so no new open joins it, and goes once no open holds it.
+    pub(crate) async fn release_draft(
         &self,
         scope: &BucketScope,
         instance_id: u64,
         stage_id: Ulid,
         generation: u64,
     ) -> Answer {
-        let mut state = self.shared.state.lock();
-        if let Ok(instance) = instance_mut(&mut state, scope, instance_id)
-            && instance.draft == Some((stage_id, generation))
-        {
+        let unused = {
+            let mut state = self.shared.state.lock();
+            let Some(bucket) = state.buckets.get_mut(scope) else {
+                return Ok(VfsEvent::Done);
+            };
+            let Some(instance) = bucket.instances.get(&instance_id) else {
+                return Ok(VfsEvent::Done);
+            };
+            if instance.draft != Some((stage_id, generation)) {
+                return Ok(VfsEvent::Done);
+            }
+            let reason = instance.detached.unwrap_or(DetachReason::LostLife);
+            bucket.detach(instance_id, reason);
+            let instance = (bucket.instances.get_mut(&instance_id)).ok_or(VfsFailure::NotFound)?;
             instance.draft = None;
+            instance.retained = true;
+            instance.change = self
+                .shared
+                .changes
+                .touch(&scope.bucket, &instance.key, true)?;
+            match instance.opens.is_empty() {
+                true => release_stage(&mut state, scope, instance_id),
+                false => None,
+            }
+        };
+        if let Some(name) = unused {
+            let path = self.path(&name);
+            crate::blocking(move || {
+                crate::remove_quietly(&path);
+                Ok(())
+            })
+            .await?;
         }
         Ok(VfsEvent::Done)
     }

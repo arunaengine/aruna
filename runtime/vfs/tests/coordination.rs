@@ -258,6 +258,50 @@ async fn delete_pending_blocks() {
 }
 
 #[tokio::test]
+async fn clear_disposition_unblocks() {
+    let (_folder, handle) = booted().await;
+    let first = request("a.txt", committed(), reader());
+    let open_id = first.open_id;
+    let instance_id = opened(&handle, first).await;
+    let pending = VfsEffect::SetDisposition {
+        scope: scope(),
+        instance_id,
+        open_id,
+        pending: true,
+        owner: None,
+    };
+    assert!(matches!(
+        handle.execute(pending).await,
+        VfsEvent::Instance(Some(_))
+    ));
+    let close = VfsEffect::CloseOpen {
+        scope: scope(),
+        open_id,
+        detach_unstable: false,
+    };
+    let answer = handle.execute(close).await;
+    let VfsEvent::Closed(summary) = answer else {
+        panic!("unexpected answer {answer:?}");
+    };
+    assert!(summary.delete_pending && summary.remaining_opens == 0);
+    let retry = VfsEffect::OpenInstance(request("a.txt", committed(), reader()));
+    let blocked = handle.execute(retry).await;
+    assert_eq!(blocked, VfsEvent::Failed(VfsFailure::DeletePending));
+    let clear = VfsEffect::ClearDisposition {
+        scope: scope(),
+        instance_id,
+    };
+    assert_eq!(handle.execute(clear).await, VfsEvent::Done);
+    let lookup = VfsEffect::LookupById {
+        scope: scope(),
+        instance_id,
+    };
+    assert_eq!(handle.execute(lookup).await, VfsEvent::Instance(None));
+    let reopened = opened(&handle, request("a.txt", committed(), reader())).await;
+    assert_ne!(reopened, instance_id);
+}
+
+#[tokio::test]
 async fn atomic_locks_rollback() {
     let (_folder, handle) = booted().await;
     let instance_id = opened(&handle, request("a.txt", committed(), reader())).await;
@@ -320,6 +364,7 @@ async fn close_releases_own() {
     let close = VfsEffect::CloseOpen {
         scope: scope(),
         open_id: first_open,
+        detach_unstable: false,
     };
     let answer = handle.execute(close).await;
     let VfsEvent::Closed(summary) = answer else {

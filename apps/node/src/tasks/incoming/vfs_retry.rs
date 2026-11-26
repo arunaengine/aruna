@@ -547,6 +547,7 @@ mod tests {
             display_gid: 0,
             mode: 0o755,
             created_at_ms: 1,
+            revoked_at_ms: None,
         }
     }
 

@@ -4,8 +4,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::structs::storage::vfs::{
-    BucketScope, DetachReason, DirectoryWitness, FileIdentity, HandleIdentity, HandleKind,
-    NfsMountBinding, NfsStageRecord, StageBase, StageDisposition, StageOwner,
+    DetachReason, DirectoryWitness, FileIdentity, HandleIdentity, HandleKind, NfsMountBinding,
+    NfsStageRecord, StageBase, StageDisposition, StageOwner,
 };
 use aruna_core::user::id::UserId;
 use aruna_core::vfs_effects::{
@@ -21,10 +21,10 @@ use aruna_ops_data::vfs::mutate::{MkdirInput, RemoveInput, RenameInput};
 use aruna_ops_data::vfs::path::{NameUse, check_component, child_key, split_parent};
 use aruna_ops_data::vfs::publish::{CloseInput, CloseOutcome, PublishInput};
 use aruna_ops_data::vfs::{
-    AllocateHandleOperation, DetachInstanceOperation, InstanceTarget, LiveStageOperation,
-    LookupInstanceOperation, QuotaStageOperation, UpdateShareOperation, VfsCloseOperation,
-    VfsCommitOperation, VfsError, VfsLockOperation, VfsMkdirOperation, VfsOpenOperation,
-    VfsReadOperation, VfsRemoveOperation, VfsRenameOperation, VfsWriteOperation, stage_scope,
+    AllocateHandleOperation, InstanceTarget, LiveStageOperation, LookupInstanceOperation,
+    QuotaStageOperation, UpdateShareOperation, VfsCloseOperation, VfsCommitOperation, VfsError,
+    VfsLockOperation, VfsMkdirOperation, VfsOpenOperation, VfsReadOperation, VfsRemoveOperation,
+    VfsRenameOperation, VfsWriteOperation, stage_scope,
 };
 use aruna_runner::driver::drive;
 use bytes::Bytes;
@@ -115,6 +115,46 @@ pub(super) fn covers(ranges: &[ByteRange], (offset, length): (u64, u64)) -> bool
         reached = reached.max(range.offset.saturating_add(range.length));
     }
     reached >= offset.saturating_add(length)
+}
+
+/// One read a replay runs again: the instance and version it reads, and its range.
+pub(super) type ReplayRead = ((Option<u64>, Option<Ulid>), (u64, u32));
+
+/// The reads that admit the bytes of `source` again. Committed bytes are read from their
+/// version alone, past any later overlay; a read the version answered alone, such as a short
+/// or empty one at the end of the file, never needs the instance, which a close may have ended.
+pub(super) fn replay_reads(
+    source: &ReadSource,
+    (offset, length): (u64, u32),
+) -> Result<Vec<ReplayRead>, NfsStat4> {
+    let length = length.min(IO_LIMIT);
+    let returned = u64::from(source.returned);
+    let mut reads = Vec::new();
+    if !source.base_ranges.is_empty() {
+        let Some(version_id) = source.version_id else {
+            return Err(NfsStat4::Access);
+        };
+        let base = (None, Some(version_id));
+        for range in &source.base_ranges {
+            let part = u32::try_from(range.length).map_err(|_| NfsStat4::Access)?;
+            reads.push((base, (range.offset, part)));
+        }
+        if source.instance_id.is_none() || covers(&source.base_ranges, (offset, returned)) {
+            let exact = source.base_ranges.len() == 1
+                && source.base_ranges[0].offset == offset
+                && source.base_ranges[0].length == u64::from(length);
+            if !exact {
+                reads.push((base, (offset, length)));
+            }
+            return Ok(reads);
+        }
+    } else if source.returned == 0
+        && let Some(version_id) = source.version_id
+    {
+        return Ok(vec![((None, Some(version_id)), (offset, length))]);
+    }
+    reads.push(((source.instance_id, source.version_id), (offset, length)));
+    Ok(reads)
 }
 
 /// The stage owner of a checkpoint written through `binding`; a job credential writes an
@@ -365,46 +405,26 @@ impl ArunaNfsBackend {
             publish: None,
             stage: stage.clone(),
         };
-        let (stage, pending) = match drive(VfsCloseOperation::new(input), &self.context).await {
-            Ok(CloseOutcome::Pending) => (stage, true),
+        // Unstable bytes without a checkpoint leave the name inside the close, under the same
+        // state lock, so no writer of another mount joins them in between.
+        let close = VfsCloseOperation::new(input)
+            .with_detach_unstable()
+            .with_instance(slot.instance_id);
+        let stage = match drive(close, &self.context).await {
+            Ok(CloseOutcome::Pending) => stage,
             // An earlier attempt ended the open; a live checkpoint of this binding stays.
             Err(VfsError::Vfs(VfsFailure::NotFound)) => {
-                let stage = stage.filter(|stage| stage.owner.mount_id == binding.mount_id);
-                let left = stage.is_none() && self.unstable_left(&scope, slot).await?;
-                (stage, left)
+                stage.filter(|stage| stage.owner.mount_id == binding.mount_id)
             }
-            Ok(_) => (None, false),
+            Ok(_) => None,
             Err(error) => return Err(status_of(error)),
         };
-        if let Some(stage) = stage {
-            let retain = QuotaStageOperation::retain(scope, stage, DetachReason::LostLife)
-                .with_instance(slot.instance_id);
-            return drive(retain, &self.context).await.map_err(status_of);
-        }
-        if !pending {
+        let Some(stage) = stage else {
             return Ok(());
-        }
-        // Unstable bytes without a checkpoint leave the name, so no other open serves them.
-        let (instance_id, reason) = (Some(slot.instance_id), DetachReason::LostLife);
-        let detach = DetachInstanceOperation::new(scope, object.object_id, instance_id, reason);
-        drive(detach, &self.context)
-            .await
-            .map(|_| ())
-            .map_err(status_of)
-    }
-
-    /// Whether the instance of `slot` still holds dirty bytes with no writer and no stage, as
-    /// a revoked close leaves it when its detach failed.
-    async fn unstable_left(&self, scope: &BucketScope, slot: &OpenSlot) -> Result<bool, NfsStat4> {
-        let target = InstanceTarget::Instance(slot.instance_id);
-        let lookup = LookupInstanceOperation::new(scope.clone(), target);
-        let summary = drive(lookup, &self.context).await.map_err(status_of)?;
-        Ok(summary.is_some_and(|found| {
-            found.writer_count == 0
-                && found.dirty
-                && found.stage_id.is_none()
-                && found.detached.is_none()
-        }))
+        };
+        let retain = QuotaStageOperation::retain(scope, stage, DetachReason::LostLife)
+            .with_instance(slot.instance_id);
+        drive(retain, &self.context).await.map_err(status_of)
     }
 
     /// Ends one VFS open; the last dirty writer publishes the effective image.
@@ -419,8 +439,8 @@ impl ArunaNfsBackend {
         close_status(closed.map_err(status_of)?, detached)
     }
 
-    /// The shared instance of an open of this server now, by handle or else by name; another
-    /// protocol may have published, renamed or detached it since the open.
+    /// The shared instance of an open of this server now, by handle, name or else instance
+    /// number; another protocol may have published, renamed or detached it since the open.
     async fn shared_of(
         &self,
         binding: &NfsMountBinding,
@@ -431,6 +451,7 @@ impl ArunaNfsBackend {
         let targets = [
             InstanceTarget::Handle(object.object_id),
             InstanceTarget::Key(slot.key.clone()),
+            InstanceTarget::Instance(slot.instance_id),
         ];
         for target in targets {
             let lookup = LookupInstanceOperation::new(scope.clone(), target);
@@ -457,7 +478,7 @@ impl ArunaNfsBackend {
             .is_some_and(|found| found.detached.is_some());
         let dirty = summary.as_ref().is_some_and(|found| found.dirty);
         let marker = match summary.as_ref() {
-            Some(found) if found.delete_pending && found.open_count <= 1 => {
+            Some(found) if found.delete_pending => {
                 let owner = found.disposition_owner.as_ref();
                 let user = owner.map_or(binding.owner, |owner| owner.user);
                 self.parent_marker(binding, &found.key, user).await?
@@ -482,7 +503,7 @@ impl ArunaNfsBackend {
             publish,
             stage,
         };
-        let mut close = VfsCloseOperation::new(input);
+        let mut close = VfsCloseOperation::new(input).with_instance(slot.instance_id);
         if let Some(put) = marker {
             close = close.with_parent_marker(put);
         }
@@ -759,6 +780,7 @@ impl ArunaNfsBackend {
         };
         let read = drive(VfsReadOperation::new(input), &self.context).await;
         let read = read.map_err(status_of)?;
+        let returned = u32::try_from(read.data.len()).unwrap_or(u32::MAX);
         Ok(ReadReply {
             data: read.data.into(),
             eof: read.eof,
@@ -767,6 +789,7 @@ impl ArunaNfsBackend {
                 version_id: read.version_id,
                 instance_id,
                 base_ranges: read.base_ranges,
+                returned,
             }),
         })
     }
@@ -783,26 +806,10 @@ impl ArunaNfsBackend {
         if !pinned || !holds(binding, &source.key) {
             return Err(NfsStat4::Access);
         }
-        let length = length.min(IO_LIMIT);
-        // Committed bytes are read again from their version alone, past any later overlay.
-        if !source.base_ranges.is_empty() {
-            let Some(version_id) = source.version_id else {
-                return Err(NfsStat4::Access);
-            };
-            for range in &source.base_ranges {
-                let part = u32::try_from(range.length).map_err(|_| NfsStat4::Access)?;
-                let base = (None, Some(version_id));
-                self.read_again(binding, &source.key, base, (range.offset, part))
-                    .await?;
-            }
-            let whole = (offset, u64::from(length));
-            if source.instance_id.is_none() || covers(&source.base_ranges, whole) {
-                return Ok(());
-            }
+        for (served, range) in replay_reads(source, (offset, length))? {
+            self.read_again(binding, &source.key, served, range).await?;
         }
-        let served = (source.instance_id, source.version_id);
-        self.read_again(binding, &source.key, served, (offset, length))
-            .await
+        Ok(())
     }
 
     /// One read of `key` from this instance and version, past byte locks, for a replay.

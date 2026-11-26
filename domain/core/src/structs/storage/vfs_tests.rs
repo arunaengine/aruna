@@ -98,6 +98,7 @@ fn records_round_trip() {
         display_gid: 1000,
         mode: 0o755,
         created_at_ms: 11,
+        revoked_at_ms: None,
     };
     let bytes = binding.to_bytes().unwrap();
     assert_eq!(bytes, binding.to_bytes().unwrap());

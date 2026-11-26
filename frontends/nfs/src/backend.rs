@@ -146,6 +146,8 @@ pub struct ReadSource {
     pub instance_id: Option<u64>,
     /// The ranges served from the committed version, read again past any later overlay.
     pub base_ranges: Vec<ByteRange>,
+    /// Number of bytes the original read returned.
+    pub returned: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

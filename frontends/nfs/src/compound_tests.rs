@@ -1086,6 +1086,7 @@ async fn replay_records_uses() {
         version_id: None,
         instance_id: Some(file),
         base_ranges: Vec::new(),
+        returned: 2,
     };
     let read = ReplayAccess::Read {
         offset: 0,
