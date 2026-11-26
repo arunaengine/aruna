@@ -2526,6 +2526,7 @@ async fn delivers_empty_dir() {
         }
         other => panic!("expected parent listing with empty dir, got {other:?}"),
     }
+}
 
 #[tokio::test]
 async fn run_area_untracked() {

@@ -262,6 +262,8 @@ impl Env {
             secrets: BTreeMap::new(),
             path_restrictions: None,
             captured_remote: Vec::new(),
+            directory_pins: Vec::new(),
+            directory_roots: Vec::new(),
             used_tools: Vec::new(),
             limits: None,
             automation: origin,

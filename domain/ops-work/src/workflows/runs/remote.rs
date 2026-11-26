@@ -1106,6 +1106,8 @@ mod tests {
             }],
             directory_roots: Vec::new(),
             used_tools: Vec::new(),
+            limits: None,
+            automation: None,
         };
         let child = Target {
             bucket: "data".into(),
