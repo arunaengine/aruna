@@ -117,6 +117,15 @@ async fn explains_tasks() {
         closed.contains(&opened[0].0),
         "the report session is closed"
     );
+    let sent = runs.host.sent();
+    let streamed: usize = sent
+        .iter()
+        .filter_map(|msg| match msg {
+            HostToCoordinator::RunReplayPages { pages } => Some(pages.len()),
+            _ => None,
+        })
+        .sum();
+    assert_eq!(streamed, 1, "log pages stream before the report request");
     let asked = asked(&runs);
     let Some(PreflightKind::ComputeWhy {
         task_id, log_pages, ..
@@ -124,7 +133,7 @@ async fn explains_tasks() {
     else {
         panic!("a why request: {asked:?}");
     };
-    assert_eq!((*task_id, log_pages.len()), (1, 1));
+    assert_eq!((*task_id, log_pages.len()), (1, 0));
 
     let hidden = TaskWhyOperation::new(&runs.fixture.stranger, run.run_id, 1);
     assert_eq!(drive(hidden, context).await, Err(CatalogError::NotFound));
@@ -177,6 +186,66 @@ async fn compares_readable_runs() {
     assert_eq!(drive(missing, context).await, Err(CatalogError::NotFound));
     let bob = CompareRunsOperation::new(&runs.fixture.bob, foreign.run_id, first.run_id);
     assert_eq!(drive(bob, context).await, Err(CatalogError::NotFound));
+}
+
+// Large report logs split across bounded RunReplayPages frames before the PreflightRequest.
+#[tokio::test]
+async fn chunks_large_reports() {
+    let runs = runs().await;
+    let context = &runs.fixture.context;
+    let run_id = Ulid::from_bytes([88; 16]);
+    let big = "x".repeat(1_200_000);
+    let page = |seq: u64| aruna_workflow_contract::preflight::RunLogPage {
+        entries: vec![RunLogEntry::Change {
+            seq,
+            change_json: json!({"payload": big}),
+        }],
+    };
+    let kind = PreflightKind::ComputeCompare {
+        first_run_id: "r1".into(),
+        second_run_id: "r2".into(),
+        first_log_pages: vec![page(1), page(2)],
+        second_log_pages: vec![page(3), page(4)],
+    };
+    runs.host
+        .script(vec![answer(PreflightResult::ComputeCompare {
+            comparison_json: Some(json!({"tasks": []})),
+        })]);
+    let call = super::reports::ReportCallOperation::new(run_id, kind);
+    let reply = drive(call, context).await.unwrap().unwrap();
+    assert!(matches!(reply, PreflightResult::ComputeCompare { .. }));
+    let sent = runs.host.sent();
+    let replay_frames: Vec<usize> = sent
+        .iter()
+        .filter_map(|msg| match msg {
+            HostToCoordinator::RunReplayPages { pages } => Some(pages.len()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        replay_frames.len() >= 2,
+        "expected multiple replay chunks, got {replay_frames:?}"
+    );
+    assert_eq!(replay_frames.iter().sum::<usize>(), 4);
+    for msg in &sent {
+        assert!(
+            aruna_workflow_contract::encode_message(msg).is_ok(),
+            "every frame fits inside MAX_FRAME_BYTES"
+        );
+    }
+    let Some(HostToCoordinator::PreflightRequest {
+        kind:
+            PreflightKind::ComputeCompare {
+                first_log_pages,
+                second_log_pages,
+                ..
+            },
+        ..
+    }) = sent.last()
+    else {
+        panic!("expected final PreflightRequest, got {:?}", sent.last());
+    };
+    assert!(first_log_pages.is_empty() && second_log_pages.is_empty());
 }
 
 // Time, changes and the HTML report answer from the records without a log and from uwe with one.

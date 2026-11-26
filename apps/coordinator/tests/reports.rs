@@ -128,6 +128,37 @@ async fn reports_recorded_runs() {
     };
     assert!(html.contains("<html"), "{}", &html[..html.len().min(200)]);
     assert!(html.contains("run-first"));
+
+    // Streamed replay pages work for single-run reports and two-run comparisons alike.
+    for page in &first {
+        host.send(
+            &aruna_workflow_contract::HostToCoordinator::RunReplayPages {
+                pages: vec![page.clone()],
+            },
+        )
+        .await;
+    }
+    for page in &second {
+        host.send(
+            &aruna_workflow_contract::HostToCoordinator::RunReplayPages {
+                pages: vec![page.clone()],
+            },
+        )
+        .await;
+    }
+    let streamed = host
+        .preflight(PreflightKind::ComputeCompare {
+            first_run_id: "run-first".into(),
+            second_run_id: "run-second".into(),
+            first_log_pages: Vec::new(),
+            second_log_pages: Vec::new(),
+        })
+        .await;
+    let Ok(PreflightResult::ComputeCompare { comparison_json }) = streamed else {
+        panic!("{streamed:?}");
+    };
+    assert!(comparison_json.is_some_and(|comparison| comparison.is_object()));
+
     host.shutdown().await.expect("a clean end");
 }
 

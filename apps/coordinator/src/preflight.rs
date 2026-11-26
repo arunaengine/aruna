@@ -45,6 +45,15 @@ pub async fn answer(
     kind: PreflightKind,
     cancel: CancellationToken,
 ) -> Result<PreflightResult, ContractError> {
+    answer_with(kind, Vec::new(), cancel).await
+}
+
+/// Answers one request, replaying any log pages streamed ahead of a report request.
+pub async fn answer_with(
+    kind: PreflightKind,
+    staged: Vec<RunLogPage>,
+    cancel: CancellationToken,
+) -> Result<PreflightResult, ContractError> {
     match kind {
         PreflightKind::Check {
             source,
@@ -124,7 +133,7 @@ pub async fn answer(
             let run = simulate(&workspace, language, inputs, params, cancel).await?;
             dry_result(&run)
         }
-        report => blocking(move || answer_report(report)).await,
+        report => blocking(move || answer_report(report, &staged)).await,
     }
 }
 
@@ -410,14 +419,17 @@ fn tool_folder(files: &WorkflowSource) -> Result<tempfile::TempDir, ContractErro
     Ok(folder)
 }
 
-fn answer_report(kind: PreflightKind) -> Result<PreflightResult, ContractError> {
+fn answer_report(
+    kind: PreflightKind,
+    staged: &[RunLogPage],
+) -> Result<PreflightResult, ContractError> {
     match kind {
         PreflightKind::ComputeWhy {
             run_id,
             task_id,
             log_pages,
         } => {
-            let store = replayed(&[&log_pages], Path::new(REPLAY_ROOT))?;
+            let store = replayed(&[staged, &log_pages], Path::new(REPLAY_ROOT))?;
             known_run(&store, &run_id)?;
             let why = store.why(&run_id, task_id).map_err(read_error)?;
             Ok(PreflightResult::ComputeWhy {
@@ -431,7 +443,7 @@ fn answer_report(kind: PreflightKind) -> Result<PreflightResult, ContractError> 
             second_log_pages,
         } => {
             let store = replayed(
-                &[&first_log_pages, &second_log_pages],
+                &[staged, &first_log_pages, &second_log_pages],
                 Path::new(REPLAY_ROOT),
             )?;
             known_run(&store, &first_run_id)?;
@@ -442,7 +454,7 @@ fn answer_report(kind: PreflightKind) -> Result<PreflightResult, ContractError> 
             })
         }
         PreflightKind::ComputeTime { run_id, log_pages } => {
-            let store = replayed(&[&log_pages], Path::new(REPLAY_ROOT))?;
+            let store = replayed(&[staged, &log_pages], Path::new(REPLAY_ROOT))?;
             known_run(&store, &run_id)?;
             let time = store.time_spent(&run_id).map_err(read_error)?;
             Ok(PreflightResult::ComputeTime {
@@ -450,7 +462,7 @@ fn answer_report(kind: PreflightKind) -> Result<PreflightResult, ContractError> 
             })
         }
         PreflightKind::ComputeChanges { run_id, log_pages } => {
-            let store = replayed(&[&log_pages], Path::new(REPLAY_ROOT))?;
+            let store = replayed(&[staged, &log_pages], Path::new(REPLAY_ROOT))?;
             let run = known_run(&store, &run_id)?;
             // The node compares these with what its storage and registries hold now.
             let changes_json = json!({
@@ -467,9 +479,9 @@ fn answer_report(kind: PreflightKind) -> Result<PreflightResult, ContractError> 
             base_uri,
             source,
             entrypoint,
-        } => build_crate(&run_id, &log_pages, &base_uri, &source, &entrypoint),
+        } => build_crate(&run_id, staged, &log_pages, &base_uri, &source, &entrypoint),
         PreflightKind::BuildReport { run_id, log_pages } => {
-            let store = replayed(&[&log_pages], Path::new(REPLAY_ROOT))?;
+            let store = replayed(&[staged, &log_pages], Path::new(REPLAY_ROOT))?;
             known_run(&store, &run_id)?;
             let html = run_page::report(&ReportReader { store }, &run_id)
                 .map_err(read_error)?
@@ -487,13 +499,14 @@ fn answer_report(kind: PreflightKind) -> Result<PreflightResult, ContractError> 
 /// files of its store under `base_uri`.
 fn build_crate(
     run_id: &str,
+    staged: &[RunLogPage],
     log_pages: &[RunLogPage],
     base_uri: &str,
     source: &WorkflowSource,
     entrypoint: &str,
 ) -> Result<PreflightResult, ContractError> {
     let workspace = Workspace::create(source, entrypoint)?;
-    let store = replayed(&[log_pages], workspace.path())?;
+    let store = replayed(&[staged, log_pages], workspace.path())?;
     let run = known_run(&store, run_id)?;
     let mut sources = HashMap::new();
     for file in &source.files {

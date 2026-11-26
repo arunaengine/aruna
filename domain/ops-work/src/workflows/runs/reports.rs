@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::WORKFLOW_TASK_KEYSPACE;
@@ -28,7 +28,7 @@ use super::control::pins_of;
 use super::data::ObjectAccessOperation;
 use super::events::{run_json, time_text};
 use super::log::{LineageLogOperation, LoadLogOperation, pages_answer};
-use super::run::{workflow_answer, workflow_call};
+use super::run::{replay_chunks, workflow_answer, workflow_call};
 use super::{RunAccessOperation, RunTasksOperation, access_of, tasks_answer};
 use crate::workflows::versions::{GetVersionOperation, VersionView};
 use crate::workflows::{CatalogError, Need};
@@ -40,16 +40,39 @@ pub type ReportAnswer = Result<PreflightResult, WorkflowError>;
 #[derive(Debug, PartialEq)]
 enum CallStep {
     Open,
+    Replay,
     Send,
     Receive,
     Close,
 }
 
+/// Extracts report log pages from `kind` so they stream in bounded `RunReplayPages` frames.
+fn take_pages(kind: &mut PreflightKind) -> Vec<RunLogPage> {
+    match kind {
+        PreflightKind::ComputeWhy { log_pages, .. }
+        | PreflightKind::ComputeTime { log_pages, .. }
+        | PreflightKind::ComputeChanges { log_pages, .. }
+        | PreflightKind::BuildRunCrate { log_pages, .. }
+        | PreflightKind::BuildReport { log_pages, .. } => std::mem::take(log_pages),
+        PreflightKind::ComputeCompare {
+            first_log_pages,
+            second_log_pages,
+            ..
+        } => {
+            let mut pages = std::mem::take(first_log_pages);
+            pages.extend(std::mem::take(second_log_pages));
+            pages
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// One report request to a coordinator attempt of its own in report mode: it opens the session,
-/// sends the request, waits for the answer and closes the session again.
+/// streams log pages in bounded batches, sends the request, waits for the answer and closes.
 #[derive(Debug, PartialEq)]
 pub struct ReportCallOperation {
     kind: Option<PreflightKind>,
+    chunks: VecDeque<Vec<RunLogPage>>,
     run_id: Ulid,
     session: String,
     answer: Option<ReportAnswer>,
@@ -58,9 +81,12 @@ pub struct ReportCallOperation {
 }
 
 impl ReportCallOperation {
-    pub fn new(run_id: Ulid, kind: PreflightKind) -> Self {
+    pub fn new(run_id: Ulid, mut kind: PreflightKind) -> Self {
+        let pages = take_pages(&mut kind);
+        let chunks = replay_chunks(&pages).into();
         Self {
             kind: Some(kind),
+            chunks,
             run_id,
             session: format!("report-{run_id}"),
             answer: None,
@@ -76,6 +102,20 @@ impl ReportCallOperation {
     ) -> Result<Next<ReportAnswer>, CatalogError> {
         self.step = step;
         Ok(Next::Call(workflow_call(effect)))
+    }
+
+    fn send_next(&mut self) -> Result<Next<ReportAnswer>, CatalogError> {
+        let session = self.session.clone();
+        if let Some(pages) = self.chunks.pop_front() {
+            let message = HostToCoordinator::RunReplayPages { pages };
+            return self.effect(CallStep::Replay, WorkflowEffect::Send { session, message });
+        }
+        let kind = self.kind.take().ok_or(IoError::Unfinished)?;
+        let message = HostToCoordinator::PreflightRequest {
+            request_id: 1,
+            kind,
+        };
+        self.effect(CallStep::Send, WorkflowEffect::Send { session, message })
     }
 
     /// Keeps the answer and closes the session, which every path after the open does.
@@ -115,15 +155,11 @@ impl Operation for ReportCallOperation {
         match (std::mem::replace(&mut self.step, CallStep::Close), answer) {
             (CallStep::Open, WorkflowAnswer::Opened(Ok(()))) => {
                 self.opened = true;
-                let kind = self.kind.take().ok_or(IoError::Unfinished)?;
-                let message = HostToCoordinator::PreflightRequest {
-                    request_id: 1,
-                    kind,
-                };
-                let session = self.session.clone();
-                self.effect(CallStep::Send, WorkflowEffect::Send { session, message })
+                self.send_next()
             }
             (CallStep::Open, WorkflowAnswer::Opened(Err(error))) => Ok(Next::Done(Err(error))),
+            (CallStep::Replay, WorkflowAnswer::Sent(Ok(()))) => self.send_next(),
+            (CallStep::Replay, WorkflowAnswer::Sent(Err(error))) => self.close(Err(error)),
             (CallStep::Send, WorkflowAnswer::Sent(Ok(()))) => self.receive(),
             (CallStep::Send, WorkflowAnswer::Sent(Err(error))) => self.close(Err(error)),
             (CallStep::Receive, WorkflowAnswer::Received(received)) => match received {

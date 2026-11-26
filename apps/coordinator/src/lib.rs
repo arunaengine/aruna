@@ -138,14 +138,19 @@ async fn session(
                             respond(rpc, request_id, Err(refused));
                             continue;
                         }
+                        let staged = match mode {
+                            CoordinatorMode::Report => std::mem::take(&mut replay_pages),
+                            _ => Vec::new(),
+                        };
                         let (rpc, cancel) = (rpc.clone(), cancel.child_token());
                         requests.spawn(async move {
-                            let result = preflight::answer(kind, cancel).await;
+                            let result = preflight::answer_with(kind, staged, cancel).await;
                             respond(&rpc, request_id, result);
                         });
                     }
                     HostToCoordinator::RunReplayPages { pages }
-                        if mode == CoordinatorMode::Run && !started =>
+                        if (mode == CoordinatorMode::Run && !started)
+                            || mode == CoordinatorMode::Report =>
                     {
                         replay_pages.extend(pages);
                     }
