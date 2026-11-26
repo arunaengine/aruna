@@ -25,6 +25,7 @@ see [`.env.example`](../.env.example).
 - [Backups and disaster recovery](#backups-and-disaster-recovery)
 - [Upgrades and migrations](#upgrades-and-migrations)
 - [Observability, compute and multi-node realms](#observability-compute-and-multi-node-realms)
+- [Applet hosting](#applet-hosting)
 - [Operator pre-flight checklist](#operator-pre-flight-checklist)
 
 ## Releases and image tags
@@ -699,6 +700,69 @@ a realm administrator in the portal (or API):
    before the first start to populate its placement attributes.
 3. Start the node. Once it finishes syncing and joins the realm, remove `ONBOARDING_SECRET` from
    `aruna.env` (it is only read on first start).
+
+## Applet hosting
+
+Applet hosting is optional and stays off while `APPLETS_DOMAIN` is unset. When enabled, each applet
+runs on its own origin (`https://<slug>.<APPLETS_DOMAIN>`) behind the stateless `aruna-gateway`
+process, which fetches host decisions and pinned files from the node's `/edge/v1/*` routes using a
+shared edge key.
+
+### Dedicated registered domain (required)
+
+Serve applets from a **separate registered domain** of their own, just as GitHub serves Pages on
+`github.io` instead of `github.com`. For example, if your portal, API, S3 and OIDC provider live
+under `example.org`, configure `APPLETS_DOMAIN=apps.example.net` (not `apps.example.org`):
+
+- **Why:** Browsers scope parent-domain cookies (`Domain=...`) and `SameSite` checks by registered
+  domain rather than by hostname. Hosting untrusted or group-authored applet JavaScript on a
+  subdomain of the portal or identity provider's domain would let applet script set cookies for the
+  parent domain and treat requests to sibling services as same-site.
+- **Startup enforcement:** The node refuses to start if `APPLETS_DOMAIN` shares its last two DNS
+  labels with `APPLETS_PORTAL_ORIGIN`, `PORTAL_PUBLIC_URL`, `API_PUBLIC_URL`, `S3_PUBLIC_URL`,
+  `S3_HOST`, or any configured OIDC issuer or discovery host.
+- **Custom domains:** When `APPLETS_CUSTOM_DOMAINS=true`, custom domains must have at least three
+  DNS labels, lie outside `APPLETS_DOMAIN`, pass `_aruna-verify.<host>` TXT and IP checks, and not
+  share a registered domain with the node's portal, API, S3 or OIDC hosts. A verified custom domain
+  still shares cookie and `SameSite` scope with its own parent domain, so groups should avoid
+  pointing applets at subdomains of sensitive institutional zones.
+
+### Node and gateway settings
+
+On the node (`aruna.env`):
+
+```bash
+APPLETS_DOMAIN=apps.example.net
+APPLETS_EDGE_KEY_SHA256=<64-hex-sha256-of-APPLETS_EDGE_KEY>
+APPLETS_PORTAL_ORIGIN=https://rdm.example.org
+APPLETS_CUSTOM_DOMAINS=false
+APPLETS_GUESTS=false
+APPLETS_EMBEDDING=false
+APPLETS_MAX_ORIGINS=8
+```
+
+On the gateway (`aruna-gateway`):
+
+```bash
+APPLETS_EDGE_KEY=<random-shared-secret>
+ARUNA_GATEWAY_UPSTREAMS=http://aruna:3000
+ARUNA_GATEWAY_LISTEN=0.0.0.0:8090
+# Set when a reverse proxy terminates TLS in front of the gateway:
+ARUNA_GATEWAY_TRUSTED_PROXY=172.18.0.2
+```
+
+Reverse proxy and TLS notes:
+
+- Terminate TLS for `*.<APPLETS_DOMAIN>` (wildcard certificate) and forward requests to
+  `aruna-gateway` with the original `Host` header preserved.
+- If you enable custom domains with on-demand TLS (such as Caddy `on_demand_tls`), point the proxy's
+  internal ask check at `http://<gateway>:8090/_edge/tls-check`.
+- **Keep `/_edge/*` internal:** Do not expose `/_edge/health` or `/_edge/tls-check` through the
+  public ingress. The gateway rejects browser requests to `/_edge/tls-check`, and blocking
+  `/_edge/*` at the reverse proxy prevents external host-existence probes.
+- When `APPLETS_DOMAIN` is configured, the node automatically extends the portal's `frame-src` CSP
+  to `blob: https://*.<APPLETS_DOMAIN>` so builder previews load without admitting custom domains
+  or other external frames.
 
 ## Operator pre-flight checklist
 
