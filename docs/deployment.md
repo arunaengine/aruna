@@ -60,7 +60,7 @@ bundles:
 
   ```bash
   curl -fsSL https://github.com/arunaengine/aruna/releases/download/v3.0.0-alpha.210/release-images.json \
-    | jq -r '.images[] | select(.name == "aruna") | (.tags[] | select(contains("-portal."))), .reference'
+    | jq -er '.images[] | select(.name == "aruna" and any(.tags[]; contains("-portal."))) | (.tags[] | select(contains("-portal."))), .reference'
   ```
 
   Pinning prevents a container recreation from silently pulling a newer release before you have

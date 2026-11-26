@@ -90,7 +90,7 @@ digest from the release's `release-images.json` when serving the embedded portal
 
 ```bash
 curl -fsSL https://github.com/arunaengine/aruna/releases/download/v3.0.0-alpha.210/release-images.json \
-  | jq -r '.images[] | select(.name == "aruna") | (.tags[] | select(contains("-portal."))), .reference'
+  | jq -er '.images[] | select(.name == "aruna" and any(.tags[]; contains("-portal."))) | (.tags[] | select(contains("-portal."))), .reference'
 ```
 
 To build the image from a checkout of this repository instead, run `docker build -t aruna:local .`
