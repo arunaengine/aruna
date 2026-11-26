@@ -34,13 +34,14 @@ use aruna_storage::errors::StorageLibError;
 use aruna_storage::storage::handle::StorageHandle;
 use aruna_storage::storage::persistence::FjallPersistPolicy;
 use aruna_storage::storage::worker::FjallStorage;
+use aruna_vfs::{VfsConfig, VfsHandle};
 use irokle::net::IrohRuntimeConfig;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
 use crate::compute_setup::build_registry;
 use crate::shutdown::{NodeShutdown, ShutdownOutcome, shutdown_grace_env};
-use aruna_config::settings::{DocumentSyncSettings, Settings};
+use aruna_config::settings::{DocumentSyncSettings, Settings, VfsSettings};
 use aruna_config::{Config, SetupError, resolve_config};
 
 /// How much event recording keeps in memory when `EVENT_RECORDING` is enabled.
@@ -70,6 +71,8 @@ pub struct NodeResources {
     pub(crate) session_s3: Option<std::net::SocketAddr>,
     pub(crate) monitoring: Arc<MonitoringState>,
     pub(crate) ops_handle: tokio::task::JoinHandle<()>,
+    /// The SMB and NFS settings, which the resolved configuration does not carry.
+    pub(crate) vfs: VfsSettings,
 }
 
 /// The resources acquired so far. Infallible ownership is created up front;
@@ -136,6 +139,8 @@ impl Acquired {
             s3: None,
             portal: None,
             session_s3: None,
+            smb: None,
+            nfs: None,
             https: None,
             monitoring: self.monitoring,
             task_handle: self.task_handle,
@@ -158,9 +163,10 @@ impl Acquired {
         outcome
     }
 
-    fn finish(self, config: Config) -> NodeResources {
+    fn finish(self, config: Config, vfs: VfsSettings) -> NodeResources {
         NodeResources {
             config,
+            vfs,
             driver_ctx: self
                 .driver_ctx
                 .expect("acquisition builds the driver context"),
@@ -342,6 +348,7 @@ pub(crate) async fn acquire_with_storage(
     on_drain: &mut impl FnMut(),
 ) -> Result<Option<NodeResources>, Box<dyn std::error::Error>> {
     let mut acquired = Acquired::new(storage_handle, task_handle);
+    let vfs = settings.vfs.clone();
     // A stop accepted before configuration resolution must not read or write
     // identity or send enrollment traffic.
     if stop.is_cancelled() {
@@ -366,8 +373,8 @@ pub(crate) async fn acquire_with_storage(
             return Err(error.into());
         }
     };
-    match fill(&config, &mut acquired, stop, &mut checkpoint).await {
-        Ok(()) => Ok(Some(acquired.finish(config))),
+    match fill(&config, &vfs, &mut acquired, stop, &mut checkpoint).await {
+        Ok(()) => Ok(Some(acquired.finish(config, vfs))),
         Err(error) => {
             on_drain();
             let cleanup = acquired.cleanup(shutdown_grace_env()).await;
@@ -399,8 +406,9 @@ pub(crate) async fn acquire_resources(
 ) -> Result<NodeResources, Box<dyn std::error::Error>> {
     let mut acquired = Acquired::new(storage_handle, task_handle);
     let stop = tokio_util::sync::CancellationToken::new();
-    match fill(&config, &mut acquired, &stop, &mut checkpoint).await {
-        Ok(()) => Ok(acquired.finish(config)),
+    let vfs = VfsSettings::default();
+    match fill(&config, &vfs, &mut acquired, &stop, &mut checkpoint).await {
+        Ok(()) => Ok(acquired.finish(config, vfs)),
         Err(error) => {
             acquired.cleanup(shutdown_grace_env()).await;
             Err(error)
@@ -412,6 +420,7 @@ pub(crate) async fn acquire_resources(
 /// as soon as it exists so a later failure owns it.
 async fn fill(
     config: &Config,
+    vfs: &VfsSettings,
     acquired: &mut Acquired,
     stop: &tokio_util::sync::CancellationToken,
     checkpoint: &mut impl FnMut(StartupStage) -> Result<(), Box<dyn std::error::Error>>,
@@ -540,6 +549,8 @@ async fn fill(
     checkpoint(StartupStage::Compute)?;
     stopped(stop)?;
 
+    // Storage reports head changes to the file servers before any of them serves.
+    let vfs_handle = open_vfs(vfs, config, &acquired.storage_handle)?;
     let (http, policy) = blob_handle.repository_client();
     let driver_ctx = Arc::new(DriverContext {
         storage_handle: acquired.storage_handle.clone(),
@@ -549,6 +560,7 @@ async fn fill(
         task_handle: Some(acquired.task_handle.clone()),
         compute_handle: compute_handle.clone(),
         outbound_handle: Some(aruna_egress::OutboundHandle::new(http, policy)),
+        vfs_handle,
     });
     // The driver context and the monitoring refresher it feeds are owned before
     // the ops listener can fail to bind.
@@ -609,6 +621,11 @@ async fn fill(
     let origin = (config.realm_id, config.node_id);
     crate::startup::sweeps::spawn_recovery_sweep(driver_ctx.clone(), origin, &acquired.shutdown);
     stopped(stop)?;
+    // The file servers recover their durable state before any listener binds.
+    if driver_ctx.vfs_handle.is_some() {
+        recover_vfs(driver_ctx.as_ref()).await?;
+        stopped(stop)?;
+    }
 
     // Bind compute reconciliation before startup recovery.
     initialize_net_holder(
@@ -627,6 +644,54 @@ async fn fill(
     acquired.task_queues = Some(task_queues);
     checkpoint(StartupStage::TaskQueues)?;
 
+    Ok(())
+}
+
+/// Opens the stage folder when SMB or NFS is on and has storage report every committed head
+/// change to it. `None` when both are off.
+fn open_vfs(
+    vfs: &VfsSettings,
+    config: &Config,
+    storage_handle: &StorageHandle,
+) -> Result<Option<VfsHandle>, Box<dyn std::error::Error>> {
+    if !vfs.enabled() {
+        return Ok(None);
+    }
+    let stage_dir = vfs
+        .stage_dir
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from(&config.storage_path).join("vfs-stage"));
+    let vfs_handle = VfsHandle::open(VfsConfig {
+        stage_dir,
+        node_stage_bytes: vfs.node_stage_bytes,
+        group_stage_bytes: vfs.group_stage_bytes,
+    })?;
+    if !storage_handle.install_head_observer(Arc::new(vfs_handle.clone())) {
+        return Err("another head change observer is already installed on storage".into());
+    }
+    Ok(Some(vfs_handle))
+}
+
+/// Syncs a new boot generation and settles receipts, handles and stages from durable rows.
+/// Referenced checkpoints that are missing or corrupt are reported as storage failures.
+async fn recover_vfs(driver_ctx: &DriverContext) -> Result<(), Box<dyn std::error::Error>> {
+    use aruna_ops_data::vfs::recovery::ColdStartOperation;
+
+    let report = drive(ColdStartOperation::new(), driver_ctx).await?;
+    if !report.corrupt.is_empty() {
+        error!(
+            stages = ?report.corrupt,
+            "File server checkpoints are missing or corrupt; their stages stay unrestored"
+        );
+    }
+    info!(
+        boot_generation = report.boot_generation,
+        receipts = report.receipts,
+        restored = report.restored,
+        retained = report.retained,
+        orphans = report.orphans.len(),
+        "Recovered the file server state"
+    );
     Ok(())
 }
 

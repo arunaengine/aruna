@@ -48,6 +48,7 @@ fn context() -> (DriverContext, tempfile::TempDir) {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     (context, dir)
 }

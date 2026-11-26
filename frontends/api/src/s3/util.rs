@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::s3::auth::Action;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use aruna_core::structs::storage::blob::{BackendLocation, ensure_confined_path};
@@ -22,126 +21,10 @@ use s3s::{S3Error, S3ErrorCode, S3Result, s3_error};
 use std::path::Path;
 use ulid::Ulid;
 
-pub fn operation_permission(operation_name: &str) -> Option<Action> {
-    match operation_name {
-        // Write operations (operations that modify state/data)
-        "AbortMultipartUpload" => Some(Action::Write),
-        "CompleteMultipartUpload" => Some(Action::Write),
-        "CopyObject" => Some(Action::Write),
-        "CreateBucket" => Some(Action::Write),
-        "CreateBucketMetadataTableConfiguration" => Some(Action::Write),
-        "CreateMultipartUpload" => Some(Action::Write),
-        "DeleteBucket" => Some(Action::Write),
-        "DeleteBucketAnalyticsConfiguration" => Some(Action::Write),
-        "DeleteBucketCors" => Some(Action::Write),
-        "DeleteBucketEncryption" => Some(Action::Write),
-        "DeleteBucketIntelligentTieringConfiguration" => Some(Action::Write),
-        "DeleteBucketInventoryConfiguration" => Some(Action::Write),
-        "DeleteBucketLifecycle" => Some(Action::Write),
-        "DeleteBucketMetadataTableConfiguration" => Some(Action::Write),
-        "DeleteBucketMetricsConfiguration" => Some(Action::Write),
-        "DeleteBucketOwnershipControls" => Some(Action::Write),
-        "DeleteBucketPolicy" => Some(Action::Write),
-        "DeleteBucketReplication" => Some(Action::Write),
-        "DeleteBucketTagging" => Some(Action::Write),
-        "DeleteBucketWebsite" => Some(Action::Write),
-        "DeleteObject" => Some(Action::Write),
-        "DeleteObjectTagging" => Some(Action::Write),
-        "DeleteObjects" => Some(Action::Write),
-        "DeletePublicAccessBlock" => Some(Action::Write),
-        "PutBucketAccelerateConfiguration" => Some(Action::Write),
-        "PutBucketAcl" => Some(Action::Write),
-        "PutBucketAnalyticsConfiguration" => Some(Action::Write),
-        "PutBucketCors" => Some(Action::Write),
-        "PutBucketEncryption" => Some(Action::Write),
-        "PutBucketIntelligentTieringConfiguration" => Some(Action::Write),
-        "PutBucketInventoryConfiguration" => Some(Action::Write),
-        "PutBucketLifecycleConfiguration" => Some(Action::Write),
-        "PutBucketLogging" => Some(Action::Write),
-        "PutBucketMetricsConfiguration" => Some(Action::Write),
-        "PutBucketNotificationConfiguration" => Some(Action::Write),
-        "PutBucketOwnershipControls" => Some(Action::Write),
-        "PutBucketPolicy" => Some(Action::Write),
-        "PutBucketReplication" => Some(Action::Write),
-        "PutBucketRequestPayment" => Some(Action::Write),
-        "PutBucketTagging" => Some(Action::Write),
-        "PutBucketVersioning" => Some(Action::Write),
-        "PutBucketWebsite" => Some(Action::Write),
-        "PutObject" => Some(Action::Write),
-        "PutObjectAcl" => Some(Action::Write),
-        "PutObjectLegalHold" => Some(Action::Write),
-        "PutObjectLockConfiguration" => Some(Action::Write),
-        "PutObjectRetention" => Some(Action::Write),
-        "PutObjectTagging" => Some(Action::Write),
-        "PutPublicAccessBlock" => Some(Action::Write),
-        "RestoreObject" => Some(Action::Write),
-        "UploadPart" => Some(Action::Write),
-        "UploadPartCopy" => Some(Action::Write),
-        "WriteGetObjectResponse" => Some(Action::Write),
-
-        // Read operations (operations that only retrieve/read data)
-        "GetBucketAccelerateConfiguration" => Some(Action::Read),
-        "GetBucketAcl" => Some(Action::Read),
-        "GetBucketAnalyticsConfiguration" => Some(Action::Read),
-        "GetBucketCors" => Some(Action::Read),
-        "GetBucketEncryption" => Some(Action::Read),
-        "GetBucketIntelligentTieringConfiguration" => Some(Action::Read),
-        "GetBucketInventoryConfiguration" => Some(Action::Read),
-        "GetBucketLifecycleConfiguration" => Some(Action::Read),
-        "GetBucketLocation" => Some(Action::Read),
-        "GetBucketLogging" => Some(Action::Read),
-        "GetBucketMetadataTableConfiguration" => Some(Action::Read),
-        "GetBucketMetricsConfiguration" => Some(Action::Read),
-        "GetBucketNotificationConfiguration" => Some(Action::Read),
-        "GetBucketOwnershipControls" => Some(Action::Read),
-        "GetBucketPolicy" => Some(Action::Read),
-        "GetBucketPolicyStatus" => Some(Action::Read),
-        "GetBucketReplication" => Some(Action::Read),
-        "GetBucketRequestPayment" => Some(Action::Read),
-        "GetBucketTagging" => Some(Action::Read),
-        "GetBucketVersioning" => Some(Action::Read),
-        "GetBucketWebsite" => Some(Action::Read),
-        "GetObject" => Some(Action::Read),
-        "GetObjectAcl" => Some(Action::Read),
-        "GetObjectAttributes" => Some(Action::Read),
-        "GetObjectLegalHold" => Some(Action::Read),
-        "GetObjectLockConfiguration" => Some(Action::Read),
-        "GetObjectRetention" => Some(Action::Read),
-        "GetObjectTagging" => Some(Action::Read),
-        "GetObjectTorrent" => Some(Action::Read),
-        "GetPublicAccessBlock" => Some(Action::Read),
-        "HeadBucket" => Some(Action::Read),
-        "HeadObject" => Some(Action::Read),
-        "ListBucketAnalyticsConfigurations" => Some(Action::Read),
-        "ListBucketIntelligentTieringConfigurations" => Some(Action::Read),
-        "ListBucketInventoryConfigurations" => Some(Action::Read),
-        "ListBucketMetricsConfigurations" => Some(Action::Read),
-        "ListBuckets" => Some(Action::Read),
-        "ListMultipartUploads" => Some(Action::Read),
-        "ListObjectVersions" => Some(Action::Read),
-        "ListObjects" => Some(Action::Read),
-        "ListObjectsV2" => Some(Action::Read),
-        "ListParts" => Some(Action::Read),
-        "SelectObjectContent" => Some(Action::Read),
-
-        // Unknown operation
-        _ => None,
-    }
-}
+pub use aruna_ops_data::s3::access::admit::operation_permission;
 
 pub(crate) fn anonymous_read_allowed(operation_name: &str) -> bool {
     matches!(operation_name, "GetObject")
-}
-
-/// Reads a signed caller may make on another group's bucket, as Everyone.
-pub(crate) fn public_read_allowed(operation_name: &str, has_key: bool) -> bool {
-    match has_key {
-        true => matches!(operation_name, "GetObject" | "HeadObject"),
-        false => matches!(
-            operation_name,
-            "HeadBucket" | "GetBucketLocation" | "ListObjects" | "ListObjectsV2"
-        ),
-    }
 }
 
 pub(crate) fn validate_object_key(key: &str) -> S3Result<()> {
@@ -456,7 +339,7 @@ mod tests {
     use super::{
         S3ChecksumAlgorithm, anonymous_read_allowed, bucket_name_reason, checksum_response_hashes,
         declared_trailer_algorithm, operation_permission, parse_copy_source, parse_part_number,
-        parse_source_range, public_read_allowed, validate_object_key,
+        parse_source_range, validate_object_key,
     };
     use crate::s3::auth::Action;
     use crate::s3::checksum::parse_upload_checksum;
@@ -661,31 +544,6 @@ mod tests {
                 !anonymous_read_allowed(operation),
                 "{operation} must not be allowed anonymously"
             );
-        }
-    }
-
-    #[test]
-    fn public_reads_listed() {
-        for operation in ["GetObject", "HeadObject"] {
-            assert!(public_read_allowed(operation, true));
-            assert!(!public_read_allowed(operation, false));
-        }
-        for operation in [
-            "HeadBucket",
-            "GetBucketLocation",
-            "ListObjects",
-            "ListObjectsV2",
-        ] {
-            assert!(public_read_allowed(operation, false));
-            assert!(!public_read_allowed(operation, true));
-        }
-        for operation in [
-            "ListObjectVersions",
-            "ListMultipartUploads",
-            "GetObjectTagging",
-        ] {
-            assert!(!public_read_allowed(operation, false));
-            assert!(!public_read_allowed(operation, true));
         }
     }
 

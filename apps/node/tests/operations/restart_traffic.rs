@@ -1002,6 +1002,7 @@ fn drain_context(node: &TestNode) -> Arc<DriverContext> {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     })
 }
 

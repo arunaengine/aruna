@@ -112,6 +112,10 @@ pub struct NodeShutdown {
     pub portal: Option<JoinHandle<()>>,
     /// Optional session bridge listener; joined with the other ingress tasks.
     pub session_s3: Option<aruna_api::s3::server::S3ServerHandle>,
+    /// SMB and NFS keep their connection children owned like S3; both drain before writer
+    /// admission and storage close.
+    pub smb: Option<aruna_smb::SmbServerHandle>,
+    pub nfs: Option<aruna_nfs::NfsServerHandle>,
     /// Native HTTPS front, redirect and reload; handed-over connections drain with their service.
     pub https: Option<aruna_api::https::listener::HttpsHandle>,
     /// The monitoring refresher owner. Its sampler is cancelled and awaited
@@ -198,6 +202,8 @@ impl NodeShutdown {
         let mut s3 = self.s3;
         let mut portal = self.portal;
         let mut session_s3 = self.session_s3;
+        let mut smb = self.smb;
+        let mut nfs = self.nfs;
         let mut https = self.https;
         let mut ingress_complete = false;
         phase("ingress", ingress, async {
@@ -214,6 +220,12 @@ impl NodeShutdown {
             portal = None;
             if let Some(session_s3) = session_s3.as_mut() {
                 session_s3.wait_until_released().await;
+            }
+            if let Some(smb) = smb.as_mut() {
+                smb.wait_until_released().await;
+            }
+            if let Some(nfs) = nfs.as_mut() {
+                nfs.wait_until_released().await;
             }
             if let Some(https) = https.as_mut() {
                 https.wait_until_released().await;
@@ -234,6 +246,12 @@ impl NodeShutdown {
             if let Some(session_s3) = session_s3.as_ref() {
                 session_s3.abort();
             }
+            if let Some(smb) = smb.as_ref() {
+                smb.abort();
+            }
+            if let Some(nfs) = nfs.as_ref() {
+                nfs.abort();
+            }
             if let Some(https) = https.as_ref() {
                 https.abort();
             }
@@ -250,6 +268,12 @@ impl NodeShutdown {
             }
             if let Some(session_s3) = session_s3.as_mut() {
                 session_s3.wait_until_released().await;
+            }
+            if let Some(smb) = smb.as_mut() {
+                smb.wait_until_released().await;
+            }
+            if let Some(nfs) = nfs.as_mut() {
+                nfs.wait_until_released().await;
             }
             if let Some(https) = https.as_mut() {
                 https.wait_until_released().await;
@@ -605,6 +629,8 @@ mod tests {
             s3: None,
             portal: None,
             session_s3: None,
+            smb: None,
+            nfs: None,
             https: None,
             monitoring: None,
             task_handle: TaskHandle::new(),
@@ -978,6 +1004,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         });
         let secret = iroh::SecretKey::from_bytes(&[0x58; 32]);
         let server = S3Server::new(

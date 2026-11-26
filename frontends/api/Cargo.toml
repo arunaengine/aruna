@@ -19,6 +19,7 @@ test-hooks = ["aruna-ops-work/test-hooks", "aruna-runner/test-hooks", "dep:aruna
 [dependencies]
 zeroize = { workspace = true }
 # Aruna modules
+aruna-admission = { workspace = true }
 aruna-clock = { workspace = true }
 aruna-core = { workspace = true }
 aruna-ops-data = { workspace = true }

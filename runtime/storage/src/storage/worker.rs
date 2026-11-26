@@ -26,6 +26,7 @@ use super::handle::{
     StorageReceivers, cleanup_effect, effect_txn_id, finish_cleanup, observe_cleanup,
     storage_effect_mutates,
 };
+use super::heads::{HeadObservers, HeadRows};
 use super::hot_cache::CacheWriter;
 use super::metrics::{StorageMetrics, record_storage_call};
 use super::persistence::FjallPersistPolicy;
@@ -206,6 +207,9 @@ pub struct FjallStorage {
     pub(super) txn_rows: HashMap<Ulid, Vec<(String, ByteView)>>,
     /// The handle's hot cache, whose changed rows are dropped before a write replies.
     pub(super) cache: CacheWriter,
+    /// Heads and watch keys each open write transaction changed, for their commit.
+    pub(super) txn_heads: HashMap<Ulid, HeadRows>,
+    pub(super) heads: HeadObservers,
 }
 
 impl FjallStorage {
@@ -239,6 +243,7 @@ impl FjallStorage {
         self.txn_usage.remove(&txn_id);
         self.txn_rows.remove(&txn_id);
         self.config_txns.remove(&txn_id);
+        self.txn_heads.remove(&txn_id);
         self.cache.take(txn_id);
         // Dropping the last handle rolls the transaction back.
         self.txns.remove(&txn_id);
@@ -662,9 +667,13 @@ impl FjallStorage {
 
         let mut tx = tx;
         let mut prepared = Vec::with_capacity(members.len());
+        let mut changed = HeadRows::default();
         for item in members {
             match self.apply_group_member(&mut tx, &item.0) {
-                Ok(event) => prepared.push((item, Ok(event))),
+                Ok((event, heads)) => {
+                    changed.extend(heads);
+                    prepared.push((item, Ok(event)));
+                }
                 Err(error) => prepared.push((item, Err(error))),
             }
         }
@@ -692,6 +701,8 @@ impl FjallStorage {
         {
             self.note_config_change();
         }
+        // Even a failed group may have committed before its journal persist failed.
+        self.heads.notify(&changed);
 
         if group_error.is_none() {
             for ((effect, ..), outcome) in &prepared {
@@ -731,11 +742,12 @@ impl FjallStorage {
         }
     }
 
+    /// Stages one member in the group's `tx`; also answers the heads it changes.
     fn apply_group_member(
         &self,
         tx: &mut fjall::OptimisticWriteTx,
         effect: &StorageEffect,
-    ) -> Result<StorageEvent, StorageError> {
+    ) -> Result<(StorageEvent, HeadRows), StorageError> {
         match effect {
             StorageEffect::Write {
                 key_space,
@@ -745,8 +757,10 @@ impl FjallStorage {
             } => {
                 let keyspace = self.store.resolve_keyspace(key_space)?;
                 self.keep_preimages(tx, [(key_space.as_str(), key)])?;
+                let heads = HeadRows::of([(key_space.as_str(), key)]);
+                self.drop_watches(tx, &heads)?;
                 tx.insert(keyspace, key.clone(), value.clone());
-                Ok(StorageEvent::WriteResult { key: key.clone() })
+                Ok((StorageEvent::WriteResult { key: key.clone() }, heads))
             }
             StorageEffect::BatchWrite {
                 writes,
@@ -759,12 +773,14 @@ impl FjallStorage {
                     resolved.push((keyspace, key_space, key, value));
                 }
                 let rows = writes.iter().map(|(space, key, _)| (space.as_str(), key));
+                let heads = HeadRows::of(rows.clone());
                 self.keep_preimages(tx, rows)?;
+                self.drop_watches(tx, &heads)?;
                 for (keyspace, key_space, key, value) in resolved {
                     tx.insert(keyspace, key.clone(), value.clone());
                     entries.push((key_space.clone(), key.clone()));
                 }
-                Ok(StorageEvent::BatchWriteResult { entries })
+                Ok((StorageEvent::BatchWriteResult { entries }, heads))
             }
             StorageEffect::Delete {
                 key_space,
@@ -773,8 +789,10 @@ impl FjallStorage {
             } => {
                 let keyspace = self.store.resolve_keyspace(key_space)?;
                 self.keep_preimages(tx, [(key_space.as_str(), key)])?;
+                let heads = HeadRows::of([(key_space.as_str(), key)]);
+                self.drop_watches(tx, &heads)?;
                 tx.remove(keyspace, key.clone());
-                Ok(StorageEvent::DeleteResult { key: key.clone() })
+                Ok((StorageEvent::DeleteResult { key: key.clone() }, heads))
             }
             StorageEffect::BatchDelete {
                 deletes,
@@ -787,12 +805,14 @@ impl FjallStorage {
                     resolved.push((keyspace, key_space, key));
                 }
                 let rows = deletes.iter().map(|(space, key)| (space.as_str(), key));
+                let heads = HeadRows::of(rows.clone());
                 self.keep_preimages(tx, rows)?;
+                self.drop_watches(tx, &heads)?;
                 for (keyspace, key_space, key) in resolved {
                     tx.remove(keyspace, key.clone());
                     entries.push((key_space.clone(), key.clone()));
                 }
-                Ok(StorageEvent::BatchDeleteResult { entries })
+                Ok((StorageEvent::BatchDeleteResult { entries }, heads))
             }
             _ => Err(StorageError::InvalidEffect),
         }

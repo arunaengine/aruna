@@ -1,4 +1,4 @@
-//! Binds the REST, S3, portal and session listeners and reports which one exited.
+//! Binds the REST, S3, SMB, NFS, portal and session listeners and reports which one exited.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -15,15 +15,20 @@ use aruna_core::device_wipe::DeviceWipe;
 use aruna_core::listener::{HostRoute, S3ServerTimeouts};
 use aruna_core::metrics::NodeMetrics;
 use aruna_core::structs::identity::auth::NodeCapabilities;
+use aruna_nfs::{ArunaNfsBackend, ArunaNfsConfig, NfsServer, NfsServerConfig, NfsServerHandle};
+use aruna_nfs::{NfsTlsConfig, Revocation};
 use aruna_ops_data::device::replica::DEFAULT_CACHE_BYTES;
 use aruna_ops_data::device::replica_store::store_cache_budget;
 use aruna_runner::driver::DriverContext;
 use aruna_runner::jobs::runtime::JobsRuntime;
 use aruna_scheduler::shutdown::Shutdown;
+use aruna_smb::{ArunaSmbBackend, ArunaSmbConfig, SmbConfig, SmbServer, SmbServerHandle};
+use aruna_vfs::{GrantRevocation, VfsHandle};
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
 use crate::portal;
+use aruna_config::settings::VfsSettings;
 use aruna_config::{Config, PortalConfig, StartupMode};
 
 pub(crate) struct ServerBindings {
@@ -35,6 +40,9 @@ pub(crate) struct ServerBindings {
     /// The optional session bridge listener, joined with the other ingress
     /// listeners instead of being left to its cancellation token.
     pub(crate) session_s3_handle: Option<S3ServerHandle>,
+    /// The SMB and NFS file servers; each owns its connection children like S3.
+    pub(crate) smb_handle: Option<SmbServerHandle>,
+    pub(crate) nfs_handle: Option<NfsServerHandle>,
     /// Native HTTPS: the front, redirect and reload tasks.
     pub(crate) https_handle: Option<HttpsHandle>,
     pub(crate) realm_id: aruna_core::structs::identity::realm::RealmId,
@@ -52,6 +60,8 @@ struct StartedListeners {
     portal: Option<tokio::task::JoinHandle<()>>,
     s3: Option<S3ServerHandle>,
     session_s3: Option<S3ServerHandle>,
+    smb: Option<SmbServerHandle>,
+    nfs: Option<NfsServerHandle>,
     https: Option<HttpsHandle>,
 }
 
@@ -61,6 +71,14 @@ impl StartedListeners {
     /// bind releases every accepted connection, not just the accept loop.
     async fn abort_all(&mut self) {
         if let Some(mut handle) = self.https.take() {
+            handle.abort();
+            handle.wait_until_released().await;
+        }
+        if let Some(mut handle) = self.nfs.take() {
+            handle.abort();
+            handle.wait_until_released().await;
+        }
+        if let Some(mut handle) = self.smb.take() {
             handle.abort();
             handle.wait_until_released().await;
         }
@@ -82,7 +100,7 @@ impl StartedListeners {
 /// Everything a wipe erases: the store root, every derived root, and every
 /// filesystem backend. A backend this process cannot erase is named instead, so
 /// the wipe reports an incomplete erasure rather than claiming a complete one.
-fn wipe_plan(config: &Config) -> (Vec<std::path::PathBuf>, Vec<String>) {
+fn wipe_plan(config: &Config, vfs: &VfsSettings) -> (Vec<std::path::PathBuf>, Vec<String>) {
     let (mut roots, unsupported) = backend_wipe(&config.blob_backends);
     roots.extend([
         std::path::PathBuf::from(&config.storage_path),
@@ -90,6 +108,7 @@ fn wipe_plan(config: &Config) -> (Vec<std::path::PathBuf>, Vec<String>) {
         config.sync_storage_path.clone(),
         std::path::PathBuf::from(&config.blob_root),
     ]);
+    roots.extend(vfs.stage_dir.clone());
     (aruna_config::outermost_roots(&roots), unsupported)
 }
 
@@ -210,6 +229,7 @@ async fn bind_session_s3(
 
 pub(crate) async fn bind(
     config: &Config,
+    vfs: &VfsSettings,
     session_s3: Option<std::net::SocketAddr>,
     driver_ctx: Arc<DriverContext>,
     jobs_runtime: Arc<JobsRuntime>,
@@ -217,16 +237,16 @@ pub(crate) async fn bind(
     shutdown: &Shutdown,
 ) -> Result<ServerBindings, Box<dyn std::error::Error>> {
     let mut started = StartedListeners::default();
-    match bind_all(
-        config,
-        session_s3,
-        driver_ctx,
-        jobs_runtime,
-        metrics,
-        shutdown,
-        &mut started,
-    )
-    .await
+    match started
+        .bind_all(
+            (config, vfs),
+            session_s3,
+            driver_ctx,
+            jobs_runtime,
+            metrics,
+            shutdown,
+        )
+        .await
     {
         Ok(bindings) => Ok(bindings),
         Err(error) => {
@@ -236,225 +256,361 @@ pub(crate) async fn bind(
     }
 }
 
-/// Binds every configured listener in order, registering each started task on
-/// `started` before the next fallible step.
-async fn bind_all(
-    config: &Config,
-    session_s3: Option<std::net::SocketAddr>,
-    driver_ctx: Arc<DriverContext>,
-    jobs_runtime: Arc<JobsRuntime>,
-    metrics: Arc<NodeMetrics>,
-    shutdown: &Shutdown,
-    started: &mut StartedListeners,
-) -> Result<ServerBindings, Box<dyn std::error::Error>> {
-    let is_initial_node = config.is_initial_node();
-    let is_initial_boot = !matches!(config.startup_mode, StartupMode::Provisioned);
-    // Certificates and HTTPS sockets first: a failure here starts nothing.
-    let mut https = crate::startup::https::prepare(config.https.as_ref()).await?;
-    if let Some(blob) = &driver_ctx.blob_handle {
-        blob.install_git(Arc::new(aruna_blob::git::GitStore::new(
-            std::path::Path::new(&config.storage_path).join("git"),
-            std::env::current_exe()?,
-        )));
-    }
-    #[cfg(unix)]
-    crate::backup::serve(
-        std::path::Path::new(&config.storage_path),
-        &driver_ctx,
-        shutdown,
-    );
-    let s3_timeouts = config.s3_timeouts();
-    // A wildcard S3 bind already answers on the gateway, so it needs no second
-    // listener. Session containers still target the gateway address.
-    let wildcard_s3 = config
-        .s3_address
-        .as_deref()
-        .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
-        .is_some_and(|address| address.ip().is_unspecified());
-    let session_s3 = session_s3
-        .filter(|_| !wildcard_s3)
-        .map(|address| SessionS3 {
-            address,
-            realm_id: config.realm_id,
-            node_id: config.node_id,
-            key: aruna_core::credential_encryption::CredentialEncryptionKey::derive(
-                &config.node_state.net_secret_key,
-            ),
-            rocrate_limits: config.rocrate_limits.clone(),
-        });
-    if matches!(config.node_capabilities, NodeCapabilities::User { .. }) {
-        let budget = store_cache_budget(device_cache_env());
-        if let Err(error) = aruna_runner::driver::drive(budget, &driver_ctx).await {
-            warn!(%error, "The device cache budget could not be stored");
+impl StartedListeners {
+    /// Binds every configured listener in order, registering each started task on
+    /// `self` before the next fallible step.
+    async fn bind_all(
+        &mut self,
+        (config, vfs): (&Config, &VfsSettings),
+        session_s3: Option<std::net::SocketAddr>,
+        driver_ctx: Arc<DriverContext>,
+        jobs_runtime: Arc<JobsRuntime>,
+        metrics: Arc<NodeMetrics>,
+        shutdown: &Shutdown,
+    ) -> Result<ServerBindings, Box<dyn std::error::Error>> {
+        let started = self;
+        let is_initial_node = config.is_initial_node();
+        let is_initial_boot = !matches!(config.startup_mode, StartupMode::Provisioned);
+        // Certificates and HTTPS sockets first: a failure here starts nothing.
+        let mut https = crate::startup::https::prepare(config.https.as_ref()).await?;
+        let nfs_tls = nfs_tls(vfs).await?;
+        if let Some(blob) = &driver_ctx.blob_handle {
+            blob.install_git(Arc::new(aruna_blob::git::GitStore::new(
+                std::path::Path::new(&config.storage_path).join("git"),
+                std::env::current_exe()?,
+            )));
         }
-    }
-    let device_wipe = match matches!(config.node_capabilities, NodeCapabilities::User { .. }) {
-        true => {
-            let (roots, unsupported) = wipe_plan(config);
-            // Reject unsafe wipe roots before startup and erase only their normalized paths.
-            let roots = aruna_config::validate_wipe_roots(&roots, dirs::home_dir().as_deref())?;
-            Some(Arc::new(DeviceWipe::new(roots, unsupported)))
-        }
-        false => None,
-    };
-    if let Some(hosting) = config.applets.hosting.as_ref() {
-        match aruna_runner::driver::drive(
-            aruna_ops_identity::document_repository::GetConfigOperation::new(config.realm_id),
+        #[cfg(unix)]
+        crate::backup::serve(
+            std::path::Path::new(&config.storage_path),
             &driver_ctx,
-        )
-        .await
-        {
-            Ok(realm) => {
-                if let Some(host) = hosting.provider_conflict(&realm.oidc_providers) {
+            shutdown,
+        );
+        let s3_timeouts = config.s3_timeouts();
+        // A wildcard S3 bind already answers on the gateway, so it needs no second
+        // listener. Session containers still target the gateway address.
+        let wildcard_s3 = config
+            .s3_address
+            .as_deref()
+            .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
+            .is_some_and(|address| address.ip().is_unspecified());
+        let session_s3 = session_s3
+            .filter(|_| !wildcard_s3)
+            .map(|address| SessionS3 {
+                address,
+                realm_id: config.realm_id,
+                node_id: config.node_id,
+                key: aruna_core::credential_encryption::CredentialEncryptionKey::derive(
+                    &config.node_state.net_secret_key,
+                ),
+                rocrate_limits: config.rocrate_limits.clone(),
+            });
+        if matches!(config.node_capabilities, NodeCapabilities::User { .. }) {
+            let budget = store_cache_budget(device_cache_env());
+            if let Err(error) = aruna_runner::driver::drive(budget, &driver_ctx).await {
+                warn!(%error, "The device cache budget could not be stored");
+            }
+        }
+        let device_wipe = match matches!(config.node_capabilities, NodeCapabilities::User { .. }) {
+            true => {
+                let (roots, unsupported) = wipe_plan(config, vfs);
+                // Reject unsafe wipe roots before startup and erase only their normalized paths.
+                let roots = aruna_config::validate_wipe_roots(&roots, dirs::home_dir().as_deref())?;
+                Some(Arc::new(DeviceWipe::new(roots, unsupported)))
+            }
+            false => None,
+        };
+        if let Some(hosting) = config.applets.hosting.as_ref() {
+            match aruna_runner::driver::drive(
+                aruna_ops_identity::document_repository::GetConfigOperation::new(config.realm_id),
+                &driver_ctx,
+            )
+            .await
+            {
+                Ok(realm) => {
+                    if let Some(host) = hosting.provider_conflict(&realm.oidc_providers) {
+                        return Err(format!(
+                            "APPLETS_DOMAIN {} must use its own registered domain separate from realm OIDC provider ({host})",
+                            hosting.applet_domain
+                        )
+                        .into());
+                    }
+                }
+                Err(aruna_ops_identity::document_repository::GetConfigError::DocumentNotFound) => {}
+                Err(error) => {
                     return Err(format!(
-                        "APPLETS_DOMAIN {} must use its own registered domain separate from realm OIDC provider ({host})",
+                        "cannot verify APPLETS_DOMAIN {} against realm OIDC providers: {error}",
                         hosting.applet_domain
                     )
                     .into());
                 }
             }
-            Err(aruna_ops_identity::document_repository::GetConfigError::DocumentNotFound) => {}
-            Err(error) => {
-                return Err(format!(
-                    "cannot verify APPLETS_DOMAIN {} against realm OIDC providers: {error}",
-                    hosting.applet_domain
-                )
-                .into());
-            }
         }
-    }
-    let mut state = ServerState::new(
-        driver_ctx.clone(),
-        config.realm_id,
-        config.node_id,
-        config.node_capabilities.clone(),
-        is_initial_node,
-        Some(Arc::new(OidcValidator::new()?)),
-        jobs_runtime,
-    )
-    .await
-    .with_metrics(metrics.clone())
-    .with_rocrate_limits(config.rocrate_limits.clone())
-    .with_applets(config.applets.clone())
-    .with_assistant_proxy(config.assistant_proxy)
-    .with_disabled_features(config.disabled_features.clone())
-    .with_import_roots(served_roots(&config.blob_backends))
-    .with_trusted_proxies(config.trusted_proxies.clone())
-    .with_rate_limits(aruna_api::rate_limit::ApiRateLimits::new(
-        config.rate_limits.ip_per_minute,
-        config.rate_limits.ip_burst,
-        config.rate_limits.principal_per_minute,
-        config.rate_limits.principal_burst,
-    ))
-    .with_shutdown_token(shutdown.token());
-    if let Some(wipe) = device_wipe.clone() {
-        state = state.with_device_wipe(wipe);
-    }
-    let state = Arc::new(state);
-    portal::initialize(config.portal.clone(), state.clone()).await;
-
-    let cors =
-        CorsConfig::new(config.cors_allowed_origins.clone()).with_desktop(config.desktop_cors);
-    let server_config = ServerConfig {
-        http_addr: config.http_socket_addr,
-        max_body_size: config.max_body_size,
-        cors: cors.clone(),
-    };
-    let server = Server::new(state.clone(), server_config)
-        .with_public_url(config.api_public_url.clone())
-        .with_mcp_enabled(config.mcp_enabled);
-
-    started.portal = bind_portal(
-        https
-            .as_mut()
-            .and_then(|https| https.take(HostRoute::Portal)),
-        &config.portal,
-        config.api_public_url.as_deref(),
-        PortalCspConfig::new(config.portal_csp_origins.clone()),
-        config.registry_url.as_ref().map(ToString::to_string),
-        state.clone(),
-        shutdown,
-    )
-    .await?;
-
-    // A device serves S3 only where S3_HOST and S3_ADDRESS are configured; the
-    // desktop shell sets both to loopback by default, and the pair stays whole.
-    let session_driver_ctx = driver_ctx.clone();
-    let cors_for_sessions = cors.clone();
-    let metrics_for_sessions = metrics.clone();
-    if let (Some(s3_address), Some(s3_host)) =
-        (config.s3_address.as_deref(), config.s3_host.as_deref())
-    {
-        let s3_server = S3Server::new(
-            s3_address,
-            s3_host,
-            driver_ctx,
+        // One set of limits for every frontend, so another protocol or session never adds
+        // to one user's allowance.
+        let shared_limits = Arc::new(
+            aruna_admission::RateLimits::new(
+                config.rate_limits.ip_per_minute,
+                config.rate_limits.ip_burst,
+                config.rate_limits.principal_per_minute,
+                config.rate_limits.principal_burst,
+            )
+            .with_vfs_limits(aruna_admission::VfsLimits {
+                peer_connections: vfs.peer_connections as usize,
+                principal_operations: vfs.principal_operations as usize,
+                ..Default::default()
+            }),
+        );
+        let mut state = ServerState::new(
+            driver_ctx.clone(),
             config.realm_id,
             config.node_id,
-            aruna_core::credential_encryption::CredentialEncryptionKey::derive(
-                &config.node_state.net_secret_key,
-            ),
-            config.rocrate_limits.clone(),
-            cors,
-            metrics,
+            config.node_capabilities.clone(),
+            is_initial_node,
+            Some(Arc::new(OidcValidator::new()?)),
+            jobs_runtime,
         )
-        .await?
-        .with_concurrency_limits(
-            config.rate_limits.s3_max_connections as usize,
-            config.rate_limits.s3_max_requests as usize,
-        )
-        .with_timeouts(s3_timeouts)
+        .await
+        .with_metrics(metrics.clone())
+        .with_rocrate_limits(config.rocrate_limits.clone())
+        .with_applets(config.applets.clone())
+        .with_assistant_proxy(config.assistant_proxy)
+        .with_disabled_features(config.disabled_features.clone())
+        .with_import_roots(served_roots(&config.blob_backends))
         .with_trusted_proxies(config.trusted_proxies.clone())
-        .with_rate_limits(aruna_api::rate_limit::ApiRateLimits::new(
-            config.rate_limits.ip_per_minute,
-            config.rate_limits.ip_burst,
-            config.rate_limits.principal_per_minute,
-            config.rate_limits.principal_burst,
-        ))?;
+        .with_rate_limits(aruna_api::rate_limit::ApiRateLimits::from_shared(
+            shared_limits.clone(),
+        ))
+        .with_shutdown_token(shutdown.token());
+        if let Some(wipe) = device_wipe.clone() {
+            state = state.with_device_wipe(wipe);
+        }
+        let state = Arc::new(state);
+        portal::initialize(config.portal.clone(), state.clone()).await;
 
-        let s3_listener = TcpListener::bind(s3_address).await?;
-        let s3_bound_addr = s3_listener.local_addr()?;
-        state
-            .register_s3_interface(
-                s3_bound_addr,
-                config.s3_public_url.as_deref().unwrap_or(s3_host),
-            )
-            .await;
-        let s3_listener = CombinedListener::new(
-            s3_listener,
-            https.as_mut().and_then(|https| https.take(HostRoute::S3)),
-        );
-        let (_s3_addr, s3_handle) = s3_server.run_with_listener(s3_listener, shutdown.token())?;
-        started.s3 = Some(s3_handle);
-        started.session_s3 = bind_session_s3(
-            session_s3,
-            s3_host,
-            session_driver_ctx,
-            cors_for_sessions,
-            metrics_for_sessions,
-            s3_timeouts,
+        let cors =
+            CorsConfig::new(config.cors_allowed_origins.clone()).with_desktop(config.desktop_cors);
+        let server_config = ServerConfig {
+            http_addr: config.http_socket_addr,
+            max_body_size: config.max_body_size,
+            cors: cors.clone(),
+        };
+        let server = Server::new(state.clone(), server_config)
+            .with_public_url(config.api_public_url.clone())
+            .with_mcp_enabled(config.mcp_enabled);
+
+        started.portal = bind_portal(
+            https
+                .as_mut()
+                .and_then(|https| https.take(HostRoute::Portal)),
+            &config.portal,
+            config.api_public_url.as_deref(),
+            PortalCspConfig::new(config.portal_csp_origins.clone()),
+            config.registry_url.as_ref().map(ToString::to_string),
+            state.clone(),
             shutdown,
         )
-        .await;
+        .await?;
+
+        // A device serves S3 only where S3_HOST and S3_ADDRESS are configured; the
+        // desktop shell sets both to loopback by default, and the pair stays whole.
+        let session_driver_ctx = driver_ctx.clone();
+        let file_driver_ctx = driver_ctx.clone();
+        let cors_for_sessions = cors.clone();
+        let metrics_for_sessions = metrics.clone();
+        if let (Some(s3_address), Some(s3_host)) =
+            (config.s3_address.as_deref(), config.s3_host.as_deref())
+        {
+            let s3_server = S3Server::new(
+                s3_address,
+                s3_host,
+                driver_ctx,
+                config.realm_id,
+                config.node_id,
+                aruna_core::credential_encryption::CredentialEncryptionKey::derive(
+                    &config.node_state.net_secret_key,
+                ),
+                config.rocrate_limits.clone(),
+                cors,
+                metrics,
+            )
+            .await?
+            .with_concurrency_limits(
+                config.rate_limits.s3_max_connections as usize,
+                config.rate_limits.s3_max_requests as usize,
+            )
+            .with_timeouts(s3_timeouts)
+            .with_trusted_proxies(config.trusted_proxies.clone())
+            .with_rate_limits(aruna_api::rate_limit::ApiRateLimits::from_shared(
+                shared_limits.clone(),
+            ))?;
+
+            let s3_listener = TcpListener::bind(s3_address).await?;
+            let s3_bound_addr = s3_listener.local_addr()?;
+            state
+                .register_s3_interface(
+                    s3_bound_addr,
+                    config.s3_public_url.as_deref().unwrap_or(s3_host),
+                )
+                .await;
+            let s3_listener = CombinedListener::new(
+                s3_listener,
+                https.as_mut().and_then(|https| https.take(HostRoute::S3)),
+            );
+            let (_s3_addr, s3_handle) =
+                s3_server.run_with_listener(s3_listener, shutdown.token())?;
+            started.s3 = Some(s3_handle);
+            started.session_s3 = bind_session_s3(
+                session_s3,
+                s3_host,
+                session_driver_ctx,
+                cors_for_sessions,
+                metrics_for_sessions,
+                s3_timeouts,
+                shutdown,
+            )
+            .await;
+        }
+
+        let mut smb_backend = None;
+        if let Some(address) = vfs.smb_listen_addr {
+            let credential_key = aruna_core::credential_encryption::CredentialEncryptionKey::derive(
+                &config.node_state.net_secret_key,
+            );
+            let backend = Arc::new(ArunaSmbBackend::new(
+                file_driver_ctx.clone(),
+                ArunaSmbConfig {
+                    realm_id: config.realm_id,
+                    node_id: config.node_id,
+                    credential_key,
+                },
+            ));
+            let server =
+                SmbServer::new(backend.clone(), shared_limits.clone(), SmbConfig::default())?;
+            let listener = TcpListener::bind(address).await?;
+            let (_, handle) = server.run_with_listener(listener, shutdown.token())?;
+            started.smb = Some(handle);
+            smb_backend = Some(backend);
+        }
+        let mut nfs_backend = None;
+        if let (Some(address), Some(tls)) = (vfs.nfs_listen_addr, nfs_tls) {
+            let backend = Arc::new(ArunaNfsBackend::new(ArunaNfsConfig {
+                context: file_driver_ctx.clone(),
+                realm_id: config.realm_id,
+                node_id: config.node_id,
+            }));
+            let mut server_config =
+                NfsServerConfig::new(address, tls, config.node_state.net_secret_key);
+            server_config.lease_secs = u32::try_from(vfs.nfs_lease_secs).unwrap_or(u32::MAX);
+            let server = NfsServer::new(server_config, backend.clone(), shared_limits.clone());
+            let listener = TcpListener::bind(address).await?;
+            started.nfs = Some(server.run_with_listener(listener, shutdown.token())?);
+            nfs_backend = Some(backend);
+        }
+        if let Some(vfs_handle) = file_driver_ctx.vfs_handle.as_ref() {
+            bridge_revocations(vfs_handle, smb_backend, nfs_backend, shutdown);
+        }
+
+        let rest_routed = https.as_mut().and_then(|https| https.take(HostRoute::Rest));
+        started.https = https.map(|https| https.start(shutdown)).transpose()?;
+        let rest_listener = TcpListener::bind(config.http_socket_addr).await?;
+        let rest_listener = CombinedListener::new(rest_listener, rest_routed);
+        let rest_handle = tokio::spawn(server.run_with_listener(rest_listener, shutdown.token()));
+
+        Ok(ServerBindings {
+            rest_handle,
+            s3_handle: started.s3.take(),
+            portal_handle: started.portal.take(),
+            session_s3_handle: started.session_s3.take(),
+            smb_handle: started.smb.take(),
+            nfs_handle: started.nfs.take(),
+            https_handle: started.https.take(),
+            realm_id: config.realm_id,
+            node_id: config.node_id,
+            is_initial_boot,
+            device_wipe,
+        })
     }
+}
 
-    let rest_routed = https.as_mut().and_then(|https| https.take(HostRoute::Rest));
-    started.https = https.map(|https| https.start(shutdown)).transpose()?;
-    let rest_listener = TcpListener::bind(config.http_socket_addr).await?;
-    let rest_listener = CombinedListener::new(rest_listener, rest_routed);
-    let rest_handle = tokio::spawn(server.run_with_listener(rest_listener, shutdown.token()));
+/// Reads the NFS certificate and key and checks them before any listener binds, so a bad
+/// file fails startup with nothing opened. `None` without an NFS listener.
+async fn nfs_tls(vfs: &VfsSettings) -> Result<Option<NfsTlsConfig>, Box<dyn std::error::Error>> {
+    if vfs.nfs_listen_addr.is_none() {
+        return Ok(None);
+    }
+    let read = |path: Option<std::path::PathBuf>| async move {
+        let Some(path) = path else {
+            return Ok(Vec::new());
+        };
+        tokio::fs::read(&path)
+            .await
+            .map_err(|error| format!("cannot read the NFS TLS file {}: {error}", path.display()))
+    };
+    let tls = NfsTlsConfig {
+        cert_pem: read(vfs.nfs_certificate.clone()).await?,
+        key_pem: read(vfs.nfs_key.clone()).await?,
+        loopback_cleartext: vfs.nfs_loopback_cleartext,
+    };
+    if !tls.loopback_cleartext || !tls.cert_pem.is_empty() || !tls.key_pem.is_empty() {
+        aruna_nfs::tls::server_config(&tls)?;
+    }
+    Ok(Some(tls))
+}
 
-    Ok(ServerBindings {
-        rest_handle,
-        s3_handle: started.s3.take(),
-        portal_handle: started.portal.take(),
-        session_s3_handle: started.session_s3.take(),
-        https_handle: started.https.take(),
-        realm_id: config.realm_id,
-        node_id: config.node_id,
-        is_initial_boot,
-        device_wipe,
-    })
+/// Forwards every revoked host, binding or access key to the running file servers, so their
+/// sessions, opens and connections end now. Stops with the shutdown token.
+fn bridge_revocations(
+    vfs_handle: &VfsHandle,
+    smb: Option<Arc<ArunaSmbBackend>>,
+    nfs: Option<Arc<ArunaNfsBackend>>,
+    shutdown: &Shutdown,
+) {
+    if smb.is_none() && nfs.is_none() {
+        return;
+    }
+    let mut revocations = vfs_handle.subscribe_revocations();
+    let token = shutdown.token();
+    shutdown.spawn(async move {
+        loop {
+            let received = tokio::select! {
+                _ = token.cancelled() => return,
+                received = revocations.recv() => received,
+            };
+            let revocation = match received {
+                Ok(revocation) => revocation,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                    // Each request admits its grant again, so a missed revocation ends later.
+                    warn!(missed, "File server revocations were missed");
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            };
+            forward_revocation(&revocation, smb.as_deref(), nfs.as_deref());
+        }
+    });
+}
+
+fn forward_revocation(
+    revocation: &GrantRevocation,
+    smb: Option<&ArunaSmbBackend>,
+    nfs: Option<&ArunaNfsBackend>,
+) {
+    if let (Some(smb), Some(access_key)) = (smb, revocation.access_key.as_ref()) {
+        smb.publish_revocation(access_key.clone());
+    }
+    let Some(nfs) = nfs else {
+        return;
+    };
+    if let Some(host_id) = revocation.host_id {
+        nfs.publish_revocation(Revocation::Host(host_id));
+    }
+    if let Some(mount_id) = revocation.mount_id {
+        nfs.publish_revocation(Revocation::Mount(mount_id));
+    }
+    if let Some(access_key) = revocation.access_key.as_ref() {
+        nfs.publish_revocation(Revocation::AccessKey(access_key.clone()));
+    }
 }
 
 /// Binds the portal SPA listener when a portal is configured. `API_PUBLIC_URL`
@@ -520,6 +676,22 @@ pub(crate) async fn portal_exit(handle: Option<&mut tokio::task::JoinHandle<()>>
 pub(crate) async fn s3_exit(handle: Option<&mut S3ServerHandle>) -> String {
     match handle {
         Some(handle) => handle.exit("S3").await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Resolves when a configured SMB listener exits, and never without one.
+pub(crate) async fn smb_exit(handle: Option<&mut SmbServerHandle>) -> String {
+    match handle {
+        Some(handle) => handle.exit("SMB").await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Resolves when a configured NFS listener exits, and never without one.
+pub(crate) async fn nfs_exit(handle: Option<&mut NfsServerHandle>) -> String {
+    match handle {
+        Some(handle) => handle.exit("NFS").await,
         None => std::future::pending().await,
     }
 }
@@ -600,6 +772,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         });
         let secret = iroh::SecretKey::from_bytes(&[0x46; 32]);
         let shutdown = Shutdown::new();
@@ -716,10 +889,12 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         });
 
         let error = match bind(
             &config,
+            &VfsSettings::default(),
             None,
             driver_ctx,
             JobsRuntime::new_paused(),
@@ -814,9 +989,11 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         });
         match bind(
             config,
+            &VfsSettings::default(),
             None,
             driver_ctx,
             aruna_runner::jobs::runtime::JobsRuntime::new_paused(),
@@ -879,6 +1056,7 @@ mod tests {
                 task_handle: None,
                 compute_handle: None,
                 outbound_handle: None,
+                vfs_handle: None,
             }),
             CorsConfig::default(),
             std::sync::Arc::new(aruna_core::metrics::NodeMetrics::new()),
@@ -912,6 +1090,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         });
         let secret = iroh::SecretKey::from_bytes(&[0x44; 32]);
         let session = SessionS3 {
@@ -964,6 +1143,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         });
         let secret = iroh::SecretKey::from_bytes(&[0x45; 32]);
         let session = SessionS3 {

@@ -130,6 +130,7 @@ async fn setup_context() -> TestContext {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let actor = Actor {
         node_id,

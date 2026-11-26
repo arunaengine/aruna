@@ -302,6 +302,7 @@ pub async fn resolve_config<H: Handle>(
         node_weight,
         https,
         fjall_cache_bytes: _,
+        vfs: _,
     } = settings;
     let bootstrap_timeout = Duration::from_secs(bootstrap_timeout_secs);
     // The store arrived already open and owned; the identity store owns every read and

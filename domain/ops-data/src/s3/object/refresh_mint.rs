@@ -188,7 +188,8 @@ impl MintSuccessorOperation {
         .with_advance_count(advance_count + 1)
         .with_policies(self.predecessor.placement_policies.clone())?;
         let version_key = VersionKey::new(&refresh.bucket, &refresh.key, version_id);
-        let next = CurrentVersionPointer::next_for(Some(&pointer), version_id)?;
+        let life_id = self.ids.mint(self.now_ms);
+        let next = CurrentVersionPointer::next_live_inherit(Some(&pointer), version_id, life_id)?;
         let binding = bucket.distribution.as_ref();
         let next = stamp_head(next, binding, epoch);
         let successor = stamp_version(successor, binding, next.generation, epoch);

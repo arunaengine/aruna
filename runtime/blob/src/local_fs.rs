@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::folder_sync::{sync_dir, unsynced};
 use bytes::Bytes;
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::ambient_authority;
@@ -130,13 +131,13 @@ impl Core {
     }
 
     fn open_folder(&self, parts: &[&str]) -> Result<Dir> {
-        self.walk(parts, false)
+        self.walk(parts, false, None)
     }
 
     /// Opens the folder `parts` names, one level at a time relative to the level above, so
     /// no symlink is followed even if a folder is swapped while it is walked. `create` makes
-    /// missing folders below the served one.
-    fn walk(&self, parts: &[&str], create: bool) -> Result<Dir> {
+    /// missing folders below the served one. `above` keeps every folder above the one returned.
+    fn walk(&self, parts: &[&str], create: bool, mut above: Option<&mut Vec<Dir>>) -> Result<Dir> {
         let opened = Dir::open_ambient_dir(&self.root, ambient_authority());
         let mut folder = opened.map_err(|error| match absent(&error) {
             true => gone(),
@@ -159,13 +160,23 @@ impl Core {
                     Err(error) => return Err(io_error(error)),
                 }
             }
-            folder = open_child(&folder, part)?.ok_or_else(|| missing(&key))?;
+            let child = open_child(&folder, part)?.ok_or_else(|| missing(&key))?;
+            let parent = std::mem::replace(&mut folder, child);
+            if let Some(above) = &mut above {
+                above.push(parent);
+            }
         }
         Ok(folder)
     }
 
-    /// The folder that holds the file `path` names, and the file's name.
-    fn parent_of<'a>(&self, path: &'a str, create: bool) -> Result<(Dir, &'a str)> {
+    /// The folder that holds the file `path` names, and the file's name. `create` and `above`
+    /// work as in [`Core::walk`].
+    fn parent_of<'a>(
+        &self,
+        path: &'a str,
+        create: bool,
+        above: Option<&mut Vec<Dir>>,
+    ) -> Result<(Dir, &'a str)> {
         let parts = path_parts(path)?;
         let Some((name, folders)) = parts.split_last().filter(|_| !path.ends_with('/')) else {
             return Err(missing(path));
@@ -174,13 +185,13 @@ impl Core {
         if !self.allowed(&key) {
             return Err(refused(&key));
         }
-        Ok((self.walk(folders, create)?, name))
+        Ok((self.walk(folders, create, above)?, name))
     }
 
     /// Removes the file `path` names, or the empty folder when it ends with `/`. Anything
     /// else at the path, such as a symlink, counts as absent.
     fn remove(&self, path: &str) -> Result<()> {
-        let (folder, name) = match self.parent_of(path.trim_end_matches('/'), false) {
+        let (folder, name) = match self.parent_of(path.trim_end_matches('/'), false, None) {
             Ok(found) => found,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error),
@@ -307,7 +318,12 @@ impl Service for LocalFs {
             return Err(read_only());
         }
         let (core, path) = (self.core.clone(), path.to_string());
-        blocking(move || core.walk(&path_parts(&path)?, true).map(|_| ())).await?;
+        blocking(move || {
+            let mut above = Vec::new();
+            core.walk(&path_parts(&path)?, true, Some(&mut above))?;
+            sync_folders(above.iter().rev())
+        })
+        .await?;
         Ok(RpCreateDir::default())
     }
 
@@ -333,7 +349,7 @@ impl Service for LocalFs {
             core: self.core.clone(),
             path: path.to_string(),
             if_not_exists: args.if_not_exists(),
-            spool: None,
+            state: WriteState::Unopened,
         })
     }
 
@@ -407,6 +423,8 @@ impl oio::PositionRead for FileReader {
 /// A file a write fills next to its target, in the target's folder.
 struct Spool {
     folder: Dir,
+    /// The served folder and the folders below it that lead to `folder`. Publish syncs them.
+    above: Vec<Dir>,
     name: String,
     temp: String,
     file: File,
@@ -415,7 +433,8 @@ struct Spool {
 
 impl Spool {
     fn open(core: &Core, path: &str) -> Result<Self> {
-        let (folder, name) = core.parent_of(path, true)?;
+        let mut above = Vec::new();
+        let (folder, name) = core.parent_of(path, true, Some(&mut above))?;
         let temp = format!("{TEMP_PREFIX}{}", Ulid::generate());
         let mut options = OpenOptions::new();
         options
@@ -426,6 +445,7 @@ impl Spool {
         Ok(Self {
             name: name.to_string(),
             folder,
+            above,
             temp,
             file: file.into_std(),
             size: 0,
@@ -440,7 +460,7 @@ impl Spool {
     }
 
     /// Moves the written file into place. A create-only write links it, which fails when the
-    /// target exists, also on NFS; any other renames it over the target.
+    /// target exists, also on NFS; any other renames it over the target. Then it syncs folders.
     fn publish(self, if_not_exists: bool) -> Result<u64> {
         if let Err(error) = self.file.sync_all() {
             return Err(self.discard(new_std_io_error(error)));
@@ -456,7 +476,10 @@ impl Spool {
             remove_temp(folder, temp);
         }
         match placed {
-            Ok(()) => Ok(self.size),
+            Ok(()) => {
+                sync_folders(std::iter::once(folder).chain(self.above.iter().rev()))?;
+                Ok(self.size)
+            }
             Err(error) if if_not_exists && error.kind() == std::io::ErrorKind::AlreadyExists => {
                 Err(Error::new(
                     ErrorKind::ConditionNotMatch,
@@ -466,6 +489,13 @@ impl Spool {
             Err(error) => Err(io_error(error)),
         }
     }
+}
+
+/// Syncs each folder in turn, deepest first, so a new entry and the folders made for it last.
+fn sync_folders<'a>(folders: impl IntoIterator<Item = &'a Dir>) -> Result<()> {
+    folders
+        .into_iter()
+        .try_for_each(|folder| sync_dir(folder).map_err(unsynced))
 }
 
 fn remove_temp(folder: &Dir, temp: &str) {
@@ -479,16 +509,35 @@ pub struct FileWriter {
     core: Arc<Core>,
     path: String,
     if_not_exists: bool,
-    spool: Option<Spool>,
+    state: WriteState,
+}
+
+/// Where a write stands. Taking the spool out ends the write until a step puts it back, so a
+/// retried call after a failure never starts a new, empty spool that could replace the target.
+enum WriteState {
+    Unopened,
+    Open(Spool),
+    Ended,
 }
 
 impl FileWriter {
     async fn take_spool(&mut self) -> Result<Spool> {
-        if let Some(spool) = self.spool.take() {
-            return Ok(spool);
+        match std::mem::replace(&mut self.state, WriteState::Ended) {
+            WriteState::Open(spool) => Ok(spool),
+            WriteState::Unopened => {
+                let (core, path) = (self.core.clone(), self.path.clone());
+                let opened = blocking(move || Spool::open(&core, &path)).await;
+                // Nothing was written yet, so a failed open may be tried again.
+                if opened.is_err() {
+                    self.state = WriteState::Unopened;
+                }
+                opened
+            }
+            WriteState::Ended => Err(Error::new(
+                ErrorKind::Unexpected,
+                "the write has already ended",
+            )),
         }
-        let (core, path) = (self.core.clone(), self.path.clone());
-        blocking(move || Spool::open(&core, &path)).await
     }
 }
 
@@ -505,7 +554,7 @@ impl oio::Write for FileWriter {
             Ok(spool)
         })
         .await?;
-        self.spool = Some(spool);
+        self.state = WriteState::Open(spool);
         Ok(())
     }
 
@@ -517,7 +566,7 @@ impl oio::Write for FileWriter {
     }
 
     async fn abort(&mut self) -> Result<()> {
-        let Some(spool) = self.spool.take() else {
+        let WriteState::Open(spool) = std::mem::replace(&mut self.state, WriteState::Ended) else {
             return Ok(());
         };
         blocking(move || {

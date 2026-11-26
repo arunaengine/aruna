@@ -612,6 +612,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         let group_id = Ulid::generate();
 
@@ -677,6 +678,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         let group_id = Ulid::generate();
         let connector = |user: &str| SourceConnectorInput {
@@ -876,6 +878,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         let group_id = Ulid::generate();
 
@@ -974,6 +977,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         let created = drive(
             SourceConnectorOperation::new(SourceConnectorInput {

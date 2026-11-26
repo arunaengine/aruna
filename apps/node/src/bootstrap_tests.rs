@@ -149,6 +149,7 @@ fn context_net(
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     }
 }
 

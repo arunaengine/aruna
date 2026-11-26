@@ -809,6 +809,7 @@ mod test {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
 
         let bucket_info = BucketInfo {
@@ -844,6 +845,7 @@ mod test {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
 
         let bucket_info = BucketInfo {
@@ -888,6 +890,7 @@ mod test {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         // A replicated recreation carries the same record, creation time included.
         let bucket_info = BucketInfo {
@@ -942,6 +945,7 @@ mod test {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         let binding = aruna_core::structs::storage::distribution::DistributionBinding {
             set_id: Ulid::generate(),

@@ -35,6 +35,7 @@ fn test_context() -> (TempDir, DriverContext) {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     (tempdir, context)
 }

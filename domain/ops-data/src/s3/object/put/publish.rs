@@ -4,7 +4,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::structs::storage::blob::BackendRef;
+use aruna_core::keyspaces::{
+    BUCKET_CREATION_KEYSPACE, DELETE_AUDIT_KEYSPACE, DELETE_TRAIL_KEYSPACE,
+};
+use aruna_core::structs::storage::blob::{BackendRef, incarnation};
+use aruna_core::structs::storage::delete_audit::{
+    BlobAuditKind, BlobAuditRecord, delete_audit_key, trail_key,
+};
 
 impl PutObjectOperation {
     pub(super) fn read_publication(&mut self) -> Turn {
@@ -161,21 +167,8 @@ impl PutObjectOperation {
     }
 
     pub(super) fn location_row(&self) -> Result<(String, Key, Value), PutObjectError> {
-        let location = self.get_output().cloned();
-        let location = location.ok_or(PutObjectError::MissingOutput)?;
-        let blake3_hash = location.get_blake3();
-        let blake3_hash = blake3_hash.ok_or(PutObjectError::MissingHash("blake3".to_string()))?;
-        let blake3_hash = <[u8; 32]>::try_from(blake3_hash).map_err(ConversionError::from)?;
-        let key = BlobLocationKey::new(
-            blake3_hash,
-            location.format.encoding(),
-            location.backend.clone(),
-        );
-        Ok((
-            BLOB_LOCATIONS_KEYSPACE.to_string(),
-            key.to_bytes().into(),
-            location.to_bytes()?.into(),
-        ))
+        let location = self.get_output();
+        stored_row(location.ok_or(PutObjectError::MissingOutput)?)
     }
 
     fn alias_context(&self) -> HeadAliasContext {
@@ -204,7 +197,38 @@ impl PutObjectOperation {
         {
             return Err(PutObjectError::HeadChanged);
         }
-        self.existing_pointer = existing.clone();
+        if let Some(expected) = self.expected_life
+            && existing.as_ref().and_then(|pointer| pointer.life_id) != expected
+        {
+            return Err(PutObjectError::HeadChanged);
+        }
+        self.existing_pointer = existing;
+        if self.source_delete.is_some() {
+            return self.read_source();
+        }
+        self.read_guards()
+    }
+
+    /// The caller's guards and ranges are read before this transaction writes any row they
+    /// could hit, one call at a time.
+    fn read_guards(&mut self) -> Turn {
+        if let Some(call) = self.row_fence.as_mut().and_then(RowFence::check_guards) {
+            return self.call(PutObjectState::RowGuards, call);
+        }
+        self.lookup_checked()
+    }
+
+    pub(super) fn guards_answered(&mut self, result: IoResult) -> Turn {
+        let fence = self.row_fence.as_mut();
+        match fence.map(|fence| fence.answer_call(result)) {
+            Some(Ok(())) => self.read_guards(),
+            Some(Err(error)) => Err(fence_error(error)),
+            None => Err(PutObjectError::InvalidOperationState),
+        }
+    }
+
+    fn lookup_checked(&mut self) -> Turn {
+        let existing = self.existing_pointer.clone();
         if let Some(pointer) = existing.as_ref() {
             let key = self.version_key(pointer.version_id).to_bytes()?;
             let read = read_row(BLOB_VERSIONS_KEYSPACE, key);
@@ -249,7 +273,13 @@ impl PutObjectOperation {
         existing: Option<&CurrentVersionPointer>,
         version_id: Ulid,
     ) -> Turn {
-        let pointer = CurrentVersionPointer::next_for(existing, version_id)?;
+        let pointer = match self.life {
+            Some(life_id) => CurrentVersionPointer::next_live_fresh(existing, version_id, life_id)?,
+            None => {
+                let life_id = self.ids.mint(self.now_ms);
+                CurrentVersionPointer::next_live_inherit(existing, version_id, life_id)?
+            }
+        };
         let pointer = stamp_head(pointer, self.binding.as_ref(), self.version_epoch);
         let head = (
             BLOB_HEAD_KEYSPACE.to_string(),
@@ -524,11 +554,19 @@ impl PutObjectOperation {
         }
     }
 
-    /// The caller's row fence, the import rows, then the reconcile row of the written blob,
+    /// The caller's fence rows, the import rows, then the reconcile row of the written blob,
     /// which commits with the version.
     pub(super) fn write_cleanup_row(&mut self) -> Turn {
+        if let Some(source) = self.source_delete.clone().filter(|_| !self.source_written) {
+            self.source_written = true;
+            return self.write_source(source);
+        }
+        if self.parent_marker.is_some() && !self.marker_read {
+            self.marker_read = true;
+            return self.read_marker_rows();
+        }
         let next = match (self.row_fence.as_mut(), self.version_id) {
-            (Some(fence), Some(version_id)) => fence.next_call(version_id),
+            (Some(fence), Some(version_id)) => fence.apply_mutations(version_id),
             (Some(_), None) => return Err(PutObjectError::InvalidOperationState),
             (None, _) => None,
         };
@@ -557,9 +595,8 @@ impl PutObjectOperation {
         let fence = self.row_fence.as_mut();
         match fence.map(|fence| fence.answer_call(result)) {
             Some(Ok(())) => self.write_cleanup_row(),
-            Some(Err(FenceError::Taken)) => Err(PutObjectError::FenceTaken),
-            Some(Err(FenceError::Storage(error))) => Err(error.into()),
-            Some(Err(FenceError::Unexpected)) | None => Err(PutObjectError::InvalidOperationState),
+            Some(Err(error)) => Err(fence_error(error)),
+            None => Err(PutObjectError::InvalidOperationState),
         }
     }
 
@@ -575,6 +612,16 @@ impl PutObjectOperation {
             let stored = Some(&location).filter(|stored| stored.ulid == written.ulid);
             let reconcile = stored.and_then(|stored| self.reconcile_work(stored.clone()).ok());
             calls.push(IoCall::child(ReleaseWrite::new(written.ulid, reconcile)));
+        }
+        // Marker bytes the marker did not publish go, as a duplicate copy does.
+        if let Some(written) = self.marker_location.as_ref() {
+            let stored = (self.marker_output.as_ref()).filter(|stored| stored.ulid == written.ulid);
+            let reconcile = stored.and_then(|stored| self.reconcile_work(stored.clone()).ok());
+            calls.push(IoCall::child(ReleaseWrite::new(written.ulid, reconcile)));
+            if stored.is_none() {
+                let location = written.clone();
+                calls.push(Effect::blob(BlobEffect::Delete { location }).into());
+            }
         }
         // Distributed buckets are found through their content indexes, not the DHT.
         if self.binding.is_none()
@@ -607,5 +654,381 @@ impl PutObjectOperation {
             },
             calls,
         })
+    }
+}
+
+fn fence_error(error: FenceError) -> PutObjectError {
+    match error {
+        FenceError::Taken => PutObjectError::FenceTaken,
+        FenceError::Storage(error) => error.into(),
+        FenceError::Unexpected => PutObjectError::InvalidOperationState,
+    }
+}
+
+/// The location row of `location`, keyed by its hash, encoding and backend.
+fn stored_row(location: &BackendLocation) -> Result<(String, Key, Value), PutObjectError> {
+    let blake3_hash = location.get_blake3();
+    let blake3_hash = blake3_hash.ok_or(PutObjectError::MissingHash("blake3".to_string()))?;
+    let blake3_hash = <[u8; 32]>::try_from(blake3_hash).map_err(ConversionError::from)?;
+    let key = BlobLocationKey::new(
+        blake3_hash,
+        location.format.encoding(),
+        location.backend.clone(),
+    );
+    Ok((
+        BLOB_LOCATIONS_KEYSPACE.to_string(),
+        key.to_bytes().into(),
+        location.to_bytes()?.into(),
+    ))
+}
+
+/// The source delete and the parent marker, both written in the version transaction.
+impl PutObjectOperation {
+    /// The purge fence, head and incarnation of the source, read before any row is written.
+    fn read_source(&mut self) -> Turn {
+        let source = self.source_delete.as_ref();
+        let source = source.ok_or(PutObjectError::InvalidOperationState)?;
+        // A distributed bucket's markers belong to its coordinator and inventory.
+        if self.binding.is_some() {
+            return Err(PutObjectError::PutObjectFailed);
+        }
+        let bucket = &self.config.request.bucket;
+        let head = BlobHeadKey::new(bucket.clone(), source.key.clone()).to_bytes()?;
+        let reads = vec![
+            (PURGE_FENCE_KEYSPACE.to_string(), fence_key(bucket)),
+            (BLOB_HEAD_KEYSPACE.to_string(), head.into()),
+            (
+                BUCKET_CREATION_KEYSPACE.to_string(),
+                bucket.as_bytes().to_vec().into(),
+            ),
+        ];
+        self.call(PutObjectState::ReadSourceHead, IoCall::Read(reads))
+    }
+
+    /// Only the live head the caller saw may be deleted; any other refuses the whole write.
+    pub(super) fn source_head_read(&mut self, values: Vec<Option<Value>>) -> Turn {
+        let [fence, head, creation] = <[Option<Value>; 3]>::try_from(values)
+            .map_err(|_| PutObjectError::InvalidOperationState)?;
+        let source = self.source_delete.clone();
+        let source = source.ok_or(PutObjectError::InvalidOperationState)?;
+        let bucket = self.config.request.bucket.clone();
+        check_fence_row(fence.as_deref(), &bucket, &source.key)?;
+        self.source_incarnation = incarnation(creation.as_deref());
+        let head = (head.as_ref())
+            .map(|value| CurrentVersionPointer::from_bytes(value.as_ref()))
+            .transpose()?;
+        let Some(head) = head.filter(|head| head.life_id.is_some()) else {
+            return Err(PutObjectError::HeadChanged);
+        };
+        if source
+            .expected_life
+            .is_some_and(|life| head.life_id != Some(life))
+            || source
+                .expected_version
+                .is_some_and(|id| head.version_id != id)
+        {
+            return Err(PutObjectError::HeadChanged);
+        }
+        let key = VersionKey::new(bucket, source.key, head.version_id).to_bytes()?;
+        self.source_head = Some(head);
+        let read = read_row(BLOB_VERSIONS_KEYSPACE, key);
+        self.call(PutObjectState::ReadSourceVersion, read)
+    }
+
+    pub(super) fn source_version_read(&mut self, value: Option<Value>) -> Turn {
+        let version = value.and_then(|value| BlobVersion::from_bytes(value.as_ref()).ok());
+        let version = version.filter(|version| !version.is_deleted());
+        let version = version.ok_or(PutObjectError::HeadChanged)?;
+        let source = self.source_delete.as_ref();
+        let source = source.ok_or(PutObjectError::InvalidOperationState)?;
+        let released = version.offered_size(&self.config.request.bucket, &source.key);
+        self.source_released = released.unwrap_or(0);
+        self.read_guards()
+    }
+
+    /// The marker version, head, replication obligation and delete trail of the source.
+    fn write_source(&mut self, source: SourceDelete) -> Turn {
+        let config = &self.config;
+        let (bucket, marker) = (config.request.bucket.clone(), source.marker_version);
+        let pointer = CurrentVersionPointer::next_deleted(self.source_head.as_ref(), marker)?;
+        let head = BlobHeadKey::new(bucket.clone(), source.key.clone()).to_bytes()?;
+        let created_at = UNIX_EPOCH + Duration::from_millis(marker.timestamp_ms());
+        let version = BlobVersion::deleted(created_at, source.deleted_by);
+        let version_key = VersionKey::new(bucket.clone(), source.key.clone(), marker);
+        let auth = AuthContext {
+            user_id: source.deleted_by,
+            realm_id: config.realm_id,
+            path_restrictions: self.restrictions.clone(),
+            session: None,
+        };
+        let obligation = LiveObligationRecord::new(
+            config.node_id,
+            auth,
+            bucket.clone(),
+            source.key.clone(),
+            marker,
+            true,
+        );
+        let record = BlobAuditRecord {
+            realm_id: config.realm_id,
+            group_id: config.group_id,
+            node_id: config.node_id,
+            user_id: source.deleted_by,
+            kind: BlobAuditKind::DeleteMarker,
+            bucket,
+            key: source.key,
+            version_id: Some(marker),
+            occurred_at_ms: self.now_ms,
+        };
+        let audit: Value = record.to_bytes()?.into();
+        let audit_id = self.ids.mint(self.now_ms);
+        let trail = trail_key(&record, self.source_incarnation, audit_id);
+        let rows = vec![
+            (
+                BLOB_HEAD_KEYSPACE.to_string(),
+                head.into(),
+                pointer.to_bytes()?.into(),
+            ),
+            (
+                BLOB_VERSIONS_KEYSPACE.to_string(),
+                version_key.to_bytes()?.into(),
+                version.to_bytes()?.into(),
+            ),
+            live_obligation_entry(&obligation)?,
+            (
+                DELETE_AUDIT_KEYSPACE.to_string(),
+                delete_audit_key(self.config.group_id, audit_id).into(),
+                audit.clone(),
+            ),
+            (DELETE_TRAIL_KEYSPACE.to_string(), trail.into(), audit),
+        ];
+        self.call(PutObjectState::WriteSource, IoCall::Write(rows))
+    }
+
+    /// The source stops counting as a live object and gains a marker row.
+    pub(super) fn start_source_usage(&mut self) -> Turn {
+        let delta = UsageDelta {
+            objects: -1,
+            referenced_bytes: -i128::from(self.source_released),
+            ..Default::default()
+        };
+        let mut update = UsageCounterUpdate::for_group(self.config.group_id, delta)
+            .in_bucket(&self.config.request.bucket, RowChange::AddedMarker);
+        let call = update.start_calls(self.ids.mint(self.now_ms)).into_call();
+        self.source_usage = Some(update);
+        self.call(PutObjectState::SourceUsage, call)
+    }
+
+    pub(super) fn source_usage_step(&mut self, result: IoResult) -> Turn {
+        let update = self.source_usage.as_mut();
+        let update = update.ok_or(PutObjectError::PutObjectFailed)?;
+        match update.step_calls(result)? {
+            Some(call) => Ok(Next::Call(call.into_call())),
+            None => self.write_cleanup_row(),
+        }
+    }
+
+    /// The marker's empty bytes, written like any upload before the version transaction.
+    pub(super) fn write_marker_blob(&mut self) -> Turn {
+        let marker = self.parent_marker.as_ref();
+        let marker = marker.ok_or(PutObjectError::InvalidOperationState)?;
+        if self.binding.is_some() {
+            return Err(PutObjectError::PutObjectFailed);
+        }
+        let bucket = self.config.request.bucket.clone();
+        let resolved = resolve_backend(&self.config.routing, &bucket, &marker.key)?;
+        let write = BlobEffect::Write {
+            bucket,
+            key: marker.key.clone(),
+            resolved: resolved.with_encryption(self.seal_plan),
+            created_by: marker.owner,
+            blob: BackendStream::empty(),
+            size: Some(0),
+        };
+        self.effect(PutObjectState::WriteMarkerBlob, Effect::blob(write))
+    }
+
+    pub(super) fn marker_written(&mut self, event: Event) -> Turn {
+        match event.into_blob() {
+            Ok(BlobEvent::WriteFinished { location }) => {
+                self.marker_location = Some(location);
+                self.start_publish()
+            }
+            Ok(BlobEvent::Error(error)) => Err(PutObjectError::BlobWriteFailed(error)),
+            _ => Err(PutObjectError::InvalidOperationState),
+        }
+    }
+
+    /// The marker's head and the stored copy of its bytes, read in the version transaction.
+    fn read_marker_rows(&mut self) -> Turn {
+        let marker = self.parent_marker.as_ref();
+        let marker = marker.ok_or(PutObjectError::InvalidOperationState)?;
+        let written = self.marker_location.as_ref();
+        let written = written.ok_or(PutObjectError::MissingOutput)?;
+        let hash = written.get_blake3();
+        let hash = hash.ok_or(PutObjectError::MissingHash("blake3".to_string()))?;
+        let stored =
+            BlobLocationKey::from_blake3(hash, written.format.encoding(), written.backend.clone())?;
+        let bucket = self.config.request.bucket.clone();
+        let head = BlobHeadKey::new(bucket, marker.key.clone()).to_bytes()?;
+        let reads = vec![
+            (BLOB_HEAD_KEYSPACE.to_string(), head.into()),
+            (
+                BLOB_LOCATIONS_KEYSPACE.to_string(),
+                stored.to_bytes().into(),
+            ),
+        ];
+        self.call(PutObjectState::ReadMarkerRows, IoCall::Read(reads))
+    }
+
+    /// A live marker needs nothing; otherwise the marker commits as a fresh empty object.
+    pub(super) fn marker_rows_read(&mut self, values: Vec<Option<Value>>) -> Turn {
+        let [head, stored] = <[Option<Value>; 2]>::try_from(values)
+            .map_err(|_| PutObjectError::InvalidOperationState)?;
+        let head = (head.as_ref())
+            .map(|value| CurrentVersionPointer::from_bytes(value.as_ref()))
+            .transpose()?;
+        if head.as_ref().is_some_and(|head| head.life_id.is_some()) {
+            self.marker_skipped = true;
+            return self.write_cleanup_row();
+        }
+        let marker = self.parent_marker.clone();
+        let marker = marker.ok_or(PutObjectError::InvalidOperationState)?;
+        let written = self.marker_location.clone();
+        let written = written.ok_or(PutObjectError::MissingOutput)?;
+        self.marker_new = stored.is_none();
+        let output = match stored {
+            Some(value) => BackendLocation::from_bytes(value.as_ref())?,
+            None => written.clone(),
+        };
+        let mut rows = Vec::new();
+        if self.marker_new {
+            rows.push(stored_row(&output)?);
+        }
+        rows.extend(self.marker_entries(&marker, head.as_ref(), &output)?);
+        let work = self.reconcile_work(written.clone())?;
+        rows.push((
+            BLOB_CLEANUP_KEYSPACE.to_string(),
+            written.ulid.to_bytes().to_vec().into(),
+            work.to_bytes()?.into(),
+        ));
+        self.marker_output = Some(output);
+        self.call(PutObjectState::WriteMarkerRows, IoCall::Write(rows))
+    }
+
+    /// Head, path index, version, archive owner, registration and obligation of the marker.
+    fn marker_entries(
+        &self,
+        marker: &ParentMarker,
+        existing: Option<&CurrentVersionPointer>,
+        output: &BackendLocation,
+    ) -> Result<Vec<(String, Key, Value)>, PutObjectError> {
+        let (config, version_id) = (&self.config, marker.version_id);
+        let hash = output.get_blake3();
+        let hash = hash.ok_or(PutObjectError::MissingHash("blake3".to_string()))?;
+        let hash = <[u8; 32]>::try_from(hash).map_err(ConversionError::from)?;
+        let pointer = CurrentVersionPointer::next_live_fresh(existing, version_id, marker.life_id)?;
+        let context = HeadAliasContext::new(
+            config.realm_id,
+            config.group_id,
+            config.node_id,
+            config.request.bucket.clone(),
+            marker.key.clone(),
+        );
+        let created_at = UNIX_EPOCH + Duration::from_millis(version_id.timestamp_ms());
+        let origin = VersionOrigin::Upload {
+            node_id: config.node_id,
+            device: None,
+            client: None,
+        };
+        let version = BlobVersion::materialized(
+            hash,
+            output.backend.clone(),
+            output.format.encoding(),
+            created_at,
+            marker.owner,
+            None,
+        )
+        .with_origin(Some(origin))
+        .with_policies(self.bucket_policies.clone())?;
+        let key = VersionKey::new(
+            config.request.bucket.clone(),
+            marker.key.clone(),
+            version_id,
+        );
+        let mut rows = vec![
+            (
+                BLOB_HEAD_KEYSPACE.to_string(),
+                context.head_key().to_bytes()?.into(),
+                pointer.to_bytes()?.into(),
+            ),
+            (
+                PATHS_INDEX_KEYSPACE.to_string(),
+                context.path_index_key(hash, version_id).to_bytes()?.into(),
+                Value::from(Vec::new()),
+            ),
+            (
+                BLOB_VERSIONS_KEYSPACE.to_string(),
+                key.to_bytes()?.into(),
+                version.to_bytes()?.into(),
+            ),
+        ];
+        if output.format.bucket_key().is_some() {
+            let owner = CopyOwner::new(ArchiveKey::of(output), key.clone());
+            let empty = Value::from(Vec::new());
+            rows.push((COPY_OWNER_KEYSPACE.to_string(), owner.key()?.into(), empty));
+        }
+        rows.push(register_entry(CopyRegistration {
+            version: key,
+            node_id: config.node_id,
+            location: output,
+            policies: &version.placement_policies,
+            origin: CopyOrigin::Write,
+            subject_generation: self.stored_subject(),
+            registered_at_ms: version_id.timestamp_ms(),
+        })?);
+        let auth = AuthContext {
+            user_id: marker.owner,
+            realm_id: config.realm_id,
+            path_restrictions: self.restrictions.clone(),
+            session: None,
+        };
+        let obligation = LiveObligationRecord::new(
+            config.node_id,
+            auth,
+            config.request.bucket.clone(),
+            marker.key.clone(),
+            version_id,
+            false,
+        );
+        rows.push(live_obligation_entry(&obligation)?);
+        Ok(rows)
+    }
+
+    /// The marker counts as one more live object; new bytes also count as stored.
+    pub(super) fn start_marker_usage(&mut self) -> Turn {
+        let output = self.marker_output.clone();
+        let output = output.ok_or(PutObjectError::MissingOutput)?;
+        let stored = StoredDelta::for_location(&output, self.marker_new);
+        let stored = stored.ok_or(PutObjectError::MissingHash("blake3".to_string()))?;
+        let delta = UsageDelta {
+            objects: 1,
+            logical_bytes: i128::from(output.blob_size),
+            ..Default::default()
+        };
+        let mut update = UsageCounterUpdate::with_stored(self.config.group_id, delta, stored)
+            .in_bucket(&self.config.request.bucket, RowChange::AddedVersion);
+        let call = update.start_calls(self.ids.mint(self.now_ms)).into_call();
+        self.marker_usage = Some(update);
+        self.call(PutObjectState::MarkerUsage, call)
+    }
+
+    pub(super) fn marker_usage_step(&mut self, result: IoResult) -> Turn {
+        let update = self.marker_usage.as_mut();
+        let update = update.ok_or(PutObjectError::PutObjectFailed)?;
+        match update.step_calls(result)? {
+            Some(call) => Ok(Next::Call(call.into_call())),
+            None => self.write_cleanup_row(),
+        }
     }
 }

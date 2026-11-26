@@ -556,7 +556,9 @@ impl SealedCopyOperation {
     }
 
     fn write_head(&mut self) -> Turn {
-        let pointer = CurrentVersionPointer::next_for(self.existing.as_ref(), self.version_id)?;
+        let life_id = self.ids.mint(self.now_ms);
+        let existing = self.existing.as_ref();
+        let pointer = CurrentVersionPointer::next_live_inherit(existing, self.version_id, life_id)?;
         let pointer = stamp_head(pointer, self.binding.as_ref(), self.epoch);
         self.head = Some(pointer.clone());
         self.step = Step::WriteHead;

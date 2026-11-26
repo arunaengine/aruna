@@ -434,6 +434,7 @@ impl OperationsTaskHandler {
             | TaskKey::SettleJobTerminals
             | TaskKey::DrainLinkQueue
             | TaskKey::DrainCaptures
+            | TaskKey::SweepNfsTombstones
             | TaskKey::ReconcileSyncedFolders
             | TaskKey::DrainUploadOutbox
             | TaskKey::DrainDeviceIntake => Box::pin(self.run_trigger(key)),

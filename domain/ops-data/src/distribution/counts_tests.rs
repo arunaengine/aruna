@@ -55,6 +55,7 @@ async fn counts_owner_group() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     let (snapshot, bytes) = record(true);
     aruna_runner::testing::write_value(
@@ -99,6 +100,7 @@ async fn reads_deleting_record() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     let (mut snapshot, _) = record(true);
     snapshot.lifecycle.deletion = Some(Deletion {

@@ -151,6 +151,9 @@ pub struct KubernetesConfig {
     /// KubeDAL mounts run input views and session data with their own endpoint and credential;
     /// `None` mounts them through `s3_mount_driver`, whose endpoint is driver wide.
     pub kubedal: Option<Box<KubedalMount>>,
+    /// Mounts inputs or session data from a node's SMB or NFS share instead; `None` keeps
+    /// the S3 and KubeDAL mounts.
+    pub share_mount: Option<Box<ShareMount>>,
     /// Manifest files the operator adds to the compute namespace, such as a
     /// network policy for a cluster the standard policies cannot express.
     pub policy_manifests: Vec<PathBuf>,
@@ -187,6 +190,7 @@ impl Default for KubernetesConfig {
             s3_port: 443,
             s3_mount_driver: None,
             kubedal: None,
+            share_mount: None,
             policy_manifests: Vec::new(),
             execution_location: String::new(),
             execution_labels: BTreeMap::new(),
@@ -220,10 +224,63 @@ pub struct KubedalCache {
     pub worker_labels: BTreeMap<String, String>,
 }
 
+/// The node share that a stock CSI driver mounts. Every volume reads from `host` for its
+/// whole life, so all clients of one volume talk to the same node.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShareMount {
+    /// DNS name of the node as the workers reach it.
+    pub host: String,
+    pub driver: ShareDriver,
+}
+
+/// The CSI driver of the share and which mounts it takes over.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ShareDriver {
+    /// `csi-driver-smb`: each attempt logs in with its own access key.
+    Smb { inputs: bool, sessions: bool },
+    /// `csi-driver-nfs` on trusted, enrolled workers: the NFS bindings for inputs and
+    /// sessions. The worker's mTLS identity logs in, so only isolated pods may mount them.
+    Nfs {
+        inputs: Option<String>,
+        sessions: Option<String>,
+    },
+}
+
+impl ShareMount {
+    pub fn inputs(&self) -> bool {
+        match &self.driver {
+            ShareDriver::Smb { inputs, .. } => *inputs,
+            ShareDriver::Nfs { inputs, .. } => inputs.is_some(),
+        }
+    }
+
+    pub fn sessions(&self) -> bool {
+        match &self.driver {
+            ShareDriver::Smb { sessions, .. } => *sessions,
+            ShareDriver::Nfs { sessions, .. } => sessions.is_some(),
+        }
+    }
+}
+
 impl KubernetesConfig {
     /// Whether any driver can mount a run's inputs.
     pub fn mounts_inputs(&self) -> bool {
-        self.s3_mount_driver.is_some() || self.kubedal.is_some()
+        self.s3_mount_driver.is_some() || self.kubedal.is_some() || self.share_inputs().is_some()
+    }
+
+    /// Whether any driver can mount a session's workspace data.
+    pub fn mounts_sessions(&self) -> bool {
+        self.s3_mount_driver.is_some() || self.kubedal.is_some() || self.share_sessions().is_some()
+    }
+
+    /// The share that mounts run inputs, when it takes them over.
+    pub fn share_inputs(&self) -> Option<&ShareMount> {
+        self.share_mount.as_deref().filter(|share| share.inputs())
+    }
+
+    /// The share that mounts session data, when it takes it over.
+    pub fn share_sessions(&self) -> Option<&ShareMount> {
+        self.share_mount.as_deref().filter(|share| share.sessions())
     }
 }
 

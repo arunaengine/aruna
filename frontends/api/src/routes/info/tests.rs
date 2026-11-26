@@ -427,6 +427,7 @@ async fn usage_counts_documents() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let state = Arc::new(
         ServerState::new(
@@ -585,6 +586,7 @@ async fn setup_management_state() -> (Arc<ServerState>, RealmId, UserId, TempDir
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
 
     let realm_signing_key = generate_signing_key();

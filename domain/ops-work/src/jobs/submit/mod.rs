@@ -586,6 +586,7 @@ mod tests {
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         }
     }
 

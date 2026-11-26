@@ -9,8 +9,11 @@ members = [
     "apps/cli",
     "apps/registry",
     "apps/compute-helper",
+    "frontends/admission",
     "frontends/api",
     "frontends/gateway",
+    "frontends/nfs",
+    "frontends/smb",
     "frontends/wire",
     "domain/core",
     "domain/kpabe",
@@ -24,6 +27,7 @@ members = [
     "runtime/clock",
     "runtime/config",
     "runtime/storage",
+    "runtime/vfs",
     "runtime/p2p",
     "runtime/blob",
     "runtime/rdf-graph",
@@ -45,7 +49,7 @@ resolver = "3"
 
 [workspace.package]
 description = "A federated data orchestration network"
-version = "3.0.0-alpha.211"
+version = "3.0.0-alpha.212"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/arunaengine/aruna"
@@ -56,7 +60,10 @@ argon2 = { version = "0.6.0", default-features = false, features = ["alloc", "ze
 aruna-kpabe = { path = "domain/kpabe" }
 # Workspace crates
 aruna = { path = "apps/node" }
+aruna-admission = { path = "frontends/admission" }
 aruna-api = { path = "frontends/api" }
+aruna-nfs = { path = "frontends/nfs" }
+aruna-smb = { path = "frontends/smb" }
 aruna-blob = { path = "runtime/blob" }
 aruna-cli = { path = "apps/cli" }
 aruna-compute = { path = "runtime/compute", default-features = false }
@@ -75,6 +82,7 @@ aruna-plugin = { path = "plugins/sdk" }
 aruna-plugin-contract = { path = "domain/plugin-contract" }
 aruna-wasm-host = { path = "runtime/wasm-host", default-features = false }
 aruna-storage = { path = "runtime/storage" }
+aruna-vfs = { path = "runtime/vfs" }
 aruna-scheduler = { path = "runtime/scheduler" }
 aruna-test-harness = { path = "testing/harness" }
 aruna-wire = { path = "frontends/wire" }
@@ -82,6 +90,7 @@ aruna-workflow = { path = "runtime/workflow" }
 aruna-workflow-contract = { path = "domain/workflow-contract" }
 
 # Third-party crates
+aes = "0.9.4"
 aes-gcm = "0.11.1"
 aes-gcm-core = { package = "aes-gcm", version = "0.11.1", default-features = false, features = ["aes", "zeroize"] }
 ahash = "0.8.14"
@@ -122,6 +131,7 @@ cel-interpreter = "0.10.0"
 chacha20poly1305 = "0.11.0"
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.10", features = ["derive", "env"] }
+cmac = "0.8.0"
 # Pinned to craqle 0.3.2 main (data entity removal) and Irokle 0.3.2; resolves the irokle below.
 craqle = { git = "https://github.com/arunaengine/craqle", rev = "a002de3335dbcca23160164e3eb868f2da4a0358", features = [
     "iroh",
@@ -189,6 +199,8 @@ lettre = { version = "0.11.24", default-features = false, features = [
     "webpki-roots",
 ] }
 lru = "0.19.2"
+md-5 = "0.11.0"
+md4 = "0.11.0"
 md5 = "0.8.1"
 mime = "0.3.18"
 nix = { version = "0.32.0", features = ["time", "fs", "process", "signal"] }
@@ -226,6 +238,7 @@ proptest = "1.12.0"
 quick-xml = "0.42.0"
 rand = "0.10.4"
 rand_core = { version = "0.10.1", default-features = false }
+rc4 = "0.2.0"
 regex = "1.13.2"
 reqwest = { version = "0.13.5", default-features = false, features = [
     "json",

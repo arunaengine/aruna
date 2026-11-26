@@ -226,6 +226,7 @@ fn collect_kubernetes(
         mount_driver: parse_nonempty(env.var("ARUNA_COMPUTE_K8S_S3_MOUNT_DRIVER").as_deref()),
         kubedal_driver: parse_nonempty(env.var("ARUNA_COMPUTE_K8S_KUBEDAL_DRIVER").as_deref()),
         kubedal_cache: kubedal_cache(env)?,
+        share_mount: share_mount(env)?,
         session_endpoint: parse_nonempty(
             env.var("ARUNA_COMPUTE_K8S_S3_SESSION_ENDPOINT").as_deref(),
         )
@@ -271,6 +272,87 @@ fn kubedal_cache(
         scope,
         worker_labels,
     }))
+}
+
+const SHARE_HOST: &str = "ARUNA_COMPUTE_K8S_SHARE_HOST";
+const SHARE_DRIVER: &str = "ARUNA_COMPUTE_K8S_SHARE_DRIVER";
+const SHARE_INPUTS: &str = "ARUNA_COMPUTE_K8S_SHARE_INPUTS";
+const SHARE_SESSIONS: &str = "ARUNA_COMPUTE_K8S_SHARE_SESSIONS";
+
+/// The node's SMB or NFS share that takes over run inputs or session data. Nothing set keeps
+/// the S3 and KubeDAL mounts; a partial or contradictory setting is refused.
+pub(super) fn share_mount(
+    env: &dyn aruna_config::settings::SettingsEnv,
+) -> Result<Option<aruna_compute::executor::config::ShareMount>, String> {
+    use aruna_compute::executor::config::{ShareDriver, ShareMount};
+
+    let value = |key: &str| parse_nonempty(env.var(key).as_deref());
+    let (host, driver) = (value(SHARE_HOST), value(SHARE_DRIVER));
+    let (inputs, sessions) = (value(SHARE_INPUTS), value(SHARE_SESSIONS));
+    let (host, driver) = match (host, driver) {
+        (None, None) if inputs.is_none() && sessions.is_none() => return Ok(None),
+        (Some(host), Some(driver)) => (share_host(&host)?, driver),
+        _ => {
+            return Err(format!(
+                "{SHARE_HOST} and {SHARE_DRIVER} configure a share together, with {SHARE_INPUTS} \
+                 or {SHARE_SESSIONS}"
+            ));
+        }
+    };
+    let driver = match driver.as_str() {
+        "smb" => ShareDriver::Smb {
+            inputs: share_switch(SHARE_INPUTS, inputs.as_deref())?,
+            sessions: share_switch(SHARE_SESSIONS, sessions.as_deref())?,
+        },
+        "nfs" => ShareDriver::Nfs {
+            inputs: inputs
+                .map(|id| share_binding(SHARE_INPUTS, id))
+                .transpose()?,
+            sessions: sessions
+                .map(|id| share_binding(SHARE_SESSIONS, id))
+                .transpose()?,
+        },
+        other => return Err(format!("{SHARE_DRIVER} must be smb or nfs, not {other:?}")),
+    };
+    let share = ShareMount { host, driver };
+    match share.inputs() || share.sessions() {
+        true => Ok(Some(share)),
+        false => Err(format!(
+            "the share takes over nothing; set {SHARE_INPUTS} or {SHARE_SESSIONS}"
+        )),
+    }
+}
+
+/// A bare DNS name or address of the pinned node, without scheme, path or port.
+fn share_host(host: &str) -> Result<String, String> {
+    let bare = !host.contains("://") && !host.contains('/') && !host.contains(char::is_whitespace);
+    match bare {
+        true => Ok(host.to_string()),
+        false => Err(format!(
+            "{SHARE_HOST} must be a bare host name, not {host:?}"
+        )),
+    }
+}
+
+/// An SMB switch: an exact boolean spelling, since a typo must not silently disable it.
+fn share_switch(key: &str, value: Option<&str>) -> Result<bool, String> {
+    match value {
+        None | Some("0" | "false" | "no") => Ok(false),
+        Some("1" | "true" | "yes") => Ok(true),
+        Some(other) => Err(format!(
+            "{key} must be true or false for smb, not {other:?}"
+        )),
+    }
+}
+
+/// An NFS mount binding id as the binding routes return it.
+fn share_binding(key: &str, value: String) -> Result<String, String> {
+    match ulid::Ulid::from_string(&value) {
+        Ok(_) => Ok(value),
+        Err(_) => Err(format!(
+            "{key} must be an NFS mount binding id for nfs, not {value:?}"
+        )),
+    }
 }
 
 /// The gateway address of the Docker session bridge, on the configured S3 port.
@@ -908,5 +990,68 @@ mod pure_tests {
         );
         let bad = ("ARUNA_COMPUTE_K8S_KUBEDAL_CACHE_WORKER_LABELS", "no-value");
         assert!(kubedal_cache(&env(&[scope, bad])).is_err());
+    }
+
+    fn share_env(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn share_stays_optional() {
+        // Nothing set keeps the S3 and KubeDAL mounts unchanged.
+        assert_eq!(share_mount(&share_env(&[])), Ok(None));
+    }
+
+    #[test]
+    fn parses_share_drivers() {
+        use aruna_compute::executor::config::{ShareDriver, ShareMount};
+        let host = (SHARE_HOST, "node-2.example.test");
+        let smb = share_env(&[host, (SHARE_DRIVER, "smb"), (SHARE_INPUTS, "true")]);
+        let expected = ShareMount {
+            host: "node-2.example.test".to_string(),
+            driver: ShareDriver::Smb {
+                inputs: true,
+                sessions: false,
+            },
+        };
+        assert_eq!(share_mount(&smb), Ok(Some(expected)));
+        let binding = "01JABCDEF0123456789ABCDEFG";
+        let nfs = share_env(&[host, (SHARE_DRIVER, "nfs"), (SHARE_SESSIONS, binding)]);
+        let share = share_mount(&nfs).unwrap().unwrap();
+        let driver = ShareDriver::Nfs {
+            inputs: None,
+            sessions: Some(binding.to_string()),
+        };
+        assert_eq!(share.driver, driver);
+    }
+
+    #[test]
+    fn rejects_partial_shares() {
+        let host = (SHARE_HOST, "node-2.example.test");
+        let refused = |pairs: &[(&str, &str)]| share_mount(&share_env(pairs)).is_err();
+        assert!(refused(&[host]));
+        assert!(refused(&[(SHARE_DRIVER, "smb"), (SHARE_INPUTS, "true")]));
+        assert!(refused(&[(SHARE_INPUTS, "true")]));
+        assert!(refused(&[host, (SHARE_DRIVER, "smb")]));
+        assert!(refused(&[
+            host,
+            (SHARE_DRIVER, "cifs"),
+            (SHARE_INPUTS, "1")
+        ]));
+        assert!(refused(&[
+            host,
+            (SHARE_DRIVER, "smb"),
+            (SHARE_INPUTS, "TRUE")
+        ]));
+        assert!(refused(&[
+            host,
+            (SHARE_DRIVER, "nfs"),
+            (SHARE_INPUTS, "true")
+        ]));
+        let url = (SHARE_HOST, "smb://node-2.example.test");
+        assert!(refused(&[url, (SHARE_DRIVER, "smb"), (SHARE_INPUTS, "1")]));
     }
 }

@@ -244,6 +244,7 @@ async fn rejects_foreign_peer() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     let unknown = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
@@ -282,6 +283,7 @@ async fn checks_advance_policy() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     let realm_id = RealmId::from_bytes([4u8; 32]);
     let foreign_realm = RealmId::from_bytes([5u8; 32]);
@@ -488,6 +490,7 @@ async fn foreign_reads_denied() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     let realm_id = RealmId::from_bytes([9u8; 32]);
     let foreign_realm = RealmId::from_bytes([10u8; 32]);

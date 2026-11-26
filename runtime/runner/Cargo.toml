@@ -24,6 +24,7 @@ aruna-p2p = { workspace = true }
 aruna-egress = { workspace = true }
 aruna-wasm-host = { workspace = true }
 aruna-storage = { workspace = true }
+aruna-vfs = { workspace = true }
 aruna-scheduler = { workspace = true }
 async-trait = { workspace = true, optional = true }
 bytes = { workspace = true }

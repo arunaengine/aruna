@@ -221,6 +221,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
 
         let document_id = Ulid::generate();

@@ -9,6 +9,7 @@ use crate::s3::purge_fence::fence_key;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::id::NodeId;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     BROKEN_VERSION_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE,
@@ -220,6 +221,8 @@ pub struct RenameKeysOperation {
     truncated: bool,
     writes: Vec<(String, Key, Value)>,
     plan: Option<RenamePlan>,
+    now_ms: u64,
+    ids: IdMint,
 }
 
 impl RenameKeysOperation {
@@ -239,6 +242,8 @@ impl RenameKeysOperation {
             truncated: false,
             writes: Vec::new(),
             plan: None,
+            now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 
@@ -822,7 +827,7 @@ impl RenameKeysOperation {
     }
 
     /// The rows to delete under the old keys and to write under the new ones.
-    fn moves(&self) -> Result<RowMoves, RenameError> {
+    fn moves(&mut self) -> Result<RowMoves, RenameError> {
         let bucket = &self.input.bucket;
         let (mut deletes, mut writes) = (Vec::new(), Vec::new());
         for (item, found) in self.items.iter().zip(&self.found) {
@@ -830,7 +835,11 @@ impl RenameKeysOperation {
                 let old = BlobHeadKey::new(bucket.clone(), item.from.clone()).to_bytes()?;
                 let new = BlobHeadKey::new(bucket.clone(), item.to.clone()).to_bytes()?;
                 deletes.push((BLOB_HEAD_KEYSPACE.to_string(), old.into()));
-                writes.push((BLOB_HEAD_KEYSPACE.to_string(), new.into(), head.clone()));
+                // A moved object starts a new local life at its new name; a marker has none.
+                let pointer = CurrentVersionPointer::from_bytes(head)?;
+                let life_id = pointer.life_id.map(|_| self.ids.mint(self.now_ms));
+                let value = pointer.with_life(life_id).to_bytes()?;
+                writes.push((BLOB_HEAD_KEYSPACE.to_string(), new.into(), value.into()));
             }
             let moved =
                 |key: &VersionKey| VersionKey::new(bucket.clone(), &item.to, key.version_id);
@@ -1001,6 +1010,14 @@ impl Operation for RenameKeysOperation {
             true => TransactionMode::Write,
             false => TransactionMode::ReadSnapshot,
         }
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 }
 

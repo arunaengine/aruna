@@ -29,3 +29,4 @@ pub(crate) mod tests;
 pub mod timer;
 pub mod transfer;
 pub mod usage_publish;
+pub mod vfs;

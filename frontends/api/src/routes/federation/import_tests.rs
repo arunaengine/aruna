@@ -120,6 +120,7 @@ async fn fixture(with_blob: bool) -> Fixture {
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let capabilities = NodeCapabilities::management_node(key(21)).unwrap();
     let limits = RoCrateLimits {

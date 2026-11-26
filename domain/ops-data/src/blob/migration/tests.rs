@@ -615,6 +615,7 @@ async fn encryption_retires_compression() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     let mut record = CompressionMigration::new(ZSTD, 1);
     record.failed = 2;

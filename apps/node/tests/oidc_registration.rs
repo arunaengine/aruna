@@ -131,6 +131,7 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let incoming = initialize_incoming_fixture(context.clone());
     let shutdown = aruna_scheduler::shutdown::Shutdown::new();

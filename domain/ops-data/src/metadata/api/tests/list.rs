@@ -180,6 +180,7 @@ async fn group_scan_capped() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     let within = drive(GroupRecordsOperation::new(group_id, 2), &context)

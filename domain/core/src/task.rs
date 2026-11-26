@@ -101,6 +101,8 @@ pub enum TaskKey {
     DrainAppliedSync,
     /// Takes the Git snapshots of materialized documents whose capture marks remain.
     DrainCaptures,
+    /// Collects expired file server handle tombstones, old cookie positions and receipts.
+    SweepNfsTombstones,
 }
 
 impl TaskKey {

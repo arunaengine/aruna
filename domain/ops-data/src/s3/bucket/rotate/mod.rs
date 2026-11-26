@@ -3,6 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::s3::bucket::encryption::{
+    FenceAnswer, fence_answer, fence_call, release_call, stage_page,
+};
 use crate::s3::bucket::key::abe::PrepareAbe;
 use crate::s3::bucket::key::rows::{
     Row, SettingsError, authority_keys, copy_targets, full_scan, generation_rows, group_bucket_key,
@@ -17,14 +20,14 @@ use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
-    BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE, GROUP_ENCRYPTED_KEYSPACE, TRANSITION_KEYSPACE,
-    TRANSITION_QUEUE_KEYSPACE, UPLOAD_KEYSPACE,
+    BUCKET_CREATION_KEYSPACE, BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE,
+    GROUP_ENCRYPTED_KEYSPACE, TRANSITION_KEYSPACE, TRANSITION_QUEUE_KEYSPACE, UPLOAD_KEYSPACE,
 };
 use aruna_core::node::vault::{VaultEntry, VaultPurpose};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::values as row_values;
+use aruna_core::rows::{outside_answer, outside_call, read_row, values as row_values};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::storage::blob::{BucketInfo, incarnation};
 use aruna_core::structs::storage::encryption::{
     BlockCipher, BlockKeys, BucketEncryption, BucketHolder, BucketKeyError, BucketKeyRecord,
     BucketKeyRef, EncryptionMode, KeyState, SealPlan, SealedCopy, UnlockStatus,
@@ -45,7 +48,14 @@ use ulid::Ulid;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChangeState {
+    /// Reads the bucket incarnation outside the transaction for the `vault_locked` fence.
+    ReadCreation,
+    /// Waits for the file servers to fence stage admission of the bucket.
+    FenceVault,
     ReadBucket,
+    /// Reads the incarnation again in the transaction and looks for any plaintext stage.
+    ReadIncarnation,
+    CheckStages,
     CheckUploads,
     ReadKey,
     CheckUnlocked,
@@ -92,6 +102,10 @@ pub enum ChangeError {
     Unchanged,
     #[error("the bucket has open multipart uploads")]
     OpenUploads,
+    /// A `vault_locked` bucket keeps no plaintext file server stage on this node; a stage
+    /// inventory that cannot be read keeps the change refused too.
+    #[error("the bucket still has plaintext file server stages")]
+    PlainStages,
     #[error("the key holders do not meet the recovery rule")]
     RecoveryUnmet,
     /// Replacing an unfinished transition would strand the copies it still has to move.
@@ -155,6 +169,12 @@ pub struct ChangeEncryptionOperation {
     /// The node vault copy this change writes.
     vault: Option<(Ulid, SharedSecret)>,
     result: Option<ChangeResult>,
+    /// The file server fence of a change to `vault_locked` and the incarnation it covers.
+    fence: Option<Ulid>,
+    fenced_scope: Option<u128>,
+    /// Set once the outcome went to the commit; an unknown commit keeps the fence closed.
+    committing: bool,
+    rolled_back: bool,
 }
 
 impl ChangeEncryptionOperation {
@@ -172,7 +192,69 @@ impl ChangeEncryptionOperation {
             new_key: None,
             vault: None,
             result: None,
+            fence: None,
+            fenced_scope: None,
+            committing: false,
+            rolled_back: false,
         }
+    }
+
+    /// A change into `vault_locked` fences file server stages; a rotation keeps its mode.
+    fn locks_vault(&self) -> bool {
+        matches!(
+            self.input.change,
+            KeyChange::Settings {
+                mode: EncryptionMode::VaultLocked,
+                ..
+            }
+        )
+    }
+
+    /// The authority reads that open the change's transaction.
+    fn read_authority(&mut self) -> ChangeTurn {
+        let (realm_id, group_id) = (self.input.realm_id, self.input.group_id);
+        let reads = authority_keys(&self.input.bucket, realm_id, group_id);
+        self.call(ChangeState::ReadBucket, IoCall::Read(reads))
+    }
+
+    fn creation_read(&mut self, result: IoResult) -> ChangeTurn {
+        let creation = outside_answer(result)?.value()?;
+        let incarnation = incarnation(creation.as_deref());
+        self.fenced_scope = Some(incarnation);
+        let scope =
+            aruna_core::structs::storage::vfs::BucketScope::new(&self.input.bucket, incarnation);
+        self.call(ChangeState::FenceVault, fence_call(scope))
+    }
+
+    fn vault_fenced(&mut self, result: IoResult) -> ChangeTurn {
+        match fence_answer(result.event()?) {
+            FenceAnswer::Held(fence_id) => self.fence = Some(fence_id),
+            FenceAnswer::Unconfigured => {}
+            FenceAnswer::Refused => return Err(ChangeError::PlainStages),
+        }
+        self.read_authority()
+    }
+
+    /// Reads one stage row of either kind in this transaction, so a stage admitted meanwhile
+    /// conflicts. A recreated bucket is not the incarnation the file server fence covers.
+    fn read_stages(&mut self, creation: Option<Value>) -> ChangeTurn {
+        let incarnation = incarnation(creation.as_deref());
+        if self
+            .fenced_scope
+            .is_some_and(|fenced| fenced != incarnation)
+        {
+            return Err(ChangeError::PlainStages);
+        }
+        let page = stage_page(&self.input.bucket, incarnation);
+        let page = page.ok_or(ChangeError::PlainStages)?;
+        self.call(ChangeState::CheckStages, page)
+    }
+
+    fn stages_read(&mut self, rows: &[(Key, Value)]) -> ChangeTurn {
+        if !rows.is_empty() {
+            return Err(ChangeError::PlainStages);
+        }
+        self.call(ChangeState::CheckUploads, full_scan(UPLOAD_KEYSPACE, None))
     }
 
     fn call(&mut self, state: ChangeState, call: IoCall) -> ChangeTurn {
@@ -254,6 +336,11 @@ impl ChangeEncryptionOperation {
         );
         if self.input.change != KeyChange::Rotate && wanted == current {
             return Err(ChangeError::Unchanged);
+        }
+        if self.locks_vault() {
+            let bucket = self.input.bucket.as_bytes().to_vec();
+            let read = read_row(BUCKET_CREATION_KEYSPACE, bucket);
+            return self.call(ChangeState::ReadIncarnation, read);
         }
         self.call(ChangeState::CheckUploads, full_scan(UPLOAD_KEYSPACE, None))
     }
@@ -398,20 +485,22 @@ impl ChangeEncryptionOperation {
         self.call(ChangeState::WriteVault, Effect::Storage(write).into())
     }
 
-    /// A change that moves copies wakes the transition worker once it committed.
+    /// A change that moves copies wakes the transition worker once it committed, and the file
+    /// server fence opens again once the commit is confirmed.
     fn finish(&mut self) -> ChangeTurn {
         let output = self.result.take().ok_or(ChangeError::NotFinished)?;
-        if output.transition.is_none() {
+        let release = self.fence.map(|fence_id| release_call(fence_id, false));
+        self.committing = true;
+        if output.transition.is_none() && release.is_none() {
             return Ok(Next::Done(output));
         }
         let wake = Effect::Task(TaskEffect::ShortenTimer {
             key: TaskKey::MigrateCompression,
             after: Duration::ZERO,
         });
-        Ok(Next::Then {
-            output,
-            calls: vec![wake.into()],
-        })
+        let wake = output.transition.is_some().then(|| IoCall::from(wake));
+        let calls = wake.into_iter().chain(release).collect();
+        Ok(Next::Then { output, calls })
     }
 
     fn grants_read(&mut self, rows: Vec<(Key, Value)>) -> ChangeTurn {
@@ -437,14 +526,22 @@ impl Operation for ChangeEncryptionOperation {
     type Error = ChangeError;
 
     fn first(&mut self) -> ChangeTurn {
-        let (realm_id, group_id) = (self.input.realm_id, self.input.group_id);
-        let reads = authority_keys(&self.input.bucket, realm_id, group_id);
-        self.call(ChangeState::ReadBucket, IoCall::Read(reads))
+        // The fence is taken before the transaction, which never waits on the file servers.
+        if self.locks_vault() {
+            let bucket = self.input.bucket.as_bytes().to_vec();
+            let read = outside_call(read_row(BUCKET_CREATION_KEYSPACE, bucket));
+            return self.call(ChangeState::ReadCreation, read);
+        }
+        self.read_authority()
     }
 
     fn next(&mut self, result: IoResult) -> ChangeTurn {
         match self.state {
+            ChangeState::ReadCreation => self.creation_read(result),
+            ChangeState::FenceVault => self.vault_fenced(result),
             ChangeState::ReadBucket => self.read_bucket(result.values()?),
+            ChangeState::ReadIncarnation => self.read_stages(result.value()?),
+            ChangeState::CheckStages => self.stages_read(&result.page()?.0),
             ChangeState::CheckUploads => self.check_uploads(&result.page()?.0),
             ChangeState::ReadKey => self.read_key(row_values::<2>(result)?),
             ChangeState::CheckUnlocked => match (result.event()?).into_blob() {
@@ -507,11 +604,17 @@ impl Operation for ChangeEncryptionOperation {
         TransactionMode::Write
     }
 
-    /// A failed change keeps no key.
+    /// A failed change keeps no key. Its fence opens again unless the commit outcome is unknown.
     fn abort(&mut self) -> Vec<IoCall> {
         self.new_key = None;
         self.vault = None;
-        Vec::new()
+        let keep_closed = self.committing && !self.rolled_back;
+        let fence = self.fence.take();
+        fence.map_or_else(Vec::new, |id| vec![release_call(id, keep_closed)])
+    }
+
+    fn rolled_back(&mut self) {
+        self.rolled_back = true;
     }
 
     fn seed(&mut self, entropy: u128) {

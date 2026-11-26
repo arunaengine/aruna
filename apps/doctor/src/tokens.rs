@@ -764,6 +764,7 @@ mod tests {
             task_handle: Some(task_handle.clone()),
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         });
         let jobs_runtime = aruna_runner::jobs::runtime::JobsRuntime::new();
         let shutdown = aruna_scheduler::shutdown::Shutdown::new();

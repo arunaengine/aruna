@@ -41,7 +41,12 @@ fn absent() -> IoResult {
 }
 
 fn pointer() -> CurrentVersionPointer {
-    CurrentVersionPointer::next_for(None, Ulid::from_bytes([5; 16])).unwrap()
+    CurrentVersionPointer::next_live_fresh(
+        None,
+        Ulid::from_bytes([5; 16]),
+        Ulid::from_bytes([6; 16]),
+    )
+    .unwrap()
 }
 
 fn observed(entry: &SourceEntry) -> BlobVersion {

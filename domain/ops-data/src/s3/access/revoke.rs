@@ -377,6 +377,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
 
         // Access keys are validated as strictly alphanumeric.
@@ -454,6 +455,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         let user_access = UserAccess {
             access_key: "tokenkey".to_string(),

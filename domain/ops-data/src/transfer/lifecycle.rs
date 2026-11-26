@@ -1846,6 +1846,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         let space = DISTRIBUTION_LIFECYCLE_KEYSPACE;
         let key = [1u8; 16];

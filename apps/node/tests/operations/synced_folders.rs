@@ -911,6 +911,7 @@ async fn recovers_interrupted_bind() -> TestResult<()> {
     let unanswered = std::sync::Arc::new(DriverContext {
         net_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
         graph_handle: None,
         task_handle: None,
         ..(*device.context).clone()

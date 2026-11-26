@@ -146,6 +146,7 @@ async fn restart_resumes_migration() {
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let shutdown = aruna_scheduler::shutdown::Shutdown::new();
     start_task_queues(restarted, task_handle, JobsRuntime::new(), &shutdown).await;

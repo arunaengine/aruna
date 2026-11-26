@@ -66,6 +66,7 @@ async fn full_context() -> (TempDir, DriverContext) {
         blob_handle: Some(blob_handle),
         graph_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
         task_handle: None,
         compute_handle: None,
     };

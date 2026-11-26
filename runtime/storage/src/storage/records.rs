@@ -11,6 +11,7 @@ use byteview::ByteView;
 use fjall::{OptimisticTxKeyspace, Readable};
 use ulid::Ulid;
 
+use super::heads::HeadRows;
 use super::worker::{
     FjallStorage, Store, Txn, batch_read_with, iterate_page, range_page, read_last_with,
     store_batch_read, store_iterate, store_last, store_read,
@@ -113,15 +114,18 @@ impl FjallStorage {
                 Ok(txn) => {
                     txn.insert(keyspace, key.clone(), value);
                     self.note_rows(txn_id, [(key_space.as_str(), &key)]);
+                    self.note_heads(txn_id, [(key_space.as_str(), &key)]);
                     StorageEvent::WriteResult { key }
                 }
                 Err(error) => StorageEvent::Error { error },
             };
         }
+        let heads = HeadRows::of([(key_space.as_str(), &key)]);
         let result = self.buffered_write_tx().and_then(|mut tx| {
             self.keep_preimages(&mut tx, [(key_space.as_str(), &key)])?;
+            self.drop_watches(&mut tx, &heads)?;
             tx.insert(keyspace, key.clone(), value);
-            self.commit_buffered(tx)?;
+            self.commit_heads(tx, &heads)?;
             self.persist_journal()
         });
         match result {
@@ -163,6 +167,8 @@ impl FjallStorage {
                 txn_id,
                 entries.iter().map(|(space, key)| (space.as_str(), key)),
             );
+            let rows = entries.iter().map(|(space, key)| (space.as_str(), key));
+            self.note_heads(txn_id, rows);
         } else {
             let mut tx = match self.buffered_write_tx() {
                 Ok(tx) => tx,
@@ -173,9 +179,11 @@ impl FjallStorage {
                 entries.push((key_space, key));
             }
             let rows = entries.iter().map(|(space, key)| (space.as_str(), key));
+            let heads = HeadRows::of(rows.clone());
             if let Err(error) = self
                 .keep_preimages(&mut tx, rows)
-                .and_then(|()| self.commit_buffered(tx))
+                .and_then(|()| self.drop_watches(&mut tx, &heads))
+                .and_then(|()| self.commit_heads(tx, &heads))
                 .and_then(|()| self.persist_journal())
             {
                 return StorageEvent::Error { error };
@@ -206,6 +214,7 @@ impl FjallStorage {
                     txn.remove(keyspace, key.clone());
                     self.hold_txn_delete(txn_id, &key_space);
                     self.note_rows(txn_id, [(key_space.as_str(), &key)]);
+                    self.note_heads(txn_id, [(key_space.as_str(), &key)]);
                     StorageEvent::DeleteResult { key }
                 }
                 Err(error) => StorageEvent::Error { error },
@@ -216,9 +225,11 @@ impl FjallStorage {
             Err(error) => return StorageEvent::Error { error },
         };
         tx.remove(keyspace, key.clone());
+        let heads = HeadRows::of([(key_space.as_str(), &key)]);
         if let Err(error) = self
             .keep_preimages(&mut tx, [(key_space.as_str(), &key)])
-            .and_then(|()| self.commit_buffered(tx))
+            .and_then(|()| self.drop_watches(&mut tx, &heads))
+            .and_then(|()| self.commit_heads(tx, &heads))
             .and_then(|()| self.persist_journal())
         {
             return StorageEvent::Error { error };
@@ -263,6 +274,8 @@ impl FjallStorage {
                 txn_id,
                 entries.iter().map(|(space, key)| (space.as_str(), key)),
             );
+            let rows = entries.iter().map(|(space, key)| (space.as_str(), key));
+            self.note_heads(txn_id, rows);
         } else {
             let mut tx = match self.buffered_write_tx() {
                 Ok(tx) => tx,
@@ -273,9 +286,11 @@ impl FjallStorage {
                 entries.push((key_space, key));
             }
             let rows = entries.iter().map(|(space, key)| (space.as_str(), key));
+            let heads = HeadRows::of(rows.clone());
             if let Err(error) = self
                 .keep_preimages(&mut tx, rows)
-                .and_then(|()| self.commit_buffered(tx))
+                .and_then(|()| self.drop_watches(&mut tx, &heads))
+                .and_then(|()| self.commit_heads(tx, &heads))
                 .and_then(|()| self.persist_journal())
             {
                 return StorageEvent::Error { error };

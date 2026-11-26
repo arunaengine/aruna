@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod handle;
+mod heads;
 mod hot_cache;
 #[cfg(debug_assertions)]
 mod ledger;
@@ -27,6 +28,8 @@ mod tests_cache;
 mod tests_config;
 #[cfg(test)]
 mod tests_counters;
+#[cfg(test)]
+mod tests_heads;
 #[cfg(test)]
 mod tests_memory;
 #[cfg(test)]

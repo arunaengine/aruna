@@ -1,0 +1,328 @@
+//! Tests of the Aruna NFS backend: error mapping, host networks and revocation, folder
+//! confinement, refused writes on job views and the replay recheck against live state.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::storage::vfs::EnrolledHostRecord;
+use aruna_core::user::id::UserId;
+use aruna_core::vfs_effects::VfsFailure;
+use aruna_ops_data::vfs::EnrollHostOperation;
+use aruna_ops_data::vfs::admin::EnrollInput;
+use aruna_runner::driver::drive;
+use aruna_runner::testing::memory_context;
+
+use super::admit::host_allows;
+use super::exports::{holds, root_key};
+use super::*;
+use crate::rpc::RpcPrincipal;
+use crate::types::share;
+
+/// The ed25519 base point, a valid node key.
+const NODE_KEY: [u8; 32] = [
+    0x58, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
+    0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
+];
+
+fn owner() -> UserId {
+    UserId::new(Ulid::from_parts(1, 5), RealmId([1; 32]))
+}
+
+fn backend() -> ArunaNfsBackend {
+    ArunaNfsBackend::new(ArunaNfsConfig {
+        context: Arc::new(memory_context()),
+        realm_id: RealmId([1; 32]),
+        node_id: NodeId::from_bytes(&NODE_KEY).expect("the base point is a valid key"),
+    })
+}
+
+fn binding(target: NfsMountTarget) -> NfsMountBinding {
+    NfsMountBinding {
+        mount_id: Ulid::from_parts(2, 1),
+        host_id: Ulid::from_parts(3, 1),
+        owner: owner(),
+        access_key: "AKVIEW".to_string(),
+        group_id: Ulid::from_parts(4, 1),
+        target,
+        read_only: false,
+        allowed_networks: Vec::new(),
+        display_uid: 1000,
+        display_gid: 1000,
+        mode: 0o755,
+        created_at_ms: 1,
+    }
+}
+
+fn host_record(networks: &[&str], revoked: Option<u64>) -> EnrolledHostRecord {
+    EnrolledHostRecord {
+        host_id: Ulid::from_parts(3, 1),
+        owner: owner(),
+        fingerprints: vec![[7; 32]],
+        allowed_networks: networks.iter().map(|network| network.to_string()).collect(),
+        worker_pool: false,
+        created_at_ms: 1,
+        revoked_at_ms: revoked,
+    }
+}
+
+fn peer(last: u8) -> IpAddr {
+    IpAddr::V4(Ipv4Addr::new(10, 1, 2, last))
+}
+
+/// A caller of `binding` after the backend admitted it for this compound.
+fn admitted(backend: &ArunaNfsBackend, binding: &NfsMountBinding) -> Caller {
+    backend
+        .tables
+        .lock()
+        .mounts
+        .insert(binding.mount_id, binding.clone());
+    let host = HostIdentity {
+        host_id: binding.host_id,
+        owner: binding.owner,
+    };
+    Caller {
+        host,
+        peer: peer(1),
+        export: Arc::new(MountExport {
+            mount_id: binding.mount_id,
+            host_id: binding.host_id,
+            principal: binding.owner,
+            access_key: binding.access_key.clone(),
+            incarnation: 9,
+            root: aruna_ops_data::vfs::path::JOB_ROOT,
+            read_only: true,
+            persistent: true,
+        }),
+    }
+}
+
+#[test]
+fn vfs_errors_map() {
+    let cases = [
+        (VfsError::NotFound, NfsStat4::NoEntry),
+        (VfsError::Denied, NfsStat4::Access),
+        (VfsError::InvalidName, NfsStat4::Invalid),
+        (VfsError::IsDirectory, NfsStat4::IsDirectory),
+        (VfsError::NotDirectory, NfsStat4::NotDirectory),
+        (VfsError::NotEmpty, NfsStat4::NotEmpty),
+        (VfsError::Exists, NfsStat4::Exist),
+        (VfsError::CrossExport, NfsStat4::Xdev),
+        (VfsError::ReadOnly, NfsStat4::ReadOnly),
+        (VfsError::Distributed, NfsStat4::Access),
+        (VfsError::VaultLocked, NfsStat4::Access),
+        (VfsError::KeyRequired, NfsStat4::Access),
+        (VfsError::Quarantined, NfsStat4::Access),
+        (VfsError::QuotaExceeded, NfsStat4::QuotaExceeded),
+        (VfsError::NoSpace, NfsStat4::NoSpace),
+        (VfsError::ShareViolation, NfsStat4::ShareDenied),
+        (VfsError::LockConflict, NfsStat4::Denied),
+        (VfsError::DeletePending, NfsStat4::Access),
+        (VfsError::StaleHandle, NfsStat4::Stale),
+        (VfsError::ExpiredHandle, NfsStat4::FilehandleExpired),
+        (VfsError::BadCookie, NfsStat4::BadCookie),
+        (VfsError::Conflict, NfsStat4::Delay),
+        (VfsError::Unavailable("busy".into()), NfsStat4::Delay),
+        (VfsError::CorruptStage, NfsStat4::Io),
+        (VfsError::Storage("disk".into()), NfsStat4::Io),
+        (VfsError::Vfs(VfsFailure::NoSpace), NfsStat4::Io),
+    ];
+    for (error, status) in cases {
+        assert_eq!(vfs_status(&error), status, "{error:?}");
+    }
+}
+
+#[test]
+fn view_errors_map() {
+    let cases = [
+        (ViewError::NotFound, NfsStat4::NoEntry),
+        (ViewError::Denied, NfsStat4::Access),
+        (ViewError::MissingVersion, NfsStat4::Stale),
+        (ViewError::Locked, NfsStat4::Access),
+        (ViewError::KeyRequired, NfsStat4::Access),
+        (ViewError::Unavailable("down".into()), NfsStat4::Io),
+    ];
+    for (error, status) in cases {
+        assert_eq!(view_status(&error), status, "{error:?}");
+    }
+}
+
+#[test]
+fn networks_admit_peers() {
+    let networks = vec!["10.1.0.0/16".to_string(), "fd00::/8".to_string()];
+    assert!(network_allows(&networks, peer(3)));
+    assert!(!network_allows(
+        &networks,
+        IpAddr::V4(Ipv4Addr::new(10, 2, 0, 1))
+    ));
+    let local = IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1));
+    assert!(network_allows(&networks, local));
+    // An IPv4 peer seen on a dual-stack socket is still checked as IPv4.
+    let mapped = IpAddr::V6(Ipv4Addr::new(10, 1, 9, 9).to_ipv6_mapped());
+    assert!(network_allows(&networks, mapped));
+    assert!(!network_allows(&["not a network".to_string()], peer(3)));
+    assert!(!network_allows(&[], peer(3)));
+}
+
+#[test]
+fn revoked_hosts_refused() {
+    assert!(host_allows(&host_record(&["10.1.0.0/16"], None), peer(1)));
+    assert!(!host_allows(
+        &host_record(&["10.1.0.0/16"], Some(5)),
+        peer(1)
+    ));
+    assert!(!host_allows(
+        &host_record(&["192.168.0.0/16"], None),
+        peer(1)
+    ));
+}
+
+#[test]
+fn folders_hold_components() {
+    let target = NfsMountTarget::for_folder("data", 7, "team").expect("a canonical folder");
+    let folder = binding(target);
+    assert_eq!(root_key(&folder), "team");
+    assert!(holds(&folder, "team"));
+    assert!(holds(&folder, "team/a"));
+    assert!(holds(&folder, "team/a/b"));
+    assert!(!holds(&folder, "team-old/a"));
+    assert!(!holds(&folder, "teamwork"));
+    assert!(!holds(&folder, "other/team/a"));
+    let whole = binding(NfsMountTarget::for_bucket("data", 7).expect("a bucket"));
+    assert_eq!(root_key(&whole), "");
+    assert!(holds(&whole, "team-old/a"));
+}
+
+#[tokio::test]
+async fn views_refuse_writes() {
+    let backend = backend();
+    let view = binding(NfsMountTarget::JobInputView {
+        job_id: JobId::from_bytes([8; 16]),
+    });
+    let caller = admitted(&backend, &view);
+    let object = ObjectRef {
+        mount_id: view.mount_id,
+        object_id: aruna_ops_data::vfs::path::JOB_ROOT,
+    };
+    let state = IoState::Anonymous;
+    let write = backend
+        .write(
+            &caller,
+            object,
+            &state,
+            0,
+            Bytes::from_static(b"x"),
+            StableHow::FileSync,
+        )
+        .await;
+    assert_eq!(write, Err(NfsStat4::ReadOnly));
+    let resize = AttributeChange {
+        size: Some(0),
+        ..AttributeChange::default()
+    };
+    let setattr = backend
+        .set_attributes(&caller, object, &state, &resize)
+        .await;
+    assert_eq!(setattr, Err(NfsStat4::ReadOnly));
+    assert_eq!(
+        backend.commit(&caller, object, 0, 0).await,
+        Err(NfsStat4::ReadOnly)
+    );
+    let change = AttributeChange::default();
+    let create = backend
+        .create_file(&caller, object, "new", CreateMode::Guarded, &change)
+        .await;
+    assert_eq!(create, Err(NfsStat4::ReadOnly));
+    let mkdir = backend
+        .create_directory(&caller, object, "dir", &change)
+        .await;
+    assert_eq!(mkdir, Err(NfsStat4::ReadOnly));
+    assert_eq!(
+        backend.remove(&caller, object, "a").await,
+        Err(NfsStat4::ReadOnly)
+    );
+    let rename = backend.rename(&caller, object, "a", object, "b").await;
+    assert_eq!(rename, Err(NfsStat4::ReadOnly));
+    let writer = ShareRequest {
+        owner: OwnerKey {
+            client_id: 1,
+            owner: Bytes::from_static(b"owner"),
+        },
+        access: share::WRITE,
+        deny: 0,
+    };
+    assert_eq!(
+        backend.open(&caller, object, &writer).await,
+        Err(NfsStat4::ReadOnly)
+    );
+}
+
+#[tokio::test]
+async fn fingerprint_finds_host() {
+    let backend = backend();
+    let enroll = EnrollHostOperation::new(EnrollInput {
+        owner: owner(),
+        fingerprints: vec![[7; 32]],
+        proven: [7; 32],
+        allowed_networks: vec!["10.1.0.0/16".to_string()],
+        worker_pool: false,
+    });
+    let host = drive(enroll, &backend.context)
+        .await
+        .expect("host enrolled");
+    let found = backend.enrolled_host([7; 32], peer(4)).await;
+    assert_eq!(found.map(|found| found.host_id), Some(host.host_id));
+    let outside = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+    assert_eq!(backend.enrolled_host([7; 32], outside).await, None);
+    assert_eq!(backend.enrolled_host([9; 32], peer(4)).await, None);
+}
+
+#[tokio::test]
+async fn lapsed_replay_refused() {
+    let backend = backend();
+    let enroll = EnrollHostOperation::new(EnrollInput {
+        owner: owner(),
+        fingerprints: vec![[7; 32]],
+        proven: [7; 32],
+        allowed_networks: vec!["10.1.0.0/16".to_string()],
+        worker_pool: false,
+    });
+    let host = drive(enroll, &backend.context)
+        .await
+        .expect("host enrolled");
+    let identity = HostIdentity {
+        host_id: host.host_id,
+        owner: host.owner,
+    };
+    let grant = |peer, mounts| ReplayGrant {
+        host: identity,
+        peer,
+        principal: RpcPrincipal::Sys {
+            uid: 1000,
+            gid: 1000,
+        },
+        mounts,
+        reads: true,
+        writes: false,
+    };
+    assert_eq!(
+        backend.recheck_replay(&grant(peer(4), Vec::new())).await,
+        Ok(())
+    );
+    let outside = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+    let moved = backend.recheck_replay(&grant(outside, Vec::new())).await;
+    assert_eq!(moved, Err(NfsStat4::Access));
+    // A deleted binding, or one whose key is gone, never releases its cached reply.
+    let deleted = backend
+        .recheck_replay(&grant(peer(4), vec![Ulid::from_parts(5, 5)]))
+        .await;
+    assert_eq!(deleted, Err(NfsStat4::Access));
+    let unknown = HostIdentity {
+        host_id: Ulid::from_parts(6, 6),
+        owner: owner(),
+    };
+    let mut lost = grant(peer(4), Vec::new());
+    lost.host = unknown;
+    assert_eq!(backend.recheck_replay(&lost).await, Err(NfsStat4::Access));
+}

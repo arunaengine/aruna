@@ -73,6 +73,7 @@ async fn make_node(realm_id: RealmId, seed: u8) -> RecoveryNode {
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let incoming = aruna::inbound::initialize_incoming_fixture(context.clone());
     RecoveryNode {

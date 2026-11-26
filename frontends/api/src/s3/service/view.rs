@@ -34,7 +34,10 @@ fn view_error(error: ViewError) -> s3s::S3Error {
     match error {
         ViewError::NotFound => s3_error!(NoSuchKey, "The specified key does not exist."),
         ViewError::Denied => s3_error!(AccessDenied, "The input read is denied"),
-        ViewError::Unavailable(_) => {
+        ViewError::Unavailable(_)
+        | ViewError::MissingVersion
+        | ViewError::Locked
+        | ViewError::KeyRequired => {
             s3_error!(ServiceUnavailable, "The input source is unavailable")
         }
     }

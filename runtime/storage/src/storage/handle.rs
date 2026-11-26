@@ -17,6 +17,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::{Handle, StoragePort};
 use aruna_core::node::vault::NodeVaultKey;
 use aruna_core::realm_vault::{RealmKeys, RealmVaultError};
+use aruna_core::structs::storage::vfs::HeadChangeObserver;
 use aruna_core::telemetry::record_stage;
 use async_trait::async_trait;
 use byteview::ByteView;
@@ -25,6 +26,7 @@ use tokio::sync::oneshot;
 use tracing::{Span, warn};
 use ulid::Ulid;
 
+use super::heads::HeadObservers;
 use super::hot_cache::{HotCache, Row, cached_slot};
 use super::metrics::{InFlightGuard, StorageMetrics, StorageMetricsSnapshot};
 use super::owner::TransactionOwner;
@@ -106,6 +108,8 @@ pub struct StorageHandle {
     pub(super) policies: Arc<PolicyPrograms>,
     /// Point reads of read-mostly keyspaces; only a handle with its own worker keeps one.
     pub(super) cache: Option<Arc<HotCache>>,
+    /// The observer the store tells about each committed head change.
+    pub(super) heads: HeadObservers,
     /// The in-memory store that answers effects in place of the worker, in tests.
     #[cfg(any(test, feature = "test-hooks"))]
     pub(super) memory: Option<Arc<super::memory::MemoryStore>>,
@@ -181,6 +185,7 @@ impl StorageHandle {
                 range_indexes: Arc::new(OnceLock::new()),
                 policies: Arc::new(PolicyPrograms::default()),
                 cache: None,
+                heads: HeadObservers::default(),
                 #[cfg(any(test, feature = "test-hooks"))]
                 memory: None,
             },
@@ -198,6 +203,12 @@ impl StorageHandle {
     pub fn install_metadata_indexes(&self, path: impl AsRef<std::path::Path>) {
         let root = path.as_ref().join(crate::key_index::RANGE_INDEX_DIR);
         self.install_range_indexes(RangeIndexes::new(root));
+    }
+
+    /// Tells `observer` about each committed head change of this store from now on, also after
+    /// an unknown commit outcome. Set once at startup; false when an observer is set already.
+    pub fn install_head_observer(&self, observer: Arc<dyn HeadChangeObserver>) -> bool {
+        self.heads.install(observer)
     }
 
     /// The range key indexes; `None` on a node that keeps none.

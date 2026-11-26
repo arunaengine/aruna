@@ -118,6 +118,7 @@ async fn caps_declared_outputs() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     let mut spec = ExecutionSpec {
         group_id: Ulid::from_bytes([3u8; 16]),
@@ -310,6 +311,7 @@ async fn dedup_lookup_matches() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
     let payload = JobPayload::Probe {
@@ -354,6 +356,7 @@ async fn tombstone_preserves_gone() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
     let job_id = JobId::from_bytes([3u8; 16]);
@@ -394,6 +397,7 @@ async fn report_expiry_hides() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     let realm_id = RealmId([1u8; 32]);
     let owner = UserId::new(Ulid::from_bytes([2u8; 16]), realm_id);
@@ -461,6 +465,7 @@ async fn internal_access_hidden() {
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
     for (job_id, payload) in [

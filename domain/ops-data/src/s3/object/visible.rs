@@ -9,10 +9,15 @@ use std::collections::VecDeque;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::cursor;
+use aruna_core::keyspaces::BLOB_HEAD_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::blob::{BlobHeadKey, CurrentVersionPointer};
 use aruna_core::structs::storage::link::LinkTarget;
+use aruna_core::structs::storage::vfs::{VfsWatchKey, decode_token};
+use aruna_core::types::{Key, Value};
 use serde::{Deserialize, Serialize};
+use ulid::Ulid;
 
 use crate::s3::object::link::{LinkCaller, LinkError, LinkNode, TargetVisibleOperation};
 use crate::s3::object::list::{
@@ -56,6 +61,9 @@ pub struct VisiblePage<O = ListedObject> {
     pub objects: Vec<O>,
     pub prefixes: Vec<String>,
     pub next: Option<NextPage>,
+    /// The snapshot witness changed around a listing read: the page is empty and the caller
+    /// discards the slice, then retries from its current binding.
+    pub stale: bool,
 }
 
 impl<O> Default for VisiblePage<O> {
@@ -64,6 +72,65 @@ impl<O> Default for VisiblePage<O> {
             objects: Vec::new(),
             prefixes: Vec::new(),
             next: None,
+            stale: false,
+        }
+    }
+}
+
+/// What must still hold around every listing read, so a file server slice of a directory
+/// whose proof changed is discarded instead of shown.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SnapshotWitness {
+    /// The head of `key` holds the live object `life_id`.
+    Head { key: String, life_id: Ulid },
+    /// The head of `key` is still the absent or marker predecessor an unpublished name was
+    /// created over, and its watch key still holds `watch_token` when one is given.
+    StagedPredecessor {
+        key: String,
+        expected_predecessor: Option<Ulid>,
+        watch_token: Option<Ulid>,
+    },
+}
+
+impl SnapshotWitness {
+    /// The head row, then the watch key when a token is checked.
+    fn reads(&self, bucket: &str) -> Option<Vec<(String, Key)>> {
+        let space = || BLOB_HEAD_KEYSPACE.to_string();
+        let (key, token) = match self {
+            Self::Head { key, .. } => (key, None),
+            Self::StagedPredecessor {
+                key, watch_token, ..
+            } => (key, *watch_token),
+        };
+        let head = BlobHeadKey::new(bucket, key.as_str()).to_bytes().ok()?;
+        let mut reads = vec![(space(), Key::from(head))];
+        if token.is_some() {
+            let watch = VfsWatchKey::new(bucket, key.as_str()).to_bytes().ok()?;
+            reads.push((space(), Key::from(watch)));
+        }
+        Some(reads)
+    }
+
+    /// Whether the rows `reads` asked for still prove the witness; an unreadable row does not.
+    fn holds(&self, values: &[Option<Value>]) -> bool {
+        let head = values.first().and_then(Option::as_ref);
+        let head = head.map(|value| CurrentVersionPointer::from_bytes(value.as_ref()));
+        let Some(head) = head.transpose().ok() else {
+            return false;
+        };
+        match self {
+            Self::Head { life_id, .. } => head.and_then(|head| head.life_id) == Some(*life_id),
+            Self::StagedPredecessor {
+                expected_predecessor,
+                watch_token,
+                ..
+            } => {
+                let token = values.get(1).and_then(Option::as_ref);
+                let token = token.and_then(|value| decode_token(value.as_ref()).ok());
+                head.as_ref().map(|head| head.version_id) == *expected_predecessor
+                    && head.is_none_or(|head| head.life_id.is_none())
+                    && watch_token.is_none_or(|watch| token == Some(watch))
+            }
         }
     }
 }
@@ -273,6 +340,8 @@ enum VisibleStep<O> {
     Object(O, EntryPlace),
     ProbePage,
     ProbeObject,
+    /// The witness read before the first listing, or after a page it holds until then.
+    Witness(Option<(Listed<O>, bool)>),
 }
 
 /// One page of the entries a rule admits, from the input's position or a hidden one. A common
@@ -295,6 +364,10 @@ pub struct VisiblePageOperation<S: ListSource, R> {
     more: Option<ListContinuationToken>,
     probe: Option<Probe<S::Object>>,
     step: VisibleStep<S::Object>,
+    /// The caller's deadline in Unix milliseconds, compared with the runner's stamped time.
+    deadline_ms: Option<u64>,
+    now_ms: u64,
+    witness: Option<SnapshotWitness>,
 }
 
 type VisibleTurn<S, R> = Result<
@@ -329,7 +402,69 @@ where
             more: None,
             probe: None,
             step: VisibleStep::Page,
+            deadline_ms: None,
+            now_ms: 0,
+            witness: None,
         }
+    }
+
+    /// Ends the page at a resumable cursor once the runner's time reaches `deadline_ms`.
+    pub fn with_deadline(mut self, deadline_ms: Option<u64>) -> Self {
+        self.deadline_ms = deadline_ms;
+        self
+    }
+
+    /// Checks `witness` before the first listing read and after each one.
+    pub fn with_witness(mut self, witness: SnapshotWitness) -> Self {
+        self.witness = Some(witness);
+        self
+    }
+
+    /// The scan budget is spent or the deadline passed, so the page ends at a cursor.
+    fn exhausted(&self) -> bool {
+        let late = (self.deadline_ms).is_some_and(|deadline| self.now_ms >= deadline);
+        self.budget == 0 || late
+    }
+
+    /// Reads the witness and holds `listed` until it answers; `None` without a witness.
+    fn check_witness(&mut self, listed: Option<(Listed<S::Object>, bool)>) -> VisibleTurn<S, R> {
+        let reads = self
+            .witness
+            .as_ref()
+            .map(|witness| witness.reads(&self.bucket));
+        match (reads, listed) {
+            (None, None) => self.begin(),
+            (None, Some((list, false))) => self.page_read(list),
+            (None, Some((list, true))) => self.probe_listed(list),
+            (Some(None), _) => self.stale(),
+            (Some(Some(reads)), listed) => {
+                self.step = VisibleStep::Witness(listed);
+                Ok(Next::Call(IoCall::Read(reads)))
+            }
+        }
+    }
+
+    fn witness_read(
+        &mut self,
+        values: Vec<Option<Value>>,
+        listed: Option<(Listed<S::Object>, bool)>,
+    ) -> VisibleTurn<S, R> {
+        let holds = (self.witness.as_ref()).is_some_and(|witness| witness.holds(&values));
+        match (holds, listed) {
+            (false, _) => self.stale(),
+            (true, None) => self.begin(),
+            (true, Some((list, false))) => self.page_read(list),
+            (true, Some((list, true))) => self.probe_listed(list),
+        }
+    }
+
+    /// Discards everything found so far: the slice is reported stale.
+    fn stale(&mut self) -> VisibleTurn<S, R> {
+        self.page = VisiblePage {
+            stale: true,
+            ..VisiblePage::default()
+        };
+        self.done()
     }
 
     fn done(&mut self) -> VisibleTurn<S, R> {
@@ -357,6 +492,10 @@ where
     }
 
     fn start(&mut self) -> VisibleTurn<S, R> {
+        self.check_witness(None)
+    }
+
+    fn begin(&mut self) -> VisibleTurn<S, R> {
         let Some(hidden) = self.hidden.take() else {
             return self.list_page();
         };
@@ -379,6 +518,10 @@ where
     }
 
     fn page_read(&mut self, list: Listed<S::Object>) -> VisibleTurn<S, R> {
+        // A page of only tombstones costs one, so a long run of them still ends the request.
+        if list.objects.is_empty() && list.prefixes.is_empty() {
+            self.budget = self.budget.saturating_sub(1);
+        }
         self.more = list.next;
         let mut entries: Vec<_> = (list.objects.into_iter().map(Entry::Object))
             .chain(list.prefixes.into_iter().map(Entry::Group))
@@ -402,6 +545,13 @@ where
                 return match (self.more.take(), self.after_last()) {
                     (None, _) => self.done(),
                     (Some(_), Some(next)) => self.end_at(next),
+                    (Some(token), None) if self.exhausted() => {
+                        let position = Some(token);
+                        self.seal_end(&HiddenCursor {
+                            position,
+                            pending: None,
+                        })
+                    }
                     (Some(token), None) => {
                         self.input.continuation_token = Some(token);
                         self.input.start_after = None;
@@ -475,7 +625,7 @@ where
         }
         let rest = !self.entries.is_empty() || self.more.is_some();
         let full = self.page.objects.len() + self.page.prefixes.len() >= self.max;
-        if (full || self.budget == 0) && rest {
+        if (full || self.exhausted()) && rest {
             let Some(next) = self.after_last() else {
                 let hidden = HiddenCursor {
                     position: Some(position),
@@ -530,6 +680,10 @@ where
                 let Some(token) = probe.next.take() else {
                     return self.probe_end(ProbeEnd::Empty);
                 };
+                if self.exhausted() {
+                    return self.probe_end(ProbeEnd::Stopped(token.last_key));
+                }
+                let probe = self.probe.as_mut().ok_or(IoError::Unfinished)?;
                 probe.input.continuation_token = Some(token);
                 probe.input.max_keys = None;
                 let call = self.source.call(&probe.input);
@@ -557,8 +711,19 @@ where
             return Some(ProbeEnd::Shown);
         }
         self.budget = self.budget.saturating_sub(1);
-        (self.budget == 0)
+        (self.exhausted())
             .then(|| ProbeEnd::Stopped(after_entry(&self.bucket, S::key(object), false).last_key))
+    }
+
+    /// A probe page of only tombstones costs one, like an empty listing page.
+    fn probe_listed(&mut self, list: Listed<S::Object>) -> VisibleTurn<S, R> {
+        if list.objects.is_empty() {
+            self.budget = self.budget.saturating_sub(1);
+        }
+        let probe = self.probe.as_mut().ok_or(IoError::Unfinished)?;
+        probe.objects = list.objects.into();
+        probe.next = list.next;
+        self.probe_next()
     }
 
     fn probe_decided(&mut self, object: S::Object, shown: bool) -> VisibleTurn<S, R> {
@@ -597,7 +762,8 @@ where
                     self.page.prefixes.push(group);
                     self.entry_done(place, true, 0)
                 }
-                ProbeEnd::Empty => self.entry_done(place, false, 0),
+                // A prefix with no shown entry costs one, like any hidden entry.
+                ProbeEnd::Empty => self.entry_done(place, false, 1),
                 ProbeEnd::Stopped(at) => match self.after_last() {
                     Some(next) => self.end_at(next),
                     None => {
@@ -653,7 +819,7 @@ where
             },
             VisibleStep::Page => {
                 let list = self.source.take(result)?;
-                self.page_read(list)
+                self.check_witness(Some((list, false)))
             }
             VisibleStep::Object(object, place) => {
                 let shown = self.rule.answered(result)?;
@@ -661,10 +827,7 @@ where
             }
             VisibleStep::ProbePage => {
                 let list = self.source.take(result)?;
-                let probe = self.probe.as_mut().ok_or(IoError::Unfinished)?;
-                probe.objects = list.objects.into();
-                probe.next = list.next;
-                self.probe_next()
+                self.check_witness(Some((list, true)))
             }
             VisibleStep::ProbeObject => {
                 let shown = self.rule.answered(result)?;
@@ -673,7 +836,12 @@ where
                 let object = probe.current.take().ok_or(IoError::Unfinished)?;
                 self.probe_decided(object, shown)
             }
+            VisibleStep::Witness(listed) => self.witness_read(result.values()?, listed),
         }
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
     }
 }
 
@@ -880,6 +1048,140 @@ mod tests {
     fn zero_limit_empty() {
         let mut list = VisiblePageOperation::new(Pages, Keys, input(0), None);
         assert_eq!(list.first(), Ok(Next::Done(VisiblePage::default())));
+    }
+
+    #[test]
+    fn tombstone_pages_charged() {
+        // Pages of only delete markers spend the budget, so a long run of them seals a cursor.
+        let mut list = VisiblePageOperation::new(Pages, Keys, input(5), None);
+        list.budget = 2;
+        list.first().unwrap();
+        assert_eq!(
+            list.next(page(&[], &[], true)),
+            Ok(Next::Call(IoCall::Sync))
+        );
+        let hidden = HiddenCursor {
+            position: Some(after_entry("b", "more", false)),
+            pending: None,
+        };
+        assert_eq!(list.next(page(&[], &[], true)), sealing(&hidden));
+        assert!(sealed_end(&mut list).objects.is_empty());
+    }
+
+    #[test]
+    fn probe_tombstones_charged() {
+        // An empty probe page costs one, and a spent budget keeps the probe's place.
+        let mut list = VisiblePageOperation::new(Pages, Keys, input(5), None);
+        list.budget = 2;
+        list.first().unwrap();
+        list.next(page(&[], &["open/"], false)).unwrap();
+        assert_eq!(
+            list.next(page(&[], &[], true)),
+            Ok(Next::Call(IoCall::Sync))
+        );
+        let at = after_entry("b", "more", false).last_key;
+        let hidden = HiddenCursor {
+            position: None,
+            pending: Some(("open/".to_string(), Some(at))),
+        };
+        assert_eq!(list.next(page(&[], &[], true)), sealing(&hidden));
+    }
+
+    #[test]
+    fn empty_prefix_costs() {
+        // A prefix whose probe found nothing shown costs like a hidden entry.
+        let mut list = VisiblePageOperation::new(Pages, Keys, input(5), None);
+        list.budget = 2;
+        list.first().unwrap();
+        list.next(page(&[], &["open/", "shown/"], false)).unwrap();
+        let hidden = HiddenCursor {
+            position: Some(after_entry("b", "open/", true)),
+            pending: None,
+        };
+        assert_eq!(list.next(page(&[], &[], false)), sealing(&hidden));
+    }
+
+    #[test]
+    fn deadline_seals_cursor() {
+        // A passed deadline ends the page at a resumable cursor, never at a false end.
+        let list = VisiblePageOperation::new(Pages, Keys, input(5), None);
+        let mut list = list.with_deadline(Some(10));
+        list.stamp(5);
+        list.first().unwrap();
+        list.stamp(10);
+        let hidden = HiddenCursor {
+            position: Some(after_entry("b", "a", false)),
+            pending: None,
+        };
+        assert_eq!(list.next(page(&["a", "b"], &[], false)), sealing(&hidden));
+        let found = sealed_end(&mut list);
+        assert!(!found.stale);
+        // Shown entries end the page after the last of them instead.
+        let list = VisiblePageOperation::new(Pages, Keys, input(5), None);
+        let mut list = list.with_deadline(Some(10));
+        list.stamp(11);
+        list.first().unwrap();
+        let Ok(Next::Done(found)) = list.next(page(&["shown/a", "z"], &[], false)) else {
+            panic!("the page ends after its shown entry");
+        };
+        let expected = after_entry("b", "shown/a", false);
+        assert_eq!(found.next, Some(NextPage::After(expected)));
+    }
+
+    fn head_row(life_id: Option<Ulid>, version: u8) -> Option<Value> {
+        let head = CurrentVersionPointer::new(Ulid::from_bytes([version; 16])).with_life(life_id);
+        Some(head.to_bytes().unwrap().into())
+    }
+
+    #[test]
+    fn witness_guards_slices() {
+        // The witness is read before the first page and after each one; a change discards it.
+        let life = Ulid::from_bytes([3; 16]);
+        let witness = SnapshotWitness::Head {
+            key: "d/".to_string(),
+            life_id: life,
+        };
+        let list = VisiblePageOperation::new(Pages, Keys, input(5), None);
+        let mut list = list.with_witness(witness);
+        let head = BlobHeadKey::new("b", "d/").to_bytes().unwrap();
+        let read = IoCall::Read(vec![(BLOB_HEAD_KEYSPACE.to_string(), head.into())]);
+        assert_eq!(list.first(), Ok(Next::Call(read)));
+        let held = IoResult::Values(vec![head_row(Some(life), 1)]);
+        assert_eq!(list.next(held), Ok(Next::Call(IoCall::Sync)));
+        let turn = list.next(page(&["shown/a"], &[], false));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
+        let moved = IoResult::Values(vec![head_row(Some(Ulid::from_bytes([4; 16])), 1)]);
+        let Ok(Next::Done(found)) = list.next(moved) else {
+            panic!("a changed witness ends the slice");
+        };
+        assert!(found.stale);
+        assert!(found.objects.is_empty());
+    }
+
+    #[test]
+    fn staged_witness_holds() {
+        // An unpublished name holds while its predecessor is unchanged and its token is current.
+        let token = Ulid::from_bytes([5; 16]);
+        let marker = Ulid::from_bytes([1; 16]);
+        let witness = SnapshotWitness::StagedPredecessor {
+            key: "d/a".to_string(),
+            expected_predecessor: Some(marker),
+            watch_token: Some(token),
+        };
+        assert_eq!(witness.reads("b").map(|reads| reads.len()), Some(2));
+        let watch = |token: Ulid| Some(Value::from(token.to_bytes().to_vec()));
+        assert!(witness.holds(&[head_row(None, 1), watch(token)]));
+        assert!(!witness.holds(&[head_row(None, 1), watch(marker)]));
+        assert!(!witness.holds(&[head_row(None, 1), None]));
+        assert!(!witness.holds(&[head_row(Some(token), 1), watch(token)]));
+        assert!(!witness.holds(&[head_row(None, 2), watch(token)]));
+        let absent = SnapshotWitness::StagedPredecessor {
+            key: "d/a".to_string(),
+            expected_predecessor: None,
+            watch_token: None,
+        };
+        assert!(absent.holds(&[None]));
+        assert!(!absent.holds(&[head_row(None, 1)]));
     }
 
     #[test]

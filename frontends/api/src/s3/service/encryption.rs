@@ -153,6 +153,10 @@ fn enable_error(error: EnableError) -> S3Error {
             OperationAborted,
             "The bucket's stored copies are still moving to a new encryption; retry later"
         ),
+        EnableError::PlainStages => s3_error!(
+            OperationAborted,
+            "Publish or delete the bucket's plaintext file server stages before enabling encryption"
+        ),
         EnableError::RecoveryUnmet => s3_error!(
             InvalidRequest,
             "The bucket key holders do not meet the recovery rule"
@@ -222,6 +226,13 @@ mod tests {
     fn running_transition_aborts() {
         let error = enable_error(EnableError::TransitionRunning);
         assert_eq!(error.code(), &S3ErrorCode::OperationAborted);
+    }
+
+    #[test]
+    fn plain_stages_abort() {
+        let error = enable_error(EnableError::PlainStages);
+        assert_eq!(error.code(), &S3ErrorCode::OperationAborted);
+        assert_eq!(error.status_code(), Some(http::StatusCode::CONFLICT));
     }
 
     #[test]

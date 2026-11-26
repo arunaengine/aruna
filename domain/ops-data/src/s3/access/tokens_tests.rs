@@ -180,6 +180,7 @@ async fn fixture() -> Fixture {
         task_handle: Some(aruna_scheduler::TaskHandle::new()),
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     let realm_id = RealmId::from_bytes([7u8; 32]);
     let node_id = iroh::SecretKey::from_bytes(&[5u8; 32]).public();

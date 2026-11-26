@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use aruna_core::calls::IoError;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::id::NodeId;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
     DISTRIBUTION_FENCE_KEYSPACE, DISTRIBUTION_KEYSPACE, PURGE_FENCE_KEYSPACE, S3_BUCKET_KEYSPACE,
@@ -345,7 +346,8 @@ pub(super) fn page_rows(
     items: &[PageItem],
     plans: &[Plan],
     (guards, previous): (&PageGuards, Vec<Option<BlobVersion>>),
-    (realm_id, local, now_ms): (RealmId, NodeId, u64),
+    (realm_id, local): (RealmId, NodeId),
+    (ids, now_ms): (&mut IdMint, u64),
 ) -> Result<PageRows, PageError> {
     let mut previous = previous.into_iter();
     let mut rows = PageRows {
@@ -360,7 +362,8 @@ pub(super) fn page_rows(
     };
     let (mut applied, mut single) = (0u32, Vec::new());
     let mut roots = BTreeMap::new();
-    for ((manifest, item), plan) in page.manifests.iter().zip(items).zip(plans) {
+    let records = page.manifests.iter().zip(items).zip(plans);
+    for (((manifest, item), plan), stored) in records.zip(&guards.heads) {
         let (install, replaced) = match plan {
             Plan::Single => {
                 single.push(manifest.version_id);
@@ -403,11 +406,20 @@ pub(super) fn page_rows(
         if let Some(root) = &item.root {
             roots.insert(root.digest()?, root.clone());
         }
+        let was_live = replaced.as_ref().is_some_and(|v| !v.is_deleted());
         if install {
             let head = BlobHeadKey::new(&page.bucket, key).to_bytes()?;
-            let pointer = head_pointer(manifest, item).to_bytes()?;
-            rows.writes
-                .push((BLOB_HEAD_KEYSPACE.to_string(), head.into(), pointer.into()));
+            // A reference is live: it keeps the life of a live head, or starts a local one.
+            let kept = stored.as_ref().and_then(|pointer| pointer.life_id);
+            let life_id = kept
+                .filter(|_| was_live)
+                .unwrap_or_else(|| ids.mint(now_ms));
+            let pointer = head_pointer(manifest, item).with_life(Some(life_id));
+            rows.writes.push((
+                BLOB_HEAD_KEYSPACE.to_string(),
+                head.into(),
+                pointer.to_bytes()?.into(),
+            ));
         }
         // A member keeps the receipt of a pulled version, so a later coordinator answers replays.
         if let Some(receipt) = tagged_receipt((&page.bucket, key), &manifest.metadata, false) {
@@ -419,7 +431,6 @@ pub(super) fn page_rows(
         let released = replaced
             .as_ref()
             .and_then(|version| version.offered_size(&page.bucket, key));
-        let was_live = replaced.as_ref().is_some_and(|v| !v.is_deleted());
         rows.delta.objects += i128::from(install) - i128::from(install && was_live);
         rows.delta.referenced_bytes += i128::from(size) - i128::from(released.unwrap_or(0));
         let added = AddedVersion {

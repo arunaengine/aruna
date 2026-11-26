@@ -24,6 +24,7 @@ async fn paused_runtime_waits() {
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let job_id = job_id();
     let record = JobRecord::new(
@@ -106,6 +107,7 @@ async fn start_keeps_job() {
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let job_id = job_id();
     let record = JobRecord::new(

@@ -1196,6 +1196,7 @@ async fn initialize_context(
         task_handle: Some(task_handle.clone()),
         compute_handle: compute,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let incoming = initialize_incoming_fixture(context.clone());
     let shutdown = aruna_scheduler::shutdown::Shutdown::new();

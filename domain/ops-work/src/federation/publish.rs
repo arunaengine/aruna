@@ -480,6 +480,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         let config = config(RegistrationMode::Enabled, true);
         let target = DocumentTarget::RealmConfig {
@@ -539,6 +540,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         let mut sent = 0;
         for _ in 0..runs {

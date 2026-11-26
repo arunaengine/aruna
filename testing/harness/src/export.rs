@@ -110,6 +110,7 @@ pub async fn export_node(realm_id: RealmId, metadata: bool) -> BaoNode {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     BaoNode {
         _tempdir: tempdir,

@@ -1294,6 +1294,7 @@ mod tests {
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         });
         let realm_id = RealmId([8u8; 32]);
         let group_id = Ulid::from_bytes([9u8; 16]);
@@ -1470,6 +1471,7 @@ mod tests {
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         let realm_id = RealmId([9u8; 32]);
         let group_id = Ulid::from_bytes([3u8; 16]);

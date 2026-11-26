@@ -153,6 +153,8 @@ impl FjallStorage {
             usage_views: HashSet::new(),
             txn_rows: HashMap::new(),
             cache: CacheWriter::new(handle.cache.clone()),
+            txn_heads: HashMap::new(),
+            heads: handle.heads.clone(),
         }
     }
 }

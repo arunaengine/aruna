@@ -228,6 +228,8 @@ pub struct SuccessorMint {
     plan: SuccessorPlan,
     state: MintState,
     predecessor: Option<BlobVersion>,
+    /// The local life of the stored head; the planned expected head never carries one.
+    head_life: Option<Ulid>,
     effective_refs: Vec<PlacementPolicyRef>,
     outcome: Option<SuccessorOutcome>,
     /// Owner read from the bucket record inside this transaction.
@@ -251,6 +253,7 @@ impl SuccessorMint {
             ids: IdMint::default(),
             state: MintState::ReadMutation,
             predecessor: None,
+            head_life: None,
             effective_refs: Vec::new(),
             outcome: None,
             group_id: None,
@@ -357,6 +360,7 @@ impl SuccessorMint {
                 current: Some(current),
             });
         }
+        self.head_life = current.life_id;
         self.state = MintState::ReadBucket;
         // The destination bucket and the local subject, so the commit re-checks both.
         let bucket = self.plan.context.bucket.as_bytes();
@@ -562,7 +566,15 @@ impl SuccessorMint {
             self.plan.auth_context.user_id,
         )
         .with_policies(self.effective_refs.clone())?;
-        let next = CurrentVersionPointer::next_for(Some(&self.plan.expected_head), version_id)?;
+        // The successor continues the stored head's life, or stays a marker after one.
+        let head = self.plan.expected_head.clone().with_life(self.head_life);
+        let next = match predecessor.is_deleted() {
+            true => CurrentVersionPointer::next_deleted(Some(&head), version_id)?,
+            false => {
+                let life_id = self.ids.mint(self.now_ms);
+                CurrentVersionPointer::next_live_inherit(Some(&head), version_id, life_id)?
+            }
+        };
         let next = stamp_head(next, self.binding.as_ref(), self.epoch);
         let successor = stamp_version(
             successor,

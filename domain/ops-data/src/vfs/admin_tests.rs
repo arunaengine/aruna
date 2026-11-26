@@ -1,0 +1,257 @@
+//! Enrolled hosts, mount bindings and the retained stages a bucket admin recovers.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use super::VfsError;
+use super::admin::*;
+use super::handles_tests::{asked, context, granted, id, user};
+use crate::s3::bucket::key::test_rows::authority_rows;
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::vfs::{
+    EnrolledHostRecord, NfsMountBinding, NfsMountTarget, NfsStageRecord, StageBase,
+    StageDisposition, StageOwner, StageScope, VfsRecord,
+};
+use aruna_core::types::{Key, Value};
+use aruna_core::user::id::UserId;
+use aruna_core::vfs_effects::VfsEffect;
+
+fn stranger() -> UserId {
+    UserId::new(id(40), RealmId::from_bytes([1; 32]))
+}
+
+fn host(owner: UserId) -> EnrolledHostRecord {
+    EnrolledHostRecord {
+        host_id: id(30),
+        owner,
+        fingerprints: vec![[1; 32]],
+        allowed_networks: vec!["10.0.0.0/8".to_string()],
+        worker_pool: false,
+        created_at_ms: 1,
+        revoked_at_ms: None,
+    }
+}
+
+fn row<T: VfsRecord>(record: &T) -> Option<Value> {
+    Some(Value::from(record.to_bytes().unwrap()))
+}
+
+#[test]
+fn network_notation_checked() {
+    for good in ["10.0.0.0/8", "192.168.1.7/32", "fd00::/8", "::1/128"] {
+        assert!(valid_network(good), "{good}");
+    }
+    for bad in [
+        "10.0.0.0",
+        "10.0.0.0/33",
+        "fd00::/129",
+        "host/8",
+        "10.0.0.0/x",
+    ] {
+        assert!(!valid_network(bad), "{bad}");
+    }
+}
+
+#[test]
+fn enrollment_needs_possession() {
+    let input = |proven| EnrollInput {
+        owner: user(),
+        fingerprints: vec![[1; 32]],
+        proven,
+        allowed_networks: vec!["10.0.0.0/8".to_string()],
+        worker_pool: false,
+    };
+    let mut refused = EnrollHostOperation::new(input([2; 32]));
+    assert_eq!(refused.first(), Err(VfsError::Denied));
+    let mut operation = EnrollHostOperation::new(input([1; 32]));
+    operation.seed(7);
+    operation.stamp(5);
+    assert_eq!(operation.transaction(), TransactionMode::Write);
+    assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Read(_)))));
+    let turn = operation.next(IoResult::Values(vec![None]));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Write(_)))));
+    let Ok(Next::Done(enrolled)) = operation.next(IoResult::Done) else {
+        panic!("expected the enrolled host");
+    };
+    assert_eq!((enrolled.owner, enrolled.created_at_ms), (user(), 5));
+}
+
+#[test]
+fn host_owner_only() {
+    // Only the verified owner rotates or revokes a host, and revocation ends its grants.
+    let mut foreign = HostChangeOperation::new(id(30), stranger(), HostChange::Revoke);
+    foreign.first().unwrap();
+    let turn = foreign.next(IoResult::Values(vec![row(&host(user()))]));
+    assert_eq!(turn, Err(VfsError::Denied));
+
+    let mut operation = HostChangeOperation::new(id(30), user(), HostChange::Revoke);
+    operation.stamp(9);
+    operation.first().unwrap();
+    let turn = operation.next(IoResult::Values(vec![row(&host(user()))]));
+    let Ok(Next::Call(IoCall::Write(writes))) = turn else {
+        panic!("expected the host row");
+    };
+    let stored = EnrolledHostRecord::from_bytes(&writes[0].2).unwrap();
+    assert_eq!(stored.revoked_at_ms, Some(9));
+    let Ok(Next::Then { calls, .. }) = operation.next(IoResult::Done) else {
+        panic!("expected the revocation of live grants");
+    };
+    let revoke = VfsEffect::RevokeGrant {
+        host_id: Some(id(30)),
+        mount_id: None,
+        access_key: None,
+    };
+    assert_eq!(
+        asked(&Ok::<_, VfsError>(Next::<()>::Call(
+            calls.into_iter().next().unwrap()
+        ))),
+        revoke
+    );
+
+    // A rotation must prove one of its new keys.
+    let rotate = HostChange::Rotate {
+        fingerprints: vec![[3; 32]],
+        proven: [1; 32],
+    };
+    let mut unproven = HostChangeOperation::new(id(30), user(), rotate);
+    assert_eq!(unproven.first(), Err(VfsError::Denied));
+}
+
+fn binding(owner: UserId, mount: u8) -> NfsMountBinding {
+    NfsMountBinding {
+        mount_id: id(mount),
+        host_id: id(30),
+        owner,
+        access_key: "KEY1".to_string(),
+        group_id: id(3),
+        target: NfsMountTarget::for_folder("bucket", 7, "team").unwrap(),
+        read_only: false,
+        allowed_networks: Vec::new(),
+        display_uid: 1000,
+        display_gid: 1000,
+        mode: 0o750,
+        created_at_ms: 1,
+    }
+}
+
+#[test]
+fn mount_delete_revokes() {
+    let mut foreign = MountRowOperation::delete(id(50), stranger());
+    foreign.first().unwrap();
+    let turn = foreign.next(IoResult::Values(vec![row(&binding(user(), 50))]));
+    assert_eq!(turn, Err(VfsError::NotFound));
+
+    let mut operation = MountRowOperation::delete(id(50), user());
+    assert_eq!(operation.transaction(), TransactionMode::Write);
+    operation.first().unwrap();
+    let turn = operation.next(IoResult::Values(vec![row(&binding(user(), 50))]));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Delete(_)))));
+    let Ok(Next::Then { output, calls }) = operation.next(IoResult::Done) else {
+        panic!("expected the revocation of the mount's state");
+    };
+    assert_eq!(output.mount_id, id(50));
+    assert_eq!(calls.len(), 1);
+}
+
+#[test]
+fn listing_filters_owner() {
+    let key = |mount| Key::from([&[2u8][..], &id(mount).to_bytes()].concat());
+    let rows = vec![
+        (key(50), row(&binding(user(), 50)).unwrap()),
+        (key(51), row(&binding(stranger(), 51)).unwrap()),
+        (key(52), row(&binding(user(), 52)).unwrap()),
+    ];
+    let mut operation = ListMountsOperation::new(user(), None, None, 10);
+    operation.first().unwrap();
+    let Ok(Next::Done(page)) = operation.next(IoResult::Page { rows, next: None }) else {
+        panic!("expected one page");
+    };
+    let mounts: Vec<_> = page.items.iter().map(|mount| mount.mount_id).collect();
+    assert_eq!(mounts, vec![id(50), id(52)]);
+    assert_eq!(page.next, None);
+}
+
+fn retained(generation: u64) -> NfsStageRecord {
+    NfsStageRecord {
+        stage_id: id(12),
+        handle_id: 4,
+        owner: StageOwner {
+            user: user(),
+            access_key: "KEY1".to_string(),
+            mount_id: id(13),
+            scope: StageScope::User,
+        },
+        key: "p/a".to_string(),
+        generation,
+        checkpoint: "c".to_string(),
+        logical_size: 5,
+        base: StageBase::Unpublished {
+            token: id(6),
+            predecessor: None,
+        },
+        source_copies: Vec::new(),
+        source_policies: Vec::new(),
+        destination_copies: Vec::new(),
+        destination_policies: Vec::new(),
+        disposition: StageDisposition::Retained {
+            reason: aruna_core::structs::storage::vfs::DetachReason::LostLife,
+        },
+        quota_retry: None,
+        foreign_life: None,
+        updated_at_ms: 1,
+    }
+}
+
+fn admin() -> StageAdmin {
+    StageAdmin {
+        context: context(),
+        bucket: "bucket".to_string(),
+    }
+}
+
+/// Answers the admission and the authority rows naming `admins`.
+fn admitted(operation: &mut DeleteStageOperation, admins: &[UserId]) -> Result<Next<()>, VfsError> {
+    operation.first().unwrap();
+    operation.next(granted()).unwrap();
+    // The bucket's creator is someone else, so only the listed admins count.
+    let info = aruna_test_harness::s3::bucket_info(id(3), stranger());
+    let values = authority_rows(&info, None, admins);
+    operation.next(IoResult::Values(
+        values.into_iter().map(|(_, value)| value).collect(),
+    ))
+}
+
+#[test]
+fn stage_admin_fenced() {
+    // A caller outside the bucket admins is refused.
+    let mut outsider = DeleteStageOperation::new(admin(), id(12), 2);
+    assert_eq!(admitted(&mut outsider, &[]), Err(VfsError::Denied));
+    // The generation the admin saw is the explicit conflict fence.
+    let mut stale = DeleteStageOperation::new(admin(), id(12), 3);
+    assert!(matches!(
+        admitted(&mut stale, &[user()]),
+        Ok(Next::Call(IoCall::Read(_)))
+    ));
+    assert_eq!(
+        stale.next(IoResult::Values(vec![row(&retained(2))])),
+        Err(VfsError::Conflict)
+    );
+    let mut operation = DeleteStageOperation::new(admin(), id(12), 2);
+    admitted(&mut operation, &[user()]).unwrap();
+    let turn = operation.next(IoResult::Values(vec![row(&retained(2))]));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Delete(_)))));
+    let Ok(Next::Then { calls, .. }) = operation.next(IoResult::Done) else {
+        panic!("expected the file removal after the commit");
+    };
+    let remove = VfsEffect::RemoveCheckpoint {
+        stage_id: id(12),
+        generation: 2,
+    };
+    assert_eq!(
+        asked(&Ok::<_, VfsError>(Next::<()>::Call(
+            calls.into_iter().next().unwrap()
+        ))),
+        remove
+    );
+}

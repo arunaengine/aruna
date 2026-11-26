@@ -23,6 +23,7 @@ async fn resolves_empty_hash() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     let result = drive(ResolvePathsOperation::new([1u8; 32]), &context)
@@ -42,6 +43,7 @@ async fn resolves_existing_aliases() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     let hash = [8u8; 32];

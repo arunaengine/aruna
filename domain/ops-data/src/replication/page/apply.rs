@@ -82,8 +82,16 @@ impl PageApplyOperation {
     fn write_rows(&mut self, previous: Vec<Option<BlobVersion>>) -> Step {
         let guards = self.guards.as_ref().ok_or(PageError::NotFinished)?;
         let page = &self.input.page;
-        let here = (self.input.realm_id, self.input.local, self.now_ms);
-        let rows = page_rows(page, &self.items, &self.plans, (guards, previous), here)?;
+        let here = (self.input.realm_id, self.input.local);
+        let ids = (&mut self.ids, self.now_ms);
+        let rows = page_rows(
+            page,
+            &self.items,
+            &self.plans,
+            (guards, previous),
+            here,
+            ids,
+        )?;
         // Nothing to store: the page ends with its answer and the transaction writes nothing.
         if rows.written == 0 {
             return Ok(Next::Done(rows.answer));

@@ -227,15 +227,47 @@ impl IncomingVersionOperation {
         match head.transpose() {
             Ok(head) => {
                 self.object_delta = self.named_head_delta(head.as_ref());
-                self.write_version()
+                self.write_named_life(head)
             }
             Err(error) => self.fail(error.into()),
         }
     }
 
+    /// A replaced row the head still names flips liveness without a new head order, so only the
+    /// local life changes: a fresh one for a revived object, none for a marker.
+    pub(super) fn write_named_life(&mut self, head: Option<CurrentVersionPointer>) -> Turn {
+        let Some(head) = head.filter(|_| self.object_delta != 0) else {
+            return self.write_version();
+        };
+        let live = self.manifest.kind == ReplicationItemKind::Materialized;
+        let life_id = live.then(|| self.ids.mint(self.now_ms));
+        let row = BlobHeadKey::new(&self.manifest.bucket, &self.manifest.key)
+            .to_bytes()
+            .and_then(|key| Ok((key, head.with_life(life_id).to_bytes()?)));
+        match row {
+            Ok((key, value)) => {
+                let row = (BLOB_HEAD_KEYSPACE.to_string(), key.into(), value.into());
+                self.write(IncomingVersionState::ApplyHeadTransition, vec![row])
+            }
+            Err(error) => self.fail(error.into()),
+        }
+    }
+
+    /// Sets the local life of the pending head: a live successor of a live head keeps it, a
+    /// revived or new object gets a fresh one and a marker none. The sender's life never counts.
     pub(super) fn apply_liveness(&mut self, previous_live: bool) -> Turn {
         let next_live = self.manifest.kind == ReplicationItemKind::Materialized;
         self.object_delta = i128::from(u8::from(next_live)) - i128::from(u8::from(previous_live));
+        let kept = (self.existing_current_pointer.as_ref())
+            .and_then(|pointer| pointer.life_id)
+            .filter(|_| previous_live);
+        let life_id = match next_live {
+            true => Some(kept.unwrap_or_else(|| self.ids.mint(self.now_ms))),
+            false => None,
+        };
+        if let Some(pending) = self.pending_head.as_mut() {
+            pending.pointer.life_id = life_id;
+        }
         self.prepare_head_transition()
     }
 
@@ -303,6 +335,7 @@ impl IncomingVersionOperation {
         } else {
             self.pending_head = None;
             self.object_delta = self.named_head_delta(existing_pointer.as_ref());
+            return self.write_named_life(existing_pointer);
         }
         self.resume_head_transition()
     }

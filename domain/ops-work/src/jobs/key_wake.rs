@@ -350,6 +350,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         let storage = &context.storage_handle;
         let node = iroh::SecretKey::from_bytes(&[1; 32]).public();
@@ -395,6 +396,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         let node = iroh::SecretKey::from_bytes(&[1; 32]).public();
         let job_id = JobId::from_bytes([5; 16]);
@@ -471,6 +473,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         let node = iroh::SecretKey::from_bytes(&[1; 32]).public();
         let key = BucketKeyRef::new(Ulid::from_bytes([8; 16]), 1);

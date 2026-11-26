@@ -14,6 +14,7 @@ pub(crate) mod shard;
 mod storage;
 pub mod task;
 mod workflow;
+mod vfs;
 
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, GroupEvent, GroupResult, NetEvent, SubOperationEvent};
@@ -228,6 +229,9 @@ pub(crate) async fn dispatch_effect_until(
         Effect::Workflow(effect) => Event::Workflow(Box::new(
             Box::pin(workflow::dispatch_workflow(*effect, context)).await,
         )),
+        Effect::Vfs(effect) => Event::Vfs(Box::new(
+            Box::pin(vfs::dispatch_vfs(*effect, context)).await,
+        )),
     };
 
     trace!(
@@ -270,6 +274,7 @@ pub(crate) fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Git(_) => "git",
         Effect::Workflow(_) => "workflow",
         Effect::Plugin(_) => "plugin",
+        Effect::Vfs(_) => "vfs",
     }
 }
 

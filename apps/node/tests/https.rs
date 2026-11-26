@@ -504,6 +504,8 @@ fn shutdown_sequence(
         portal: None,
         session_s3: None,
         https: None,
+        smb: None,
+        nfs: None,
         monitoring: None,
         task_handle: aruna_scheduler::TaskHandle::new(),
         jobs_runtime: aruna_runner::jobs::runtime::JobsRuntime::new(),
@@ -539,6 +541,7 @@ async fn drained_stack(
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let secret = iroh::SecretKey::from_bytes(&[0x61; 32]);
     let stack = tls_s3(

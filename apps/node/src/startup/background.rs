@@ -342,6 +342,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         });
         let task_handle = TaskHandle::new();
         let jobs_runtime = JobsRuntime::new_paused();

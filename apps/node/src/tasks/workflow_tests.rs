@@ -1085,6 +1085,7 @@ async fn net_context(storage: StorageHandle) -> (Arc<DriverContext>, aruna_p2p::
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     (context, net)
 }
@@ -1972,6 +1973,7 @@ fn compute_context(storage: StorageHandle) -> Arc<DriverContext> {
         task_handle: Some(TaskHandle::new()),
         compute_handle: Some(Arc::new(registry)),
         outbound_handle: None,
+        vfs_handle: None,
     })
 }
 

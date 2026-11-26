@@ -846,6 +846,7 @@ async fn spawn_metadata_node(realm_id: RealmId) -> DistributedMetadataNode {
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let incoming = initialize_incoming_fixture(context.clone());
     let state = Arc::new(

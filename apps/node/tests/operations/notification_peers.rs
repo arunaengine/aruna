@@ -88,6 +88,7 @@ async fn spawn(realm_id: RealmId, secret: [u8; 32]) -> Node {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let incoming = initialize_incoming_fixture(context.clone());
     Node {

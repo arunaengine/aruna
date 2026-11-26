@@ -192,6 +192,7 @@ fn test_context() -> (tempfile::TempDir, DriverContext) {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     (directory, context)
 }
@@ -237,6 +238,7 @@ async fn net_context() -> (tempfile::TempDir, DriverContext) {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         },
     )
 }
@@ -380,6 +382,7 @@ async fn drive_commit_safe() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     let result = drive(MarkerAbortOperation { fail: false }, &context).await;
@@ -404,6 +407,7 @@ async fn drive_error_cleanup() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     let result = drive(MarkerAbortOperation { fail: true }, &context).await;
@@ -1018,6 +1022,7 @@ async fn deadline_runs_abort() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     let result = crate::driver::drive_until(
@@ -1058,6 +1063,7 @@ pub async fn test_driver() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     let operation = TestOperation::new();
@@ -1101,6 +1107,7 @@ async fn driver_preserves_fifo() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     assert!(drive(EffectOrderOperation, &context).await.is_err());
@@ -1181,6 +1188,7 @@ async fn driver_dispatches_staging() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     let observed = drive(StagingDispatchOperation, &context)
@@ -1230,6 +1238,7 @@ fn suboperation_depth_enforced() {
                     task_handle: None,
                     compute_handle: None,
                     outbound_handle: None,
+                    vfs_handle: None,
                 };
 
                 let event = drive(RecursiveSubOperation, &context)
@@ -1260,6 +1269,7 @@ async fn bulk_skips_foreground() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     }
     .bulk();
     let read = StorageEffect::Read {
@@ -1346,6 +1356,7 @@ fn bare_context() -> DriverContext {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     }
 }
 
@@ -2153,6 +2164,7 @@ async fn hang_limit_answers() {
         compute_handle: None,
         graph_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     let limits = HangLimits {
         storage: Some(Duration::from_secs(1)),

@@ -195,6 +195,7 @@ async fn drain_keeps_timer() {
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     }))
     .await;
 
@@ -244,6 +245,7 @@ async fn outbox_sync_retry() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
     let record = aruna_ops_identity::sync::outbox::record::new_identified_record(
@@ -294,6 +296,7 @@ async fn retained_outbox_timer() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
     let record = aruna_ops_identity::sync::outbox::record::new_identified_record(
@@ -387,6 +390,7 @@ async fn refused_cleanup_kept() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
 
@@ -465,6 +469,7 @@ async fn applied_retry_kept() {
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
 
@@ -504,6 +509,7 @@ async fn refused_rearm_kept() {
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
 
@@ -537,6 +543,7 @@ fn refusing_handler() -> (tempfile::TempDir, OperationsTaskHandler, TaskHandle) 
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
     (temp_dir, handler, task_handle)
@@ -588,6 +595,7 @@ async fn renewal_keeps_prompt() {
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
     let key = TaskKey::PublishRegistration;
@@ -622,6 +630,7 @@ async fn stopped_prompt_restored() {
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
     let key = TaskKey::PublishRegistration;
@@ -677,6 +686,7 @@ async fn timer_change_waits() {
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
     let key = TaskKey::RefreshBlobHolders;
@@ -734,6 +744,7 @@ async fn drain_reconcile_wakes() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
 
@@ -846,6 +857,7 @@ async fn drain_reconcile_summary() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
 
@@ -939,6 +951,7 @@ async fn drain_reconcile_config() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
 
@@ -1019,6 +1032,7 @@ async fn placement_storage_rearms() {
         task_handle: Some(task_handle),
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
 
     let before_ms = unix_timestamp_millis();

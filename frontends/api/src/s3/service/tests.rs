@@ -97,6 +97,7 @@ fn parser_service(realm_id: RealmId, node_id: NodeId) -> (TempDir, ArunaS3Servic
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     (
         storage_dir,
@@ -414,6 +415,7 @@ async fn put_survives_queue() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let realm_id = RealmId([40u8; 32]);
     let node_id = iroh::SecretKey::from_bytes(&[4u8; 32]).public();
@@ -530,6 +532,7 @@ async fn build_watch_context(
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     (storage_dir, context, net)
 }
@@ -771,6 +774,7 @@ async fn refresh_failure_hidden() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let refresh = ReferenceRefresh {
         bucket: "bucket".to_string(),
@@ -883,6 +887,7 @@ fn setup_state() -> TestState {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let realm_id = aruna_core::structs::identity::realm::RealmId([9u8; 32]);
 
@@ -2451,6 +2456,7 @@ async fn setup_copy_authorization(
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let realm_id = RealmId([36u8; 32]);
     let node_id = NodeId::from_bytes(&[0u8; 32]).unwrap();
@@ -2638,6 +2644,7 @@ async fn source_policy_denied() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let realm_id = RealmId([37u8; 32]);
     let node_id = NodeId::from_bytes(&[0u8; 32]).unwrap();
@@ -2733,6 +2740,7 @@ async fn delete_uses_context() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let realm_id = RealmId([38u8; 32]);
     let node_id = NodeId::from_bytes(&[0u8; 32]).unwrap();
@@ -2907,6 +2915,7 @@ async fn delimiter_groups_results() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let realm_id = RealmId([2u8; 32]);
     let group_id = Ulid::generate();
@@ -2985,6 +2994,7 @@ async fn delimiter_paginates() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let realm_id = RealmId([3u8; 32]);
     let group_id = Ulid::generate();
@@ -3138,6 +3148,7 @@ async fn prefix_page_complete() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let realm_id = RealmId([33u8; 32]);
     let group_id = Ulid::generate();
@@ -3204,6 +3215,7 @@ async fn listing_counts_entries() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let realm_id = RealmId([34u8; 32]);
     let group_id = Ulid::generate();
@@ -3325,6 +3337,7 @@ async fn large_group_collapses() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let realm_id = RealmId([4u8; 32]);
     let group_id = Ulid::generate();
@@ -3409,6 +3422,7 @@ async fn reference_returns_metadata() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let realm_id = RealmId([5u8; 32]);
     let group_id = Ulid::generate();
@@ -3592,6 +3606,7 @@ async fn zero_max_honored() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let realm_id = RealmId([6u8; 32]);
     let group_id = Ulid::generate();
@@ -3657,6 +3672,7 @@ async fn start_after_prefixes() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let realm_id = RealmId([7u8; 32]);
     let group_id = Ulid::generate();
@@ -3732,6 +3748,7 @@ async fn listing_requires_access() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let realm_id = RealmId([8u8; 32]);
     let service =
@@ -3769,6 +3786,7 @@ async fn max_keys_validated() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let realm_id = RealmId([35u8; 32]);
     let group_id = Ulid::generate();
@@ -3830,6 +3848,7 @@ async fn listing_applies_encoding() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let realm_id = RealmId([36u8; 32]);
     let group_id = Ulid::generate();
@@ -3905,6 +3924,7 @@ async fn fetch_owner_group() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let realm_id = RealmId([37u8; 32]);
     let group_id = Ulid::generate();

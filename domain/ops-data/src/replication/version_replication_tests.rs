@@ -165,6 +165,7 @@ async fn source_auth(input: &ReplicateScopeInput, allow: bool) -> (TempDir, Sour
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     let realm_id = input.auth_context.realm_id;
     let group_id = Ulid::from_bytes([3u8; 16]);

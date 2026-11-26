@@ -529,6 +529,7 @@ mod tests {
                 task_handle: None,
                 compute_handle: Some(Arc::new(registry)),
                 outbound_handle: None,
+                vfs_handle: None,
             }),
             job_id: JobId::from_bytes([0xCB; 16]),
             owner_node_id: iroh::SecretKey::from_bytes(&[0xCD; 32]).public(),

@@ -741,6 +741,7 @@ mod test {
             task_handle: Some(task_handle),
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
 
         let realm_id = aruna_core::structs::identity::realm::RealmId([0u8; 32]);
@@ -820,6 +821,7 @@ mod test {
             task_handle: Some(task_handle),
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
 
         let realm_id = aruna_core::structs::identity::realm::RealmId([0u8; 32]);

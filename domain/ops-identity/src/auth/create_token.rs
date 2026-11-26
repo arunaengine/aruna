@@ -208,6 +208,7 @@ mod test {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
 
         let signing_key: SigningKey = generate_signing_key();

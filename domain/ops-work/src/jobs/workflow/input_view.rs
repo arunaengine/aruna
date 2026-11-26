@@ -9,7 +9,7 @@ use std::ops::Range;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::CACHE_MANIFEST_KEY;
 use aruna_core::cursor;
-use aruna_core::errors::StagingSourceError;
+use aruna_core::errors::{ConversionError, StagingSourceError};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE;
 use aruna_core::native_reference::GrantedBody;
@@ -22,7 +22,8 @@ use aruna_core::structs::execution::job::input::{
 use aruna_core::structs::execution::job::local::{JobRecord, credential_job_id};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::encryption::BucketEncryption;
+use aruna_core::structs::storage::abe::AbeError;
+use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyError};
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::types::{GroupId, Key};
 use thiserror::Error;
@@ -50,6 +51,12 @@ pub enum ViewError {
     Denied,
     #[error("the input view is unavailable: {0}")]
     Unavailable(String),
+    #[error("the captured input version no longer exists")]
+    MissingVersion,
+    #[error("the input bucket is locked")]
+    Locked,
+    #[error("the input needs its object key")]
+    KeyRequired,
 }
 
 impl From<IoError> for ViewError {
@@ -520,6 +527,26 @@ fn granted_error(error: StagingSourceError) -> ViewError {
     }
 }
 
+/// A local read of the captured version keeps a missing version, a lock and a needed key typed.
+fn read_error(error: GetObjectError) -> ViewError {
+    match error {
+        GetObjectError::NoSuchVersion | GetObjectError::Abe(AbeError::Missing) => {
+            ViewError::MissingVersion
+        }
+        GetObjectError::ConversionError(ConversionError::BucketKey(BucketKeyError::Locked(_)))
+        | GetObjectError::PendingContent(_)
+        | GetObjectError::Abe(AbeError::Pending) => ViewError::Locked,
+        GetObjectError::Abe(AbeError::Required) => ViewError::KeyRequired,
+        other => ViewError::Unavailable(other.to_string()),
+    }
+}
+
+/// Whether `entry` is a stored copy on this node, which a read serves here and nowhere else.
+pub fn local_materialized(entry: &ViewEntry, local: NodeId) -> bool {
+    entry.captured.source_node_id == local
+        && matches!(entry.captured.content, InputContent::Blake3(_))
+}
+
 #[derive(Debug, PartialEq)]
 enum EntryStep {
     Authorize,
@@ -555,6 +582,12 @@ impl ViewEntryOperation {
         range: Option<Range<u64>>,
     ) -> Self {
         Self::new(auth, entry, local, false, range)
+    }
+
+    /// This head or read, if its entry is a stored copy on this node; `None` refuses any other
+    /// entry, so it is never read from a holder or through a grant.
+    pub fn local_only(self) -> Option<Self> {
+        local_materialized(&self.entry, self.local).then_some(self)
     }
 
     fn new(
@@ -658,8 +691,8 @@ impl Operation for ViewEntryOperation {
                 Ok(Next::Call(IoCall::child(get)))
             }
             EntryStep::Read => {
-                let get = (result.child::<GetObjectResult, GetObjectError>()?)
-                    .map_err(|error| ViewError::Unavailable(error.to_string()))?;
+                let get =
+                    (result.child::<GetObjectResult, GetObjectError>()?).map_err(read_error)?;
                 Ok(Next::Done(Some(get.blob)))
             }
             EntryStep::Managed => {
@@ -1193,5 +1226,55 @@ mod tests {
         };
         let mut read = ViewEntryOperation::read(viewer(), reference, other_node(), None);
         assert_eq!(read.first(), Err(ViewError::Denied));
+    }
+
+    // A missing version, a lock and a needed key stay typed and are never read elsewhere.
+    #[test]
+    fn read_errors_typed() {
+        let locked = BucketKeyError::Locked(Ulid::from_parts(3, 3));
+        let cases = [
+            (GetObjectError::NoSuchVersion, ViewError::MissingVersion),
+            (
+                GetObjectError::Abe(AbeError::Missing),
+                ViewError::MissingVersion,
+            ),
+            (
+                GetObjectError::ConversionError(locked.into()),
+                ViewError::Locked,
+            ),
+            (GetObjectError::Abe(AbeError::Pending), ViewError::Locked),
+            (
+                GetObjectError::Abe(AbeError::Required),
+                ViewError::KeyRequired,
+            ),
+        ];
+        for (error, expected) in cases {
+            let mut read = ViewEntryOperation::read(viewer(), entry("a"), holder_node(), None);
+            read.first().unwrap();
+            read.next(entry_reply(Ok::<_, SourceReadError>(source_group())))
+                .unwrap();
+            let failed = entry_reply(Err::<GetObjectResult, _>(error));
+            assert_eq!(read.next(failed), Err(expected));
+        }
+    }
+
+    // Only a stored copy on this node is admitted; a remote or reference entry is refused.
+    #[test]
+    fn local_only_admits() {
+        let local = |entry| ViewEntryOperation::read(viewer(), entry, holder_node(), None);
+        assert!(local(entry("a")).local_only().is_some());
+        let head = ViewEntryOperation::head(viewer(), entry("a"), holder_node());
+        assert!(head.local_only().is_some());
+        let mut remote = entry("a");
+        remote.captured.source_node_id = other_node();
+        assert!(!local_materialized(&remote, holder_node()));
+        assert!(local(remote).local_only().is_none());
+        let mut reference = entry("a");
+        reference.captured.content = InputContent::Reference {
+            etag: None,
+            range_bound: true,
+        };
+        assert!(!local_materialized(&reference, holder_node()));
+        assert!(local(reference).local_only().is_none());
     }
 }

@@ -138,6 +138,7 @@ pub(crate) async fn installed_setup() -> InstalledHarness {
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let handler = Arc::new(
         OperationsTaskHandler::new(context.clone(), JobsRuntime::new()).with_outbox_limits(1, 1, 2),

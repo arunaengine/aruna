@@ -402,6 +402,7 @@ mod tests {
             task_handle: Some(task_handle),
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
 
         let realm_config = CreateRealmConfig {
@@ -678,6 +679,7 @@ mod tests {
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         for user_id in [admin_id, UserId::local(Ulid::generate(), realm_id)] {
             let result = drive(

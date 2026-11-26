@@ -27,6 +27,7 @@ pub(crate) fn opened() -> (TempDir, DriverContext) {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     (dir, ctx)
 }

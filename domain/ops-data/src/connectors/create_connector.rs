@@ -338,6 +338,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
 
         let result = drive(
@@ -405,6 +406,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         let (group, other) = (
             ulid::Ulid::from_bytes([1; 16]),
@@ -457,6 +459,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         let id = ulid::Ulid::from_bytes([4; 16]);
         let create = |group: u8| {

@@ -51,6 +51,7 @@ mod manifest;
 mod session;
 mod status;
 
+use manifest::csi::{self, ShareSource};
 use manifest::{
     HELPER_PATH, PolicyManifest, StageMarker, WORKSPACE_PATH, data_node_manifest, data_pv_manifest,
     data_pvc_manifest, helper_name, helper_pod, job_manifest, marker_manifest, marker_name,
@@ -295,7 +296,7 @@ impl KubernetesBackend {
         for (index, bucket) in mount_buckets(layout).iter().enumerate() {
             let pv = mount_pv_manifest(context, &self.config, index, bucket)?;
             let pvc = mount_pvc_manifest(context, &self.config, index)?;
-            self.ensure_volume(context, bucket, pv, pvc).await?;
+            self.ensure_volume(context, pv, pvc).await?;
         }
         Ok(())
     }
@@ -365,6 +366,12 @@ impl KubernetesBackend {
             return Ok(());
         };
         let bucket = &workspace.bucket_name;
+        if let Some(source) = csi::session_source(&self.config, bucket, mount) {
+            let name = csi::share_data_name(&context.attempt.external_name());
+            return self
+                .ensure_share(context, spec, &name, &source, false)
+                .await;
+        }
         if self.config.kubedal.is_some() {
             let secret = mount_secret_manifest(context, &self.config, spec)?;
             self.create_secret(context, secret).await?;
@@ -373,19 +380,36 @@ impl KubernetesBackend {
         }
         let pv = data_pv_manifest(context, &self.config, bucket, &mount.prefix)?;
         let pvc = data_pvc_manifest(context, &self.config)?;
-        self.ensure_volume(context, bucket, pv, pvc).await
+        self.ensure_volume(context, pv, pvc).await
     }
 
+    /// One attempt's share volume, and its SMB login when the share is SMB.
+    async fn ensure_share(
+        &self,
+        context: &FenceContext,
+        spec: &TaskSpec,
+        name: &str,
+        source: &ShareSource,
+        read_only: bool,
+    ) -> Result<(), BackendError> {
+        if matches!(source, ShareSource::Smb { .. }) {
+            let secret = csi::share_secret_manifest(context, &self.config, spec)?;
+            self.create_secret(context, secret).await?;
+        }
+        let pv = csi::share_pv_manifest(context, &self.config, name, source, read_only)?;
+        let pvc = csi::share_pvc_manifest(context, &self.config, name)?;
+        self.ensure_volume(context, pv, pvc).await
+    }
+
+    /// Creates the volume and its claim. One left by this attempt is kept when its CSI
+    /// driver, handle and attributes match the wanted volume.
     async fn ensure_volume(
         &self,
         context: &FenceContext,
-        bucket: &str,
         pv: PersistentVolume,
         pvc: PersistentVolumeClaim,
     ) -> Result<(), BackendError> {
-        let driver = self.config.s3_mount_driver.as_deref().ok_or_else(|| {
-            BackendError::InvalidSpec("S3 mounts are disabled on this backend".to_string())
-        })?;
+        let wanted = pv.spec.as_ref().and_then(|spec| spec.csi.as_ref());
         let name = pv.name_any();
         match self.pvs().create(&PostParams::default(), &pv).await {
             Ok(_) => {}
@@ -402,15 +426,11 @@ impl KubernetesBackend {
                         .spec
                         .as_ref()
                         .and_then(|spec| spec.csi.as_ref())
-                        .is_some_and(|csi| {
-                            csi.driver == driver
-                                && csi.volume_handle == name
-                                && csi
-                                    .volume_attributes
-                                    .as_ref()
-                                    .and_then(|attributes| attributes.get("bucketName"))
-                                    .map(String::as_str)
-                                    == Some(bucket)
+                        .zip(wanted)
+                        .is_some_and(|(csi, wanted)| {
+                            csi.driver == wanted.driver
+                                && csi.volume_handle == wanted.volume_handle
+                                && csi.volume_attributes == wanted.volume_attributes
                         });
                 if !valid {
                     return Err(BackendError::Conflict(format!(
@@ -1156,6 +1176,9 @@ impl ExecutorBackend for KubernetesBackend {
         if let Some(kubedal) = &self.config.kubedal {
             drivers.get(&kubedal.driver).await.map_err(kube_error)?;
         }
+        if let Some(driver) = csi::share_driver(&self.config) {
+            drivers.get(driver).await.map_err(kube_error)?;
+        }
         let accounts: Api<ServiceAccount> =
             Api::namespaced(self.client.clone(), &self.config.namespace);
         accounts
@@ -1163,7 +1186,7 @@ impl ExecutorBackend for KubernetesBackend {
             .await
             .map_err(kube_error)?;
         for (group, resource, subresource, verb) in session::required_access(
-            self.config.s3_mount_driver.is_some(),
+            self.config.s3_mount_driver.is_some() || self.config.share_mount.is_some(),
             self.config.kubedal.is_some(),
         ) {
             session::check_access(
@@ -1243,9 +1266,16 @@ impl ExecutorBackend for KubernetesBackend {
             StagingMode::S3Mount => {
                 if !spec.s3_mounts.is_empty() {
                     self.ensure_secret(context, spec).await?;
-                    match self.config.kubedal.is_some() {
-                        true => self.ensure_data_nodes(context, &layout).await?,
-                        false => self.ensure_mounts(context, &layout).await?,
+                    let buckets = mount_buckets(&layout);
+                    let share = csi::input_source(&self.config, &spec.attempt.job_id, &buckets)?;
+                    match (share, self.config.kubedal.is_some()) {
+                        (Some(source), _) => {
+                            let name = csi::share_input_name(&context.attempt.external_name());
+                            self.ensure_share(context, spec, &name, &source, true)
+                                .await?
+                        }
+                        (None, true) => self.ensure_data_nodes(context, &layout).await?,
+                        (None, false) => self.ensure_mounts(context, &layout).await?,
                     }
                 }
                 if needs_workspace(spec) {
@@ -1719,7 +1749,7 @@ fn validate_config(config: &KubernetesConfig) -> Result<(), BackendError> {
             "the KubeDAL cache scope must not be empty".to_string(),
         ));
     }
-    Ok(())
+    csi::check_config(config)
 }
 
 fn validate_spec(

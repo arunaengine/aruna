@@ -3408,6 +3408,7 @@ async fn setup_closed_storage() -> Arc<ServerState> {
                 task_handle: None,
                 compute_handle: None,
                 outbound_handle: None,
+                vfs_handle: None,
             }),
             realm_id,
             node_id,

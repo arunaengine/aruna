@@ -1108,13 +1108,26 @@ pub(crate) fn checked_refs(refs: &[PlacementPolicyRef]) -> Result<(), Conversion
     Ok(())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Equality compares the replicated fields only: `life_id` is this node's own identity of the
+/// live object, so replay, placement preconditions and ordering never see it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CurrentVersionPointer {
     pub version_id: Ulid,
     pub generation: u64,
     /// The head version's original epoch; always 0 in an ordinary bucket.
     pub epoch: OriginalEpoch,
+    /// Node-local identity of the live object at this name; `None` while the head is a marker.
+    pub life_id: Option<Ulid>,
 }
+
+impl PartialEq for CurrentVersionPointer {
+    fn eq(&self, other: &Self) -> bool {
+        (self.version_id, self.generation, self.epoch)
+            == (other.version_id, other.generation, other.epoch)
+    }
+}
+
+impl Eq for CurrentVersionPointer {}
 
 impl CurrentVersionPointer {
     pub fn new(version_id: Ulid) -> Self {
@@ -1126,6 +1139,7 @@ impl CurrentVersionPointer {
             version_id,
             generation,
             epoch: OriginalEpoch::default(),
+            life_id: None,
         }
     }
 
@@ -1134,14 +1148,49 @@ impl CurrentVersionPointer {
         self
     }
 
+    /// The same head with `life_id` as its local identity, for a replica install.
+    pub fn with_life(mut self, life_id: Option<Ulid>) -> Self {
+        self.life_id = life_id;
+        self
+    }
+
     /// The one head comparator: original epoch first, then the per-key generation.
     pub fn order(&self) -> (OriginalEpoch, u64) {
         (self.epoch, self.generation)
     }
 
+    /// A live successor that keeps the live object's identity; `fresh_life_id` is used only
+    /// when `existing` holds none, so a successor of a marker or of no head starts a new life.
+    pub fn next_live_inherit(
+        existing: Option<&Self>,
+        version_id: Ulid,
+        fresh_life_id: Ulid,
+    ) -> Result<Self, ConversionError> {
+        let life_id = existing.and_then(|pointer| pointer.life_id);
+        Ok(Self::next_for(existing, version_id)?.with_life(life_id.or(Some(fresh_life_id))))
+    }
+
+    /// A live successor with a new identity: a recreation, a moved-in object or a replacement
+    /// that must not continue the previous life even when the version id repeats.
+    pub fn next_live_fresh(
+        existing: Option<&Self>,
+        version_id: Ulid,
+        fresh_life_id: Ulid,
+    ) -> Result<Self, ConversionError> {
+        Ok(Self::next_for(existing, version_id)?.with_life(Some(fresh_life_id)))
+    }
+
+    /// A delete marker successor, which ends the live object's identity.
+    pub fn next_deleted(
+        existing: Option<&Self>,
+        version_id: Ulid,
+    ) -> Result<Self, ConversionError> {
+        Self::next_for(existing, version_id)
+    }
+
     /// Checked local advancement at the existing epoch, so a successor always supersedes.
     /// Saturating would stop producing a later generation, so exhaustion fails instead.
-    pub fn next_for(existing: Option<&Self>, version_id: Ulid) -> Result<Self, ConversionError> {
+    fn next_for(existing: Option<&Self>, version_id: Ulid) -> Result<Self, ConversionError> {
         let (epoch, generation) = match existing {
             Some(pointer) => (
                 pointer.epoch,
@@ -1834,6 +1883,44 @@ mod tests {
             Err(ConversionError::HeadGenerationExhausted),
             "a wrapped generation would no longer be newer"
         );
+    }
+
+    #[test]
+    fn life_follows_liveness() {
+        let (first, second) = (Ulid::from_bytes([8u8; 16]), Ulid::from_bytes([9u8; 16]));
+        let live = CurrentVersionPointer::next_live_inherit(None, Ulid::from_bytes([1; 16]), first)
+            .unwrap();
+        assert_eq!(live.life_id, Some(first));
+        let update =
+            CurrentVersionPointer::next_live_inherit(Some(&live), live.version_id, second).unwrap();
+        assert_eq!(update.life_id, Some(first), "a live update keeps its life");
+        let marker =
+            CurrentVersionPointer::next_deleted(Some(&update), Ulid::from_bytes([2; 16])).unwrap();
+        assert_eq!(marker.life_id, None);
+        let revived =
+            CurrentVersionPointer::next_live_inherit(Some(&marker), live.version_id, second)
+                .unwrap();
+        assert_eq!(
+            revived.life_id,
+            Some(second),
+            "a recreation starts a new life"
+        );
+        let moved =
+            CurrentVersionPointer::next_live_fresh(Some(&update), update.version_id, second)
+                .unwrap();
+        assert_eq!(moved.life_id, Some(second));
+        assert_eq!(moved.generation, update.generation + 1);
+    }
+
+    #[test]
+    fn life_outside_equality() {
+        // Replays and placement preconditions compare the replicated fields only.
+        let head = pointer(4, 3);
+        let local = head.clone().with_life(Some(Ulid::from_bytes([6u8; 16])));
+        assert_eq!(head, local);
+        assert!(local.supersedes(Some(&head)));
+        let restored = CurrentVersionPointer::from_bytes(&local.to_bytes().unwrap()).unwrap();
+        assert_eq!(restored.life_id, local.life_id);
     }
 
     #[test]

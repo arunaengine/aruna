@@ -367,6 +367,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         let realm_id = RealmId::from_bytes([13; 32]);
         let placement = PlacementRef {

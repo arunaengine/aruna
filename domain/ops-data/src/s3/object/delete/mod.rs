@@ -93,7 +93,9 @@ pub enum DeleteObjectState {
     /// Reads the bucket's creation row for the incarnation its delete trail belongs to.
     ReadAuditBucket,
     WriteDeleteAudit,
-    /// Reads the row fence's guards or writes its receipts in the delete transaction.
+    /// Reads the row fence's guards before the delete moves the head or any version row.
+    RowGuards,
+    /// Writes the row fence's receipts and rows, then deletes its rows, before the commit.
     RowFence,
 }
 
@@ -230,6 +232,8 @@ pub struct DeleteObjectOperation {
     expected: Option<BlobVersion>,
     /// The head a delete marker may only cover while it is still current.
     expected_head: Option<Ulid>,
+    /// The head's life the delete expects, `None` for no live object; another life refuses it.
+    expected_life: Option<Option<Ulid>>,
     /// The bucket incarnation the delete is made in, read in its transaction for the trail.
     incarnation: Option<u128>,
     row_fence: Option<RowFence>,
@@ -276,6 +280,7 @@ impl DeleteObjectOperation {
             metadata: HashMap::new(),
             expected: None,
             expected_head: None,
+            expected_life: None,
             incarnation: None,
             row_fence: None,
             set_hint: None,
@@ -318,11 +323,24 @@ impl DeleteObjectOperation {
     /// Refuses the delete with `FenceTaken` unless its transaction still reads each guard as
     /// given; each receipt key then records the delete marker's id in that transaction.
     pub fn with_fence(
-        mut self,
+        self,
         guards: Vec<(String, Key, Option<Value>)>,
         receipts: Vec<(String, Key)>,
     ) -> Self {
-        self.row_fence = Some(RowFence::new(guards, receipts));
+        self.with_row_fence(RowFence::new(guards, receipts))
+    }
+
+    /// The full fence: its guards are read before the head or a version row moves, its rows
+    /// written and deleted after them, all in the delete transaction.
+    pub fn with_row_fence(mut self, fence: RowFence) -> Self {
+        self.row_fence = Some(fence);
+        self
+    }
+
+    /// Refuses the delete with `VersionChanged` unless the head's life is still `life_id`;
+    /// `None` expects an absent head or a delete marker.
+    pub fn with_expected_life(mut self, life_id: Option<Ulid>) -> Self {
+        self.expected_life = Some(life_id);
         self
     }
 
@@ -558,11 +576,24 @@ impl DeleteObjectOperation {
             .as_ref()
             .map(|value| CurrentVersionPointer::from_bytes(value.as_ref()))
             .transpose()?;
-        self.existing_pointer = existing.clone();
         let head = existing.as_ref().map(|pointer| pointer.version_id);
         if self.expected_head.is_some() && head != self.expected_head {
             return Err(DeleteObjectError::VersionChanged);
         }
+        let life = existing.as_ref().and_then(|pointer| pointer.life_id);
+        if self.expected_life.is_some_and(|expected| expected != life) {
+            return Err(DeleteObjectError::VersionChanged);
+        }
+        self.existing_pointer = existing;
+        // The caller's guards are read before this transaction writes any row they could hit.
+        if let Some(call) = self.row_fence.as_mut().and_then(RowFence::check_guards) {
+            return self.call(DeleteObjectState::RowGuards, call);
+        }
+        self.head_checked()
+    }
+
+    fn head_checked(&mut self) -> Turn {
+        let existing = self.existing_pointer.clone();
         let version_id = self.pending_version_id.take();
         let version_id = version_id.ok_or(DeleteObjectError::InvalidOperationState)?;
         if let Some(target_version_id) = self.input.version_id {
@@ -608,15 +639,19 @@ impl DeleteObjectOperation {
     }
 
     fn replace_head(&mut self, existing: Option<&CurrentVersionPointer>) -> Turn {
-        match self
-            .latest_remaining
-            .as_ref()
-            .map(|metadata| (metadata.version_id, metadata.materialized_hash))
-        {
+        let remaining = self.latest_remaining.as_ref();
+        match remaining.map(|metadata| (metadata.version_id, metadata.materialized_hash)) {
+            // The surviving version decides liveness; a live one keeps a live head's life.
             Some((version_id, new_hash)) => {
                 self.pending_hash = new_hash;
-                self.pending_new_pointer =
-                    Some(CurrentVersionPointer::next_for(existing, version_id)?);
+                let pointer = match remaining.is_some_and(|metadata| metadata.deleted) {
+                    true => CurrentVersionPointer::next_deleted(existing, version_id)?,
+                    false => {
+                        let life_id = self.ids.mint(self.now_ms);
+                        CurrentVersionPointer::next_live_inherit(existing, version_id, life_id)?
+                    }
+                };
+                self.pending_new_pointer = Some(pointer);
             }
             None => {
                 self.pending_new_pointer = None;
@@ -941,7 +976,7 @@ impl DeleteObjectOperation {
         // A permanent delete mints no marker; its receipts name the deleted version.
         let version_id = self.version_id.or(self.input.version_id);
         let next = match (self.row_fence.as_mut(), version_id) {
-            (Some(fence), Some(version_id)) => fence.next_call(version_id),
+            (Some(fence), Some(version_id)) => fence.apply_mutations(version_id),
             (Some(_), None) => return Err(DeleteObjectError::InvalidOperationState),
             (None, _) => None,
         };
@@ -951,12 +986,15 @@ impl DeleteObjectOperation {
         self.deleted()
     }
 
+    /// Answers the fence's guard read, then its writes and deletes, in that order.
     fn fence_answered(&mut self, result: IoResult) -> Turn {
+        let guards = self.state == DeleteObjectState::RowGuards;
         match self
             .row_fence
             .as_mut()
             .map(|fence| fence.answer_call(result))
         {
+            Some(Ok(())) if guards => self.head_checked(),
             Some(Ok(())) => self.commit_fenced(),
             Some(Err(FenceError::Taken)) => Err(DeleteObjectError::FenceTaken),
             Some(Err(FenceError::Storage(error))) => Err(error.into()),
@@ -979,7 +1017,7 @@ impl DeleteObjectOperation {
         version_id: Ulid,
         existing: Option<&CurrentVersionPointer>,
     ) -> Turn {
-        let pointer = CurrentVersionPointer::next_for(existing, version_id)?;
+        let pointer = CurrentVersionPointer::next_deleted(existing, version_id)?;
         let pointer = stamp_head(pointer, self.binding.as_ref(), self.marker_epoch);
         self.marker_head = Some(pointer.clone());
         self.pending_new_pointer = Some(pointer);
@@ -1135,7 +1173,9 @@ impl Operation for DeleteObjectOperation {
                 result.done()?;
                 self.commit_fenced()
             }
-            DeleteObjectState::RowFence => self.fence_answered(result),
+            DeleteObjectState::RowGuards | DeleteObjectState::RowFence => {
+                self.fence_answered(result)
+            }
         }
     }
 

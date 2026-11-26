@@ -54,6 +54,7 @@ async fn fixture(limits: RoCrateLimits) -> Fixture {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let state = ServerState::new(
         Arc::clone(&ctx),

@@ -997,6 +997,7 @@ mod test {
             task_handle: Some(task_handle),
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
 
         let realm_signing_key: SigningKey = generate_signing_key();

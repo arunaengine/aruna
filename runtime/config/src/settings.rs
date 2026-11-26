@@ -125,6 +125,7 @@ pub struct Settings {
     pub node_weight: Option<u32>,
     /// `None` unless `HTTPS_SOCKET_ADDRESS` turns native HTTPS on.
     pub https: Option<HttpsSettings>,
+    pub vfs: VfsSettings,
 }
 
 /// Native HTTPS: the listener, the certificate files and the routed public origins.
@@ -149,6 +150,135 @@ pub struct HttpsSettings {
     pub ca: Option<PathBuf>,
     pub redirect: Option<SocketAddr>,
     pub routes: HostRoutes,
+}
+
+/// Native SMB and NFS file sharing and its local write staging, from the `ARUNA_VFS_*` keys.
+/// Both listeners stay off unless their address is set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VfsSettings {
+    pub smb_listen_addr: Option<SocketAddr>,
+    pub nfs_listen_addr: Option<SocketAddr>,
+    pub nfs_certificate: Option<PathBuf>,
+    pub nfs_key: Option<PathBuf>,
+    /// Serves NFS without TLS for local development, allowed only on a loopback address.
+    pub nfs_loopback_cleartext: bool,
+    /// Folder of staged writes; `<DATABASE_DIR>/vfs-stage` once a listener is on.
+    pub stage_dir: Option<PathBuf>,
+    /// Most staged bytes on this node, and per group.
+    pub node_stage_bytes: u64,
+    pub group_stage_bytes: u64,
+    /// How long an acknowledged stage kept outside the namespace stays for recovery.
+    pub stage_retention_secs: u64,
+    /// How long the reason a handle went stale is kept.
+    pub tombstone_retention_secs: u64,
+    pub nfs_lease_secs: u64,
+    /// Most connections of one peer, and most outstanding operations of one principal, each
+    /// across all its connections.
+    pub peer_connections: u32,
+    pub principal_operations: u32,
+}
+
+impl Default for VfsSettings {
+    fn default() -> Self {
+        Self {
+            smb_listen_addr: None,
+            nfs_listen_addr: None,
+            nfs_certificate: None,
+            nfs_key: None,
+            nfs_loopback_cleartext: false,
+            stage_dir: None,
+            node_stage_bytes: 4 << 30,
+            group_stage_bytes: 1 << 30,
+            stage_retention_secs: 7 * 24 * 60 * 60,
+            tombstone_retention_secs: 24 * 60 * 60,
+            nfs_lease_secs: 90,
+            peer_connections: 16,
+            principal_operations: 1_024,
+        }
+    }
+}
+
+impl VfsSettings {
+    /// Whether an SMB or NFS listener is on.
+    pub fn enabled(&self) -> bool {
+        self.smb_listen_addr.is_some() || self.nfs_listen_addr.is_some()
+    }
+
+    /// Checks the values together: every limit is positive, a group fits in the node stage,
+    /// and NFS has TLS files unless cleartext is allowed on a loopback address.
+    pub fn validate(&self) -> Result<(), SetupError> {
+        let limits = [
+            ("ARUNA_VFS_NODE_STAGE_BYTES", self.node_stage_bytes),
+            ("ARUNA_VFS_GROUP_STAGE_BYTES", self.group_stage_bytes),
+            ("ARUNA_VFS_STAGE_RETENTION_SECS", self.stage_retention_secs),
+            (
+                "ARUNA_VFS_TOMBSTONE_RETENTION_SECS",
+                self.tombstone_retention_secs,
+            ),
+            ("ARUNA_VFS_NFS_LEASE_SECS", self.nfs_lease_secs),
+            (
+                "ARUNA_VFS_PEER_CONNECTIONS",
+                u64::from(self.peer_connections),
+            ),
+            (
+                "ARUNA_VFS_PRINCIPAL_OPERATIONS",
+                u64::from(self.principal_operations),
+            ),
+        ];
+        if let Some((key, _)) = limits.into_iter().find(|(_, value)| *value == 0) {
+            return Err(invalid_config_value(key, "0", "must be greater than zero"));
+        }
+        if self.group_stage_bytes > self.node_stage_bytes {
+            return Err(invalid_config_value(
+                "ARUNA_VFS_GROUP_STAGE_BYTES",
+                self.group_stage_bytes.to_string(),
+                "must not exceed ARUNA_VFS_NODE_STAGE_BYTES",
+            ));
+        }
+        let cleartext = self.nfs_loopback_cleartext;
+        let Some(nfs) = self.nfs_listen_addr else {
+            let stray = [
+                (
+                    "ARUNA_VFS_NFS_CERTIFICATE_PATH",
+                    self.nfs_certificate.is_some(),
+                ),
+                ("ARUNA_VFS_NFS_KEY_PATH", self.nfs_key.is_some()),
+                ("ARUNA_VFS_NFS_LOOPBACK_CLEARTEXT", cleartext),
+            ];
+            return match stray.into_iter().find(|(_, set)| *set) {
+                Some((key, _)) => Err(invalid_config_value(
+                    key,
+                    "set",
+                    "needs ARUNA_VFS_NFS_LISTEN_ADDR",
+                )),
+                None => Ok(()),
+            };
+        };
+        match (&self.nfs_certificate, &self.nfs_key) {
+            (Some(_), None) => {
+                return Err(SetupError::MissingConfigValue("ARUNA_VFS_NFS_KEY_PATH"));
+            }
+            (None, Some(_)) => {
+                return Err(SetupError::MissingConfigValue(
+                    "ARUNA_VFS_NFS_CERTIFICATE_PATH",
+                ));
+            }
+            (None, None) if !cleartext => {
+                return Err(SetupError::MissingConfigValue(
+                    "ARUNA_VFS_NFS_CERTIFICATE_PATH",
+                ));
+            }
+            _ => {}
+        }
+        if cleartext && !nfs.ip().is_loopback() {
+            return Err(invalid_config_value(
+                "ARUNA_VFS_NFS_LISTEN_ADDR",
+                nfs.to_string(),
+                "cleartext NFS is allowed only on a loopback address",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for Settings {
@@ -342,6 +472,7 @@ pub fn read_settings_from(env: &dyn SettingsEnv) -> Result<Settings, SetupError>
     let portal = portal_config_env(env)?;
     let assistant_proxy = assistant_proxy_env(env)?;
     let disabled_features = disabled_features_env(env)?;
+    let vfs = vfs_env(env, &storage_path)?;
     // The SPA is served from another origin than the API, so it cannot reach a
     // relative API path and needs the advertised one.
     if matches!(portal, PortalConfig::Artifact { .. }) && api_public_url.is_none() {
@@ -404,6 +535,7 @@ pub fn read_settings_from(env: &dyn SettingsEnv) -> Result<Settings, SetupError>
         node_location,
         node_weight,
         https: None,
+        vfs,
     };
     settings.https = https_env(env, &mut settings)?;
     check_applets(&mut settings)?;
@@ -1182,6 +1314,81 @@ fn event_recording_env(env: &dyn SettingsEnv) -> Result<bool, SetupError> {
         Some(value) if value == "enabled" => Ok(true),
         Some(value) if value == "disabled" => Ok(false),
         Some(value) => Err(invalid_config_value(
+            KEY,
+            value,
+            "expected one of: enabled, disabled",
+        )),
+    }
+}
+
+/// The `ARUNA_VFS_*` keys, checked together; unset keys keep the defaults.
+fn vfs_env(env: &dyn SettingsEnv, storage_path: &str) -> Result<VfsSettings, SetupError> {
+    let defaults = VfsSettings::default();
+    let file = |key| Ok::<_, SetupError>(optional_nonempty_env(env, key)?.map(PathBuf::from));
+    let mut vfs = VfsSettings {
+        smb_listen_addr: socket_env(env, "ARUNA_VFS_SMB_LISTEN_ADDR")?,
+        nfs_listen_addr: socket_env(env, "ARUNA_VFS_NFS_LISTEN_ADDR")?,
+        nfs_certificate: file("ARUNA_VFS_NFS_CERTIFICATE_PATH")?,
+        nfs_key: file("ARUNA_VFS_NFS_KEY_PATH")?,
+        nfs_loopback_cleartext: cleartext_env(env)?,
+        stage_dir: file("ARUNA_VFS_STAGE_DIR")?,
+        node_stage_bytes: positive_u64_env(
+            env,
+            "ARUNA_VFS_NODE_STAGE_BYTES",
+            defaults.node_stage_bytes,
+        )?,
+        group_stage_bytes: positive_u64_env(
+            env,
+            "ARUNA_VFS_GROUP_STAGE_BYTES",
+            defaults.group_stage_bytes,
+        )?,
+        stage_retention_secs: positive_u64_env(
+            env,
+            "ARUNA_VFS_STAGE_RETENTION_SECS",
+            defaults.stage_retention_secs,
+        )?,
+        tombstone_retention_secs: positive_u64_env(
+            env,
+            "ARUNA_VFS_TOMBSTONE_RETENTION_SECS",
+            defaults.tombstone_retention_secs,
+        )?,
+        nfs_lease_secs: positive_u64_env(env, "ARUNA_VFS_NFS_LEASE_SECS", defaults.nfs_lease_secs)?,
+        peer_connections: positive_u32_env(
+            env,
+            "ARUNA_VFS_PEER_CONNECTIONS",
+            defaults.peer_connections,
+        )?,
+        principal_operations: positive_u32_env(
+            env,
+            "ARUNA_VFS_PRINCIPAL_OPERATIONS",
+            defaults.principal_operations,
+        )?,
+    };
+    if vfs.enabled() && vfs.stage_dir.is_none() {
+        vfs.stage_dir = Some(PathBuf::from(format!("{storage_path}/vfs-stage")));
+    }
+    vfs.validate()?;
+    Ok(vfs)
+}
+
+fn socket_env(env: &dyn SettingsEnv, key: &'static str) -> Result<Option<SocketAddr>, SetupError> {
+    optional_nonempty_env(env, key)?
+        .map(|value| {
+            SocketAddr::from_str(value.trim())
+                .map_err(|error| invalid_config_value(key, &value, error))
+        })
+        .transpose()
+}
+
+fn cleartext_env(env: &dyn SettingsEnv) -> Result<bool, SetupError> {
+    const KEY: &str = "ARUNA_VFS_NFS_LOOPBACK_CLEARTEXT";
+    let Some(value) = optional_nonempty_env(env, KEY)? else {
+        return Ok(false);
+    };
+    match normalize_env_value(&value).as_str() {
+        "enabled" => Ok(true),
+        "disabled" => Ok(false),
+        _ => Err(invalid_config_value(
             KEY,
             value,
             "expected one of: enabled, disabled",
@@ -2259,5 +2466,111 @@ mod tests {
             "APPLETS_PORTAL_ORIGIN"
         );
         assert!(base(&[("APPLETS_PORTAL_ORIGIN", "http://localhost:5173")]).is_ok());
+    }
+
+    #[test]
+    fn vfs_off_default() {
+        let settings = parse(&[]).unwrap();
+        assert_eq!(settings.vfs, VfsSettings::default());
+        assert!(!settings.vfs.enabled());
+        assert_eq!(settings.vfs.stage_dir, None);
+        assert_eq!(settings.vfs.tombstone_retention_secs, 86_400);
+        assert!(settings.vfs.group_stage_bytes <= settings.vfs.node_stage_bytes);
+    }
+
+    #[test]
+    fn vfs_keys_parse() {
+        let vfs = parse(&[
+            ("ARUNA_VFS_SMB_LISTEN_ADDR", "0.0.0.0:445"),
+            ("ARUNA_VFS_NFS_LISTEN_ADDR", "0.0.0.0:2049"),
+            ("ARUNA_VFS_NFS_CERTIFICATE_PATH", "/tls/nfs.pem"),
+            ("ARUNA_VFS_NFS_KEY_PATH", "/tls/nfs.key"),
+            ("ARUNA_VFS_NODE_STAGE_BYTES", "100"),
+            ("ARUNA_VFS_GROUP_STAGE_BYTES", "50"),
+            ("ARUNA_VFS_STAGE_RETENTION_SECS", "3"),
+            ("ARUNA_VFS_TOMBSTONE_RETENTION_SECS", "4"),
+            ("ARUNA_VFS_NFS_LEASE_SECS", "5"),
+            ("ARUNA_VFS_PEER_CONNECTIONS", "6"),
+            ("ARUNA_VFS_PRINCIPAL_OPERATIONS", "7"),
+        ])
+        .unwrap()
+        .vfs;
+        assert_eq!(
+            vfs,
+            VfsSettings {
+                smb_listen_addr: Some("0.0.0.0:445".parse().unwrap()),
+                nfs_listen_addr: Some("0.0.0.0:2049".parse().unwrap()),
+                nfs_certificate: Some(PathBuf::from("/tls/nfs.pem")),
+                nfs_key: Some(PathBuf::from("/tls/nfs.key")),
+                nfs_loopback_cleartext: false,
+                stage_dir: Some(PathBuf::from("/tmp/aruna-settings/vfs-stage")),
+                node_stage_bytes: 100,
+                group_stage_bytes: 50,
+                stage_retention_secs: 3,
+                tombstone_retention_secs: 4,
+                nfs_lease_secs: 5,
+                peer_connections: 6,
+                principal_operations: 7,
+            }
+        );
+        let staged = parse(&[
+            ("ARUNA_VFS_SMB_LISTEN_ADDR", "127.0.0.1:4445"),
+            ("ARUNA_VFS_STAGE_DIR", "/scratch/stage"),
+        ])
+        .unwrap();
+        assert_eq!(staged.vfs.stage_dir, Some(PathBuf::from("/scratch/stage")));
+    }
+
+    #[test]
+    fn nfs_needs_tls() {
+        let nfs = ("ARUNA_VFS_NFS_LISTEN_ADDR", "0.0.0.0:2049");
+        let cert = ("ARUNA_VFS_NFS_CERTIFICATE_PATH", "/tls/nfs.pem");
+        let key = ("ARUNA_VFS_NFS_KEY_PATH", "/tls/nfs.key");
+        let cleartext = ("ARUNA_VFS_NFS_LOOPBACK_CLEARTEXT", "enabled");
+        for (pairs, missing) in [
+            (vec![nfs], "ARUNA_VFS_NFS_CERTIFICATE_PATH"),
+            (vec![nfs, cert], "ARUNA_VFS_NFS_KEY_PATH"),
+            (vec![nfs, key], "ARUNA_VFS_NFS_CERTIFICATE_PATH"),
+        ] {
+            assert!(matches!(
+                parse(&pairs).unwrap_err(),
+                SetupError::MissingConfigValue(found) if found == missing
+            ));
+        }
+        // Cleartext is a loopback-only development mode.
+        let wide = parse(&[nfs, cleartext]).unwrap_err();
+        assert_eq!(invalid_key(wide), "ARUNA_VFS_NFS_LISTEN_ADDR");
+        let local = parse(&[("ARUNA_VFS_NFS_LISTEN_ADDR", "[::1]:2049"), cleartext]).unwrap();
+        assert!(local.vfs.nfs_loopback_cleartext);
+        assert_eq!(local.vfs.nfs_certificate, None);
+    }
+
+    #[test]
+    fn vfs_rejects_values() {
+        for (key, value) in [
+            ("ARUNA_VFS_NFS_CERTIFICATE_PATH", "/tls/nfs.pem"),
+            ("ARUNA_VFS_NFS_LOOPBACK_CLEARTEXT", "enabled"),
+            ("ARUNA_VFS_NFS_LOOPBACK_CLEARTEXT", "yes"),
+            ("ARUNA_VFS_SMB_LISTEN_ADDR", "not-an-address"),
+            ("ARUNA_VFS_NODE_STAGE_BYTES", "0"),
+            ("ARUNA_VFS_PEER_CONNECTIONS", "0"),
+            ("ARUNA_VFS_NFS_LEASE_SECS", "-1"),
+        ] {
+            assert_eq!(invalid_key(parse(&[(key, value)]).unwrap_err()), key);
+        }
+        let error = parse(&[
+            ("ARUNA_VFS_NODE_STAGE_BYTES", "10"),
+            ("ARUNA_VFS_GROUP_STAGE_BYTES", "11"),
+        ])
+        .unwrap_err();
+        assert_eq!(invalid_key(error), "ARUNA_VFS_GROUP_STAGE_BYTES");
+        let zero = VfsSettings {
+            principal_operations: 0,
+            ..VfsSettings::default()
+        };
+        assert_eq!(
+            invalid_key(zero.validate().unwrap_err()),
+            "ARUNA_VFS_PRINCIPAL_OPERATIONS"
+        );
     }
 }

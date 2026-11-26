@@ -210,6 +210,7 @@ async fn start(realm_id: RealmId, seed: u8) -> Started {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     Started {

@@ -832,6 +832,7 @@ mod tests {
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         let record = registry_record(Ulid::from_parts(8, 1), "docs/tombstoned");
         write_entries(
@@ -898,6 +899,7 @@ mod tests {
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         let record = registry_record(Ulid::from_parts(9, 1), "docs/deleted");
         let index_key = aruna_core::storage_entries::iri_reference_key(
@@ -993,6 +995,7 @@ mod tests {
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         }
     }
 
@@ -1042,6 +1045,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
 
         let result = process_prune_batch(&context).await.expect("queue drains");
@@ -1071,6 +1075,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
 
         let result = process_prune_batch(&context)
@@ -1125,6 +1130,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
 
         let result = process_prune_batch(&context)

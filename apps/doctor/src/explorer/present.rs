@@ -123,6 +123,8 @@ pub(super) enum DecodedField {
     Utf8 { value: String },
     #[serde(rename = "blob_head_key")]
     BlobHeadKey { value: BlobHeadKey },
+    #[serde(rename = "unpublished_watch_key")]
+    WatchKey { bucket: String, key: String },
     #[serde(rename = "hash_path_index_key")]
     HashIndex { value: HashIndex },
     #[serde(rename = "blob_location_key")]
@@ -182,6 +184,10 @@ pub(super) enum DecodedValue {
     },
     CurrentVersionPointer {
         data: CurrentVersionPointer,
+    },
+    /// The binding token of an unpublished name's watch key.
+    WatchToken {
+        token: String,
     },
     BackendLocation {
         data: aruna_core::structs::storage::blob::BackendLocation,

@@ -401,6 +401,12 @@ impl TaskQueues {
         handler
             .reschedule_timer(TaskKey::DrainCaptures, Duration::ZERO)
             .await;
+        // The file server sweep re-arms itself while handles, cookies or receipts remain.
+        if context.vfs_handle.is_some() {
+            handler
+                .reschedule_timer(TaskKey::SweepNfsTombstones, Duration::ZERO)
+                .await;
+        }
         if context.blob_handle.is_some() {
             let arm = ArmSweepOperation::new(TaskKey::SweepHiddenBlobs);
             if let Err(error) = drive(arm, &context).await {
@@ -574,6 +580,7 @@ mod stop_tests {
             task_handle: Some(task_handle.clone()),
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         });
         let queues = install_task_queues(
             context,
