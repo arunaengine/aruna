@@ -5,6 +5,7 @@
 
 pub mod change;
 pub mod check;
+pub mod control;
 pub mod copy_stage;
 pub mod dataset_stage;
 pub mod diff;
