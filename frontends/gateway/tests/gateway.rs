@@ -56,6 +56,9 @@ async fn file(
     let (kind, body) = match query.get("path").map(String::as_str) {
         Some("/" | "/index.html") => ("text/html; charset=utf-8", PAGE),
         Some("/assets/app-B2x9cQ4f.js") => ("text/javascript", "console.log(1)"),
+        Some("/sample plot.png") => ("image/png", "png-bytes"),
+        Some("/a+b.png") => ("image/png", "plus-bytes"),
+        Some("/aruna-source-map.json") => ("application/json", "{\"secret\":true}"),
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
     ([("content-type", kind), ("etag", "\"abc\"")], body).into_response()
@@ -166,6 +169,41 @@ async fn public_files_served() {
     assert_eq!(route.text().await.expect("body"), PAGE);
     let hidden = visit(&base, "pub.apps.test", "/aruna-source-map.json", &[]).await;
     assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+    let encoded_hidden = visit(&base, "pub.apps.test", "/%61runa-source-map.json", &[]).await;
+    assert_eq!(encoded_hidden.status(), StatusCode::NOT_FOUND);
+    let spaced = visit(&base, "pub.apps.test", "/sample%20plot.png", &[]).await;
+    assert_eq!(spaced.status(), StatusCode::OK);
+    assert_eq!(spaced.text().await.expect("body"), "png-bytes");
+    let plus = visit(&base, "pub.apps.test", "/a+b.png", &[]).await;
+    assert_eq!(plus.status(), StatusCode::OK);
+    assert_eq!(plus.text().await.expect("body"), "plus-bytes");
+    let bad_escape = visit(&base, "pub.apps.test", "/bad%ZZ.png", &[]).await;
+    assert_eq!(bad_escape.status(), StatusCode::NOT_FOUND);
+    let sw_header = visit(
+        &base,
+        "pub.apps.test",
+        "/assets/app-B2x9cQ4f.js",
+        &[("service-worker", "script")],
+    )
+    .await;
+    assert_eq!(sw_header.status(), StatusCode::FORBIDDEN);
+    assert_eq!(header(&sw_header, CACHE_CONTROL), "no-store");
+    let sw_dest = visit(
+        &base,
+        "pub.apps.test",
+        "/assets/app-B2x9cQ4f.js",
+        &[("sec-fetch-dest", "serviceworker")],
+    )
+    .await;
+    assert_eq!(sw_dest.status(), StatusCode::FORBIDDEN);
+    let web_worker = visit(
+        &base,
+        "pub.apps.test",
+        "/assets/app-B2x9cQ4f.js",
+        &[("sec-fetch-dest", "worker")],
+    )
+    .await;
+    assert_eq!(web_worker.status(), StatusCode::OK);
     let helper = visit(&base, "pub.apps.test", "/_aruna/preview-helper.js", &[]).await;
     assert_eq!(helper.status(), StatusCode::NOT_FOUND);
     let unknown = visit(&base, "nobody.apps.test", "/", &[]).await;

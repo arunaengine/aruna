@@ -138,6 +138,19 @@ async fn entry(State(gateway): State<Arc<Gateway>>, request: Request) -> Respons
         }
     };
     let visit = Visit::read(&gateway, host, answer, request.headers());
+    if service_worker(request.headers()) {
+        let message = "Applet hosts do not allow service workers.";
+        let mut response = page(
+            StatusCode::FORBIDDEN,
+            "Service workers disabled",
+            message,
+            visit.frame(),
+        );
+        response
+            .headers_mut()
+            .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return response;
+    }
     match request.uri().path().strip_prefix("/_aruna/") {
         Some(rest) => {
             let rest = rest.to_string();
@@ -165,6 +178,15 @@ fn browser_request(headers: &HeaderMap) -> bool {
         || headers.contains_key("sec-fetch-site")
         || headers.contains_key("sec-fetch-mode")
         || headers.contains_key("sec-fetch-dest")
+}
+
+/// Whether the browser is fetching a service-worker script for registration or update.
+fn service_worker(headers: &HeaderMap) -> bool {
+    headers.contains_key("service-worker")
+        || headers
+            .get("sec-fetch-dest")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|dest| dest.eq_ignore_ascii_case("serviceworker"))
 }
 
 /// Lets the TLS proxy issue a certificate on demand only for hosts an applet serves.

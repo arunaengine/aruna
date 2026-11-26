@@ -50,7 +50,9 @@ pub async fn file(gateway: &Gateway, visit: &Visit, request: Request) -> Respons
     if status != StatusCode::OK {
         return page(status, title, message, frame);
     }
-    let path = request.uri().path();
+    let Some(path) = decode_path(request.uri().path()) else {
+        return not_found(frame);
+    };
     let headers = request.headers();
     if visit.preview.is_none()
         && path
@@ -72,7 +74,7 @@ pub async fn file(gateway: &Gateway, visit: &Visit, request: Request) -> Respons
             frame,
         );
     };
-    let mut fetched = fetch(gateway, visit, &route, path).await;
+    let mut fetched = fetch(gateway, visit, &route, &path).await;
     // Client-side routes have no file of their own; the app's index page renders them.
     let last = path.rsplit('/').next().unwrap_or_default();
     let fallback = navigation(headers) && !last.contains('.');
@@ -87,7 +89,7 @@ pub async fn file(gateway: &Gateway, visit: &Visit, request: Request) -> Respons
         }
     };
     match upstream.status() {
-        status if status.is_success() => respond(gateway, visit, headers, path, upstream).await,
+        status if status.is_success() => respond(gateway, visit, headers, &path, upstream).await,
         StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED if visit.token().is_none() => {
             signin_needed(visit, &request)
         }
@@ -251,4 +253,35 @@ fn matches_tag(headers: &HeaderMap, tag: &HeaderValue) -> bool {
             let candidate = candidate.trim();
             candidate == "*" || candidate.trim_start_matches("W/").as_bytes() == tag.as_bytes()
         })
+}
+
+/// Percent-decodes an HTTP request path once as UTF-8, keeping `+` literal and rejecting
+/// malformed escapes or NUL bytes.
+fn decode_path(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hi = hex_nibble(*bytes.get(index + 1)?)?;
+            let lo = hex_nibble(*bytes.get(index + 2)?)?;
+            let byte = (hi << 4) | lo;
+            if byte == 0 {
+                return None;
+            }
+            out.push(byte);
+            index += 3;
+        } else {
+            if bytes[index] == 0 {
+                return None;
+            }
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    char::from(byte).to_digit(16).map(|digit| digit as u8)
 }
