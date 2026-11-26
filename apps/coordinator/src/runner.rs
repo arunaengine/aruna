@@ -170,10 +170,102 @@ async fn prepare_and_run(
     })
 }
 
+/// One declared local output collected from `run.outputs`, with optional parent-dir prefix.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DeclaredOutput {
+    source: String,
+    target_path: Option<String>,
+    parent_dir: Option<String>,
+    basename: Option<String>,
+}
+
+/// One declared output directory that does not exist locally but lists children to deliver.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MissingDir {
+    raw_target: String,
+    target_path: String,
+    parent_scope: Option<String>,
+    basename: Option<String>,
+}
+
+/// Scoped lookup key so one local file delivered under two parents keeps both receipts.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ReceiptKey {
+    scope: Option<String>,
+    basename: Option<String>,
+    path: String,
+}
+
+/// Delivered URIs and missing-directory scopes used to rewrite workflow output locations.
+#[derive(Default)]
+struct Receipts {
+    scoped: HashMap<ReceiptKey, String>,
+    scopes: HashMap<ReceiptKey, String>,
+}
+
+impl Receipts {
+    fn insert(&mut self, key: ReceiptKey, location: String) {
+        self.scoped.insert(key, location);
+    }
+
+    fn insert_scope(&mut self, key: ReceiptKey, target_path: String) {
+        self.scopes.insert(key, target_path);
+    }
+
+    fn lookup(
+        &self,
+        map: &HashMap<ReceiptKey, String>,
+        scope: Option<&str>,
+        basename: Option<&str>,
+        raw: &str,
+    ) -> Option<String> {
+        let try_key = |base: Option<&str>, path: &str| {
+            map.get(&ReceiptKey {
+                scope: scope.map(str::to_owned),
+                basename: base.map(str::to_owned),
+                path: path.to_owned(),
+            })
+            .cloned()
+        };
+        if let Some(hit) = try_key(basename, raw) {
+            return Some(hit);
+        }
+        if basename.is_some()
+            && let Some(hit) = try_key(None, raw)
+        {
+            return Some(hit);
+        }
+        let canon = std::fs::canonicalize(raw)
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())?;
+        if let Some(hit) = try_key(basename, &canon) {
+            return Some(hit);
+        }
+        if basename.is_some() {
+            return try_key(None, &canon);
+        }
+        None
+    }
+
+    fn get(&self, scope: Option<&str>, basename: Option<&str>, loc: &str) -> Option<String> {
+        let raw = local_location(loc)?;
+        self.lookup(&self.scoped, scope, basename, &raw)
+    }
+
+    fn child_scope(
+        &self,
+        scope: Option<&str>,
+        basename: Option<&str>,
+        raw: &str,
+    ) -> Option<String> {
+        self.lookup(&self.scopes, scope, basename, raw)
+    }
+}
+
 /// One local file to deliver to the host under `target_path`.
 struct PendingFile {
     local: PathBuf,
-    raw_targets: Vec<String>,
+    raw_targets: Vec<ReceiptKey>,
     parent_dir: Option<String>,
     target_path: String,
     remote_hint: Option<String>,
@@ -183,8 +275,262 @@ struct PendingFile {
 struct OutputDir {
     raw_target: String,
     canonical: PathBuf,
+    parent_scope: Option<String>,
+    basename: Option<String>,
     target_path: String,
     leaf_empty: bool,
+}
+
+/// Planned local files, existing directories and missing parent directories for delivery.
+struct DeliveryPlan {
+    files: BTreeMap<String, PendingFile>,
+    dirs: Vec<OutputDir>,
+    missing_dirs: Vec<MissingDir>,
+}
+
+/// Resolves declared workflow outputs into concrete delivery destinations under `root`.
+fn plan_outputs(
+    root: &Path,
+    canonical_root: &Path,
+    deliveries: &[run_database::Delivered],
+    outputs: Option<&Value>,
+) -> Result<DeliveryPlan, ContractError> {
+    let mut delivery_sources: HashMap<String, String> = HashMap::new();
+    for item in deliveries {
+        let key = local_location(&item.target).unwrap_or_else(|| item.target.clone());
+        delivery_sources.insert(key.clone(), item.location.clone());
+        if let Ok(canon) = std::fs::canonicalize(&key) {
+            delivery_sources.insert(canon.to_string_lossy().into_owned(), item.location.clone());
+        }
+    }
+    let mut declared = Vec::new();
+    let mut missing_dirs = Vec::new();
+    if let Some(value) = outputs {
+        collect_output_paths(
+            value,
+            root,
+            canonical_root,
+            None,
+            &mut declared,
+            &mut missing_dirs,
+        );
+    }
+    let raw: Vec<(DeclaredOutput, Option<String>)> = match declared.is_empty() {
+        false => declared
+            .into_iter()
+            .filter(|item| !served(&item.source))
+            .map(|item| {
+                let loc = delivery_sources.get(&item.source).cloned().or_else(|| {
+                    std::fs::canonicalize(&item.source).ok().and_then(|canon| {
+                        delivery_sources
+                            .get(&canon.to_string_lossy().into_owned())
+                            .cloned()
+                    })
+                });
+                (item, loc)
+            })
+            .collect(),
+        true => deliveries
+            .iter()
+            .filter(|item| !served(&item.target))
+            .map(|item| {
+                let target = local_location(&item.target).unwrap_or_else(|| item.target.clone());
+                (
+                    DeclaredOutput {
+                        source: target,
+                        target_path: None,
+                        parent_dir: None,
+                        basename: None,
+                    },
+                    Some(item.location.clone()),
+                )
+            })
+            .collect(),
+    };
+    let mut by_target: BTreeMap<String, PendingFile> = BTreeMap::new();
+    let mut dirs: Vec<OutputDir> = Vec::new();
+    for (item, location) in raw {
+        let default_rel = relative_target(&item.source, root, canonical_root)?;
+        let target_path = item.target_path.unwrap_or(default_rel);
+        let remote_hint = location
+            .as_deref()
+            .filter(|loc| served(loc) && storage::has_version(loc))
+            .map(str::to_owned);
+        let source = resolve_source(&item.source, location.as_deref(), canonical_root)?;
+        let meta = std::fs::metadata(&source).map_err(|error| {
+            ContractError::internal(format!("cannot read output {target_path}: {error}"))
+        })?;
+        if meta.is_dir() {
+            check_path(&target_path)?;
+            let mut entries = Vec::new();
+            let mut sub_dirs = Vec::new();
+            walk_output(
+                &source,
+                &target_path,
+                canonical_root,
+                &mut entries,
+                &mut sub_dirs,
+            )?;
+            let target_base = Path::new(&item.source);
+            for (local, rel) in entries {
+                check_path(&rel)?;
+                let mut raw_targets = vec![ReceiptKey {
+                    scope: item.parent_dir.clone(),
+                    basename: None,
+                    path: local.to_string_lossy().into_owned(),
+                }];
+                if let Ok(inner) = local.strip_prefix(&source) {
+                    let joined = ReceiptKey {
+                        scope: item.parent_dir.clone(),
+                        basename: None,
+                        path: target_base.join(inner).to_string_lossy().into_owned(),
+                    };
+                    if !raw_targets.contains(&joined) {
+                        raw_targets.push(joined);
+                    }
+                }
+                let parent_dir = rel
+                    .rsplit_once('/')
+                    .map(|(parent, _)| parent.to_owned())
+                    .or_else(|| Some(target_path.clone()));
+                add_pending(
+                    &mut by_target,
+                    PendingFile {
+                        local,
+                        raw_targets,
+                        parent_dir,
+                        target_path: rel,
+                        remote_hint: None,
+                    },
+                )?;
+            }
+            for (sub_canon, sub_rel) in sub_dirs {
+                check_path(&sub_rel)?;
+                let raw_sub = sub_canon
+                    .strip_prefix(&source)
+                    .map(|inner| target_base.join(inner).to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| sub_canon.to_string_lossy().into_owned());
+                let leaf_empty = is_empty_dir(&sub_canon);
+                dirs.push(OutputDir {
+                    raw_target: raw_sub,
+                    canonical: sub_canon,
+                    parent_scope: item.parent_dir.clone(),
+                    basename: None,
+                    target_path: sub_rel,
+                    leaf_empty,
+                });
+            }
+            let leaf_empty = is_empty_dir(&source);
+            dirs.push(OutputDir {
+                raw_target: item.source,
+                canonical: source,
+                parent_scope: item.parent_dir,
+                basename: item.basename,
+                target_path,
+                leaf_empty,
+            });
+        } else if meta.is_file() {
+            check_path(&target_path)?;
+            let mut raw_targets = vec![ReceiptKey {
+                scope: item.parent_dir.clone(),
+                basename: item.basename.clone(),
+                path: item.source,
+            }];
+            let canon = ReceiptKey {
+                scope: item.parent_dir.clone(),
+                basename: item.basename,
+                path: source.to_string_lossy().into_owned(),
+            };
+            if !raw_targets.contains(&canon) {
+                raw_targets.push(canon);
+            }
+            add_pending(
+                &mut by_target,
+                PendingFile {
+                    local: source,
+                    raw_targets,
+                    parent_dir: item.parent_dir,
+                    target_path,
+                    remote_hint,
+                },
+            )?;
+        }
+    }
+    Ok(DeliveryPlan {
+        files: by_target,
+        dirs,
+        missing_dirs,
+    })
+}
+
+fn add_pending(
+    by_target: &mut BTreeMap<String, PendingFile>,
+    file: PendingFile,
+) -> Result<(), ContractError> {
+    if let Some(existing) = by_target.get_mut(&file.target_path) {
+        if existing.local != file.local {
+            return Err(ContractError::invalid(format!(
+                "conflicting outputs target {}",
+                file.target_path
+            )));
+        }
+        for key in file.raw_targets {
+            if !existing.raw_targets.contains(&key) {
+                existing.raw_targets.push(key);
+            }
+        }
+        if existing.remote_hint.is_none() {
+            existing.remote_hint = file.remote_hint;
+        }
+        return Ok(());
+    }
+    by_target.insert(file.target_path.clone(), file);
+    Ok(())
+}
+
+/// Records one delivered child under its directory and every ancestor directory prefix.
+fn record_sample(
+    samples: &mut HashMap<String, (String, String)>,
+    parent_dir: Option<&str>,
+    delivered_rel: &str,
+    location: &str,
+) {
+    let Some(mut cur) = parent_dir else {
+        return;
+    };
+    while !cur.is_empty() {
+        samples
+            .entry(cur.to_owned())
+            .or_insert_with(|| (delivered_rel.to_owned(), location.to_owned()));
+        match cur.rsplit_once('/') {
+            Some((head, _)) => cur = head,
+            None => break,
+        }
+    }
+}
+
+/// Populates missing-directory receipts only from children actually delivered beneath each prefix.
+fn finish_missing(
+    missing_dirs: Vec<MissingDir>,
+    dir_sample: &HashMap<String, (String, String)>,
+    output_base: Option<&str>,
+    receipts: &mut Receipts,
+) {
+    for dir in missing_dirs {
+        let Some((rel, loc)) = dir_sample.get(&dir.target_path) else {
+            continue;
+        };
+        let prefix = output_prefix(loc, rel, &dir.target_path)
+            .or_else(|| output_base.map(|base| prefix_for(base, &dir.target_path)))
+            .unwrap_or_else(|| format!("{}/", dir.target_path.trim_end_matches('/')));
+        let key = ReceiptKey {
+            scope: dir.parent_scope,
+            basename: dir.basename,
+            path: dir.raw_target,
+        };
+        receipts.insert(key.clone(), prefix);
+        receipts.insert_scope(key, dir.target_path);
+    }
 }
 
 /// Delivers every declared workflow output written into the coordinator workspace to the host and
@@ -203,137 +549,11 @@ async fn deliver_outputs(
     let deliveries = store
         .deliveries(run_id)
         .map_err(|error| ContractError::internal(format!("read deliveries: {error}")))?;
-    let mut delivery_sources: HashMap<String, String> = HashMap::new();
-    for item in &deliveries {
-        let key = local_location(&item.target).unwrap_or_else(|| item.target.clone());
-        delivery_sources.insert(key.clone(), item.location.clone());
-        if let Ok(canon) = std::fs::canonicalize(&key) {
-            delivery_sources.insert(canon.to_string_lossy().into_owned(), item.location.clone());
-        }
-    }
-    let mut declared = Vec::new();
-    let mut missing_dirs = Vec::new();
-    if let Some(value) = outputs.as_deref() {
-        collect_output_paths(
-            value,
-            root,
-            &canonical_root,
-            &mut declared,
-            &mut missing_dirs,
-        );
-    }
-    let raw: Vec<(String, Option<String>)> = match declared.is_empty() {
-        false => declared
-            .into_iter()
-            .filter(|path| !served(path))
-            .map(|path| {
-                let loc = delivery_sources.get(&path).cloned().or_else(|| {
-                    std::fs::canonicalize(&path).ok().and_then(|canon| {
-                        delivery_sources
-                            .get(&canon.to_string_lossy().into_owned())
-                            .cloned()
-                    })
-                });
-                (path, loc)
-            })
-            .collect(),
-        true => deliveries
-            .into_iter()
-            .filter(|item| !served(&item.target))
-            .map(|item| {
-                let target = local_location(&item.target).unwrap_or(item.target);
-                (target, Some(item.location))
-            })
-            .collect(),
-    };
-    let mut by_target: BTreeMap<String, PendingFile> = BTreeMap::new();
-    let mut dirs: Vec<OutputDir> = Vec::new();
-    for (target, location) in raw {
-        let target_path = relative_target(&target, root, &canonical_root)?;
-        let remote_hint = location
-            .as_deref()
-            .filter(|loc| served(loc) && storage::has_version(loc))
-            .map(str::to_owned);
-        let source = resolve_source(&target, location.as_deref(), &canonical_root)?;
-        let meta = std::fs::metadata(&source).map_err(|error| {
-            ContractError::internal(format!("cannot read output {target_path}: {error}"))
-        })?;
-        if meta.is_dir() {
-            check_path(&target_path)?;
-            let mut entries = Vec::new();
-            let mut sub_dirs = Vec::new();
-            walk_output(
-                &source,
-                &target_path,
-                &canonical_root,
-                &mut entries,
-                &mut sub_dirs,
-            )?;
-            let target_base = Path::new(&target);
-            for (local, rel) in entries {
-                check_path(&rel)?;
-                let mut raw_targets = vec![local.to_string_lossy().into_owned()];
-                if let Ok(inner) = local.strip_prefix(&source) {
-                    let joined = target_base.join(inner).to_string_lossy().into_owned();
-                    if !raw_targets.contains(&joined) {
-                        raw_targets.push(joined);
-                    }
-                }
-                by_target.insert(
-                    rel.clone(),
-                    PendingFile {
-                        local,
-                        raw_targets,
-                        parent_dir: Some(target_path.clone()),
-                        target_path: rel,
-                        remote_hint: None,
-                    },
-                );
-            }
-            for (sub_canon, sub_rel) in sub_dirs {
-                check_path(&sub_rel)?;
-                let raw_sub = sub_canon
-                    .strip_prefix(&source)
-                    .map(|inner| target_base.join(inner).to_string_lossy().into_owned())
-                    .unwrap_or_else(|_| sub_canon.to_string_lossy().into_owned());
-                let leaf_empty = is_empty_dir(&sub_canon);
-                dirs.push(OutputDir {
-                    raw_target: raw_sub,
-                    canonical: sub_canon,
-                    target_path: sub_rel,
-                    leaf_empty,
-                });
-            }
-            let leaf_empty = is_empty_dir(&source);
-            dirs.push(OutputDir {
-                raw_target: target,
-                canonical: source,
-                target_path,
-                leaf_empty,
-            });
-        } else if meta.is_file() {
-            check_path(&target_path)?;
-            let mut raw_targets = vec![target];
-            let canon = source.to_string_lossy().into_owned();
-            if !raw_targets.contains(&canon) {
-                raw_targets.push(canon);
-            }
-            by_target.insert(
-                target_path.clone(),
-                PendingFile {
-                    local: source,
-                    raw_targets,
-                    parent_dir: None,
-                    target_path,
-                    remote_hint,
-                },
-            );
-        }
-    }
-    let mut receipts: HashMap<String, String> = HashMap::new();
+    let plan = plan_outputs(root, &canonical_root, &deliveries, outputs.as_deref())?;
+    let mut receipts = Receipts::default();
     let mut dir_sample: HashMap<String, (String, String)> = HashMap::new();
     let mut any_sample: Option<(String, String)> = None;
-    for (index, item) in by_target.into_values().enumerate() {
+    for (index, item) in plan.files.into_values().enumerate() {
         if rpc.cancel_token().is_cancelled() {
             return Ok(());
         }
@@ -363,16 +583,17 @@ async fn deliver_outputs(
         if any_sample.is_none() {
             any_sample = Some((item.target_path.clone(), location.clone()));
         }
-        if let Some(parent) = item.parent_dir {
-            dir_sample
-                .entry(parent)
-                .or_insert_with(|| (item.target_path.clone(), location.clone()));
-        }
+        record_sample(
+            &mut dir_sample,
+            item.parent_dir.as_deref(),
+            &item.target_path,
+            &location,
+        );
         for raw_key in item.raw_targets {
             receipts.insert(raw_key, location.clone());
         }
     }
-    for dir in dirs {
+    for dir in plan.dirs {
         let prefix = if dir.leaf_empty {
             if rpc.cancel_token().is_cancelled() {
                 return Ok(());
@@ -383,9 +604,12 @@ async fn deliver_outputs(
             };
             match rpc.call(call).await? {
                 HostRpcResult::Delivered { location } => {
+                    let clean = dir.target_path.trim_end_matches('/');
                     if any_sample.is_none() {
-                        any_sample = Some((dir.target_path.clone(), location.clone()));
+                        any_sample = Some((clean.to_owned(), location.clone()));
                     }
+                    let parent = clean.rsplit_once('/').map(|(head, _)| head);
+                    record_sample(&mut dir_sample, parent, clean, &location);
                     location
                 }
                 other => {
@@ -395,36 +619,37 @@ async fn deliver_outputs(
                 }
             }
         } else {
-            output_base
-                .map(|base| prefix_for(base, &dir.target_path))
+            dir_sample
+                .get(&dir.target_path)
+                .and_then(|(rel, loc)| output_prefix(loc, rel, &dir.target_path))
+                .or_else(|| output_base.map(|base| prefix_for(base, &dir.target_path)))
                 .or_else(|| {
-                    dir_sample
-                        .get(&dir.target_path)
-                        .or(any_sample.as_ref())
+                    any_sample
+                        .as_ref()
                         .and_then(|(rel, loc)| output_prefix(loc, rel, &dir.target_path))
                 })
                 .unwrap_or_else(|| format!("{}/", dir.target_path.trim_end_matches('/')))
         };
-        receipts.insert(dir.raw_target, prefix.clone());
-        receipts.insert(dir.canonical.to_string_lossy().into_owned(), prefix);
+        receipts.insert(
+            ReceiptKey {
+                scope: dir.parent_scope.clone(),
+                basename: dir.basename.clone(),
+                path: dir.raw_target,
+            },
+            prefix.clone(),
+        );
+        receipts.insert(
+            ReceiptKey {
+                scope: dir.parent_scope,
+                basename: dir.basename,
+                path: dir.canonical.to_string_lossy().into_owned(),
+            },
+            prefix,
+        );
     }
-    for raw_dir in missing_dirs {
-        if let Ok(target_path) = relative_target(&raw_dir, root, &canonical_root)
-            && check_path(&target_path).is_ok()
-        {
-            let prefix = output_base
-                .map(|base| prefix_for(base, &target_path))
-                .or_else(|| {
-                    any_sample
-                        .as_ref()
-                        .and_then(|(rel, loc)| output_prefix(loc, rel, &target_path))
-                })
-                .unwrap_or_else(|| format!("{}/", target_path.trim_end_matches('/')));
-            receipts.insert(raw_dir, prefix);
-        }
-    }
+    finish_missing(plan.missing_dirs, &dir_sample, output_base, &mut receipts);
     if let Some(value) = outputs {
-        rewrite_locations(value, &receipts);
+        rewrite_locations(value, &receipts, None);
     }
     Ok(())
 }
@@ -448,11 +673,15 @@ fn prefix_for(base: &str, dir_path: &str) -> String {
 
 /// Derives the delivered output prefix for `dir_path` from one delivered file receipt.
 fn output_prefix(location: &str, delivered_rel: &str, dir_path: &str) -> Option<String> {
-    let without_query = location.split_once('?').map_or(location, |(head, _)| head);
-    let encoded_rel = aruna_workflow_contract::host::encode_key(delivered_rel);
+    let without_query = location
+        .split_once('?')
+        .map_or(location, |(head, _)| head)
+        .trim_end_matches('/');
+    let clean_rel = delivered_rel.trim_end_matches('/');
+    let encoded_rel = aruna_workflow_contract::host::encode_key(clean_rel);
     let base = without_query
         .strip_suffix(&format!("/{encoded_rel}"))
-        .or_else(|| without_query.strip_suffix(&format!("/{delivered_rel}")))?;
+        .or_else(|| without_query.strip_suffix(&format!("/{clean_rel}")))?;
     let encoded_dir = aruna_workflow_contract::host::encode_key(dir_path.trim_end_matches('/'));
     Some(format!("{base}/{encoded_dir}/"))
 }
@@ -470,29 +699,56 @@ fn local_location(loc: &str) -> Option<String> {
     Some(loc.to_owned())
 }
 
+fn usable_path(map: &serde_json::Map<String, Value>, field: &str) -> Option<String> {
+    map.get(field)
+        .and_then(Value::as_str)
+        .filter(|loc| !loc.is_empty() && !loc.starts_with("_:"))
+        .and_then(local_location)
+}
+
+fn entry_basename(map: &serde_json::Map<String, Value>) -> Option<String> {
+    map.get("basename")
+        .and_then(Value::as_str)
+        .filter(|name| {
+            !name.is_empty()
+                && *name != "."
+                && *name != ".."
+                && !name.contains('/')
+                && !name.contains('\\')
+        })
+        .map(str::to_owned)
+}
+
+fn child_name(map: Option<&serde_json::Map<String, Value>>, path: &str) -> Option<String> {
+    if let Some(base) = map.and_then(entry_basename) {
+        return Some(base);
+    }
+    let name = Path::new(path).file_name().and_then(|n| n.to_str())?;
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\') {
+        return None;
+    }
+    Some(name.to_owned())
+}
+
 /// Collects file and directory output paths (including `secondaryFiles`) from `run.outputs`.
 fn collect_output_paths(
     value: &Value,
     root: &Path,
     canonical_root: &Path,
-    out: &mut Vec<String>,
-    missing_dirs: &mut Vec<String>,
+    parent_dir: Option<&str>,
+    out: &mut Vec<DeclaredOutput>,
+    missing_dirs: &mut Vec<MissingDir>,
 ) {
     match value {
-        Value::Array(items) => items
-            .iter()
-            .for_each(|item| collect_output_paths(item, root, canonical_root, out, missing_dirs)),
+        Value::Array(items) => items.iter().for_each(|item| {
+            collect_output_paths(item, root, canonical_root, parent_dir, out, missing_dirs);
+        }),
         Value::Object(map) => {
             let class = map.get("class").and_then(Value::as_str);
             let is_entry = matches!(class, Some("File" | "Directory"));
-            let usable = |field: &str| {
-                map.get(field)
-                    .and_then(Value::as_str)
-                    .filter(|loc| !loc.is_empty() && !loc.starts_with("_:"))
-                    .and_then(local_location)
-            };
+            let basename = is_entry.then(|| entry_basename(map)).flatten();
             let entry_path = match is_entry {
-                true => usable("location").or_else(|| usable("path")),
+                true => usable_path(map, "location").or_else(|| usable_path(map, "path")),
                 false => None,
             };
             let walked_dir = class == Some("Directory")
@@ -504,13 +760,48 @@ fn collect_output_paths(
                     .get("listing")
                     .and_then(Value::as_array)
                     .is_some_and(|items| !items.is_empty());
+            let mut list_parent = parent_dir.map(str::to_owned);
             match (class, entry_path) {
                 (Some("Directory"), Some(path)) if !walked_dir && has_listing => {
                     if !served(&path) {
-                        missing_dirs.push(path);
+                        let dir_rel = match parent_dir {
+                            Some(parent) => {
+                                child_name(Some(map), &path).map(|name| format!("{parent}/{name}"))
+                            }
+                            None => relative_target(&path, root, canonical_root).ok(),
+                        };
+                        if let Some(rel) = dir_rel.filter(|rel| check_path(rel).is_ok()) {
+                            missing_dirs.push(MissingDir {
+                                raw_target: path,
+                                target_path: rel.clone(),
+                                parent_scope: parent_dir.map(str::to_owned),
+                                basename: basename.clone(),
+                            });
+                            list_parent = Some(rel);
+                        }
                     }
                 }
-                (_, Some(path)) => out.push(path),
+                (Some("Directory"), None) if has_listing => {
+                    if let (Some(parent), Some(base)) = (parent_dir, basename.as_deref()) {
+                        let nested = format!("{parent}/{base}");
+                        if check_path(&nested).is_ok() {
+                            list_parent = Some(nested);
+                        }
+                    }
+                }
+                (_, Some(path)) => {
+                    let target_path = parent_dir.and_then(|parent| {
+                        let name = child_name(Some(map), &path)?;
+                        let rel = format!("{parent}/{name}");
+                        check_path(&rel).ok().map(|()| rel)
+                    });
+                    out.push(DeclaredOutput {
+                        source: path,
+                        target_path,
+                        parent_dir: parent_dir.map(str::to_owned),
+                        basename,
+                    });
+                }
                 _ => {}
             }
             for (key, item) in map {
@@ -520,7 +811,11 @@ fn collect_output_paths(
                 if walked_dir && key == "listing" {
                     continue;
                 }
-                collect_output_paths(item, root, canonical_root, out, missing_dirs);
+                let next_parent = match key == "listing" && class == Some("Directory") {
+                    true => list_parent.as_deref(),
+                    false => parent_dir,
+                };
+                collect_output_paths(item, root, canonical_root, next_parent, out, missing_dirs);
             }
         }
         Value::String(text) => {
@@ -533,38 +828,67 @@ fn collect_output_paths(
                 && relative_target(&path, root, canonical_root).is_ok()
                 && candidate.exists()
             {
-                out.push(path);
+                let target_path = parent_dir.and_then(|parent| {
+                    let name = child_name(None, &path)?;
+                    let rel = format!("{parent}/{name}");
+                    check_path(&rel).ok().map(|()| rel)
+                });
+                out.push(DeclaredOutput {
+                    source: path,
+                    target_path,
+                    parent_dir: parent_dir.map(str::to_owned),
+                    basename: None,
+                });
             }
         }
         _ => {}
     }
 }
 
-fn rewrite_locations(value: &mut Value, receipts: &HashMap<String, String>) {
-    let lookup = |loc: &str| -> Option<String> {
-        let raw = local_location(loc)?;
-        if let Some(delivered) = receipts.get(&raw) {
-            return Some(delivered.clone());
-        }
-        std::fs::canonicalize(&raw)
-            .ok()
-            .and_then(|canon| receipts.get(&canon.to_string_lossy().into_owned()).cloned())
-    };
+fn rewrite_locations(value: &mut Value, receipts: &Receipts, scope: Option<&str>) {
     match value {
         Value::Array(items) => items
             .iter_mut()
-            .for_each(|item| rewrite_locations(item, receipts)),
+            .for_each(|item| rewrite_locations(item, receipts, scope)),
         Value::Object(map) => {
-            if let Some(loc) = map.get("location").and_then(Value::as_str)
-                && let Some(delivered) = lookup(loc)
-            {
-                map.insert("location".into(), Value::String(delivered));
+            let class = map.get("class").and_then(Value::as_str);
+            let is_dir = class == Some("Directory");
+            let is_entry = matches!(class, Some("File" | "Directory"));
+            let basename = is_entry.then(|| entry_basename(map)).flatten();
+            let list_scope = match is_dir {
+                true => {
+                    let raw = usable_path(map, "location").or_else(|| usable_path(map, "path"));
+                    match raw {
+                        Some(raw) => receipts
+                            .child_scope(scope, basename.as_deref(), &raw)
+                            .or_else(|| scope.map(str::to_owned)),
+                        None => match (scope, basename.as_deref()) {
+                            (Some(parent), Some(base)) => Some(format!("{parent}/{base}")),
+                            _ => scope.map(str::to_owned),
+                        },
+                    }
+                }
+                false => scope.map(str::to_owned),
+            };
+            for (key, item) in map.iter_mut() {
+                if is_entry
+                    && matches!(key.as_str(), "location" | "path")
+                    && let Value::String(text) = item
+                {
+                    if let Some(delivered) = receipts.get(scope, basename.as_deref(), text) {
+                        *text = delivered;
+                    }
+                    continue;
+                }
+                let next_scope = match key == "listing" && is_dir {
+                    true => list_scope.as_deref(),
+                    false => scope,
+                };
+                rewrite_locations(item, receipts, next_scope);
             }
-            map.values_mut()
-                .for_each(|item| rewrite_locations(item, receipts));
         }
         Value::String(text) => {
-            if let Some(delivered) = lookup(text) {
+            if let Some(delivered) = receipts.get(scope, None, text) {
                 *text = delivered;
             }
         }
@@ -923,26 +1247,34 @@ mod tests {
         });
         let mut found = Vec::new();
         let mut missing_dirs = Vec::new();
-        collect_output_paths(&outputs, root, &canon, &mut found, &mut missing_dirs);
+        collect_output_paths(&outputs, root, &canon, None, &mut found, &mut missing_dirs);
         assert!(missing_dirs.is_empty());
+        let sources: Vec<&str> = found.iter().map(|item| item.source.as_str()).collect();
         assert_eq!(
-            found,
+            sources,
             vec![
-                bam.to_string_lossy().into_owned(),
-                bai.to_string_lossy().into_owned(),
+                bam.to_string_lossy().as_ref(),
+                bai.to_string_lossy().as_ref()
             ]
         );
-        let receipts = HashMap::from([
-            (
-                bam.to_string_lossy().into_owned(),
-                "aruna://results/run/sample 1.bam?version=v1".to_owned(),
-            ),
-            (
-                bai.to_string_lossy().into_owned(),
-                "aruna://results/run/sample 1.bam.bai?version=v2".to_owned(),
-            ),
-        ]);
-        rewrite_locations(&mut outputs, &receipts);
+        let mut receipts = Receipts::default();
+        receipts.insert(
+            ReceiptKey {
+                scope: None,
+                basename: None,
+                path: bam.to_string_lossy().into_owned(),
+            },
+            "aruna://results/run/sample 1.bam?version=v1".to_owned(),
+        );
+        receipts.insert(
+            ReceiptKey {
+                scope: None,
+                basename: None,
+                path: bai.to_string_lossy().into_owned(),
+            },
+            "aruna://results/run/sample 1.bam.bai?version=v2".to_owned(),
+        );
+        rewrite_locations(&mut outputs, &receipts, None);
         assert_eq!(
             outputs["aligned"]["location"],
             "aruna://results/run/sample 1.bam?version=v1"
@@ -964,6 +1296,15 @@ mod tests {
             output_prefix(loc, "out_dir/a.txt", "empty_dir").as_deref(),
             Some("aruna://results/prefix/empty_dir/")
         );
+        assert_eq!(
+            output_prefix(
+                "aruna://results/prefix/absent/empty_sub/?version=01J2",
+                "absent/empty_sub",
+                "absent",
+            )
+            .as_deref(),
+            Some("aruna://results/prefix/absent/")
+        );
         let mut value = json!({
             "bundle": {
                 "class": "Directory",
@@ -979,25 +1320,32 @@ mod tests {
                 "listing": []
             }
         });
-        let receipts = HashMap::from([
+        let mut receipts = Receipts::default();
+        for (path, uri) in [
             (
-                "/work/outputs/out_dir/a.txt".to_owned(),
-                "aruna://results/prefix/out_dir/a.txt?version=v1".to_owned(),
+                "/work/outputs/out_dir/a.txt",
+                "aruna://results/prefix/out_dir/a.txt?version=v1",
             ),
             (
-                "/work/outputs/out_dir/b.txt".to_owned(),
-                "aruna://results/prefix/out_dir/b.txt?version=v2".to_owned(),
+                "/work/outputs/out_dir/b.txt",
+                "aruna://results/prefix/out_dir/b.txt?version=v2",
             ),
+            ("/work/outputs/out_dir", "aruna://results/prefix/out_dir/"),
             (
-                "/work/outputs/out_dir".to_owned(),
-                "aruna://results/prefix/out_dir/".to_owned(),
+                "/work/outputs/empty_dir",
+                "aruna://results/prefix/empty_dir/",
             ),
-            (
-                "/work/outputs/empty_dir".to_owned(),
-                "aruna://results/prefix/empty_dir/".to_owned(),
-            ),
-        ]);
-        rewrite_locations(&mut value, &receipts);
+        ] {
+            receipts.insert(
+                ReceiptKey {
+                    scope: None,
+                    basename: None,
+                    path: path.to_owned(),
+                },
+                uri.to_owned(),
+            );
+        }
+        rewrite_locations(&mut value, &receipts, None);
         assert_eq!(
             value["bundle"]["location"],
             "aruna://results/prefix/out_dir/"
@@ -1029,6 +1377,9 @@ mod tests {
         std::fs::write(&extra, b"extra").unwrap();
         let root = dir.path();
         let canon = std::fs::canonicalize(root).unwrap();
+        let absent_path = out_dir.join("absent");
+        let nested_path = out_dir.join("nested_absent");
+        let remote_only = out_dir.join("remote_only");
         let outputs = json!({
             "aligned": {
                 "class": "File",
@@ -1048,34 +1399,86 @@ mod tests {
             },
             "missing_parent": {
                 "class": "Directory",
-                "location": format!("file://{}", out_dir.join("absent").display()),
+                "location": format!("file://{}", absent_path.display()),
+                "listing": [
+                    {
+                        "class": "File",
+                        "path": extra.to_string_lossy(),
+                    },
+                    {
+                        "class": "Directory",
+                        "location": format!("file://{}", nested_path.display()),
+                        "listing": [{
+                            "class": "File",
+                            "path": extra.to_string_lossy(),
+                            "basename": "renamed.txt",
+                        }],
+                    },
+                ],
+            },
+            "remote_parent": {
+                "class": "Directory",
+                "location": format!("file://{}", remote_only.display()),
                 "listing": [{
                     "class": "File",
-                    "path": extra.to_string_lossy(),
+                    "location": "aruna://other/ext.txt?version=v9",
                 }],
             },
         });
-        let mut found = Vec::new();
-        let mut missing_dirs = Vec::new();
-        collect_output_paths(&outputs, root, &canon, &mut found, &mut missing_dirs);
+        let plan = plan_outputs(root, &canon, &[], Some(&outputs)).unwrap();
+        let targets: Vec<&str> = plan.files.keys().map(String::as_str).collect();
         assert_eq!(
-            found,
+            targets,
             vec![
-                main.to_string_lossy().into_owned(),
-                idx.to_string_lossy().into_owned(),
-                extra.to_string_lossy().into_owned(),
-                extra.to_string_lossy().into_owned(),
+                "a.bam",
+                "a.bam.bai",
+                "absent/extra.txt",
+                "absent/nested_absent/renamed.txt",
+                "extra.txt",
             ]
         );
-        let absent = out_dir.join("absent").to_string_lossy().into_owned();
-        assert_eq!(missing_dirs, vec![absent.clone()]);
-        let rel = relative_target(&absent, root, &canon).unwrap();
+        assert_eq!(plan.missing_dirs.len(), 3);
+        let mut receipts = Receipts::default();
+        let mut dir_sample = HashMap::new();
+        for (i, item) in plan.files.into_values().enumerate() {
+            let loc = format!("aruna://results/run/{}?version=v{i}", item.target_path);
+            record_sample(
+                &mut dir_sample,
+                item.parent_dir.as_deref(),
+                &item.target_path,
+                &loc,
+            );
+            for key in item.raw_targets {
+                receipts.insert(key, loc.clone());
+            }
+        }
+        finish_missing(plan.missing_dirs, &dir_sample, None, &mut receipts);
         let mut rewritten = outputs;
-        let receipts = HashMap::from([(absent, prefix_for("aruna://results/run", &rel))]);
-        rewrite_locations(&mut rewritten, &receipts);
+        rewrite_locations(&mut rewritten, &receipts, None);
+        assert_eq!(
+            rewritten["virtual_dir"]["listing"][0]["path"],
+            "aruna://results/run/extra.txt?version=v4"
+        );
         assert_eq!(
             rewritten["missing_parent"]["location"],
             "aruna://results/run/absent/"
+        );
+        assert_eq!(
+            rewritten["missing_parent"]["listing"][0]["path"],
+            "aruna://results/run/absent/extra.txt?version=v2"
+        );
+        assert_eq!(
+            rewritten["missing_parent"]["listing"][1]["location"],
+            "aruna://results/run/absent/nested_absent/"
+        );
+        assert_eq!(
+            rewritten["missing_parent"]["listing"][1]["listing"][0]["path"],
+            "aruna://results/run/absent/nested_absent/renamed.txt?version=v3"
+        );
+        // A missing directory with no delivered local children keeps no fabricated destination URI.
+        assert_eq!(
+            rewritten["remote_parent"]["location"],
+            format!("file://{}", remote_only.display())
         );
     }
 
