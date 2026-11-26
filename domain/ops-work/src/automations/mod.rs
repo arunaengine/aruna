@@ -13,6 +13,7 @@ pub mod identity;
 pub mod lifecycle;
 pub mod limits;
 pub mod matcher;
+pub mod notify_stage;
 pub mod reads;
 pub mod run_stage;
 pub mod start;
