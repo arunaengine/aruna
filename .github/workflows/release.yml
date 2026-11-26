@@ -66,6 +66,53 @@ jobs:
             exit 1
           }
 
+      - name: Check that an existing release tag matches this commit
+        if: github.event_name == 'push' || inputs.publish_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          tag="v$version"
+          body="$(mktemp)"
+          trap 'rm -f "$body"' EXIT
+          code="$(curl -sS -o "$body" -w '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/git/ref/tags/$tag")"
+          if [ "$code" = "404" ]; then
+            exit 0
+          fi
+          if [ "$code" != "200" ]; then
+            cat "$body" >&2
+            echo "failed to query refs/tags/$tag (HTTP $code)" >&2
+            exit 1
+          fi
+          ref_obj="$(jq -c --arg r "refs/tags/$tag" \
+            'if type == "array" then (.[] | select(.ref == $r)) else select(.ref == $r) end' "$body")"
+          if [ -z "$ref_obj" ]; then
+            exit 0
+          fi
+          obj_type="$(jq -r '.object.type' <<<"$ref_obj")"
+          obj_sha="$(jq -r '.object.sha' <<<"$ref_obj")"
+          while [ "$obj_type" = "tag" ]; do
+            code="$(curl -sS -o "$body" -w '%{http_code}' \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/git/tags/$obj_sha")"
+            if [ "$code" != "200" ]; then
+              cat "$body" >&2
+              echo "failed to dereference tag object $obj_sha (HTTP $code)" >&2
+              exit 1
+            fi
+            obj_type="$(jq -r '.object.type' "$body")"
+            obj_sha="$(jq -r '.object.sha' "$body")"
+          done
+          if [ "$obj_type" != "commit" ] || [ "$obj_sha" != "$GITHUB_SHA" ]; then
+            echo "existing tag $tag points to $obj_sha ($obj_type), refusing to publish from $GITHUB_SHA" >&2
+            exit 1
+          fi
+
       - name: Decide tags and images
         id: plan
         env:
@@ -323,6 +370,9 @@ jobs:
       && contains(fromJSON('["success", "skipped"]'), needs.companion-images.result)
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    concurrency:
+      group: release-publish-${{ needs.plan.outputs.tag }}
+      cancel-in-progress: false
     permissions:
       contents: write
 
@@ -360,6 +410,11 @@ jobs:
         run: |
           set -euo pipefail
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            tag_sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$TAG" --jq .sha)"
+            if [ "$tag_sha" != "$GITHUB_SHA" ]; then
+              echo "existing release $TAG points to $tag_sha, refusing to overwrite from $GITHUB_SHA" >&2
+              exit 1
+            fi
             gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
             gh release edit "$TAG" --prerelease="$PRERELEASE" --repo "$GITHUB_REPOSITORY"
           else
