@@ -24,6 +24,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 mod applets;
+pub(crate) mod automations;
 mod compute;
 mod context;
 pub(crate) mod data;
@@ -67,6 +68,7 @@ impl McpServer {
         let mut tool_router = context::toolset();
         tool_router.merge(compute::toolset());
         tool_router.merge(applets::toolset());
+        tool_router.merge(automations::toolset());
         tool_router.merge(data::toolset());
         tool_router.merge(metadata::toolset());
         tool_router.merge(workflows::toolset());
@@ -347,6 +349,7 @@ mod tests {
     fn all_tools() -> Vec<rmcp::model::Tool> {
         let mut router = super::context::toolset();
         router.merge(super::compute::toolset());
+        router.merge(super::automations::toolset());
         router.merge(super::data::toolset());
         router.merge(super::metadata::toolset());
         router.merge(super::workflows::toolset());
