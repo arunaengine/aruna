@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
@@ -1301,7 +1301,12 @@ impl RunTaskOperation {
                 .cloned()
                 .unwrap_or_else(|| fallback.cloned().unwrap_or_default().into_bytes())
         };
-        let manifest: Vec<(String, bool)> = (text("manifest").unwrap_or_default().lines())
+        let manifest_raw = files
+            .get("manifest")
+            .map(|bytes| String::from_utf8_lossy(bytes));
+        let mut seen_paths = BTreeSet::new();
+        let manifest: Vec<(String, bool)> = (manifest_raw.as_deref().unwrap_or_default())
+            .split_terminator('\n')
             .filter_map(|line| line.split_once(' '))
             .filter_map(|(kind, path)| {
                 let directory = match kind {
@@ -1309,7 +1314,8 @@ impl RunTaskOperation {
                     "directory" => true,
                     _ => return None,
                 };
-                Some((manifest_path(path, directory)?, directory))
+                let norm = manifest_path(path, directory)?;
+                seen_paths.insert(norm.clone()).then_some((norm, directory))
             })
             .collect();
         let files: Vec<RunFile> = (manifest.iter())

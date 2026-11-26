@@ -209,14 +209,15 @@ fn reads_remote_outputs() {
     control_files.insert("exit".into(), b"0\n".to_vec());
     control_files.insert(
         "manifest".into(),
-        b"directory .\ndirectory ./outdir/\nfile //tmp/result\n".to_vec(),
+        b"directory .\ndirectory ./outdir/\nfile //tmp/result\nfile /tmp/result\nfile a\\b "
+            .to_vec(),
     );
     let _ = dir_task.collected(summary, control_files).unwrap();
     let TaskStep::Pin(ref parts) = dir_task.step else {
         panic!("expected pinned task answer");
     };
     let (_, finished) = parts.as_ref();
-    assert_eq!(finished.outputs.len(), 3);
+    assert_eq!(finished.outputs.len(), 4);
     let dot_out = &finished.outputs[0];
     assert!(dot_out.directory && dot_out.address.is_empty() && dot_out.files_token.is_none());
     assert_eq!(dot_out.path, ".");
@@ -236,6 +237,11 @@ fn reads_remote_outputs() {
     assert!(!abs_out.directory);
     assert_eq!(abs_out.path, "/tmp/result");
     assert!(abs_out.address.ends_with("control/root/tmp/result"));
+    let space_out = &finished.outputs[3];
+    assert!(!space_out.directory);
+    assert_eq!(space_out.path, "a\\b ");
+    let space_target = resolve(&run, &space_out.address).unwrap();
+    assert!(space_target.key.ends_with("/work/a\\b "));
 
     // Paging bounds the full `RpcResponse` size strictly and rejects entries that cannot fit alone.
     let summary = ChildSummary::from_projection(&dir_ran);
