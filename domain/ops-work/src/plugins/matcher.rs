@@ -9,8 +9,8 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{EVENT_JOURNAL_KEYSPACE, PLUGIN_GAPS_KEYSPACE, PLUGIN_OUTBOX_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::plugin_runs::{
-    ForwardRow, GapReason, GapRow, JOURNAL_RETENTION_MS, JOURNAL_ROW, PENDING_ROW, SourceEvent,
-    SourceKind, gap_key, outbox_key, source_key,
+    AUTO_PENDING_ROW, ForwardRow, GapReason, GapRow, JOURNAL_RETENTION_MS, JOURNAL_ROW,
+    PENDING_ROW, SourceEvent, SourceKind, gap_key, outbox_key, source_key,
 };
 use aruna_core::types::GroupId;
 use aruna_core::user::id::UserId;
@@ -152,9 +152,19 @@ impl MatchPage {
         {
             if !self.keep {
                 let kept = [&[JOURNAL_ROW][..], &key[1..]].concat();
+                let has_auto = event.as_ref().is_some_and(|e| {
+                    matches!(
+                        e.kind,
+                        SourceKind::DataUploaded
+                            | SourceKind::AppletSubmission
+                            | SourceKind::RunFinished
+                    )
+                });
+                let auto = has_auto.then(|| [&[AUTO_PENDING_ROW][..], &key[1..]].concat());
                 let source = event.map(|event| source_key(&event.source));
                 done.push((EVENT_JOURNAL_KEYSPACE, key));
                 done.push((EVENT_JOURNAL_KEYSPACE, kept));
+                done.extend(auto.map(|key| (EVENT_JOURNAL_KEYSPACE, key)));
                 done.extend(source.map(|key| (EVENT_JOURNAL_KEYSPACE, key)));
                 continue;
             }

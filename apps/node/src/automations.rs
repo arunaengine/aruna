@@ -2,10 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_core::id::NodeId;
+use aruna_core::structs::identity::features::Feature;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_ops_work::automations::matcher::MatchEventsOperation;
 use aruna_ops_work::automations::runner::StepFiringsOperation;
@@ -21,13 +23,16 @@ pub fn spawn_worker(
     context: Arc<DriverContext>,
     realm_id: RealmId,
     node_id: NodeId,
+    disabled_features: BTreeSet<Feature>,
     shutdown: &Shutdown,
 ) {
     let token = shutdown.token();
     shutdown.spawn(async move {
         loop {
             let mut busy = false;
-            match drive(MatchEventsOperation::new(realm_id), context.as_ref()).await {
+            let matcher = MatchEventsOperation::new(realm_id)
+                .with_disabled_features(disabled_features.clone());
+            match drive(matcher, context.as_ref()).await {
                 Ok(report) => {
                     if report.scanned > 0 || report.fired > 0 {
                         busy = true;
@@ -36,12 +41,9 @@ pub fn spawn_worker(
                 }
                 Err(error) => warn!(%error, "Automation event matching failed"),
             }
-            match drive(
-                StepFiringsOperation::new((node_id, realm_id)),
-                context.as_ref(),
-            )
-            .await
-            {
+            let stepper = StepFiringsOperation::new((node_id, realm_id))
+                .with_disabled_features(disabled_features.clone());
+            match drive(stepper, context.as_ref()).await {
                 Ok(report) => {
                     if report.advanced > 0 || report.finished > 0 {
                         busy = true;

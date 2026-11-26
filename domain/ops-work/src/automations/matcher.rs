@@ -1,34 +1,34 @@
-//! Dedicated journal cursor matcher turning node events into automation firings or kept events.
+//! Durable pending-row journal matcher turning node events into automation firings or kept rows.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use aruna_core::applet::record::{SubmissionReceipt, submission_key};
-use aruna_core::automation::firing::{Firing, TriggerPayload};
+use aruna_core::automation::firing::TriggerPayload;
 use aruna_core::automation::glob::glob_match;
-use aruna_core::automation::keys::{cursor_key, kept_key, seen_key};
+use aruna_core::automation::keys::{kept_key, seen_key};
 use aruna_core::automation::record::{
     Automation, KeptEvent, Lifecycle, PauseReason, RunStatus, Trigger,
 };
-use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id_mint::IdMint;
-use aruna_core::keyspaces::{APPLETS_KEYSPACE, AUTOMATIONS_KEYSPACE, WORKFLOW_RUN_KEYSPACE};
+use aruna_core::keyspaces::{
+    APPLETS_KEYSPACE, AUTOMATIONS_KEYSPACE, EVENT_JOURNAL_KEYSPACE, WORKFLOW_RUN_KEYSPACE,
+};
 use aruna_core::operation::Operation;
-use aruna_core::plugin_runs::{JOURNAL_ROW, SourceEvent, SourceKind};
+use aruna_core::plugin_runs::{AUTO_PENDING_ROW, SourceEvent, SourceKind};
 use aruna_core::structs::execution::workflow_run::{RunState, WorkflowRunRecord, run_key};
 use aruna_core::structs::identity::features::{Feature, resolve};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::types::GroupId;
+use aruna_core::types::{GroupId, Key};
 use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 use byteview::ByteView;
 use ulid::Ulid;
 
 use super::change::{AutoChange, WriteAutoOperation};
-use super::firing_reads::decode_ulid;
-use super::limits::CountUsageOperation;
-use super::start::{new_firing_rows, parse_upload};
-use super::{AutoError, active_page, autos_page};
+use super::start::{AdmitFiringOp, AdmitOutcome, parse_upload};
+use super::{AutoError, autos_page};
 use crate::plugins::journal::{JournalRow, journal_page};
 use crate::plugins::rows::StoreError;
 
@@ -46,29 +46,28 @@ pub struct MatchReport {
 enum MatchStep {
     Config,
     Autos,
-    Active,
-    Cursor,
     Journal,
     Seen(usize, Box<SourceEvent>),
     Enrich(usize, Box<SourceEvent>),
     PauseChain(usize, Box<SourceEvent>),
-    Count(usize, Box<(SourceEvent, TriggerPayload)>),
+    Admit(usize, Box<SourceEvent>),
     Write,
-    SaveCursor,
+    DropPending,
 }
 
-/// Scans `EVENT_JOURNAL_KEYSPACE` `JOURNAL_ROW` after the automation cursor and fires or keeps
-/// matched events while enforcing self-loop guards, feature switches, chain depth and limits.
+/// Scans `EVENT_JOURNAL_KEYSPACE` `AUTO_PENDING_ROW` rows and fires or keeps matched events while
+/// enforcing self-loop guards, node/group feature switches, chain depth and atomic limits.
 #[derive(Debug, PartialEq)]
 pub struct MatchEventsOperation {
     realm_id: RealmId,
+    disabled_features: BTreeSet<Feature>,
     ids: IdMint,
     now_ms: u64,
     config: Option<RealmConfigDocument>,
     autos: Vec<Automation>,
-    active_counts: BTreeMap<Ulid, u32>,
-    pending: Vec<(usize, SourceEvent)>,
-    last_cursor: Option<Vec<u8>>,
+    rows: Vec<JournalRow>,
+    current_key: Option<Vec<u8>>,
+    matches: Vec<(usize, SourceEvent)>,
     report: MatchReport,
     step: MatchStep,
 }
@@ -77,23 +76,29 @@ impl MatchEventsOperation {
     pub fn new(realm_id: RealmId) -> Self {
         Self {
             realm_id,
+            disabled_features: BTreeSet::new(),
             ids: IdMint::default(),
             now_ms: 0,
             config: None,
             autos: Vec::new(),
-            active_counts: BTreeMap::new(),
-            pending: Vec::new(),
-            last_cursor: None,
+            rows: Vec::new(),
+            current_key: None,
+            matches: Vec::new(),
             report: MatchReport::default(),
             step: MatchStep::Config,
         }
+    }
+
+    pub fn with_disabled_features(mut self, disabled: BTreeSet<Feature>) -> Self {
+        self.disabled_features = disabled;
+        self
     }
 
     fn feature_on(&self, feature: Feature, group_id: GroupId) -> bool {
         let Some(cfg) = &self.config else {
             return false;
         };
-        resolve(cfg, &BTreeSet::new(), feature, Some(&group_id)).on
+        resolve(cfg, &self.disabled_features, feature, Some(&group_id)).on
     }
 
     fn coarse_matches(auto: &Automation, event: &SourceEvent) -> bool {
@@ -142,8 +147,8 @@ impl MatchEventsOperation {
         }
     }
 
-    fn next_pending(&mut self) -> Result<Next<MatchReport>, AutoError> {
-        if let Some((idx, event)) = self.pending.pop() {
+    fn next_match(&mut self) -> Result<Next<MatchReport>, AutoError> {
+        if let Some((idx, event)) = self.matches.pop() {
             let key = seen_key(self.autos[idx].automation_id, &event.source);
             self.step = MatchStep::Seen(idx, Box::new(event));
             return Ok(Next::Call(IoCall::Read(vec![(
@@ -151,15 +156,28 @@ impl MatchEventsOperation {
                 key,
             )])));
         }
-        if let Some(cursor) = self.last_cursor.take() {
-            self.step = MatchStep::SaveCursor;
-            return Ok(Next::Call(IoCall::Write(vec![(
-                AUTOMATIONS_KEYSPACE.to_string(),
-                cursor_key(),
-                ByteView::from(cursor),
+        if let Some(row_key) = self.current_key.take() {
+            self.step = MatchStep::DropPending;
+            return Ok(Next::Call(IoCall::Delete(vec![(
+                EVENT_JOURNAL_KEYSPACE.to_string(),
+                Key::from(row_key),
             )])));
         }
-        Ok(Next::Done(self.report))
+        self.next_row()
+    }
+
+    fn next_row(&mut self) -> Result<Next<MatchReport>, AutoError> {
+        let Some((row_key, event)) = self.rows.pop() else {
+            return Ok(Next::Done(self.report));
+        };
+        self.current_key = Some(row_key);
+        for idx in 0..self.autos.len() {
+            if Self::coarse_matches(&self.autos[idx], &event) {
+                self.matches.push((idx, event.clone()));
+            }
+        }
+        self.matches.reverse();
+        self.next_match()
     }
 
     fn write_kept(
@@ -213,18 +231,11 @@ impl MatchEventsOperation {
         {
             return self.write_kept(idx, event, "applets_disabled");
         }
-        let active = self
-            .active_counts
-            .get(&auto.automation_id)
-            .copied()
-            .unwrap_or(0);
-        if active >= auto.spec.scope.limits.max_active_firings {
-            return self.write_kept(idx, event, "max_active_firings");
-        }
-        let count = CountUsageOperation::firing(auto.automation_id, &auto.spec.scope.limits);
-        let retry_key = auto.automation_id.to_bytes();
-        self.step = MatchStep::Count(idx, Box::new((event, payload)));
-        Ok(Next::Call(IoCall::retry(count, &retry_key)))
+        let auto_id = auto.automation_id;
+        let firing_id = self.ids.mint(self.now_ms);
+        let admit = AdmitFiringOp::journal(auto_id, firing_id, event.source.clone(), payload);
+        self.step = MatchStep::Admit(idx, Box::new(event));
+        Ok(Next::Call(IoCall::retry(admit, &auto_id.to_bytes())))
     }
 }
 
@@ -264,59 +275,30 @@ impl Operation for MatchEventsOperation {
                     self.step = MatchStep::Autos;
                     return Ok(Next::Call(autos_page(Some(after))));
                 }
-                self.step = MatchStep::Active;
-                Ok(Next::Call(active_page(None)))
-            }
-            MatchStep::Active => {
-                let (rows, next) = result.page()?;
-                for (_, value) in rows {
-                    if let Some(auto_id) = decode_ulid(&value) {
-                        *self.active_counts.entry(auto_id).or_default() += 1;
-                    }
-                }
-                if let Some(after) = next {
-                    self.step = MatchStep::Active;
-                    return Ok(Next::Call(active_page(Some(after))));
-                }
-                self.step = MatchStep::Cursor;
-                Ok(Next::Call(IoCall::Read(vec![(
-                    AUTOMATIONS_KEYSPACE.to_string(),
-                    cursor_key(),
-                )])))
-            }
-            MatchStep::Cursor => {
-                let after = result.value()?.map(|bytes| bytes.to_vec());
                 self.step = MatchStep::Journal;
                 Ok(Next::Call(IoCall::child(journal_page(
-                    JOURNAL_ROW,
-                    after,
+                    AUTO_PENDING_ROW,
+                    None,
                     MATCH_BATCH,
                 ))))
             }
             MatchStep::Journal => {
-                let (rows, _) = result
+                let (mut rows, _) = result
                     .child::<(Vec<JournalRow>, Option<Vec<u8>>), StoreError>()?
                     .map_err(|err| AutoError::Storage(err.detail()))?;
                 self.report.scanned = rows.len();
-                self.last_cursor = rows.last().map(|(key, _)| key.clone());
-                for (_, event) in rows {
-                    for idx in 0..self.autos.len() {
-                        if Self::coarse_matches(&self.autos[idx], &event) {
-                            self.pending.push((idx, event.clone()));
-                        }
-                    }
-                }
-                self.pending.reverse();
-                self.next_pending()
+                rows.reverse();
+                self.rows = rows;
+                self.next_row()
             }
             MatchStep::Seen(idx, event) => {
                 if result.value()?.is_some() {
-                    return self.next_pending();
+                    return self.next_match();
                 }
                 match event.kind {
                     SourceKind::DataUploaded => {
                         let Some((bucket, version_id, key)) = parse_upload(&event) else {
-                            return self.next_pending();
+                            return self.next_match();
                         };
                         let payload = TriggerPayload::DataUploaded {
                             bucket,
@@ -332,7 +314,7 @@ impl Operation for MatchEventsOperation {
                             Ulid::from_string(&event.resource),
                             Ulid::from_string(&event.revision),
                         ) else {
-                            return self.next_pending();
+                            return self.next_match();
                         };
                         self.step = MatchStep::Enrich(idx, event);
                         Ok(Next::Call(IoCall::Read(vec![(
@@ -342,7 +324,7 @@ impl Operation for MatchEventsOperation {
                     }
                     SourceKind::RunFinished => {
                         let Ok(run_id) = Ulid::from_string(&event.revision) else {
-                            return self.next_pending();
+                            return self.next_match();
                         };
                         self.step = MatchStep::Enrich(idx, event);
                         Ok(Next::Call(IoCall::Read(vec![(
@@ -350,12 +332,12 @@ impl Operation for MatchEventsOperation {
                             run_key(run_id),
                         )])))
                     }
-                    _ => self.next_pending(),
+                    _ => self.next_match(),
                 }
             }
             MatchStep::Enrich(idx, event) => {
                 let Some(bytes) = result.value()? else {
-                    return self.next_pending();
+                    return self.next_match();
                 };
                 match event.kind {
                     SourceKind::AppletSubmission => {
@@ -365,6 +347,7 @@ impl Operation for MatchEventsOperation {
                             version_id: rec.version_id,
                             pseudonym: rec.pseudonym,
                             guest: rec.guest,
+                            outside_input: rec.outside_input || rec.guest,
                             bucket: rec.bucket,
                             key: rec.key,
                             files: rec.files,
@@ -379,14 +362,18 @@ impl Operation for MatchEventsOperation {
                             .as_ref()
                             .is_some_and(|o| o.automation_id == auto.automation_id)
                         {
-                            return self.next_pending();
+                            return self.next_match();
                         }
                         let status = match rec.state {
                             RunState::Succeeded => RunStatus::Succeeded,
                             RunState::Failed => RunStatus::Failed,
-                            _ => return self.next_pending(),
+                            _ => return self.next_match(),
                         };
-                        let rec_applet = rec.automation.as_ref().and_then(|o| o.applet_id);
+                        let rec_applet = rec
+                            .automation
+                            .as_ref()
+                            .and_then(|o| o.applet_id)
+                            .or_else(|| rec.applet.as_ref().map(|a| a.applet_id));
                         let matched = auto.spec.triggers.iter().any(|t| match t {
                             Trigger::RunFinished {
                                 workflow_id,
@@ -400,7 +387,7 @@ impl Operation for MatchEventsOperation {
                             _ => false,
                         });
                         if !matched {
-                            return self.next_pending();
+                            return self.next_match();
                         }
                         let depth = rec
                             .automation
@@ -424,17 +411,21 @@ impl Operation for MatchEventsOperation {
                             }
                             return self.write_kept(idx, *event, "chain_depth");
                         }
+                        let outside_input =
+                            rec.automation.as_ref().is_some_and(|o| o.outside_input)
+                                || rec.applet.as_ref().is_some_and(|a| a.outside_input);
                         let payload = TriggerPayload::RunFinished {
                             workflow_id: rec.workflow_id,
                             run_id: rec.run_id,
                             status,
                             outputs: rec.outputs,
                             applet_id: rec_applet,
+                            outside_input,
                             depth,
                         };
                         self.decide(idx, *event, payload)
                     }
-                    _ => self.next_pending(),
+                    _ => self.next_match(),
                 }
             }
             MatchStep::PauseChain(idx, event) => {
@@ -444,46 +435,31 @@ impl Operation for MatchEventsOperation {
                 }
                 self.write_kept(idx, *event, "chain_depth")
             }
-            MatchStep::Count(idx, boxed) => {
-                let (event, payload) = *boxed;
-                match result.child::<(), AutoError>()? {
-                    Ok(()) => {}
-                    Err(AutoError::Limited(_)) => {
-                        return self.write_kept(idx, event, "rate_limited");
-                    }
-                    Err(err) => return Err(err),
+            MatchStep::Admit(idx, event) => match result.child::<AdmitOutcome, AutoError>()? {
+                Ok(AdmitOutcome::Created(_)) => {
+                    self.report.fired += 1;
+                    self.next_match()
                 }
-                let auto = &self.autos[idx];
-                let firing = Firing::new(
-                    self.ids.mint(self.now_ms),
-                    auto.automation_id,
-                    auto.group_id,
-                    auto.revision,
-                    &auto.spec,
-                    payload,
-                    self.now_ms,
-                );
-                let mut writes = new_firing_rows(&firing)?;
-                writes.push((
-                    AUTOMATIONS_KEYSPACE.to_string(),
-                    seen_key(auto.automation_id, &event.source),
-                    ByteView::from(self.now_ms.to_be_bytes().to_vec()),
-                ));
-                *self.active_counts.entry(auto.automation_id).or_default() += 1;
-                self.report.fired += 1;
-                self.step = MatchStep::Write;
-                Ok(Next::Call(IoCall::Write(writes)))
-            }
+                Ok(AdmitOutcome::AlreadySeen | AdmitOutcome::Existing(_)) => self.next_match(),
+                Err(AutoError::Limited(msg)) => {
+                    let reason = if msg.contains("active") {
+                        "max_active_firings"
+                    } else {
+                        "rate_limited"
+                    };
+                    self.write_kept(idx, *event, reason)
+                }
+                Err(AutoError::Conflict(_)) => self.write_kept(idx, *event, "paused"),
+                Err(AutoError::NotFound) => self.next_match(),
+                Err(err) => Err(err),
+            },
             MatchStep::Write => {
                 result.done()?;
-                self.next_pending()
+                self.next_match()
             }
-            MatchStep::SaveCursor => {
+            MatchStep::DropPending => {
                 result.done()?;
-                if self.last_cursor.is_some() {
-                    return Err(IoError::Unfinished.into());
-                }
-                Ok(Next::Done(self.report))
+                self.next_row()
             }
         }
     }
