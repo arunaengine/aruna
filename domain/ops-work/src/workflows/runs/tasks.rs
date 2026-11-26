@@ -15,7 +15,7 @@ use aruna_core::id::NodeId;
 use aruna_core::job_request::LABEL_TAG_PREFIX;
 use aruna_core::job_request::{SubmissionScope, SubmitJobError, SubmitJobResult};
 use aruna_core::jobs::{JobEffect, JobEvent};
-use aruna_core::keyspaces::{BUCKET_ENCRYPTION_KEYSPACE, WORKFLOW_TASK_KEYSPACE};
+use aruna_core::keyspaces::{BUCKET_ENCRYPTION_KEYSPACE, RUN_LOG_KEYSPACE, WORKFLOW_TASK_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::execution::job::family::{JobProjection, LogicalJobSpec, LogicalJobState};
@@ -29,7 +29,8 @@ use aruna_core::structs::execution::job::local::{
     JobRecord, JobResultPayload, OutputObject, WorkspaceMode,
 };
 use aruna_core::structs::execution::workflow_run::{
-    CacheScope, RunFile, RunState, WorkflowRunRecord, WorkflowTaskRecord, named_task, task_key,
+    CacheScope, RunFile, RunState, WorkflowRunRecord, WorkflowTaskRecord, dir_page_key, named_task,
+    task_key,
 };
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::BucketInfo;
@@ -43,6 +44,8 @@ use aruna_ops_data::s3::object::get::{
 };
 use aruna_workflow_contract::host::{DirectoryFile, StartTask, TaskFinished, TaskOutput};
 use aruna_workflow_contract::{ArunaStepSettings, ContractError, HostRpcResult};
+use byteview::ByteView;
+use serde::{Deserialize, Serialize};
 use tracing::warn;
 use ulid::Ulid;
 
@@ -75,8 +78,40 @@ pub const POLL_DELAY: Duration = Duration::from_secs(2);
 pub const QUOTA_DELAY_CAP: Duration = Duration::from_secs(60);
 /// Bytes of each output stream a finished task keeps.
 pub const TAIL_BYTES: u64 = 64 * 1024;
+/// Encoded remote directory manifest bytes kept inline before spilling to paged rows.
+const INLINE_DIR_BYTES: usize = 2 * 1024 * 1024;
+/// Encoded JSON budget of one paged remote directory manifest reply.
+const DIR_PAGE_BYTES: usize = 1024 * 1024;
 /// The control files the uwe wrapper writes, read back after an attempt.
 const CONTROL_FILES: [&str; 6] = ["exit", "start", "end", "manifest", "stdout", "stderr"];
+
+/// Normalizes a relative manifest path like container output capture; returns `""` for `.`.
+fn normalize_rel(path: &str) -> Option<String> {
+    if path.contains('\0') || path.contains('\\') || path.starts_with('/') {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => continue,
+            ".." => return None,
+            normal => parts.push(normal),
+        }
+    }
+    Some(parts.join("/"))
+}
+
+/// Normalizes an absolute manifest path to its relative segments under `/`.
+fn normalize_abs(path: &str) -> Option<String> {
+    let rest = path.strip_prefix('/')?;
+    normalize_rel(rest).filter(|norm| !norm.is_empty())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredDirPage {
+    files: Vec<DirectoryFile>,
+    next_page: Option<u32>,
+}
 
 /// The key of uwe's canonical task specification: another key means another task.
 pub fn task_key_of(seed: &str) -> String {
@@ -510,6 +545,7 @@ enum TaskStep {
     Wait(JobId),
     Started(JobId),
     Control(Box<ChildSummary>),
+    Manifest(Box<(WorkflowTaskRecord, TaskFinished)>),
     Pin(Box<(WorkflowTaskRecord, TaskFinished)>),
     Finished(Box<TaskFinished>),
 }
@@ -532,6 +568,7 @@ pub struct RunTaskOperation {
 }
 
 type TaskNext = Result<Next<HostRpcResult>, CatalogError>;
+type ManifestWrites = Vec<(String, Key, ByteView)>;
 
 impl RunTaskOperation {
     pub fn new(run: WorkflowRunRecord, node: IngressNode, request: Box<StartTask>) -> Self {
@@ -677,6 +714,7 @@ impl RunTaskOperation {
                     digest: None,
                     size: file.size.unwrap_or_default(),
                     files: Vec::new(),
+                    files_token: None,
                 })
             })
             .collect();
@@ -1067,19 +1105,29 @@ impl RunTaskOperation {
     /// output records give the exact version, its size and digest.
     fn output_file(&self, summary: &ChildSummary, path: &str) -> RunFile {
         let (bucket, folder) = attempt_folder(&self.run, &self.request.name).unwrap_or_default();
-        let (bucket, key, node) = match path.strip_prefix('/') {
-            Some(absolute) => {
-                let key = format!("{folder}control/root/{absolute}");
+        let (bucket, key, node) = match path.starts_with('/') {
+            true => {
+                let abs = normalize_abs(path).unwrap_or_default();
+                let key = format!("{folder}control/root/{abs}");
                 (bucket, key, self.run.node_id)
             }
-            None if self.run.protected || self.run.local_only => {
-                let key = format!("{folder}work/{path}");
+            false if self.run.protected || self.run.local_only => {
+                let rel = normalize_rel(path).unwrap_or_default();
+                let key = match rel.is_empty() {
+                    true => format!("{folder}work"),
+                    false => format!("{folder}work/{rel}"),
+                };
                 (bucket, key, self.run.node_id)
             }
-            None => {
+            false => {
                 let node = (self.placed.as_ref()).map_or(self.run.node_id, |placed| placed.node_id);
                 let bucket = run_area_bucket(self.run.group_id, node);
-                let key = format!("{}/{path}", work_prefix(&self.run, &self.request.name));
+                let base = work_prefix(&self.run, &self.request.name);
+                let rel = normalize_rel(path).unwrap_or_default();
+                let key = match rel.is_empty() {
+                    true => base,
+                    false => format!("{base}/{rel}"),
+                };
                 (bucket, key, node)
             }
         };
@@ -1094,6 +1142,131 @@ impl RunTaskOperation {
             size: written.map(|object| object.size),
             digest: written.and_then(|object| object.digest.clone()),
         }
+    }
+
+    /// Expands outputs for `TaskFinished`, spilling large or overlapping remote directory
+    /// manifests into encoded-size-bounded pages so the reply always fits one channel frame.
+    fn build_outputs(
+        &self,
+        summary: &ChildSummary,
+        manifest: &[(String, bool)],
+        files: &[RunFile],
+        (inline_budget, page_budget): (usize, usize),
+    ) -> Result<(Vec<TaskOutput>, ManifestWrites), CatalogError> {
+        let mut inline_used = 0usize;
+        let mut outputs = Vec::with_capacity(files.len());
+        let mut writes = Vec::new();
+        let task_id = task_number(&self.request);
+        let attempt = self.request.attempt;
+        let space = RUN_LOG_KEYSPACE.to_string();
+        for (index, (file, (_, directory))) in files.iter().zip(manifest).enumerate() {
+            if *directory && file.node_id.is_some_and(|node| node != self.run.node_id) {
+                let dir_bucket = file.bucket.as_deref().unwrap_or_default();
+                let trimmed = file
+                    .key
+                    .as_deref()
+                    .unwrap_or_default()
+                    .trim_end_matches('/');
+                let dir_prefix = match trimmed.is_empty() {
+                    true => String::new(),
+                    false => format!("{trimmed}/"),
+                };
+                let mut dir_files: Vec<DirectoryFile> = summary
+                    .outputs
+                    .iter()
+                    .filter(|obj| obj.bucket == dir_bucket)
+                    .filter_map(|obj| {
+                        let rel = match dir_prefix.is_empty() {
+                            true => obj.key.as_str(),
+                            false => obj.key.strip_prefix(&dir_prefix)?,
+                        };
+                        if rel.is_empty()
+                            || rel
+                                .split('/')
+                                .any(|part| part.is_empty() || part == "." || part == "..")
+                            || rel.contains('\\')
+                        {
+                            return None;
+                        }
+                        let address = match obj.node_id == self.run.node_id {
+                            true => address_of(&obj.bucket, &obj.key, Some(obj.version_id)),
+                            false => {
+                                address_on(&obj.bucket, &obj.key, Some(obj.version_id), obj.node_id)
+                            }
+                        };
+                        Some(DirectoryFile {
+                            path: rel.to_owned(),
+                            address,
+                            size: obj.size,
+                        })
+                    })
+                    .collect();
+                dir_files.sort_by(|a, b| a.path.cmp(&b.path));
+                let size = dir_files.iter().map(|entry| entry.size).sum();
+                let encoded_size = serde_json::to_vec(&dir_files)
+                    .map_err(|error| CatalogError::Storage(error.to_string()))?
+                    .len();
+                if dir_files.is_empty() || inline_used.saturating_add(encoded_size) <= inline_budget
+                {
+                    inline_used = inline_used.saturating_add(encoded_size);
+                    outputs.push(TaskOutput {
+                        path: file.name.clone(),
+                        directory: true,
+                        address: String::new(),
+                        digest: None,
+                        size,
+                        files: dir_files,
+                        files_token: None,
+                    });
+                } else {
+                    let pages = page_dir_files(dir_files, page_budget)?;
+                    let total = pages.len();
+                    let out_idx = u32::try_from(index)
+                        .map_err(|_| CatalogError::Storage("too many task outputs".into()))?;
+                    let token = format!("{task_id}:{attempt}:{out_idx}");
+                    for (page_idx, page_files) in pages.into_iter().enumerate() {
+                        let next_page = (page_idx + 1 < total).then_some((page_idx + 1) as u32);
+                        let stored = StoredDirPage {
+                            files: page_files,
+                            next_page,
+                        };
+                        let bytes = serde_json::to_vec(&stored)
+                            .map_err(|error| CatalogError::Storage(error.to_string()))?;
+                        writes.push((
+                            space.clone(),
+                            dir_page_key(
+                                self.run.run_id,
+                                task_id,
+                                attempt,
+                                out_idx,
+                                page_idx as u32,
+                            ),
+                            ByteView::from(bytes),
+                        ));
+                    }
+                    outputs.push(TaskOutput {
+                        path: file.name.clone(),
+                        directory: true,
+                        address: String::new(),
+                        digest: None,
+                        size,
+                        files: Vec::new(),
+                        files_token: Some(token),
+                    });
+                }
+            } else {
+                outputs.push(TaskOutput {
+                    path: file.name.clone(),
+                    directory: *directory,
+                    address: file_address(self.run.node_id, file).unwrap_or_default(),
+                    digest: None,
+                    size: file.size.unwrap_or_default(),
+                    files: Vec::new(),
+                    files_token: None,
+                });
+            }
+        }
+        Ok((outputs, writes))
     }
 
     /// The answer of an ended child, from the wrapper's control files where they exist and the
@@ -1115,78 +1288,23 @@ impl RunTaskOperation {
         };
         let manifest: Vec<(String, bool)> = (text("manifest").unwrap_or_default().lines())
             .filter_map(|line| line.split_once(' '))
-            .filter(|(kind, path)| {
-                matches!(*kind, "file" | "directory")
-                    && !path.is_empty()
-                    && !path.contains('\0')
-                    && !path.split('/').any(|part| part == "..")
+            .filter(|(kind, path)| match (*kind, path.starts_with('/')) {
+                ("file", true) | ("directory", true) => normalize_abs(path).is_some(),
+                ("file", false) => normalize_rel(path).is_some_and(|norm| !norm.is_empty()),
+                ("directory", false) => normalize_rel(path).is_some(),
+                _ => false,
             })
             .map(|(kind, path)| (path.to_owned(), kind == "directory"))
             .collect();
         let files: Vec<RunFile> = (manifest.iter())
             .map(|(path, _)| self.output_file(&summary, path))
             .collect();
-        let outputs = (files.iter().zip(&manifest))
-            .map(|(file, (_, directory))| {
-                if *directory && file.node_id.is_some_and(|node| node != self.run.node_id) {
-                    let dir_bucket = file.bucket.as_deref().unwrap_or_default();
-                    let dir_prefix = format!(
-                        "{}/",
-                        file.key
-                            .as_deref()
-                            .unwrap_or_default()
-                            .trim_end_matches('/')
-                    );
-                    let dir_files: Vec<DirectoryFile> = summary
-                        .outputs
-                        .iter()
-                        .filter(|obj| obj.bucket == dir_bucket)
-                        .filter_map(|obj| {
-                            let rel = obj.key.strip_prefix(&dir_prefix)?;
-                            if rel.is_empty()
-                                || rel
-                                    .split('/')
-                                    .any(|part| part.is_empty() || part == "." || part == "..")
-                                || rel.contains('\\')
-                            {
-                                return None;
-                            }
-                            let address = match obj.node_id == self.run.node_id {
-                                true => address_of(&obj.bucket, &obj.key, Some(obj.version_id)),
-                                false => address_on(
-                                    &obj.bucket,
-                                    &obj.key,
-                                    Some(obj.version_id),
-                                    obj.node_id,
-                                ),
-                            };
-                            Some(DirectoryFile {
-                                path: rel.to_owned(),
-                                address,
-                                size: obj.size,
-                            })
-                        })
-                        .collect();
-                    let size = dir_files.iter().map(|entry| entry.size).sum();
-                    return TaskOutput {
-                        path: file.name.clone(),
-                        directory: true,
-                        address: String::new(),
-                        digest: None,
-                        size,
-                        files: dir_files,
-                    };
-                }
-                TaskOutput {
-                    path: file.name.clone(),
-                    directory: *directory,
-                    address: file_address(self.run.node_id, file).unwrap_or_default(),
-                    digest: None,
-                    size: file.size.unwrap_or_default(),
-                    files: Vec::new(),
-                }
-            })
-            .collect();
+        let (outputs, manifest_writes) = self.build_outputs(
+            &summary,
+            &manifest,
+            &files,
+            (INLINE_DIR_BYTES, DIR_PAGE_BYTES),
+        )?;
         let seconds = |name: &str| text(name).and_then(|value| value.parse::<f64>().ok());
         let has_secrets = !self.request.secret_placeholders.is_empty();
         let finished = TaskFinished {
@@ -1219,12 +1337,42 @@ impl RunTaskOperation {
         task.stdout_tail = finished.stdout_tail.clone();
         task.stderr_tail = finished.stderr_tail.clone();
         task.outputs = files;
+        if exit_code == Some(0) && !manifest_writes.is_empty() {
+            self.step = TaskStep::Manifest(Box::new((task, finished)));
+            return Ok(Next::Call(IoCall::Write(manifest_writes)));
+        }
         // Only a result with exit code 0 is kept; another one is never reused.
         if exit_code == Some(0) {
             return self.keep(task, finished);
         }
         self.change(task, TaskStep::Finished(Box::new(finished)))
     }
+}
+
+/// Splits remote directory entries into pages whose encoded JSON size fits within `budget`.
+fn page_dir_files(
+    files: Vec<DirectoryFile>,
+    budget: usize,
+) -> Result<Vec<Vec<DirectoryFile>>, CatalogError> {
+    let mut pages = Vec::new();
+    let mut current = Vec::new();
+    let mut used = 2usize;
+    for entry in files {
+        let item_size = serde_json::to_vec(&entry)
+            .map_err(|error| CatalogError::Storage(error.to_string()))?
+            .len()
+            + 1;
+        if !current.is_empty() && used.saturating_add(item_size) > budget {
+            pages.push(std::mem::take(&mut current));
+            used = 2;
+        }
+        used = used.saturating_add(item_size);
+        current.push(entry);
+    }
+    if !current.is_empty() {
+        pages.push(current);
+    }
+    Ok(pages)
 }
 
 impl Operation for RunTaskOperation {
@@ -1318,11 +1466,78 @@ impl Operation for RunTaskOperation {
                 let files = result.child::<BTreeMap<String, Vec<u8>>, CatalogError>()??;
                 self.collected(*projection, files)
             }
+            TaskStep::Manifest(parts) => {
+                result.done()?;
+                let (task, finished) = *parts;
+                if finished.exit_code == Some(0) {
+                    return self.keep(task, finished);
+                }
+                self.change(task, TaskStep::Finished(Box::new(finished)))
+            }
             TaskStep::Finished(finished) => {
                 changed(result)?;
                 Ok(Next::Done(HostRpcResult::TaskFinished(finished)))
             }
         }
+    }
+}
+
+/// Reads one stored page of exact-version child files for a remote directory output of a run.
+#[derive(Debug, PartialEq)]
+pub struct DirPageOperation {
+    run_id: Ulid,
+    token: String,
+    page: u32,
+}
+
+impl DirPageOperation {
+    pub fn new(run_id: Ulid, token: String, page: u32) -> Self {
+        Self {
+            run_id,
+            token,
+            page,
+        }
+    }
+}
+
+impl Operation for DirPageOperation {
+    type Output = HostRpcResult;
+    type Error = CatalogError;
+
+    fn first(&mut self) -> TaskNext {
+        let mut parts = self.token.split(':');
+        let parsed = match (parts.next(), parts.next(), parts.next(), parts.next()) {
+            (Some(task), Some(attempt), Some(index), None) => (
+                task.parse::<u64>().ok(),
+                attempt.parse::<u32>().ok(),
+                index.parse::<u32>().ok(),
+            ),
+            _ => (None, None, None),
+        };
+        let (Some(task_id), Some(attempt), Some(output_index)) = parsed else {
+            return Ok(Next::Done(HostRpcResult::Failed(ContractError::invalid(
+                "invalid remote directory manifest token",
+            ))));
+        };
+        let key = dir_page_key(self.run_id, task_id, attempt, output_index, self.page);
+        Ok(Next::Call(IoCall::Read(vec![(
+            RUN_LOG_KEYSPACE.to_string(),
+            key,
+        )])))
+    }
+
+    fn next(&mut self, result: IoResult) -> TaskNext {
+        let Some(bytes) = result.value()? else {
+            return Ok(Next::Done(HostRpcResult::Failed(ContractError::NotFound {
+                message: "remote directory page not found".into(),
+            })));
+        };
+        let stored: StoredDirPage = serde_json::from_slice(&bytes)
+            .map_err(|error| CatalogError::Storage(error.to_string()))?;
+        Ok(Next::Done(HostRpcResult::TaskDirectoryPage {
+            files: stored.files,
+            next_page: stored.next_page,
+        }))
     }
 }
 

@@ -6,8 +6,9 @@ use std::collections::BTreeMap;
 use std::io::Cursor;
 
 use aruna_workflow_contract::host::{
-    DirectInput, ExpectedOutput, ListEntry, SecretPlaceholder, StagedFile, StartTask, StorageEntry,
-    TaskFinished, TaskFolders, TaskOutput, TaskResources, TaskUsage, UploadReceipt,
+    DirectInput, DirectoryFile, ExpectedOutput, ListEntry, SecretPlaceholder, StagedFile,
+    StartTask, StorageEntry, TaskFinished, TaskFolders, TaskOutput, TaskResources, TaskUsage,
+    UploadReceipt,
 };
 use aruna_workflow_contract::message::{
     LogStream, ProgressCounts, RunFinishedPayload, RunStartPayload, TaskChange, TaskState,
@@ -342,6 +343,10 @@ fn rpc_requests() -> Vec<HostRpcRequest> {
             change_json: json!({"change": "ended"}),
             is_event: true,
         },
+        HostRpcRequest::TaskDirectoryPage {
+            token: "1:1:0".into(),
+            page: 0,
+        },
     ]
 }
 
@@ -365,6 +370,7 @@ fn rpc_results() -> Vec<HostRpcResult> {
                 digest: Some("sha256:00".into()),
                 size: 3,
                 files: Vec::new(),
+                files_token: None,
             }],
             stdout_tail: b"hello\n".to_vec(),
             stderr_tail: Vec::new(),
@@ -375,6 +381,14 @@ fn rpc_results() -> Vec<HostRpcResult> {
                 ..TaskUsage::default()
             }),
         })),
+        HostRpcResult::TaskDirectoryPage {
+            files: vec![DirectoryFile {
+                path: "sub/a.txt".into(),
+                address: "aruna://bucket/sub/a.txt?version=01&node=n".into(),
+                size: 3,
+            }],
+            next_page: Some(1),
+        },
         HostRpcResult::StopOrphans {
             stopped: vec!["job-1".into()],
         },

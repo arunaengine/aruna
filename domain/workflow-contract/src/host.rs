@@ -20,6 +20,11 @@ pub enum HostRpcRequest {
     },
     /// Runs one attempt of a task as a child job; answered when the attempt ended.
     StartTask(Box<StartTask>),
+    /// Reads one page of exact-version child files for a remote directory output.
+    TaskDirectoryPage {
+        token: String,
+        page: u32,
+    },
     /// Stops one running attempt, by its name; its `StartTask` call ends as cancelled.
     CancelTask {
         name: String,
@@ -165,6 +170,10 @@ pub enum HostRpcResult {
         pinned: Option<String>,
     },
     TaskFinished(Box<TaskFinished>),
+    TaskDirectoryPage {
+        files: Vec<DirectoryFile>,
+        next_page: Option<u32>,
+    },
     TaskCancelled {
         name: String,
     },
@@ -237,9 +246,12 @@ pub struct TaskOutput {
     pub address: String,
     pub digest: Option<String>,
     pub size: u64,
-    /// Exact-version child files when a directory output lives on a remote node.
+    /// Exact-version child files when a directory output lives on a remote node and fits inline.
     #[serde(default)]
     pub files: Vec<DirectoryFile>,
+    /// Paged manifest token when remote directory files are fetched via `TaskDirectoryPage`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files_token: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

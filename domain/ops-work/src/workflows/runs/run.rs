@@ -36,7 +36,7 @@ use super::data::{
     upload_target,
 };
 use super::log::{AppendLogOperation, LineageLogOperation, LoadLogOperation, pages_answer};
-use super::tasks::{RunTaskOperation, StopTasksOperation, StoppedTasks};
+use super::tasks::{DirPageOperation, RunTaskOperation, StopTasksOperation, StoppedTasks};
 use super::{RunChange, change_call, changed, creator_auth};
 use crate::jobs::lifecycle::submit_external::IngressNode;
 use crate::workflows::import::{COMPOSED_ENTRY, WIR_ENTRY, catalog_tools};
@@ -654,11 +654,20 @@ impl AnswerCallOperation {
         }
     }
 
-    fn answer(&mut self, result: HostRpcResult) -> CallNext {
-        let message = HostToCoordinator::RpcResponse {
+    fn answer(&mut self, mut result: HostRpcResult) -> CallNext {
+        let mut message = HostToCoordinator::RpcResponse {
             call_id: self.call_id,
             result: result.clone(),
         };
+        if let Err(error) = aruna_workflow_contract::encode_message(&message) {
+            result = HostRpcResult::Failed(ContractError::internal(format!(
+                "the host answer could not be framed: {error}"
+            )));
+            message = HostToCoordinator::RpcResponse {
+                call_id: self.call_id,
+                result: result.clone(),
+            };
+        }
         self.step = CallStep::Send(Box::new(result));
         Ok(Next::Call(workflow_call(WorkflowEffect::Send {
             session: session_name(self.run.run_id),
@@ -692,6 +701,9 @@ impl AnswerCallOperation {
                 let routing = self.node.routing.clone();
                 let task = RunTaskOperation::new(run, self.node.ingress.clone(), task);
                 self.child(task.routing(routing))
+            }
+            HostRpcRequest::TaskDirectoryPage { token, page } => {
+                self.child(DirPageOperation::new(run.run_id, token, page))
             }
             HostRpcRequest::CancelTask { name } => {
                 self.step = CallStep::Stop;
