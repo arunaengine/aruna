@@ -80,6 +80,9 @@ pub struct ReplicatedWorkflow {
     /// True when the outer `StoreRunLog.run` is an identity stub and the full run is chunked.
     #[serde(default)]
     pub stub_run: bool,
+    /// Sender-chosen transfer identifier scoping staged chunks and catalog rows to one transfer.
+    #[serde(default)]
+    pub transfer_id: u64,
 }
 
 /// Which secret store a workflow secret binding reads from.

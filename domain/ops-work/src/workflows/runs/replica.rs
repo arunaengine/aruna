@@ -73,8 +73,10 @@ pub fn replica_note(record: &WorkflowRunRecord, local: NodeId) -> Option<&'stati
     (record.node_id != local && record.state.is_active()).then_some(UNREACHABLE)
 }
 
-fn chunk_target(kind: &ChunkKind) -> [u8; 32] {
+fn chunk_target(peer: NodeId, transfer: u64, kind: &ChunkKind) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
+    hasher.update(peer.as_bytes());
+    hasher.update(&transfer.to_be_bytes());
     match kind {
         ChunkKind::Source => {
             hasher.update(b"source");
@@ -102,13 +104,16 @@ fn chunk_target(kind: &ChunkKind) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-fn staged_key(run_id: Ulid, kind: ChunkKind) -> Key {
-    chunk_key(run_id, chunk_target(&kind), u32::MAX)
+fn staged_key(run_id: Ulid, peer: NodeId, transfer: u64, kind: ChunkKind) -> Key {
+    chunk_key(run_id, chunk_target(peer, transfer, &kind), u32::MAX)
 }
 
-fn staged_tools_key(run_id: Ulid) -> Key {
-    let target = *blake3::hash(b"tool-index").as_bytes();
-    chunk_key(run_id, target, u32::MAX)
+fn staged_tools_key(run_id: Ulid, peer: NodeId, transfer: u64) -> Key {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(peer.as_bytes());
+    hasher.update(&transfer.to_be_bytes());
+    hasher.update(b"tool-index");
+    chunk_key(run_id, *hasher.finalize().as_bytes(), u32::MAX)
 }
 
 fn stub_run(run: &WorkflowRunRecord) -> WorkflowRunRecord {
@@ -185,13 +190,14 @@ fn push_chunks(
     start_page: u32,
     kind: ChunkKind,
     data: &[u8],
-    (chunk_size, limit, stub): (usize, usize, bool),
+    (chunk_size, limit, stub, transfer): (usize, usize, bool, u64),
 ) -> Result<(), CatalogError> {
     for chunk in chunk_blob(data, kind, chunk_size)? {
         let part = ReplicatedWorkflow {
             chunks: vec![chunk],
             more: true,
             stub_run: stub,
+            transfer_id: transfer,
             ..ReplicatedWorkflow::default()
         };
         frames.push(pack_frame(
@@ -341,6 +347,7 @@ pub struct ReplicateLogOperation {
     /// A holder missed a frame, so the next pass sends from the same page again.
     missed: bool,
     pages: u32,
+    transfer: u64,
     step: SendStep,
 }
 
@@ -360,6 +367,7 @@ impl ReplicateLogOperation {
             backfilled: BTreeSet::new(),
             missed: false,
             pages: 0,
+            transfer: 0,
             step: SendStep::Run,
         }
     }
@@ -395,8 +403,10 @@ impl ReplicateLogOperation {
     ) -> Result<Vec<Vec<u8>>, CatalogError> {
         let mut frames = Vec::new();
         let mut final_meta = None;
+        let transfer = self.transfer.max(1);
         let probe_more = ReplicatedWorkflow {
             more: true,
+            transfer_id: transfer,
             ..ReplicatedWorkflow::default()
         };
         let use_stub = measure_frame(run, start_page, &[], Some(&probe_more))? > limit / 2;
@@ -405,11 +415,12 @@ impl ReplicateLogOperation {
         let empty_part = ReplicatedWorkflow {
             more: true,
             stub_run: use_stub,
+            transfer_id: transfer,
             ..ReplicatedWorkflow::default()
         };
         let overhead = measure_frame(envelope, start_page, &[], Some(&empty_part))?;
         let chunk_size = limit.saturating_sub(overhead + 256).min(limit / 2).max(1);
-        let bounds = (chunk_size, limit, use_stub);
+        let bounds = (chunk_size, limit, use_stub, transfer);
         if let Some(bundle) = workflow {
             let mut small: Vec<Vec<u8>> = Vec::new();
             for tool_bytes in bundle.tools {
@@ -417,6 +428,7 @@ impl ReplicateLogOperation {
                     tools: vec![tool_bytes.clone()],
                     more: true,
                     stub_run: use_stub,
+                    transfer_id: transfer,
                     ..ReplicatedWorkflow::default()
                 };
                 if measure_frame(envelope, start_page, &[], Some(&solo))? <= limit {
@@ -426,6 +438,7 @@ impl ReplicateLogOperation {
                         tools: candidate,
                         more: true,
                         stub_run: use_stub,
+                        transfer_id: transfer,
                         ..ReplicatedWorkflow::default()
                     };
                     if !small.is_empty()
@@ -435,6 +448,7 @@ impl ReplicateLogOperation {
                             tools: std::mem::take(&mut small),
                             more: true,
                             stub_run: use_stub,
+                            transfer_id: transfer,
                             ..ReplicatedWorkflow::default()
                         };
                         frames.push(pack_frame(
@@ -452,6 +466,7 @@ impl ReplicateLogOperation {
                             tools: std::mem::take(&mut small),
                             more: true,
                             stub_run: use_stub,
+                            transfer_id: transfer,
                             ..ReplicatedWorkflow::default()
                         };
                         frames.push(pack_frame(
@@ -515,6 +530,7 @@ impl ReplicateLogOperation {
                 chunks: Vec::new(),
                 more: false,
                 stub_run: use_stub,
+                transfer_id: transfer,
             };
             if measure_frame(envelope, start_page, &[], Some(&commit))? > limit
                 && let Some(bytes) = commit.source.take()
@@ -564,6 +580,7 @@ impl ReplicateLogOperation {
                         tools: small,
                         more: true,
                         stub_run: use_stub,
+                        transfer_id: transfer,
                         ..ReplicatedWorkflow::default()
                     };
                     frames.push(pack_frame(
@@ -586,6 +603,7 @@ impl ReplicateLogOperation {
                     chunks: vec![chunk],
                     more: true,
                     stub_run: true,
+                    transfer_id: transfer,
                     ..ReplicatedWorkflow::default()
                 };
                 frames.push(pack_frame(
@@ -600,6 +618,7 @@ impl ReplicateLogOperation {
                 let mut commit = final_meta.take().unwrap_or_else(|| ReplicatedWorkflow {
                     more: false,
                     stub_run: true,
+                    transfer_id: transfer,
                     ..ReplicatedWorkflow::default()
                 });
                 commit.chunks.push(last);
@@ -609,6 +628,7 @@ impl ReplicateLogOperation {
                             tools: std::mem::take(&mut commit.tools),
                             more: true,
                             stub_run: true,
+                            transfer_id: transfer,
                             ..ReplicatedWorkflow::default()
                         };
                         frames.push(pack_frame(
@@ -671,6 +691,7 @@ impl ReplicateLogOperation {
                 use_stub.then(|| ReplicatedWorkflow {
                     more: false,
                     stub_run: true,
+                    transfer_id: transfer,
                     ..ReplicatedWorkflow::default()
                 })
             })
@@ -705,6 +726,7 @@ impl ReplicateLogOperation {
                         chunks: vec![chunk],
                         more: true,
                         stub_run: use_stub,
+                        transfer_id: transfer,
                         ..ReplicatedWorkflow::default()
                     };
                     frames.push(pack_frame(envelope, number, Vec::new(), Some(part), limit)?);
@@ -714,6 +736,7 @@ impl ReplicateLogOperation {
                         chunks: vec![chunk],
                         more: false,
                         stub_run: use_stub,
+                        transfer_id: transfer,
                         ..ReplicatedWorkflow::default()
                     };
                     frames.push(pack_frame(envelope, number, Vec::new(), Some(done), limit)?);
@@ -777,6 +800,7 @@ impl ReplicateLogOperation {
             true => self.workflow.clone(),
             false => None,
         };
+        self.transfer = self.transfer.wrapping_add(1).max(1);
         let frames = self.frames_from(start_page, &run, &self.log_pages, workflow)?;
         for node in holders.into_iter().rev() {
             for frame in frames.iter().rev() {
@@ -810,6 +834,10 @@ impl ReplicateLogOperation {
 impl Operation for ReplicateLogOperation {
     type Output = u32;
     type Error = CatalogError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.transfer = entropy as u64;
+    }
 
     fn first(&mut self) -> SendNext {
         Ok(Next::Call(read_run(self.run_id)))
@@ -858,6 +886,7 @@ impl Operation for ReplicateLogOperation {
                         chunks: Vec::new(),
                         more: false,
                         stub_run: false,
+                        transfer_id: 0,
                     }),
                     _ => None,
                 };
@@ -1008,6 +1037,7 @@ impl Operation for StoreReplicaOperation {
                     return Err(MetadataReadError::Forbidden);
                 }
                 let write = WriteReplicaOperation {
+                    peer: self.peer,
                     local: self.local.0,
                     run: self.run.clone(),
                     first_page: self.first_page,
@@ -1058,6 +1088,7 @@ enum WriteStep {
 /// Writes a run copy with its pages and the log head they make, in one transaction.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WriteReplicaOperation {
+    peer: NodeId,
     local: NodeId,
     run: Box<WorkflowRunRecord>,
     first_page: u32,
@@ -1079,26 +1110,39 @@ impl Operation for WriteReplicaOperation {
         let wf_key = workflow_key(self.run.workflow_id);
         let ver_key = version_key(self.run.workflow_id, self.run.version);
         let run_id = self.run.run_id;
+        let transfer = self.workflow.as_ref().map_or(0, |wf| wf.transfer_id);
+        if self
+            .workflow
+            .as_ref()
+            .is_some_and(|wf| wf.more && transfer == 0)
+        {
+            return Err(CatalogError::Forbidden);
+        }
         let mut reads = vec![
             (WORKFLOW_RUN_KEYSPACE.to_string(), run_key(run_id)),
             (RUN_LOG_KEYSPACE.to_string(), head_key(run_id)),
             (WORKFLOW_KEYSPACE.to_string(), wf_key),
             (WORKFLOW_VERSION_KEYSPACE.to_string(), ver_key.clone()),
             (WORKFLOW_SOURCE_KEYSPACE.to_string(), ver_key),
-            (
-                RUN_LOG_KEYSPACE.to_string(),
-                staged_key(run_id, ChunkKind::Workflow),
-            ),
-            (
-                RUN_LOG_KEYSPACE.to_string(),
-                staged_key(run_id, ChunkKind::Version),
-            ),
-            (
-                RUN_LOG_KEYSPACE.to_string(),
-                staged_key(run_id, ChunkKind::Source),
-            ),
-            (RUN_LOG_KEYSPACE.to_string(), staged_tools_key(run_id)),
         ];
+        if transfer != 0 {
+            reads.push((
+                RUN_LOG_KEYSPACE.to_string(),
+                staged_key(run_id, self.peer, transfer, ChunkKind::Workflow),
+            ));
+            reads.push((
+                RUN_LOG_KEYSPACE.to_string(),
+                staged_key(run_id, self.peer, transfer, ChunkKind::Version),
+            ));
+            reads.push((
+                RUN_LOG_KEYSPACE.to_string(),
+                staged_key(run_id, self.peer, transfer, ChunkKind::Source),
+            ));
+            reads.push((
+                RUN_LOG_KEYSPACE.to_string(),
+                staged_tools_key(run_id, self.peer, transfer),
+            ));
+        }
         for index in 0..self.pages.len() {
             let number = self.first_page + index as u32;
             reads.push((RUN_LOG_KEYSPACE.to_string(), page_key(run_id, number)));
@@ -1113,7 +1157,12 @@ impl Operation for WriteReplicaOperation {
                 if replicated.more {
                     reads.push((
                         RUN_LOG_KEYSPACE.to_string(),
-                        staged_key(run_id, ChunkKind::Tool(tool.tool_id, tool.version)),
+                        staged_key(
+                            run_id,
+                            self.peer,
+                            transfer,
+                            ChunkKind::Tool(tool.tool_id, tool.version),
+                        ),
                     ));
                 } else {
                     reads.push((
@@ -1127,7 +1176,7 @@ impl Operation for WriteReplicaOperation {
                     return Err(CatalogError::Forbidden);
                 }
                 if chunk.index + 1 == chunk.total {
-                    let target = chunk_target(&chunk.kind);
+                    let target = chunk_target(self.peer, transfer, &chunk.kind);
                     for prior in 0..chunk.index {
                         reads.push((
                             RUN_LOG_KEYSPACE.to_string(),
@@ -1141,6 +1190,8 @@ impl Operation for WriteReplicaOperation {
                                     RUN_LOG_KEYSPACE.to_string(),
                                     staged_key(
                                         run_id,
+                                        self.peer,
+                                        transfer,
                                         ChunkKind::Tool(id.clone(), version.clone()),
                                     ),
                                 ));
@@ -1237,10 +1288,16 @@ impl Operation for WriteReplicaOperation {
         let wf_row = values.next().flatten();
         let ver_row = values.next().flatten();
         let src_row = values.next().flatten();
-        let staged_wf = values.next().flatten();
-        let staged_ver = values.next().flatten();
-        let staged_src = values.next().flatten();
-        let staged_index_row = values.next().flatten();
+        let transfer = self.workflow.as_ref().map_or(0, |wf| wf.transfer_id);
+        let (staged_wf, staged_ver, staged_src, staged_index_row) = match transfer != 0 {
+            true => (
+                values.next().flatten(),
+                values.next().flatten(),
+                values.next().flatten(),
+                values.next().flatten(),
+            ),
+            false => (None, None, None, None),
+        };
         let mut staged_index: Vec<(String, String)> = staged_index_row
             .as_deref()
             .and_then(|bytes| postcard::from_bytes(bytes).ok())
@@ -1262,6 +1319,7 @@ impl Operation for WriteReplicaOperation {
         let mut pending_src: Option<Vec<u8>> = None;
         let mut assembled_run: Option<WorkflowRunRecord> = None;
         let run_id = self.run.run_id;
+        let peer = self.peer;
         let space = RUN_LOG_KEYSPACE.to_string();
         let wf_key = workflow_key(self.run.workflow_id);
         let ver_key = version_key(self.run.workflow_id, self.run.version);
@@ -1310,7 +1368,12 @@ impl Operation for WriteReplicaOperation {
                         let pair = (tool.tool_id, tool.version);
                         writes.push((
                             space.clone(),
-                            staged_key(run_id, ChunkKind::Tool(pair.0.clone(), pair.1.clone())),
+                            staged_key(
+                                run_id,
+                                peer,
+                                transfer,
+                                ChunkKind::Tool(pair.0.clone(), pair.1.clone()),
+                            ),
                             value,
                         ));
                         if !staged_index.contains(&pair) {
@@ -1323,7 +1386,7 @@ impl Operation for WriteReplicaOperation {
                 }
             }
             for chunk in replicated.chunks {
-                let target = chunk_target(&chunk.kind);
+                let target = chunk_target(peer, transfer, &chunk.kind);
                 if chunk.index + 1 < chunk.total {
                     writes.push((
                         space.clone(),
@@ -1346,7 +1409,7 @@ impl Operation for WriteReplicaOperation {
                         if more {
                             writes.push((
                                 space.clone(),
-                                staged_key(run_id, ChunkKind::Source),
+                                staged_key(run_id, peer, transfer, ChunkKind::Source),
                                 ByteView::from(assembled),
                             ));
                         } else {
@@ -1364,7 +1427,7 @@ impl Operation for WriteReplicaOperation {
                         if more {
                             writes.push((
                                 space.clone(),
-                                staged_key(run_id, ChunkKind::Workflow),
+                                staged_key(run_id, peer, transfer, ChunkKind::Workflow),
                                 ByteView::from(assembled),
                             ));
                         } else {
@@ -1382,7 +1445,7 @@ impl Operation for WriteReplicaOperation {
                         if more {
                             writes.push((
                                 space.clone(),
-                                staged_key(run_id, ChunkKind::Version),
+                                staged_key(run_id, peer, transfer, ChunkKind::Version),
                                 ByteView::from(assembled),
                             ));
                         } else {
@@ -1422,6 +1485,8 @@ impl Operation for WriteReplicaOperation {
                                     space.clone(),
                                     staged_key(
                                         run_id,
+                                        peer,
+                                        transfer,
                                         ChunkKind::Tool(pair.0.clone(), pair.1.clone()),
                                     ),
                                     value,
@@ -1490,25 +1555,34 @@ impl Operation for WriteReplicaOperation {
                 .map_err(|error| CatalogError::Storage(error.to_string()))?;
             writes.push((
                 space.clone(),
-                staged_tools_key(run_id),
+                staged_tools_key(run_id, peer, transfer),
                 ByteView::from(encoded),
             ));
         }
         if !more {
             if let Some(bytes) = staged_wf {
-                deletes.push((space.clone(), staged_key(run_id, ChunkKind::Workflow)));
+                deletes.push((
+                    space.clone(),
+                    staged_key(run_id, peer, transfer, ChunkKind::Workflow),
+                ));
                 if pending_wf.is_none() {
                     pending_wf = Some(bytes.to_vec());
                 }
             }
             if let Some(bytes) = staged_ver {
-                deletes.push((space.clone(), staged_key(run_id, ChunkKind::Version)));
+                deletes.push((
+                    space.clone(),
+                    staged_key(run_id, peer, transfer, ChunkKind::Version),
+                ));
                 if pending_ver.is_none() {
                     pending_ver = Some(bytes.to_vec());
                 }
             }
             if let Some(bytes) = staged_src {
-                deletes.push((space.clone(), staged_key(run_id, ChunkKind::Source)));
+                deletes.push((
+                    space.clone(),
+                    staged_key(run_id, peer, transfer, ChunkKind::Source),
+                ));
                 if pending_src.is_none() {
                     pending_src = Some(bytes.to_vec());
                 }
@@ -1549,19 +1623,19 @@ impl Operation for WriteReplicaOperation {
                     ));
                 }
             }
-            if let Some(bytes) = pending_src
-                && src_row.is_none()
-            {
+            if let Some(bytes) = pending_src {
                 let files =
                     WorkflowFiles::from_bytes(&bytes).map_err(|_| CatalogError::Forbidden)?;
                 if source_digest(&files.source()) != effective_ver.digest {
                     return Err(CatalogError::Forbidden);
                 }
-                writes.push((
-                    WORKFLOW_SOURCE_KEYSPACE.to_string(),
-                    ver_key,
-                    ByteView::from(bytes),
-                ));
+                if src_row.is_none() {
+                    writes.push((
+                        WORKFLOW_SOURCE_KEYSPACE.to_string(),
+                        ver_key,
+                        ByteView::from(bytes),
+                    ));
+                }
             }
             if let Some(full) = assembled_run {
                 if stored.as_ref().is_none_or(|old| !keep_stored(old, &full)) {
@@ -1613,12 +1687,17 @@ impl Operation for WriteReplicaOperation {
                 ByteView::from(head.to_bytes()?),
             ));
             if staged_index_row.is_some() {
-                deletes.push((space.clone(), staged_tools_key(run_id)));
+                deletes.push((space.clone(), staged_tools_key(run_id, peer, transfer)));
             }
             if !staged_index.is_empty() {
                 let mut tool_reads = Vec::with_capacity(staged_index.len() * 2);
                 for (id, version) in &staged_index {
-                    let key = staged_key(run_id, ChunkKind::Tool(id.clone(), version.clone()));
+                    let key = staged_key(
+                        run_id,
+                        peer,
+                        transfer,
+                        ChunkKind::Tool(id.clone(), version.clone()),
+                    );
                     deletes.push((space.clone(), key.clone()));
                     tool_reads.push((space.clone(), key));
                     tool_reads.push((

@@ -115,6 +115,7 @@ async fn resumes_copied_run() {
     let pages = pages(5);
     let write =
         |run: &WorkflowRunRecord, first_page: u32, pages: Vec<Vec<u8>>| WriteReplicaOperation {
+            peer: gone,
             local: here,
             run: Box::new(run.clone()),
             first_page,
@@ -224,6 +225,7 @@ async fn guards_replica_gaps() {
     let copy = copy_of(&own, gone);
     let write =
         |run: &WorkflowRunRecord, first_page: u32, pages: Vec<Vec<u8>>| WriteReplicaOperation {
+            peer: gone,
             local: here,
             run: Box::new(run.clone()),
             first_page,
@@ -411,6 +413,7 @@ async fn chunks_large_replicas() {
         chunks: Vec::new(),
         more: false,
         stub_run: false,
+        transfer_id: 0,
     };
     let send = ReplicateLogOperation::new(remote.run_id, (gone, remote.realm_id), 0);
     let mut log = pages(3);
@@ -450,6 +453,7 @@ async fn chunks_large_replicas() {
         let is_more = workflow.as_ref().is_some_and(|w| w.more);
         drive(
             WriteReplicaOperation {
+                peer: gone,
                 local: here,
                 run,
                 first_page,
@@ -644,31 +648,7 @@ async fn chunks_large_replicas() {
     assert_eq!(override_picked.len(), 1);
     assert_eq!(override_picked[0].version, "2.0");
 
-    // Missing source row on a replacement holder triggers NotFound so sender backfills from 0.
-    context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Delete {
-            key_space: WORKFLOW_SOURCE_KEYSPACE.to_string(),
-            key: version_key(wf_id, 1),
-            txn_id: None,
-        })
-        .await;
-    let missing_src = drive(
-        WriteReplicaOperation {
-            local: here,
-            run: Box::new(remote.clone()),
-            first_page: 0,
-            pages: Vec::new(),
-            workflow: None,
-            step: WriteStep::Read,
-            kept: 0,
-        },
-        context,
-    )
-    .await;
-    assert_eq!(missing_src, Err(CatalogError::NotFound));
-
-    // Malformed source bytes or a digest mismatch with the stored version are rejected.
+    // An existing source row must still reject a malformed or mismatched incoming source payload.
     let wrong_files = WorkflowFiles {
         files: vec![StoredFile {
             path: "workflow.uwe.yaml".into(),
@@ -683,6 +663,111 @@ async fn chunks_large_replicas() {
         };
         let rejected = drive(
             WriteReplicaOperation {
+                peer: gone,
+                local: here,
+                run: Box::new(remote.clone()),
+                first_page: 0,
+                pages: Vec::new(),
+                workflow: Some(bad_bundle),
+                step: WriteStep::Read,
+                kept: 0,
+            },
+            context,
+        )
+        .await;
+        assert_eq!(rejected, Err(CatalogError::Forbidden));
+    }
+
+    // An abandoned intermediate transfer's staged tool must never publish on a later transfer.
+    let mut abandoned = tool_v2.clone();
+    abandoned.tool_id = "abandoned".into();
+    abandoned.version = "1.0".into();
+    let stage_old = ReplicatedWorkflow {
+        tools: vec![abandoned.to_bytes().unwrap()],
+        more: true,
+        transfer_id: 91,
+        ..ReplicatedWorkflow::default()
+    };
+    drive(
+        WriteReplicaOperation {
+            peer: gone,
+            local: here,
+            run: Box::new(remote.clone()),
+            first_page: 0,
+            pages: Vec::new(),
+            workflow: Some(stage_old),
+            step: WriteStep::Read,
+            kept: 0,
+        },
+        context,
+    )
+    .await
+    .unwrap();
+    let retry_commit = ReplicatedWorkflow {
+        more: false,
+        transfer_id: 92,
+        ..ReplicatedWorkflow::default()
+    };
+    drive(
+        WriteReplicaOperation {
+            peer: gone,
+            local: here,
+            run: Box::new(remote.clone()),
+            first_page: 0,
+            pages: Vec::new(),
+            workflow: Some(retry_commit),
+            step: WriteStep::Read,
+            kept: 0,
+        },
+        context,
+    )
+    .await
+    .unwrap();
+    let after_retry = drive(
+        crate::workflows::ScanOperation::<ToolRecord>::of_groups(Some([remote.group_id].into())),
+        context,
+    )
+    .await
+    .unwrap();
+    assert!(
+        after_retry.iter().all(|(_, t)| t.tool_id != "abandoned"),
+        "abandoned tool from transfer 91 must not publish under transfer 92"
+    );
+
+    // Missing source row on a replacement holder triggers NotFound so sender backfills from 0.
+    context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Delete {
+            key_space: WORKFLOW_SOURCE_KEYSPACE.to_string(),
+            key: version_key(wf_id, 1),
+            txn_id: None,
+        })
+        .await;
+    let missing_src = drive(
+        WriteReplicaOperation {
+            peer: gone,
+            local: here,
+            run: Box::new(remote.clone()),
+            first_page: 0,
+            pages: Vec::new(),
+            workflow: None,
+            step: WriteStep::Read,
+            kept: 0,
+        },
+        context,
+    )
+    .await;
+    assert_eq!(missing_src, Err(CatalogError::NotFound));
+
+    // Malformed source bytes or a digest mismatch with the stored version are rejected.
+    for bad_source in [b"not-postcard".to_vec(), wrong_files.to_bytes().unwrap()] {
+        let bad_bundle = ReplicatedWorkflow {
+            source: Some(bad_source),
+            ..ReplicatedWorkflow::default()
+        };
+        let rejected = drive(
+            WriteReplicaOperation {
+                peer: gone,
                 local: here,
                 run: Box::new(remote.clone()),
                 first_page: 0,
