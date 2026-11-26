@@ -175,6 +175,18 @@ impl FollowRunOperation {
         let mut start = StartRunOperation::new(&self.auth, self.node, request)
             .in_lineage(lineage)
             .with_token(self.token.clone());
+        let mut directory_pins = Vec::new();
+        for mut pin in source.directory_pins.clone() {
+            if source.node_id != self.node.0 {
+                pin.source_node_id.get_or_insert(source.node_id);
+            }
+            if pin.source_node_id.is_some_and(|node| node != self.node.0) {
+                directory_pins.push(pin);
+            }
+        }
+        if !directory_pins.is_empty() {
+            start = start.with_directories(directory_pins);
+        }
         if source.created_by == self.auth.user_id && self.auth.path_restrictions.is_none() {
             start = start.with_captured(source.captured_remote.clone());
         }

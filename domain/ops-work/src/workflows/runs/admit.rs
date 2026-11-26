@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::compute::valid_vault_env;
@@ -15,22 +15,30 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::execution::job::identity::RETENTION_MS;
 use aruna_core::structs::execution::job::input::{
     CapturedInput, InputMode, InputSelection, InputSource, JobPayload,
 };
 use aruna_core::structs::execution::job::local::{WorkspaceMode, user_dedup_key};
 use aruna_core::structs::execution::workflow_run::{
-    CacheScope, PrecapturedInput, RunKeyRecord, RunOutput, RunState, WorkflowRunRecord,
-    WorkflowRunSpec, WorkflowSecretBinding, WorkflowSecretScope, run_key, run_key_row,
+    CacheScope, DirectoryPin, PrecapturedInput, RunKeyRecord, RunOutput, RunState,
+    WorkflowRunRecord, WorkflowRunSpec, WorkflowSecretBinding, WorkflowSecretScope, run_key,
+    run_key_row,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::types::{GroupId, Key};
 use aruna_ops_data::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
+use aruna_ops_data::s3::object::list::{
+    ListBucketError, ListBucketInput, ListBucketOperation, ListBucketResult, ListContinuationToken,
+};
+use aruna_ops_identity::auth::error::{AuthorizeError, PolicyEnforcementError};
+use aruna_ops_identity::auth::request_authorization::AuthorizeOperation;
 use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 use aruna_ops_identity::realm::mutate_placement::node_kind;
 use byteview::ByteView;
@@ -207,6 +215,21 @@ pub struct AdmittedRun {
     pub created: bool,
 }
 
+/// Upper bound on directory-entry pins captured from directory-valued parameters per run.
+const MAX_DIR_PINS: usize = 4096;
+/// Objects requested per listing page while capturing local directory parameters.
+const DIR_LIST_PAGE: usize = 256;
+
+#[derive(Debug, PartialEq)]
+struct DirScan {
+    bucket: String,
+    group_id: GroupId,
+    prefix: String,
+    pending: VecDeque<(String, Ulid)>,
+    checking: Option<(String, Ulid)>,
+    next_token: Option<ListContinuationToken>,
+}
+
 #[derive(Debug, PartialEq)]
 enum AdmitStep {
     Group,
@@ -215,6 +238,9 @@ enum AdmitStep {
     Existing(Box<VersionView>, [u8; 32]),
     Inputs(Box<VersionView>),
     Head(Box<VersionView>, String, String),
+    DirBucket(Box<VersionView>, String, String),
+    DirList(Box<(VersionView, DirScan)>),
+    DirAuth(Box<(VersionView, DirScan)>),
     Output(Box<VersionView>),
     Encryption(Box<VersionView>),
     Config(Box<VersionView>, bool),
@@ -236,7 +262,9 @@ pub struct StartRunOperation {
     bad_address: Option<String>,
     pending: Vec<PinnedInput>,
     value_heads: Vec<(String, String)>,
+    value_dirs: Vec<(String, String)>,
     value_versions: BTreeMap<(String, String), Ulid>,
+    directory_pins: Vec<DirectoryPin>,
     resolved_values: Value,
     pub(super) remote: BTreeMap<NodeId, Vec<(PinnedInput, InputSelection)>>,
     asked: Vec<PinnedInput>,
@@ -254,14 +282,16 @@ impl StartRunOperation {
         let mut refs = Vec::new();
         let bad_address = value_refs(&request.values, &mut refs).err();
         let mut value_heads = Vec::new();
+        let mut value_dirs = Vec::new();
         for (bucket, key, version, source_node_id) in refs {
-            if version.is_none()
-                && source_node_id.is_none_or(|n| n == node.0)
-                && !key.is_empty()
-                && !key.ends_with('/')
-                && !value_heads.iter().any(|(b, k)| b == &bucket && k == &key)
-            {
-                value_heads.push((bucket.clone(), key.clone()));
+            if version.is_none() && source_node_id.is_none_or(|n| n == node.0) {
+                if key.is_empty() || key.ends_with('/') {
+                    if !value_dirs.iter().any(|(b, k)| b == &bucket && k == &key) {
+                        value_dirs.push((bucket.clone(), key.clone()));
+                    }
+                } else if !value_heads.iter().any(|(b, k)| b == &bucket && k == &key) {
+                    value_heads.push((bucket.clone(), key.clone()));
+                }
             }
             pending.push(PinnedInput {
                 name: String::new(),
@@ -278,7 +308,9 @@ impl StartRunOperation {
             node,
             pending,
             value_heads,
+            value_dirs,
             value_versions: BTreeMap::new(),
+            directory_pins: Vec::new(),
             resolved_values,
             request,
             lineage: Lineage::default(),
@@ -295,6 +327,12 @@ impl StartRunOperation {
     /// Supplies the caller's bearer token for resolving remote pinned inputs at admission.
     pub fn with_token(mut self, token: Option<AuthToken>) -> Self {
         self.token = token;
+        self
+    }
+
+    /// Carries versioned directory entries from an earlier run in the lineage for cross-node resume.
+    pub fn with_directories(mut self, pins: Vec<DirectoryPin>) -> Self {
+        self.directory_pins = pins;
         self
     }
 
@@ -366,6 +404,23 @@ impl StartRunOperation {
         if !self.value_versions.is_empty() {
             pin_versions(&mut self.resolved_values, self.node.0, &self.value_versions);
         }
+        self.next_dir(view)
+    }
+
+    /// Captures authorized versioned file entries below each local directory-valued parameter.
+    fn next_dir(&mut self, view: VersionView) -> AdmitNext {
+        if self.directory_pins.len() < MAX_DIR_PINS
+            && let Some((bucket, key)) = self.value_dirs.pop()
+        {
+            let access = ObjectAccessOperation::new(
+                &self.auth,
+                self.node.0,
+                (&bucket, key.trim_end_matches('/')),
+                Permission::READ,
+            );
+            self.step = AdmitStep::DirBucket(Box::new(view), bucket, key);
+            return Ok(Next::Call(IoCall::child(access)));
+        }
         let local = self.node.0;
         let Some(output) = self.request.output.clone() else {
             return self.encryption(view);
@@ -378,6 +433,49 @@ impl StartRunOperation {
         );
         self.step = AdmitStep::Output(Box::new(view));
         Ok(Next::Call(IoCall::child(access)))
+    }
+
+    fn list_dir(&mut self, view: VersionView, mut scan: DirScan) -> AdmitNext {
+        let token = scan.next_token.take();
+        let list = ListBucketOperation::new(ListBucketInput {
+            bucket: scan.bucket.clone(),
+            group_id: scan.group_id,
+            continuation_token: token,
+            max_keys: Some(DIR_LIST_PAGE),
+            prefix: (!scan.prefix.is_empty()).then(|| scan.prefix.clone()),
+            delimiter: None,
+            start_after: None,
+        });
+        self.step = AdmitStep::DirList(Box::new((view, scan)));
+        Ok(Next::Call(IoCall::child(list)))
+    }
+
+    fn next_dir_auth(&mut self, view: VersionView, mut scan: DirScan) -> AdmitNext {
+        if self.directory_pins.len() < MAX_DIR_PINS
+            && let Some((key, version_id)) = scan.pending.pop_front()
+        {
+            let path = object_permission_path(
+                self.auth.realm_id,
+                scan.group_id,
+                self.node.0,
+                &scan.bucket,
+                &key,
+            );
+            let check = AuthorizeOperation::new(
+                self.auth.realm_id,
+                &self.auth,
+                &path,
+                &Permission::READ,
+                PolicyRequestExtras::rest(),
+            );
+            scan.checking = Some((key, version_id));
+            self.step = AdmitStep::DirAuth(Box::new((view, scan)));
+            return Ok(Next::Call(IoCall::child(check)));
+        }
+        if self.directory_pins.len() < MAX_DIR_PINS && scan.next_token.is_some() {
+            return self.list_dir(view, scan);
+        }
+        self.next_dir(view)
     }
 
     /// Reads whether local input buckets (from pins and `values`) and the output bucket encrypt.
@@ -475,6 +573,7 @@ impl StartRunOperation {
             secrets: request.secrets.clone(),
             path_restrictions: self.auth.path_restrictions.clone(),
             captured_remote: std::mem::take(&mut self.captured),
+            directory_pins: std::mem::take(&mut self.directory_pins),
             used_tools: self.lineage.used_tools.clone(),
         };
         let key = request.idempotency_key.as_ref().map(|key| {
@@ -527,6 +626,15 @@ impl StartRunOperation {
                     source_node_id,
                 });
             }
+        }
+        for pin in &self.directory_pins {
+            pins.push(PinnedInput {
+                name: String::new(),
+                bucket: pin.bucket.clone(),
+                key: pin.key.clone(),
+                version_id: pin.version_id,
+                source_node_id: pin.source_node_id,
+            });
         }
         if self.token.is_some() || self.lineage.resumes.is_none() {
             self.captured.retain(|entry| {
@@ -751,10 +859,76 @@ impl Operation for StartRunOperation {
                         HeadObjectError::NoSuchKey
                         | HeadObjectError::NoSuchVersion
                         | HeadObjectError::DeleteMarker,
-                    ) => {}
+                    ) => {
+                        if !self
+                            .value_dirs
+                            .iter()
+                            .any(|(b, k)| b == &bucket && k == &key)
+                        {
+                            self.value_dirs.push((bucket, key));
+                        }
+                    }
                     Err(error) => return Err(CatalogError::Storage(error.to_string())),
                 }
                 self.next_head(*view)
+            }
+            AdmitStep::DirBucket(view, bucket, key) => match super::data::bucket_answer(result) {
+                Ok(info) => {
+                    let prefix = match key.is_empty() || key.ends_with('/') {
+                        true => key,
+                        false => format!("{key}/"),
+                    };
+                    let scan = DirScan {
+                        bucket,
+                        group_id: info.group_id,
+                        prefix,
+                        pending: VecDeque::new(),
+                        checking: None,
+                        next_token: None,
+                    };
+                    self.list_dir(*view, scan)
+                }
+                Err(CatalogError::NotFound | CatalogError::Forbidden) => self.next_dir(*view),
+                Err(error) => Err(error),
+            },
+            AdmitStep::DirList(state) => {
+                let (view, mut scan) = *state;
+                let listed = result
+                    .child::<ListBucketResult, ListBucketError>()?
+                    .map_err(|error| CatalogError::Storage(error.to_string()))?;
+                for object in listed.objects {
+                    scan.pending.push_back((object.head.key, object.version_id));
+                }
+                scan.next_token = listed.continuation_token;
+                self.next_dir_auth(view, scan)
+            }
+            AdmitStep::DirAuth(state) => {
+                let (view, mut scan) = *state;
+                let checking = scan.checking.take();
+                match result.child::<(), AuthorizeError>()? {
+                    Ok(()) => {
+                        if let Some((key, version_id)) = checking
+                            && !self.directory_pins.iter().any(|pin| {
+                                pin.source_node_id.is_none()
+                                    && pin.bucket == scan.bucket
+                                    && pin.key == key
+                            })
+                        {
+                            self.directory_pins.push(DirectoryPin {
+                                bucket: scan.bucket.clone(),
+                                key,
+                                version_id,
+                                source_node_id: None,
+                            });
+                        }
+                    }
+                    Err(
+                        AuthorizeError::PermissionDenied
+                        | AuthorizeError::Policy(PolicyEnforcementError::Denied { .. }),
+                    ) => {}
+                    Err(error) => return Err(CatalogError::Storage(error.to_string())),
+                }
+                self.next_dir_auth(view, scan)
             }
             AdmitStep::Output(view) => {
                 super::data::bucket_answer(result).map_err(|error| match error {

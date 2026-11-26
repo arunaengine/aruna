@@ -219,6 +219,7 @@ async fn releases_workflow_secrets() {
         ]),
         path_restrictions: None,
         captured_remote: Vec::new(),
+        directory_pins: Vec::new(),
         used_tools: Vec::new(),
     };
     ctx.storage_handle

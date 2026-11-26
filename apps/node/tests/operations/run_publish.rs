@@ -594,6 +594,7 @@ async fn publishes_local_workflow() -> TestResult<()> {
         secrets: Default::default(),
         path_restrictions: None,
         captured_remote: Vec::new(),
+        directory_pins: Vec::new(),
         used_tools: Vec::new(),
     };
     device

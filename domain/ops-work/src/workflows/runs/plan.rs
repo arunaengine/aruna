@@ -229,6 +229,7 @@ impl PlanRunOperation {
             secrets: request.secrets.clone(),
             path_restrictions: self.auth.path_restrictions.clone(),
             captured_remote: Vec::new(),
+            directory_pins: Vec::new(),
             used_tools: Vec::new(),
         }
     }

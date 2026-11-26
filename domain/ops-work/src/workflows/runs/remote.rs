@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeMap;
 use std::ops::Range;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -18,20 +19,37 @@ use aruna_core::structs::execution::workflow_run::WorkflowRunRecord;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_ops_data::replication::bao_read::{BaoReadError, BaoReadOutput};
 use aruna_ops_data::replication::managed_read::ManagedReadOperation;
-use aruna_workflow_contract::{ContractError, DATA_CHUNK_BYTES, HostRpcResult, host::StorageEntry};
+use aruna_workflow_contract::host::{ListEntry, StorageEntry};
+use aruna_workflow_contract::{ContractError, DATA_CHUNK_BYTES, HostRpcResult};
 use ulid::Ulid;
 
 use super::creator_auth;
 use super::data::{DataCall, Target};
 use crate::workflows::CatalogError;
 
-/// Rewrites a precaptured link pin to its captured target object so exact-version coordinator
-/// reads work both remotely and after a resume moves execution onto the former remote holder.
+/// Rewrites a precaptured link or captured directory child to its resolved versioned object so
+/// coordinator reads and task staging work both remotely and after cross-node resume.
 pub fn resolve_precaptured(run: &WorkflowRunRecord, mut target: Target, local: NodeId) -> Target {
+    let holder = target.node.unwrap_or(local);
+    if target.version.is_none() {
+        if let Some(entry) = run.captured_remote.iter().find(|entry| {
+            entry.pin_node_id == holder
+                && entry.pin_bucket == target.bucket
+                && entry.pin_key == target.key
+        }) {
+            target.version = Some(entry.pin_version_id);
+        } else if let Some(pin) = run.directory_pins.iter().find(|pin| {
+            pin.source_node_id.unwrap_or(local) == holder
+                && pin.bucket == target.bucket
+                && pin.key == target.key
+        }) {
+            target.version = Some(pin.version_id);
+            return target;
+        }
+    }
     let Some(version) = target.version else {
         return target;
     };
-    let holder = target.node.unwrap_or(local);
     let Some(entry) = run.captured_remote.iter().find(|entry| {
         entry.pin_node_id == holder
             && entry.pin_bucket == target.bucket
@@ -56,6 +74,52 @@ pub fn resolve_precaptured(run: &WorkflowRunRecord, mut target: Target, local: N
         target.owned = false;
     }
     target
+}
+
+/// Immediate directory entries captured for `(node, bucket, prefix)` from precaptured inputs or
+/// admitted directory pins, enabling cross-node resume of directory-valued parameters.
+fn captured_entries(
+    run: &WorkflowRunRecord,
+    node: NodeId,
+    bucket: &str,
+    key: &str,
+) -> Vec<ListEntry> {
+    let prefix = match key.is_empty() || key.ends_with('/') {
+        true => key.to_owned(),
+        false => format!("{key}/"),
+    };
+    let mut entries: BTreeMap<String, bool> = BTreeMap::new();
+    let mut note = |full_key: &str| {
+        let Some(rest) = full_key.strip_prefix(&prefix) else {
+            return;
+        };
+        if rest.is_empty() {
+            return;
+        }
+        match rest.split_once('/') {
+            Some((dir, _)) if !dir.is_empty() => {
+                entries.insert(dir.to_owned(), true);
+            }
+            None => {
+                entries.entry(rest.to_owned()).or_insert(false);
+            }
+            _ => {}
+        }
+    };
+    for entry in &run.captured_remote {
+        if entry.pin_node_id == node && entry.pin_bucket == bucket {
+            note(&entry.pin_key);
+        }
+    }
+    for pin in &run.directory_pins {
+        if pin.source_node_id == Some(node) && pin.bucket == bucket {
+            note(&pin.key);
+        }
+    }
+    entries
+        .into_iter()
+        .map(|(name, directory)| ListEntry { name, directory })
+        .collect()
 }
 
 /// The read of an exact version `node` holds, as the run's creator; `None` without a version.
@@ -189,10 +253,32 @@ impl Operation for RemoteReadOperation {
 
     fn first(&mut self) -> RemoteNext {
         if matches!(self.call, DataCall::List { .. }) {
+            let entries =
+                captured_entries(&self.run, self.node, &self.target.bucket, &self.target.key);
+            if !entries.is_empty() {
+                return Ok(Next::Done(HostRpcResult::StorageList { entries }));
+            }
             return Self::failed(ContractError::unsupported(format!(
                 "a folder on node {} is not listed from here",
                 self.node
             )));
+        }
+        if matches!(self.call, DataCall::Stat { .. }) && self.target.version.is_none() {
+            let entries =
+                captured_entries(&self.run, self.node, &self.target.bucket, &self.target.key);
+            if !entries.is_empty() {
+                return Ok(Next::Done(HostRpcResult::StorageStat {
+                    entry: Some(StorageEntry {
+                        directory: true,
+                        size: 0,
+                        modified_ms: None,
+                        version: None,
+                        sha256: None,
+                        aruna_id: None,
+                        endpoints: Vec::new(),
+                    }),
+                }));
+            }
         }
         let Some(head) = read_call(&self.run, &self.target, self.node, (true, None)) else {
             return Self::failed(ContractError::invalid(
@@ -318,6 +404,7 @@ mod tests {
                 resolved: resolved_sel,
                 captured: cap,
             }],
+            directory_pins: Vec::new(),
             used_tools: Vec::new(),
         };
         let link_target = Target {

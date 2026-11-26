@@ -241,6 +241,15 @@ pub struct RunOrigin {
     pub version_id: String,
 }
 
+/// One versioned file captured from a directory-valued input parameter at admission.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryPin {
+    pub bucket: String,
+    pub key: String,
+    pub version_id: Ulid,
+    pub source_node_id: Option<NodeId>,
+}
+
 /// How many tasks of one step are in each state, kept with the run so a read needs no scan.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepRecord {
@@ -362,6 +371,9 @@ pub struct WorkflowRunRecord {
     /// Remote pinned inputs resolved and granted at admission for reuse by child tasks.
     #[serde(default)]
     pub captured_remote: Vec<PrecapturedInput>,
+    /// Versioned file entries captured from directory-valued parameters for cross-node resume.
+    #[serde(default)]
+    pub directory_pins: Vec<DirectoryPin>,
     /// Resolved `(tool_id, version)` pairs a composed workflow lowered against for this run.
     #[serde(default)]
     pub used_tools: Vec<(String, String)>,

@@ -303,7 +303,8 @@ pub fn task_spec(
         }
     };
     for (path, address) in sources {
-        let target = resolve(record, address)?;
+        let target =
+            super::remote::resolve_precaptured(record, resolve(record, address)?, record.node_id);
         let source = InputSource::S3 {
             bucket: target.bucket,
             key: target.key,
