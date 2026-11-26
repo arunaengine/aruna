@@ -10,6 +10,8 @@ pub mod copy_stage;
 pub mod dataset_stage;
 pub mod diff;
 pub mod firing_reads;
+#[cfg(test)]
+mod flow_tests;
 pub mod identity;
 pub mod lifecycle;
 pub mod limits;
