@@ -240,8 +240,10 @@ async fn runs_and_visitors() {
             firing_id: Ulid::from_string(&fid).unwrap(),
             stage: "run".into(),
             applet_id: Some(applet_id),
+            outside_input: false,
             depth: 0,
         }),
+        applet: None,
     };
     write_doc(
         &h.state.get_ctx(),

@@ -19,7 +19,7 @@ use aruna_core::workflow::WorkflowError;
 use serde_json::Value;
 use ulid::Ulid;
 
-use super::{AutoError, automation_auth};
+use super::{AutoError, automation_auth_for};
 use crate::applets::AppletError;
 use crate::applets::backends::{SandboxOperation, Sandboxing, public_ready};
 use crate::applets::reads::LoadAppletOperation;
@@ -29,35 +29,39 @@ use crate::workflows::runs::admit::{
     AdmittedRun, Lineage, PinnedInput, RunRequest, StartRunOperation,
 };
 
-/// Resolves `{{trigger.*}}` and `{{stages.<name>.*}}` references inside JSON or text templates.
-pub(crate) fn render_text(raw: &str, firing: &Firing) -> String {
+fn template_values(firing: &Firing) -> BTreeMap<String, Value> {
     let mut map = BTreeMap::new();
     match &firing.trigger {
         TriggerPayload::Manual { values_json, .. } => {
-            map.insert("trigger.values".to_string(), values_json.clone());
-            if let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(values_json) {
+            let parsed = serde_json::from_str::<Value>(values_json)
+                .unwrap_or_else(|_| Value::String(values_json.clone()));
+            if let Value::Object(obj) = &parsed {
                 for (key, value) in obj {
-                    let text = value
-                        .as_str()
-                        .map(str::to_string)
-                        .unwrap_or_else(|| value.to_string());
-                    map.insert(format!("trigger.{key}"), text);
+                    map.insert(format!("trigger.{key}"), value.clone());
                 }
             }
+            map.insert("trigger.values".to_string(), parsed);
         }
         TriggerPayload::DataUploaded {
             bucket,
             key,
             version_id,
             path,
-            ..
+            size_bytes,
         } => {
             let file = key.rsplit('/').next().unwrap_or(key).to_string();
-            map.insert("trigger.bucket".into(), bucket.clone());
-            map.insert("trigger.key".into(), key.clone());
-            map.insert("trigger.version_id".into(), version_id.to_string());
-            map.insert("trigger.path".into(), path.clone());
-            map.insert("trigger.filename".into(), file);
+            map.insert("trigger.bucket".into(), Value::String(bucket.clone()));
+            map.insert("trigger.key".into(), Value::String(key.clone()));
+            map.insert(
+                "trigger.version_id".into(),
+                Value::String(version_id.to_string()),
+            );
+            map.insert("trigger.path".into(), Value::String(path.clone()));
+            map.insert("trigger.filename".into(), Value::String(file));
+            map.insert(
+                "trigger.size_bytes".into(),
+                Value::Number((*size_bytes).into()),
+            );
         }
         TriggerPayload::RunFinished {
             workflow_id,
@@ -65,9 +69,15 @@ pub(crate) fn render_text(raw: &str, firing: &Firing) -> String {
             status,
             ..
         } => {
-            map.insert("trigger.workflow_id".into(), workflow_id.to_string());
-            map.insert("trigger.run_id".into(), run_id.to_string());
-            map.insert("trigger.status".into(), status.as_str().into());
+            map.insert(
+                "trigger.workflow_id".into(),
+                Value::String(workflow_id.to_string()),
+            );
+            map.insert("trigger.run_id".into(), Value::String(run_id.to_string()));
+            map.insert(
+                "trigger.status".into(),
+                Value::String(status.as_str().into()),
+            );
         }
         TriggerPayload::AppletSubmission {
             applet_id,
@@ -77,21 +87,30 @@ pub(crate) fn render_text(raw: &str, firing: &Firing) -> String {
             key,
             ..
         } => {
-            map.insert("trigger.applet_id".into(), applet_id.to_string());
-            map.insert("trigger.version_id".into(), version_id.to_string());
-            map.insert("trigger.pseudonym".into(), pseudonym.clone());
-            map.insert("trigger.bucket".into(), bucket.clone());
-            map.insert("trigger.key".into(), key.clone());
+            map.insert(
+                "trigger.applet_id".into(),
+                Value::String(applet_id.to_string()),
+            );
+            map.insert(
+                "trigger.version_id".into(),
+                Value::String(version_id.to_string()),
+            );
+            map.insert("trigger.pseudonym".into(), Value::String(pseudonym.clone()));
+            map.insert("trigger.bucket".into(), Value::String(bucket.clone()));
+            map.insert("trigger.key".into(), Value::String(key.clone()));
         }
     }
     for stage in &firing.stages {
         if let Some(run_id) = stage.receipt.workflow_run_id {
-            map.insert(format!("stages.{}.run_id", stage.name), run_id.to_string());
+            map.insert(
+                format!("stages.{}.run_id", stage.name),
+                Value::String(run_id.to_string()),
+            );
         }
         if let Some(doc_id) = stage.receipt.dataset_id {
             map.insert(
                 format!("stages.{}.dataset_id", stage.name),
-                doc_id.to_string(),
+                Value::String(doc_id.to_string()),
             );
         }
         for (idx, file) in stage.receipt.outputs.iter().enumerate() {
@@ -102,22 +121,86 @@ pub(crate) fn render_text(raw: &str, firing: &Firing) -> String {
                 };
                 map.insert(
                     format!("stages.{}.output.{}", stage.name, file.name),
-                    addr.clone(),
+                    Value::String(addr.clone()),
                 );
                 if idx == 0 {
-                    map.insert(format!("stages.{}.first_output", stage.name), addr);
+                    map.insert(
+                        format!("stages.{}.first_output", stage.name),
+                        Value::String(addr),
+                    );
                 }
             }
         }
     }
-    let mut out = raw.to_string();
-    for (needle, val) in map {
-        out = out.replace(&format!("{{{{{needle}}}}}"), &val);
+    map
+}
+
+fn render_str(raw: &str, vars: &BTreeMap<String, Value>) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(open) = rest.find("{{") {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 2..];
+        let Some(close) = after.find("}}") else {
+            out.push_str(&rest[open..]);
+            return out;
+        };
+        let name = &after[..close];
+        if let Some(val) = vars.get(name) {
+            match val.as_str() {
+                Some(text) => out.push_str(text),
+                None => out.push_str(&val.to_string()),
+            }
+        } else {
+            out.push_str(&rest[open..open + 2 + close + 2]);
+        }
+        rest = &after[close + 2..];
     }
+    out.push_str(rest);
     out
 }
 
-fn parse_inputs(raw: Option<&str>, firing: &Firing, local: NodeId) -> Vec<PinnedInput> {
+fn sub_json(value: Value, vars: &BTreeMap<String, Value>) -> Value {
+    match value {
+        Value::String(text) => {
+            if let Some(inner) = text.strip_prefix("{{").and_then(|s| s.strip_suffix("}}"))
+                && !inner.contains("{{")
+                && !inner.contains("}}")
+                && let Some(typed) = vars.get(inner)
+            {
+                return typed.clone();
+            }
+            Value::String(render_str(&text, vars))
+        }
+        Value::Array(items) => Value::Array(items.into_iter().map(|v| sub_json(v, vars)).collect()),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(k, v)| (k, sub_json(v, vars)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// Resolves `{{trigger.*}}` and `{{stages.<name>.*}}` references inside plain text templates.
+pub(crate) fn render_text(raw: &str, firing: &Firing) -> String {
+    let vars = template_values(firing);
+    render_str(raw, &vars)
+}
+
+/// Parses `raw` as JSON and substitutes `{{...}}` placeholders with typed JSON values/escaping.
+pub(crate) fn render_json(raw: &str, firing: &Firing) -> Result<Value, AutoError> {
+    let parsed: Value = serde_json::from_str(raw)
+        .map_err(|err| AutoError::Invalid(format!("invalid template JSON: {err}")))?;
+    let vars = template_values(firing);
+    Ok(sub_json(parsed, &vars))
+}
+
+fn parse_inputs(
+    raw: Option<&str>,
+    firing: &Firing,
+    local: NodeId,
+) -> Result<(Vec<PinnedInput>, Option<String>), AutoError> {
     let mut pins = Vec::new();
     if let TriggerPayload::AppletSubmission { files, .. } = &firing.trigger {
         for file in files {
@@ -131,27 +214,47 @@ fn parse_inputs(raw: Option<&str>, firing: &Firing, local: NodeId) -> Vec<Pinned
         }
     }
     let Some(text) = raw else {
-        return pins;
+        return Ok((pins, None));
     };
-    let rendered = render_text(text, firing);
-    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&rendered) else {
-        return pins;
+    let rendered = render_json(text, firing)?;
+    let Value::Object(map) = &rendered else {
+        return Err(AutoError::Invalid(
+            "run inputs_json must be a JSON object".into(),
+        ));
     };
     for (name, val) in map {
-        let items = match val {
-            Value::Array(list) => list,
-            other => vec![other],
+        let items: Vec<&Value> = match val {
+            Value::Array(list) => list.iter().collect(),
+            Value::Object(_) => vec![val],
+            _ => {
+                return Err(AutoError::Invalid(format!(
+                    "input `{name}` must be an object or array of objects"
+                )));
+            }
         };
         for item in items {
-            let (Some(bucket), Some(key), Some(ver)) = (
-                item["bucket"].as_str(),
-                item["key"].as_str(),
-                item["version_id"]
-                    .as_str()
-                    .and_then(|s| Ulid::from_string(s).ok()),
-            ) else {
-                continue;
+            let Some(obj) = item.as_object() else {
+                return Err(AutoError::Invalid(format!(
+                    "input `{name}` entry must be an object"
+                )));
             };
+            let bucket = obj
+                .get("bucket")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| AutoError::Invalid(format!("input `{name}` missing bucket")))?;
+            let key = obj
+                .get("key")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| AutoError::Invalid(format!("input `{name}` missing key")))?;
+            let ver = obj
+                .get("version_id")
+                .and_then(Value::as_str)
+                .and_then(|s| Ulid::from_string(s).ok())
+                .ok_or_else(|| {
+                    AutoError::Invalid(format!("input `{name}` missing valid ULID version_id"))
+                })?;
             pins.push(PinnedInput {
                 name: name.clone(),
                 bucket: bucket.to_string(),
@@ -161,7 +264,9 @@ fn parse_inputs(raw: Option<&str>, firing: &Firing, local: NodeId) -> Vec<Pinned
             });
         }
     }
-    pins
+    let encoded =
+        serde_json::to_string(&rendered).map_err(|err| AutoError::Invalid(err.to_string()))?;
+    Ok((pins, Some(encoded)))
 }
 
 #[derive(Debug, PartialEq)]
@@ -212,7 +317,7 @@ impl StartStageRun {
             placement_site,
             secrets,
             provenance_crate,
-        ) = match auto.spec.stages.get(stage_idx).map(|s| &s.kind) {
+        ) = match firing.spec.stages.get(stage_idx).map(|s| &s.kind) {
             Some(StageKind::Run {
                 workflow_id,
                 version,
@@ -237,17 +342,20 @@ impl StartStageRun {
             Some(_) => return Err(AutoError::Invalid("stage is not a run stage".into())),
             None => return Err(AutoError::Invalid("missing run stage".into())),
         };
-        let rendered = render_text(&values_json, &firing);
-        let values: Value = serde_json::from_str(&rendered)
-            .map_err(|err| AutoError::Invalid(format!("invalid run values JSON: {err}")))?;
-        let inputs = parse_inputs(inputs_json.as_deref(), &firing, local.0);
+        let values = render_json(&values_json, &firing)?;
+        if !values.is_object() {
+            return Err(AutoError::Invalid(
+                "run values_json must render to a JSON object".into(),
+            ));
+        }
+        let (inputs, rendered_inputs) = parse_inputs(inputs_json.as_deref(), &firing, local.0)?;
         let output = output_bucket.map(|bucket| RunOutput {
             bucket,
             prefix: output_prefix.unwrap_or_default(),
             node_id: Some(local.0),
             dataset_json: None,
         });
-        let rendered_inputs = inputs_json.as_deref().map(|t| render_text(t, &firing));
+        let outside_input = firing.trigger.outside_input();
         Ok(Self {
             auto,
             firing,
@@ -255,7 +363,7 @@ impl StartStageRun {
             local,
             auth: None,
             applet: None,
-            outside_input: false,
+            outside_input,
             workflow_id,
             version,
             values,
@@ -287,16 +395,18 @@ impl StartStageRun {
 
     fn start_call(&mut self) -> Result<Next<Ulid>, AutoError> {
         let auth = self.auth.as_ref().ok_or(IoError::Unfinished)?;
-        let stage_name = self.auto.spec.stages[self.stage_idx].name.clone();
+        let stage_name = self.firing.spec.stages[self.stage_idx].name.clone();
         let mut output = self.output.clone();
         if output.is_none()
-            && let (
-                TriggerPayload::AppletSubmission {
-                    pseudonym, bucket, ..
-                },
-                Some(applet),
-            ) = (&self.firing.trigger, &self.applet)
+            && let TriggerPayload::AppletSubmission {
+                pseudonym, bucket, ..
+            } = &self.firing.trigger
         {
+            let Some(applet) = &self.applet else {
+                return Err(AutoError::Conflict(
+                    "applet no longer exists for default submission output".into(),
+                ));
+            };
             let sub = applet
                 .grants
                 .submissions
@@ -335,6 +445,7 @@ impl StartStageRun {
             firing_id: self.firing.firing_id,
             stage: stage_name,
             applet_id: self.applet_id(),
+            outside_input: self.outside_input,
             depth: self.firing.trigger.chain_depth(),
         };
         let lineage = Lineage {
@@ -343,7 +454,7 @@ impl StartStageRun {
         };
         let start = StartRunOperation::new(auth, self.local, req)
             .in_lineage(lineage)
-            .with_limits(self.auto.spec.scope.limits.run_limits())
+            .with_limits(self.firing.spec.scope.limits.run_limits())
             .with_automation(origin);
         self.step = RunStep::Start;
         Ok(Next::Call(IoCall::child(start)))
@@ -355,9 +466,10 @@ impl Operation for StartStageRun {
     type Error = AutoError;
 
     fn first(&mut self) -> Result<Next<Ulid>, AutoError> {
-        let auth = automation_auth(&self.auto, self.local.1).ok_or_else(|| {
-            AutoError::Conflict("automation has no active service account".into())
-        })?;
+        let auth =
+            automation_auth_for(&self.auto, &self.firing.spec, self.local.1).ok_or_else(|| {
+                AutoError::Conflict("automation has no active service account".into())
+            })?;
         self.auth = Some(auth);
         if let Some(applet_id) = self.applet_id() {
             self.step = RunStep::Applet;
@@ -365,15 +477,26 @@ impl Operation for StartStageRun {
                 applet_id,
             ))));
         }
+        if self.outside_input {
+            self.step = RunStep::Sandbox;
+            return Ok(Next::Call(IoCall::child(SandboxOperation)));
+        }
         self.validate_call()
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Ulid>, AutoError> {
         match self.step {
             RunStep::Applet => {
-                if let Ok(Some(applet)) = result.child::<Option<Applet>, AppletError>()? {
-                    self.outside_input = applet.access == Access::Public || applet.guests.is_some();
-                    self.applet = Some(applet);
+                match result.child::<Option<Applet>, AppletError>()? {
+                    Ok(Some(applet)) => {
+                        self.outside_input |=
+                            applet.access == Access::Public || applet.guests.is_some();
+                        self.applet = Some(applet);
+                    }
+                    Ok(None) => {
+                        self.outside_input = true;
+                    }
+                    Err(err) => return Err(AutoError::Storage(err.to_string())),
                 }
                 if self.outside_input {
                     self.step = RunStep::Sandbox;
@@ -411,6 +534,7 @@ impl Operation for StartStageRun {
             RunStep::Start => match result.child::<AdmittedRun, CatalogError>()? {
                 Ok(admitted) => Ok(Next::Done(admitted.record.run_id)),
                 Err(CatalogError::Forbidden) => Err(AutoError::Forbidden),
+                Err(CatalogError::Capacity(msg)) => Err(AutoError::Capacity(msg)),
                 Err(CatalogError::Conflict(msg)) => Err(AutoError::Conflict(msg)),
                 Err(err) => Err(AutoError::Invalid(err.to_string())),
             },

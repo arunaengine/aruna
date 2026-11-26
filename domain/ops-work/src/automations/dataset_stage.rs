@@ -27,7 +27,7 @@ use ulid::Ulid;
 
 use super::copy_stage::{StageOutcome, call_intent, stage_intent_id};
 use super::run_stage::render_text;
-use super::{AutoError, automation_auth};
+use super::{AutoError, automation_auth_for};
 use crate::plugins::creates::{
     Claim, Lookup, Step as CreateStep, claim_key_in, created_text, next_step, settle_key_in,
 };
@@ -74,7 +74,7 @@ impl DatasetStageOp {
         local: (NodeId, RealmId),
     ) -> Result<Self, AutoError> {
         let (stage_name, from_stage, metadata_path, name_template, description, license) =
-            match auto.spec.stages.get(stage_idx) {
+            match firing.spec.stages.get(stage_idx) {
                 Some(stage) => match &stage.kind {
                     StageKind::Dataset {
                         from_stage,
@@ -237,7 +237,7 @@ impl DatasetStageOp {
                     &msg,
                 )
                 .map_err(|e| AutoError::Storage(e.detail()))?;
-                self.phase = DatasetPhase::RecordIntent(StageOutcome::NeedsAttention(msg));
+                self.phase = DatasetPhase::RecordIntent(StageOutcome::NeedsAttention(msg, None));
                 Ok(Next::Call(IoCall::Write(vec![row])))
             }
         }
@@ -249,7 +249,7 @@ impl Operation for DatasetStageOp {
     type Error = AutoError;
 
     fn first(&mut self) -> Result<Next<StageOutcome>, AutoError> {
-        let auth = automation_auth(&self.auto, self.local.1)
+        let auth = automation_auth_for(&self.auto, &self.firing.spec, self.local.1)
             .ok_or_else(|| AutoError::Conflict("automation has no active account".into()))?;
         self.auth = Some(auth);
         let begin = begin_in(
@@ -292,6 +292,7 @@ impl Operation for DatasetStageOp {
                 }
                 Begun::Changed | Begun::Unknown(_) => Ok(Next::Done(StageOutcome::NeedsAttention(
                     "dataset create outcome unknown".into(),
+                    None,
                 ))),
             },
             DatasetPhase::Mint => {
@@ -363,7 +364,8 @@ impl Operation for DatasetStageOp {
                             &msg,
                         )
                         .map_err(|e| AutoError::Storage(e.detail()))?;
-                        self.phase = DatasetPhase::RecordIntent(StageOutcome::NeedsAttention(msg));
+                        self.phase =
+                            DatasetPhase::RecordIntent(StageOutcome::NeedsAttention(msg, None));
                         Ok(Next::Call(IoCall::Write(vec![row])))
                     }
                 }

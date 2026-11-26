@@ -59,7 +59,7 @@ impl NotifyStageOp {
         stage_idx: usize,
         realm_id: RealmId,
     ) -> Result<Self, AutoError> {
-        let (stage_name, audience, message) = match auto.spec.stages.get(stage_idx) {
+        let (stage_name, audience, message) = match firing.spec.stages.get(stage_idx) {
             Some(stage) => match &stage.kind {
                 StageKind::Notify { audience, message } => {
                     (stage.name.clone(), *audience, message.clone())
@@ -127,6 +127,7 @@ impl Operation for NotifyStageOp {
                 }
                 Begun::Changed | Begun::Unknown(_) => Ok(Next::Done(StageOutcome::NeedsAttention(
                     "notification delivery outcome unknown".into(),
+                    None,
                 ))),
             },
             NotifyStep::AuthDoc => {

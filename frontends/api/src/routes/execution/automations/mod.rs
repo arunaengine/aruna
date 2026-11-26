@@ -54,7 +54,7 @@ pub(crate) fn auto_error(error: AutoError) -> ServerError {
         AutoError::NotFound => ServerError::NotFound,
         AutoError::Forbidden => ServerError::Forbidden,
         AutoError::Invalid(msg) => ServerError::BadRequestReason(msg),
-        AutoError::Conflict(msg) => ServerError::Conflict(msg),
+        AutoError::Conflict(msg) | AutoError::Capacity(msg) => ServerError::Conflict(msg),
         AutoError::Limited(msg) => ServerError::Refused(
             axum::http::StatusCode::TOO_MANY_REQUESTS,
             "automation_limited",

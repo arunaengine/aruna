@@ -16,7 +16,8 @@ use aruna_core::types::{GroupId, RoleId};
 use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
-use super::{AutoError, allowed, authorize_path, auto_answer, auto_row, read_auto};
+use super::firing_reads::decode_ulid;
+use super::{AutoError, active_page, allowed, authorize_path, auto_answer, auto_row, read_auto};
 
 const MAX_NAME: usize = 120;
 
@@ -189,7 +190,7 @@ fn apply(
                 validate_spec(&next_spec).map_err(AutoError::Invalid)?;
                 validate_scope(&next_spec, realm_id, auto.group_id, auto.host_node)
                     .map_err(AutoError::Invalid)?;
-                if auto.lifecycle == Lifecycle::Active && is_widening(&auto.spec, &next_spec) {
+                if auto.approved_by.is_some() && is_widening(&auto.spec, &next_spec) {
                     auto.pending = Some(PendingChange {
                         spec: next_spec,
                         requested_by: actor,
@@ -203,6 +204,8 @@ fn apply(
                             requested_by: actor,
                             requested_at_ms: now_ms,
                         });
+                    } else {
+                        auto.pending = None;
                     }
                 }
             }
@@ -239,7 +242,10 @@ fn apply(
         AutoChange::Reject => {
             auto.pending = None;
             if auto.lifecycle == Lifecycle::WaitingForApproval {
-                auto.lifecycle = Lifecycle::Draft;
+                auto.lifecycle = match auto.approved_by.is_some() {
+                    true => Lifecycle::Paused,
+                    false => Lifecycle::Draft,
+                };
             }
         }
         AutoChange::Pause(reason) => {
@@ -274,6 +280,13 @@ fn apply(
     Ok(())
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum WriteStep {
+    Read,
+    CheckActive(Box<Automation>),
+    Write(Box<Automation>),
+}
+
 /// Applies one [`AutoChange`] transactionally with optional optimistic `expected` revision check.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WriteAutoOperation {
@@ -283,7 +296,7 @@ pub struct WriteAutoOperation {
     actor: UserId,
     realm_id: RealmId,
     now_ms: u64,
-    record: Option<Automation>,
+    step: WriteStep,
 }
 
 impl WriteAutoOperation {
@@ -300,12 +313,25 @@ impl WriteAutoOperation {
             actor,
             realm_id,
             now_ms: 0,
-            record: None,
+            step: WriteStep::Read,
         }
     }
 
     pub fn node(id: Ulid, change: AutoChange, actor: UserId, realm_id: RealmId) -> Self {
         Self::new((id, None), change, actor, realm_id)
+    }
+
+    fn commit(&mut self, mut auto: Automation) -> Result<Next<Automation>, AutoError> {
+        apply(
+            &mut auto,
+            self.change.clone(),
+            self.actor,
+            self.realm_id,
+            self.now_ms,
+        )?;
+        let row = auto_row(&auto)?;
+        self.step = WriteStep::Write(Box::new(auto));
+        Ok(Next::Call(IoCall::Write(vec![row])))
     }
 }
 
@@ -322,30 +348,46 @@ impl Operation for WriteAutoOperation {
     }
 
     fn first(&mut self) -> Result<Next<Automation>, AutoError> {
+        self.step = WriteStep::Read;
         Ok(Next::Call(read_auto(self.id)))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Automation>, AutoError> {
-        if let Some(record) = self.record.take() {
-            result.done()?;
-            return Ok(Next::Done(record));
+        match std::mem::replace(&mut self.step, WriteStep::Read) {
+            WriteStep::Read => {
+                let auto = auto_answer(result)?.ok_or(AutoError::NotFound)?;
+                if self.expected.is_some_and(|exp| exp != auto.revision) {
+                    return Err(AutoError::Conflict(
+                        "automation changed meanwhile; read again".into(),
+                    ));
+                }
+                if matches!(self.change, AutoChange::Delete) && auto.lifecycle != Lifecycle::Removed
+                {
+                    self.step = WriteStep::CheckActive(Box::new(auto));
+                    return Ok(Next::Call(active_page(None)));
+                }
+                self.commit(auto)
+            }
+            WriteStep::CheckActive(auto) => {
+                let (rows, next) = result.page()?;
+                for (_, value) in rows {
+                    if decode_ulid(&value) == Some(self.id) {
+                        return Err(AutoError::Conflict(
+                            "cannot delete automation while active firings exist".into(),
+                        ));
+                    }
+                }
+                if let Some(after) = next {
+                    self.step = WriteStep::CheckActive(auto);
+                    return Ok(Next::Call(active_page(Some(after))));
+                }
+                self.commit(*auto)
+            }
+            WriteStep::Write(record) => {
+                result.done()?;
+                Ok(Next::Done(*record))
+            }
         }
-        let mut auto = auto_answer(result)?.ok_or(AutoError::NotFound)?;
-        if self.expected.is_some_and(|exp| exp != auto.revision) {
-            return Err(AutoError::Conflict(
-                "automation changed meanwhile; read again".into(),
-            ));
-        }
-        apply(
-            &mut auto,
-            self.change.clone(),
-            self.actor,
-            self.realm_id,
-            self.now_ms,
-        )?;
-        let row = auto_row(&auto)?;
-        self.record = Some(auto);
-        Ok(Next::Call(IoCall::Write(vec![row])))
     }
 
     fn expected_error(error: &AutoError) -> bool {
