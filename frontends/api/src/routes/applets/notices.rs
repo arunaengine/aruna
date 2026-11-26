@@ -19,7 +19,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use super::edge::edge_auth;
-use super::{applet_error, realm_config};
+use super::{applet_error, hosting_for, realm_config};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 
@@ -69,7 +69,7 @@ async fn policy(state: &ServerState) -> ServerResult<u64> {
     let config = realm_config(state).await?;
     let mode = config.features.get(&Feature::Applets);
     let disabled = state.disabled_features().contains(&Feature::Applets);
-    let hosting = state.applet_settings().hosting.is_some();
+    let hosting = hosting_for(state, &config).is_some();
     policy_mark(&(mode, disabled, hosting))
         .map_err(|error| ServerError::InternalError(error.into()))
 }

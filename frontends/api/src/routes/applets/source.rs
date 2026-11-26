@@ -182,7 +182,7 @@ data and on its repository document.
     responses(
         (status = 200, description = "The new main commit", body = CommitResponse),
         (status = 400, description = "Invalid base64, path or empty change", body = ErrorResponse),
-        (status = 403, description = "No WRITE on the group's data or the repository", body = ErrorResponse),
+        (status = 403, description = "No WRITE on the group's data or the repository, or applets are off", body = ErrorResponse),
         (status = 404, description = "No such applet", body = ErrorResponse),
         (status = 409, description = "The applet has no repository, or a path is locked by another user", body = ErrorResponse),
         (status = 412, description = "Main moved since `base`", body = ErrorResponse)
@@ -195,7 +195,11 @@ pub async fn commit_source(
     Path(id): Path<String>,
     Json(body): Json<CommitRequest>,
 ) -> ServerResult<Json<CommitResponse>> {
-    let repository = repository(&state, &auth, &id, Need::Write).await?;
+    let read = AppletAccessOperation::new(&auth, applet_id(&id)?, Need::Write);
+    let applet = drive(read, &state.get_ctx()).await.map_err(applet_error)?;
+    require_feature(&state, applet.group_id).await?;
+    let repository = (applet.repository)
+        .ok_or_else(|| ServerError::Conflict("the applet has no repository".to_string()))?;
     let mut files = Vec::with_capacity(body.files.len());
     for (path, content) in body.files {
         let content = (content.as_deref())

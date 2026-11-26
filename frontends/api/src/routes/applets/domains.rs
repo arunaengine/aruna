@@ -19,7 +19,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use super::wire::{DomainBody, domain_body};
-use super::{applet_error, applet_id, hosting, require_feature};
+use super::{applet_error, applet_id, effective_hosting, require_feature};
 use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
@@ -109,7 +109,7 @@ pub async fn add_domain(
     Path(id): Path<String>,
     Json(body): Json<DomainRequest>,
 ) -> ServerResult<(StatusCode, Json<DomainBody>)> {
-    let settings = hosting(&state)?;
+    let settings = effective_hosting(&state).await?;
     if !settings.custom_domains {
         return Err(ServerError::Conflict(
             "this node does not serve custom domains".to_string(),

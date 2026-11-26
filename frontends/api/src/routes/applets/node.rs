@@ -12,7 +12,7 @@ use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use super::{group_id, realm_feature};
+use super::{group_id, hosting_for, realm_config, realm_feature};
 use crate::auth::RealmAuth;
 use crate::error::{ErrorResponse, ServerResult};
 use crate::server::state::ServerState;
@@ -115,12 +115,13 @@ pub async fn applet_settings(
     Query(query): Query<SettingsQuery>,
 ) -> ServerResult<Json<AppletSettingsBody>> {
     let settings = state.applet_settings();
+    let config = realm_config(&state).await?;
     let feature_on = match query.group_id.as_deref() {
         Some(text) => Some(realm_feature(&state, group_id(text)?).await?),
         None => None,
     };
     Ok(Json(AppletSettingsBody {
-        hosting: settings.hosting.as_ref().map(|hosting| HostingBody {
+        hosting: hosting_for(&state, &config).map(|hosting| HostingBody {
             applet_domain: hosting.applet_domain.clone(),
             custom_domains: hosting.custom_domains,
             guests: hosting.guests,

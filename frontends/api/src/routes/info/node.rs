@@ -612,8 +612,18 @@ pub(crate) async fn run_node_info(state: &ServerState, auth: Option<AuthContext>
         return response;
     }
     let applets = state.applet_settings();
+    let hosting = match applets.hosting.as_ref() {
+        Some(hosting) => aruna_runner::driver::drive(
+            aruna_ops_identity::document_repository::GetConfigOperation::new(state.get_realm_id()),
+            &state.get_ctx(),
+        )
+        .await
+        .ok()
+        .is_none_or(|config| hosting.provider_conflict(&config.oidc_providers).is_none()),
+        None => false,
+    };
     response.applets = Some(aruna_wire::info::AppletCapabilities {
-        hosting: applets.hosting.is_some(),
+        hosting,
         building: applets.building.is_some(),
     });
 

@@ -118,6 +118,28 @@ impl HostingSettings {
         }
         !key.is_empty() && difference == 0
     }
+
+    /// Returns the first OIDC provider host sharing a site with `applet_domain`, if any.
+    pub fn provider_conflict(
+        &self,
+        providers: &[crate::structs::identity::realm::OidcProviderConfig],
+    ) -> Option<String> {
+        for provider in providers {
+            for raw in [&provider.issuer, &provider.discovery_url] {
+                let Some(host) = url::Url::parse(raw.trim())
+                    .ok()
+                    .and_then(|url| url.host_str().map(str::to_string))
+                    .and_then(|host| crate::applet::hosts::normalize_host(&host).ok())
+                else {
+                    continue;
+                };
+                if crate::applet::hosts::same_site(&self.applet_domain, &host) {
+                    return Some(host);
+                }
+            }
+        }
+        None
+    }
 }
 
 /// The exact restriction a visitor token of `applet_id` carries: it names no data path, so the
@@ -163,5 +185,37 @@ mod tests {
         )));
         assert!(!image_pinned("harbor.example/aruna/builder:latest"));
         assert!(!image_pinned("@sha256:abc"));
+    }
+
+    #[test]
+    fn detects_provider_conflict() {
+        use crate::structs::identity::realm::OidcProviderConfig;
+        let hosting = HostingSettings {
+            applet_domain: "apps.example.net".into(),
+            edge_key_sha256: [1; 32],
+            custom_domains: false,
+            guests: false,
+            embedding: false,
+            max_origins: DEFAULT_ORIGINS,
+            portal_origin: None,
+            protected_hosts: Vec::new(),
+        };
+        let separate = OidcProviderConfig {
+            id: "ok".into(),
+            issuer: "https://auth.other.org/realms/main".into(),
+            audience: "c".into(),
+            discovery_url: "https://auth.other.org/.well-known/openid-configuration".into(),
+        };
+        assert_eq!(hosting.provider_conflict(&[separate]), None);
+        let shared = OidcProviderConfig {
+            id: "bad".into(),
+            issuer: "https://auth.other.org/realms/main".into(),
+            audience: "c".into(),
+            discovery_url: "https://login.example.net/.well-known/openid-configuration".into(),
+        };
+        assert_eq!(
+            hosting.provider_conflict(&[shared]),
+            Some("login.example.net".to_string())
+        );
     }
 }

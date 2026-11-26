@@ -18,7 +18,7 @@ use super::wire::{
     AppletBody, ApprovalRequestBody, EmbeddingRequest, GuestsRequest, RevisionBody,
     TakedownRequest, VersionAction,
 };
-use super::{applet_error, applet_id, hosting, require_feature, serving};
+use super::{applet_error, applet_id, effective_hosting, require_feature, serving};
 use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::access::groups::ensure_group_admin;
@@ -118,7 +118,7 @@ pub async fn request_approval(
 ) -> ServerResult<Json<AppletBody>> {
     let applet = writable(&state, &auth, &id).await?;
     require_feature(&state, applet.group_id).await?;
-    let limit = hosting(&state)?.max_origins;
+    let limit = effective_hosting(&state).await?.max_origins;
     let mut own: Vec<&str> = vec![applet.host.as_str()];
     own.extend(applet.domains.iter().map(|domain| domain.host.as_str()));
     let origins = embedding_origins(&body.origins, &own, limit)
@@ -384,7 +384,7 @@ pub async fn set_embedding(
     Json(body): Json<EmbeddingRequest>,
 ) -> ServerResult<Json<AppletBody>> {
     let applet = writable(&state, &auth, &id).await?;
-    if body.enabled && !hosting(&state)?.embedding {
+    if body.enabled && !effective_hosting(&state).await?.embedding {
         return Err(ServerError::Conflict(
             "this node does not allow embedding".to_string(),
         ));
@@ -433,7 +433,7 @@ pub async fn set_guests(
 ) -> ServerResult<Json<AppletBody>> {
     let applet = writable(&state, &auth, &id).await?;
     ensure_group_admin(&state, &auth, applet.group_id).await?;
-    if body.guests.is_some() && !hosting(&state)?.guests {
+    if body.guests.is_some() && !effective_hosting(&state).await?.guests {
         return Err(ServerError::Conflict(
             "this node does not allow guest submissions".to_string(),
         ));

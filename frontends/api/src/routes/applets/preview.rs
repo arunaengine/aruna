@@ -16,7 +16,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use super::edge::{FileQuery, edge_auth, previewer, read_manifest, serve_pinned, visitor};
-use super::{applet_error, applet_id};
+use super::{applet_error, applet_id, effective_hosting};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 
@@ -33,6 +33,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
 /// nothing, so a missing preview right reads as a missing applet.
 async fn previewed(state: &ServerState, headers: &HeaderMap, id: &str) -> ServerResult<Applet> {
     edge_auth(state, headers)?;
+    effective_hosting(state).await?;
     let id = applet_id(id)?;
     let load = drive(LoadAppletOperation::new(id), &state.get_ctx()).await;
     let applet = load.map_err(applet_error)?.ok_or(ServerError::NotFound)?;

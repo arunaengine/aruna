@@ -25,7 +25,7 @@ use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use super::{applet_error, applet_id, hosting};
+use super::{applet_error, applet_id, effective_hosting, hosting};
 use crate::auth::bearer_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::rate_limit::LocalKey;
@@ -304,6 +304,7 @@ pub async fn version_file(
     Query(query): Query<FileQuery>,
 ) -> ServerResult<Response> {
     edge_auth(&state, &headers)?;
+    effective_hosting(&state).await?;
     let id = applet_id(&id)?;
     let load = drive(LoadAppletOperation::new(id), &state.get_ctx()).await;
     let applet = load.map_err(applet_error)?.ok_or(ServerError::NotFound)?;

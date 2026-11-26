@@ -127,7 +127,16 @@ impl PortalSecurity {
         connect.extend(self.config.extra_connect_origins.iter().cloned());
         let mut frame = BTreeSet::new();
         if let Some(hosting) = self.state.applet_settings().hosting.as_ref() {
-            frame.insert(format!("https://*.{}", hosting.applet_domain));
+            let safe = drive(
+                GetConfigOperation::new(self.state.get_realm_id()),
+                &self.state.get_ctx(),
+            )
+            .await
+            .ok()
+            .is_none_or(|config| hosting.provider_conflict(&config.oidc_providers).is_none());
+            if safe {
+                frame.insert(format!("https://*.{}", hosting.applet_domain));
+            }
         }
         ResolvedOrigins {
             connect,

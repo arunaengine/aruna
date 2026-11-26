@@ -16,7 +16,9 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use super::wire::{AppletBody, AppletPageBody, AppletQuery, CreateAppletRequest};
-use super::{applet_error, applet_id, group_id, hosting, limit, require_feature, serving};
+use super::{
+    applet_error, applet_id, effective_hosting, group_id, limit, require_feature, serving,
+};
 use crate::auth::{RealmAuth, UnrestrictedAuth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
@@ -139,7 +141,7 @@ pub async fn create_applet(
         .map(Ulid::from_string)
         .transpose()
         .map_err(|_| ServerError::BadRequestReason("repository is not a ULID".to_string()))?;
-    let applet_domain = hosting(&state)?.applet_domain.clone();
+    let applet_domain = effective_hosting(&state).await?.applet_domain.clone();
     require_feature(&state, group).await?;
     let request = NewApplet {
         group_id: group,

@@ -29,7 +29,7 @@ use utoipa_axum::routes;
 
 use super::edge::{edge_auth, previewer};
 use super::wire::{AccessBody, GrantsBody};
-use super::{applet_error, applet_id, hosting};
+use super::{applet_error, applet_id, effective_hosting};
 use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
@@ -181,7 +181,7 @@ pub async fn signin_info(
     Path(id): Path<String>,
     Query(query): Query<SigninInfoQuery>,
 ) -> ServerResult<Json<SigninInfoResponse>> {
-    hosting(&state)?;
+    effective_hosting(&state).await?;
     let id = applet_id(&id)?;
     let load = drive(LoadAppletOperation::new(id), &state.get_ctx()).await;
     let applet = load.map_err(applet_error)?.ok_or(ServerError::NotFound)?;
@@ -293,7 +293,7 @@ pub async fn signin_code(
     Path(id): Path<String>,
     Json(body): Json<CodeRequest>,
 ) -> ServerResult<Json<CodeResponse>> {
-    let settings = hosting(&state)?.clone();
+    let settings = effective_hosting(&state).await?.clone();
     let id = applet_id(&id)?;
     let load = drive(LoadAppletOperation::new(id), &state.get_ctx()).await;
     let applet = load.map_err(applet_error)?.ok_or(ServerError::NotFound)?;
@@ -377,7 +377,8 @@ pub async fn redeem_code(
     headers: HeaderMap,
     Json(body): Json<RedeemRequest>,
 ) -> ServerResult<Json<RedeemResponse>> {
-    let settings = edge_auth(&state, &headers)?.clone();
+    edge_auth(&state, &headers)?;
+    let settings = effective_hosting(&state).await?.clone();
     let pending = state
         .signin_codes()
         .take(&body.code)
