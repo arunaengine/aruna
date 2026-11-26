@@ -38,7 +38,9 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{WORKFLOW_RUN_KEYSPACE, WORKFLOW_TASK_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::plugin_runs::{SourceEvent, journal_entries};
 use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::workflow::workflow_permission_path;
 use aruna_core::structs::execution::workflow_run::{
     RunFile, RunOrigin, RunState, StepRecord, WorkflowRunRecord, WorkflowTaskRecord, run_key,
     task_key,
@@ -296,6 +298,17 @@ fn change_run(
             if state.is_terminal() {
                 record.finished_at_ms = Some(now_ms);
                 record.error = error;
+                if matches!(state, RunState::Succeeded | RunState::Failed) {
+                    let path = workflow_permission_path(record.realm_id, record.group_id);
+                    let event = SourceEvent::run_finished(
+                        (record.group_id, path),
+                        (record.workflow_id, record.run_id),
+                        state.as_str(),
+                        record.created_by,
+                        now_ms,
+                    );
+                    writes.extend(journal_entries(&event)?);
+                }
             }
             let payload = events::state_json(record);
             events::push(record, "state", payload, writes)

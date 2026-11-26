@@ -5,15 +5,18 @@
 
 use std::sync::Arc;
 
-use aruna_core::applet::record::{Access, Applet, Serving, guest_pseudonym, pseudonym};
+use aruna_core::applet::record::{
+    Access, Applet, Serving, SubmissionFile, guest_pseudonym, pseudonym,
+};
 use aruna_core::applet::usage::caps;
 use aruna_core::git::StoredObject;
 use aruna_ops_work::applets::backends::{SandboxOperation, public_ready};
 use aruna_ops_work::applets::intake::{IntakeOperation, Visit, applet_auth};
 use aruna_ops_work::applets::reads::LoadAppletOperation;
-use aruna_ops_work::applets::runs::{RunInput, VisitRunOperation, run_request, visitor_run};
+use aruna_ops_work::applets::runs::{
+    RunInput, VisitRunOperation, VisitorRunOperation, VisitorRunsOperation, run_request,
+};
 use aruna_ops_work::applets::{AppletAccessOperation, Need};
-use aruna_ops_work::workflows::runs::reads::RunSnapshotOperation;
 use aruna_runner::driver::drive;
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -37,7 +40,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(session))
         .routes(routes!(upload))
         .routes(routes!(submit))
-        .routes(routes!(start_run))
+        .routes(routes!(list_runs, start_run))
         .routes(routes!(run_status))
         .routes(routes!(run_results))
 }
@@ -226,9 +229,13 @@ async fn hand_in(
     state: &ServerState,
     caller: Caller,
     (name, bytes): (&str, Bytes),
+    submission: Option<Vec<SubmissionFile>>,
 ) -> ServerResult<(StatusCode, Json<HandInBody>)> {
     let node = git_node(state);
-    let intake = IntakeOperation::new(&node, &caller.applet, caller.visit, (name, bytes));
+    let mut intake = IntakeOperation::new(&node, &caller.applet, caller.visit, (name, bytes));
+    if let Some(files) = submission {
+        intake = intake.with_submission(files);
+    }
     let stored: StoredObject = drive(intake, &state.get_ctx())
         .await
         .map_err(applet_error)?;
@@ -282,7 +289,53 @@ pub async fn upload(
     if name.is_empty() || name == "." || name == ".." {
         return Err(ServerError::BadRequestReason("name a file".to_string()));
     }
-    hand_in(&state, caller, (name, body)).await
+    hand_in(&state, caller, (name, body), None).await
+}
+
+fn submission_files(
+    applet: &Applet,
+    form: &serde_json::Value,
+) -> ServerResult<Vec<SubmissionFile>> {
+    let Some(items) = form.get("files").and_then(serde_json::Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    let default_bucket = applet
+        .grants
+        .submissions
+        .as_ref()
+        .map(|folder| folder.bucket.as_str())
+        .unwrap_or_default();
+    let mut files = Vec::new();
+    for item in items {
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+        let (Some(key), Some(ver)) = (
+            obj.get("key").and_then(serde_json::Value::as_str),
+            obj.get("version_id").and_then(serde_json::Value::as_str),
+        ) else {
+            continue;
+        };
+        let version_id = Ulid::from_string(ver)
+            .map_err(|_| ServerError::BadRequestReason("file version_id is not a ULID".into()))?;
+        let name = obj
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(key)
+            .to_string();
+        let bucket = obj
+            .get("bucket")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(default_bucket)
+            .to_string();
+        files.push(SubmissionFile {
+            name,
+            bucket,
+            key: key.to_string(),
+            version_id,
+        });
+    }
+    Ok(files)
 }
 
 #[utoipa::path(
@@ -315,9 +368,16 @@ pub async fn submit(
     Json(form): Json<serde_json::Value>,
 ) -> ServerResult<(StatusCode, Json<HandInBody>)> {
     let caller = caller(&state, &headers, &id).await?;
+    let files = submission_files(&caller.applet, &form)?;
     let bytes =
         serde_json::to_vec(&form).map_err(|error| ServerError::InternalError(error.into()))?;
-    hand_in(&state, caller, ("submission.json", Bytes::from(bytes))).await
+    hand_in(
+        &state,
+        caller,
+        ("submission.json", Bytes::from(bytes)),
+        Some(files),
+    )
+    .await
 }
 
 #[derive(Clone, Debug, Deserialize, ToSchema)]
@@ -435,22 +495,49 @@ pub async fn start_run(
     Ok((StatusCode::ACCEPTED, Json(run_body(&admitted.record))))
 }
 
-/// A run of this applet that the visitor started; any other run reads as missing.
+#[utoipa::path(
+    get,
+    path = "/edge/v1/applets/{applet_id}/runs",
+    tag = "applets",
+    summary = "List a visitor's runs for an applet",
+    description = r#"Lists runs started for this visitor by the applet or by an automation triggered by their submission.
+
+**Authentication**: as for `GET /edge/v1/applets/{applet_id}/session`.
+
+**Behavior**
+- Only runs whose results stay below the visitor's own folder are returned; downstream automation
+  delivery targets outside the visitor's folder are never exposed."#,
+    params(("applet_id" = String, Path, description = "Applet id; an unparseable id is 404")),
+    responses(
+        (status = 200, description = "The visitor's runs, newest first", body = Vec<RunBody>),
+        (status = 401, description = "No valid edge key, or neither visitor nor allowed guest", body = ErrorResponse),
+        (status = 403, description = "The visitor may not use this applet", body = ErrorResponse),
+        (status = 404, description = "No such applet", body = ErrorResponse),
+        (status = 503, description = "The applet is paused", body = ErrorResponse)
+    )
+)]
+pub async fn list_runs(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ServerResult<Json<Vec<RunBody>>> {
+    let caller = caller(&state, &headers, &id).await?;
+    let list = VisitorRunsOperation::new(&caller.applet, caller.visit, 50);
+    let runs = drive(list, &state.get_ctx()).await.map_err(applet_error)?;
+    Ok(Json(runs.iter().map(run_body).collect()))
+}
+
+/// A run of this applet belonging to this visitor; any other run reads as missing.
 async fn visitor_record(
     state: &ServerState,
     caller: &Caller,
     run: &str,
 ) -> ServerResult<aruna_core::structs::execution::workflow_run::WorkflowRunRecord> {
     let run_id = Ulid::from_string(run).map_err(|_| ServerError::NotFound)?;
-    let auth = applet_auth(&caller.applet, state.get_realm_id()).ok_or(ServerError::NotFound)?;
-    let read = RunSnapshotOperation::new(&auth, run_id);
-    let snapshot = drive(read, &state.get_ctx())
+    let read = VisitorRunOperation::new(&caller.applet, caller.visit.clone(), run_id);
+    drive(read, &state.get_ctx())
         .await
-        .map_err(|_| ServerError::NotFound)?;
-    match visitor_run(&caller.applet, &caller.visit, &snapshot.record) {
-        true => Ok(snapshot.record),
-        false => Err(ServerError::NotFound),
-    }
+        .map_err(|_| ServerError::NotFound)
 }
 
 #[utoipa::path(

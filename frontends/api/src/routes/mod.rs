@@ -264,6 +264,7 @@ pub(crate) mod tests {
         ("GET", "/edge/v1/applets/{applet_id}/session"),
         ("POST", "/edge/v1/applets/{applet_id}/uploads"),
         ("POST", "/edge/v1/applets/{applet_id}/submissions"),
+        ("GET", "/edge/v1/applets/{applet_id}/runs"),
         ("POST", "/edge/v1/applets/{applet_id}/runs"),
         ("GET", "/edge/v1/applets/{applet_id}/runs/{run_id}"),
         ("GET", "/edge/v1/applets/{applet_id}/runs/{run_id}/results"),

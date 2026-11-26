@@ -3,17 +3,21 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::cmp::Reverse;
+
 use aruna_core::applet::record::{Applet, StartGrant};
 use aruna_core::applet::usage::{caps, run_limits};
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
+use aruna_core::keyspaces::WORKFLOW_RUN_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::permission_path::{escape_permission_path, pattern_overlaps_subtree};
 use aruna_core::structs::execution::workflow::workflow_permission_path;
-use aruna_core::structs::execution::workflow_run::{RunOutput, WorkflowRunRecord};
+use aruna_core::structs::execution::workflow_run::{RunOutput, WorkflowRunRecord, run_key};
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
+use aruna_core::types::Key;
 use serde_json::Value;
 use ulid::Ulid;
 
@@ -125,14 +129,118 @@ pub fn run_request(
     })
 }
 
-/// Whether `record` is a run of this applet that writes below the visitor's own folder.
+/// Whether `record` is a run of this applet (direct or automation-started) writing below the
+/// visitor's own folder.
 pub fn visitor_run(applet: &Applet, visit: &Visit, record: &WorkflowRunRecord) -> bool {
     let Ok((bucket, folder)) = visitor_folder(applet, visit) else {
         return false;
     };
-    let ours = applet.account == Some(record.created_by) && record.group_id == applet.group_id;
+    let from_applet = applet.account == Some(record.created_by);
+    let from_auto = record
+        .automation
+        .as_ref()
+        .is_some_and(|origin| origin.applet_id == Some(applet.applet_id));
+    let ours = record.group_id == applet.group_id && (from_applet || from_auto);
     ours && (record.output.as_ref())
         .is_some_and(|output| output.bucket == bucket && output.prefix.starts_with(&folder))
+}
+
+/// Reads one workflow run if it belongs to `visit` on `applet` (direct or automation-started).
+#[derive(Debug, PartialEq)]
+pub struct VisitorRunOperation {
+    applet: Applet,
+    visit: Visit,
+    run_id: Ulid,
+}
+
+impl VisitorRunOperation {
+    pub fn new(applet: &Applet, visit: Visit, run_id: Ulid) -> Self {
+        Self {
+            applet: applet.clone(),
+            visit,
+            run_id,
+        }
+    }
+}
+
+impl Operation for VisitorRunOperation {
+    type Output = WorkflowRunRecord;
+    type Error = AppletError;
+
+    fn first(&mut self) -> Result<Next<WorkflowRunRecord>, AppletError> {
+        Ok(Next::Call(IoCall::Read(vec![(
+            WORKFLOW_RUN_KEYSPACE.to_string(),
+            run_key(self.run_id),
+        )])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<WorkflowRunRecord>, AppletError> {
+        let value = result.value()?.ok_or(AppletError::NotFound)?;
+        let record = WorkflowRunRecord::from_bytes(&value)?;
+        match visitor_run(&self.applet, &self.visit, &record) {
+            true => Ok(Next::Done(record)),
+            false => Err(AppletError::NotFound),
+        }
+    }
+
+    fn expected_error(error: &AppletError) -> bool {
+        matches!(error, AppletError::NotFound)
+    }
+}
+
+/// Lists workflow runs belonging to `visit` on `applet`, newest first, hiding other destinations.
+#[derive(Debug, PartialEq)]
+pub struct VisitorRunsOperation {
+    applet: Applet,
+    visit: Visit,
+    limit: usize,
+    found: Vec<WorkflowRunRecord>,
+}
+
+impl VisitorRunsOperation {
+    pub fn new(applet: &Applet, visit: Visit, limit: usize) -> Self {
+        Self {
+            applet: applet.clone(),
+            visit,
+            limit: limit.clamp(1, 200),
+            found: Vec::new(),
+        }
+    }
+
+    fn page(after: Option<Key>) -> Next<Vec<WorkflowRunRecord>> {
+        Next::Call(IoCall::Page {
+            space: WORKFLOW_RUN_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after,
+            limit: 256,
+        })
+    }
+}
+
+impl Operation for VisitorRunsOperation {
+    type Output = Vec<WorkflowRunRecord>;
+    type Error = AppletError;
+
+    fn first(&mut self) -> Result<Next<Vec<WorkflowRunRecord>>, AppletError> {
+        Ok(Self::page(None))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Vec<WorkflowRunRecord>>, AppletError> {
+        let (rows, next) = result.page()?;
+        for (_, value) in rows {
+            let record = WorkflowRunRecord::from_bytes(&value)?;
+            if visitor_run(&self.applet, &self.visit, &record) {
+                self.found.push(record);
+            }
+        }
+        if let Some(after) = next {
+            return Ok(Self::page(Some(after)));
+        }
+        let mut items = std::mem::take(&mut self.found);
+        items.sort_by_key(|record| Reverse(record.run_id));
+        items.truncate(self.limit);
+        Ok(Next::Done(items))
+    }
 }
 
 pub(crate) fn catalog_error(error: CatalogError) -> AppletError {

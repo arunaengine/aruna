@@ -3,17 +3,25 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::applet::record::{Applet, Folder};
+use aruna_core::applet::record::{
+    Applet, Folder, SubmissionFile, SubmissionReceipt, submission_key,
+};
 use aruna_core::applet::usage::caps;
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::git::{GitNode, StoredObject};
+use aruna_core::keyspaces::APPLETS_KEYSPACE;
 use aruna_core::operation::Operation;
+use aruna_core::plugin_runs::{SourceEvent, journal_entries};
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
 use aruna_ops_data::git::GitError;
+use aruna_ops_data::s3::object::head::{
+    HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
+};
 use bytes::Bytes;
+use byteview::ByteView;
 
 use super::release::{git_error, put_named};
 use super::visits::CountVisitOperation;
@@ -56,9 +64,11 @@ pub fn intake_key(folder: &Folder, pseudonym: &str, now_ms: u64, name: &str) -> 
 #[derive(Debug, PartialEq)]
 enum IntakeStep {
     Count,
+    Verify(Box<SubmissionFile>),
     Bucket,
     Allowed(Box<BucketInfo>),
     Put,
+    Receipt(Box<StoredObject>),
 }
 
 /// Writes one hand-in of `visit` to a live applet's submission folder, after counting it
@@ -70,6 +80,8 @@ pub struct IntakeOperation {
     visit: Visit,
     name: String,
     bytes: Option<Bytes>,
+    submission: Option<Vec<SubmissionFile>>,
+    verified: Vec<SubmissionFile>,
     auth: Option<AuthContext>,
     key: String,
     now_ms: u64,
@@ -89,6 +101,8 @@ impl IntakeOperation {
             visit,
             name: name.to_string(),
             bytes: Some(bytes),
+            submission: None,
+            verified: Vec::new(),
             auth: None,
             key: String::new(),
             now_ms: 0,
@@ -96,8 +110,43 @@ impl IntakeOperation {
         }
     }
 
+    /// Marks this intake as a form submission with optional visitor upload references to verify,
+    /// persisting a submission receipt and journaling `SourceKind::AppletSubmission`.
+    pub fn with_submission(mut self, files: Vec<SubmissionFile>) -> Self {
+        self.submission = Some(files);
+        self
+    }
+
     fn folder(&self) -> Result<&Folder, AppletError> {
         (self.applet.grants.submissions.as_ref()).ok_or(AppletError::Forbidden)
+    }
+
+    fn next_verify(&mut self) -> Result<Next<StoredObject>, AppletError> {
+        let folder = self.folder()?.clone();
+        if let Some(file) = self.submission.as_mut().and_then(Vec::pop) {
+            let prefix = match folder.prefix.trim_end_matches('/') {
+                "" => format!("{}/", self.visit.pseudonym),
+                prefix => format!("{prefix}/{}/", self.visit.pseudonym),
+            };
+            if file.bucket != folder.bucket
+                || !file.key.starts_with(&prefix)
+                || file.key.contains("..")
+            {
+                return Err(AppletError::Forbidden);
+            }
+            let head = HeadObjectOperation::new(HeadObjectInput {
+                bucket: file.bucket.clone(),
+                key: file.key.clone(),
+                version_id: Some(file.version_id),
+            });
+            self.step = IntakeStep::Verify(Box::new(file));
+            return Ok(Next::Call(IoCall::child(head)));
+        }
+        self.key = intake_key(&folder, &self.visit.pseudonym, self.now_ms, &self.name);
+        self.step = IntakeStep::Bucket;
+        Ok(Next::Call(IoCall::child(GetBucketOperation::new(
+            folder.bucket,
+        ))))
     }
 
     /// The most bytes one hand-in of this visitor may hold.
@@ -141,11 +190,24 @@ impl Operation for IntakeOperation {
         match std::mem::replace(&mut self.step, IntakeStep::Put) {
             IntakeStep::Count => {
                 result.child::<(), AppletError>()??;
-                let folder = self.folder()?.clone();
-                self.key = intake_key(&folder, &self.visit.pseudonym, self.now_ms, &self.name);
-                self.step = IntakeStep::Bucket;
-                let read = GetBucketOperation::new(folder.bucket.clone());
-                Ok(Next::Call(IoCall::child(read)))
+                self.next_verify()
+            }
+            IntakeStep::Verify(file) => {
+                match result.child::<HeadObjectResult, HeadObjectError>()? {
+                    Ok(_) => self.verified.push(*file),
+                    Err(
+                        HeadObjectError::NoSuchKey
+                        | HeadObjectError::NoSuchVersion
+                        | HeadObjectError::DeleteMarker,
+                    ) => {
+                        return Err(AppletError::Invalid(format!(
+                            "referenced upload `{}` does not exist",
+                            file.key
+                        )));
+                    }
+                    Err(error) => return Err(AppletError::Storage(error.to_string())),
+                }
+                self.next_verify()
             }
             IntakeStep::Bucket => {
                 let bucket = match result.child::<BucketInfo, GetBucketError>()? {
@@ -178,10 +240,51 @@ impl Operation for IntakeOperation {
                 let call = put_named(&self.node, auth, target, self.key.clone(), bytes);
                 Ok(Next::Call(call))
             }
-            IntakeStep::Put => result
-                .child::<StoredObject, GitError>()?
-                .map_err(git_error)
-                .map(Next::Done),
+            IntakeStep::Put => {
+                let stored = result
+                    .child::<StoredObject, GitError>()?
+                    .map_err(git_error)?;
+                if self.submission.is_none() {
+                    return Ok(Next::Done(stored));
+                }
+                let auth = self.auth.as_ref().ok_or(IoError::Unfinished)?;
+                let receipt = SubmissionReceipt {
+                    applet_id: self.applet.applet_id,
+                    version_id: stored.version_id,
+                    pseudonym: self.visit.pseudonym.clone(),
+                    guest: self.visit.guest,
+                    bucket: stored.bucket.clone(),
+                    key: stored.key.clone(),
+                    files: std::mem::take(&mut self.verified),
+                    created_at_ms: self.now_ms,
+                };
+                let path = object_permission_path(
+                    auth.realm_id,
+                    self.applet.group_id,
+                    self.applet.host_node,
+                    &stored.bucket,
+                    &stored.key,
+                );
+                let event = SourceEvent::applet_submission(
+                    self.applet.group_id,
+                    path,
+                    (self.applet.applet_id, stored.version_id),
+                    self.applet.account,
+                    self.now_ms,
+                );
+                let mut writes = journal_entries(&event)?;
+                writes.push((
+                    APPLETS_KEYSPACE.to_string(),
+                    submission_key(self.applet.applet_id, stored.version_id),
+                    ByteView::from(receipt.to_bytes()?),
+                ));
+                self.step = IntakeStep::Receipt(Box::new(stored));
+                Ok(Next::Call(IoCall::Write(writes)))
+            }
+            IntakeStep::Receipt(stored) => {
+                result.done()?;
+                Ok(Next::Done(*stored))
+            }
         }
     }
 
