@@ -126,25 +126,28 @@ impl RunRequest {
 
 /// Extracts `aruna://` and `s3://` addresses from workflow values so access, encryption, and
 /// remote capture checks cover file-valued parameters under every scheme the coordinator serves.
-fn value_refs(value: &Value, out: &mut Vec<(String, String, Option<Ulid>, Option<NodeId>)>) {
+fn value_refs(
+    value: &Value,
+    out: &mut Vec<(String, String, Option<Ulid>, Option<NodeId>)>,
+) -> Result<(), String> {
     match value {
-        Value::String(text) => {
-            if let Ok(parsed) = super::data::parse_address(text) {
-                out.push(parsed);
-            }
+        Value::String(text) if text.starts_with("aruna://") || text.starts_with("s3://") => {
+            let parsed = super::data::parse_address(text).map_err(|error| error.to_string())?;
+            out.push(parsed);
         }
         Value::Array(items) => {
             for item in items {
-                value_refs(item, out);
+                value_refs(item, out)?;
             }
         }
         Value::Object(map) => {
             for item in map.values() {
-                value_refs(item, out);
+                value_refs(item, out)?;
             }
         }
         _ => {}
     }
+    Ok(())
 }
 
 /// Where a new run stands in a lineage: the run it resumes or repeats, and its cache scope.
@@ -193,6 +196,7 @@ pub struct StartRunOperation {
     node: (NodeId, RealmId),
     request: RunRequest,
     lineage: Lineage,
+    bad_address: Option<String>,
     pending: Vec<PinnedInput>,
     pub(super) remote: BTreeMap<NodeId, Vec<(PinnedInput, InputSelection)>>,
     asked: Vec<PinnedInput>,
@@ -208,7 +212,7 @@ impl StartRunOperation {
     pub fn new(auth: &AuthContext, node: (NodeId, RealmId), request: RunRequest) -> Self {
         let mut pending = request.inputs.clone();
         let mut refs = Vec::new();
-        value_refs(&request.values, &mut refs);
+        let bad_address = value_refs(&request.values, &mut refs).err();
         for (bucket, key, version, source_node_id) in refs {
             pending.push(PinnedInput {
                 name: String::new(),
@@ -225,6 +229,7 @@ impl StartRunOperation {
             pending,
             request,
             lineage: Lineage::default(),
+            bad_address,
             remote: BTreeMap::new(),
             asked: Vec::new(),
             captured: Vec::new(),
@@ -307,7 +312,7 @@ impl StartRunOperation {
     fn encryption(&mut self, view: VersionView) -> AdmitNext {
         let local = self.node.0;
         let mut refs = Vec::new();
-        value_refs(&self.request.values, &mut refs);
+        value_refs(&self.request.values, &mut refs).map_err(CatalogError::Invalid)?;
         let mut buckets: Vec<String> = (self.request.inputs.iter())
             .filter(|input| input.source_node_id.is_none_or(|node| node == local))
             .map(|input| input.bucket.clone())
@@ -439,7 +444,7 @@ impl StartRunOperation {
         let now_secs = self.now_ms / 1000;
         let mut pins = self.request.inputs.clone();
         let mut refs = Vec::new();
-        value_refs(&self.request.values, &mut refs);
+        value_refs(&self.request.values, &mut refs).map_err(CatalogError::Invalid)?;
         for (bucket, key, version, source_node_id) in refs {
             if let Some(version_id) = version {
                 pins.push(PinnedInput {
@@ -563,6 +568,9 @@ impl Operation for StartRunOperation {
     fn first(&mut self) -> AdmitNext {
         if !self.request.values.is_object() {
             return Err(CatalogError::Invalid("values must be a JSON object".into()));
+        }
+        if let Some(error) = self.bad_address.take() {
+            return Err(CatalogError::Invalid(error));
         }
         let Some(output) = &self.request.output else {
             return Err(CatalogError::Invalid(

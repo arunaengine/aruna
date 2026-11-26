@@ -266,3 +266,65 @@ pub struct UploadReceipt {
     pub version: Option<String>,
     pub sha256: Option<String>,
 }
+
+/// Percent-encodes `%`, `?`, and `#` in an `aruna://` or `s3://` object key so literal names
+/// never collide with URI query or fragment delimiters.
+pub fn encode_key(key: &str) -> String {
+    let mut out = String::with_capacity(key.len());
+    for ch in key.chars() {
+        match ch {
+            '%' => out.push_str("%25"),
+            '?' => out.push_str("%3F"),
+            '#' => out.push_str("%23"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn hex_val(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Decodes percent-encoded bytes in an `aruna://` or `s3://` object key, returning `None` on
+/// malformed escapes or non-UTF-8 byte sequences.
+pub fn decode_key(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut idx = 0;
+    while idx < bytes.len() {
+        if bytes[idx] == b'%' {
+            if idx + 2 >= bytes.len() {
+                return None;
+            }
+            let hi = hex_val(bytes[idx + 1])?;
+            let lo = hex_val(bytes[idx + 2])?;
+            out.push((hi << 4) | lo);
+            idx += 3;
+        } else {
+            out.push(bytes[idx]);
+            idx += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_key, encode_key};
+
+    #[test]
+    fn codec_round_trips() {
+        let key = "team\\west?/score%20.csv#1";
+        let encoded = encode_key(key);
+        assert_eq!(encoded, "team\\west%3F/score%2520.csv%231");
+        assert_eq!(decode_key(&encoded).as_deref(), Some(key));
+        assert_eq!(decode_key("bad%2"), None);
+        assert_eq!(decode_key("bad%ZZ"), None);
+    }
+}

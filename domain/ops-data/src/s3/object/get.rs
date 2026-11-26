@@ -1510,6 +1510,10 @@ impl GetObjectOperation {
                     if self.reference_explicit {
                         return self.proof_failed(GetObjectError::HistoricalReferenceUnavailable);
                     }
+                    if self.drift_attempts >= MAX_DRIFT_ATTEMPTS {
+                        return Err(GetObjectError::ReferenceSourceChanged);
+                    }
+                    self.drift_attempts = self.drift_attempts.saturating_add(1);
                     return self.restart();
                 }
                 // Without digests, only the read's own validators prove a pinned version.

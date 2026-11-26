@@ -73,29 +73,36 @@ pub fn pattern_overlaps_subtree(pattern: &str, subtree_root: &str) -> bool {
     let bound = bind_wildcards(pattern, subtree_root);
     let bound = bound.as_ref();
     let Some(glob_pos) = bound.find(GLOB_CHARS) else {
-        return path_within(bound.trim_end_matches('/'), subtree_root);
+        let Some(decoded) = literal_path(bound) else {
+            return true;
+        };
+        return path_within(decoded.trim_end_matches('/'), subtree_root);
     };
-    let literal = &bound[..glob_pos];
+    let Some(literal) = literal_path(&bound[..glob_pos]) else {
+        return true;
+    };
     let dir = literal.trim_end_matches('/');
-    path_within(dir, subtree_root) || subtree_root.starts_with(literal)
+    path_within(dir, subtree_root) || subtree_root.starts_with(&literal)
 }
 
-/// The pattern with each whole `*` segment after a literal prefix taken from `path`, so a
-/// restriction naming any node yields this node's literal root.
+/// The pattern with each whole `*` segment after a literal prefix taken from `path` and escaped
+/// as a literal segment, so a restriction naming any node yields this node's literal root.
 pub fn bind_wildcards<'a>(pattern: &'a str, path: &str) -> Cow<'a, str> {
     if !pattern.split('/').any(|segment| segment == "*") {
         return Cow::Borrowed(pattern);
     }
     let mut concrete = path.split('/');
     let mut aligned = true;
-    let bound: Vec<&str> = (pattern.split('/'))
+    let bound: Vec<Cow<'_, str>> = (pattern.split('/'))
         .map(|segment| match (segment, concrete.next()) {
-            ("*", Some(own)) if aligned && !own.is_empty() => own,
+            ("*", Some(own)) if aligned && !own.is_empty() => {
+                Cow::Owned(escape_permission_path(own))
+            }
             _ => {
                 // Later segments align with `path` only while each one matches one segment.
                 aligned &=
                     segment != "*" && !segment.contains(GLOB_CHARS) && !segment.contains('\\');
-                segment
+                Cow::Borrowed(segment)
             }
         })
         .collect();
@@ -573,6 +580,22 @@ mod tests {
             raw,
             &Permission::READ
         ));
+        // Concrete segments bound into a `*` wildcard preserve literal backslashes and globs.
+        let bound_root = "/r/g/G/data/team\\west/sub";
+        let wild = "/r/g/G/data/*/sub/**";
+        assert!(super::restrictions_cover_subtree(
+            [(wild, &Permission::READ)],
+            bound_root,
+            &Permission::READ
+        ));
+        let wild_restr = [PathRestriction {
+            pattern: wild.to_string(),
+            permission: Permission::READ,
+        }];
+        assert_eq!(
+            readable_roots(&granted, Some(&wild_restr), "/r/g/G/data/team\\west"),
+            vec![bound_root.to_string()]
+        );
     }
 
     #[test]

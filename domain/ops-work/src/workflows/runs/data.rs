@@ -91,53 +91,9 @@ pub fn area_of(record: &WorkflowRunRecord) -> Option<(String, String)> {
     ))
 }
 
-fn encode_key(key: &str) -> String {
-    let mut out = String::with_capacity(key.len());
-    for ch in key.chars() {
-        match ch {
-            '%' => out.push_str("%25"),
-            '?' => out.push_str("%3F"),
-            '#' => out.push_str("%23"),
-            other => out.push(other),
-        }
-    }
-    out
-}
-
-fn hex_val(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn decode_key(raw: &str, address: &str) -> Result<String, ContractError> {
-    let bytes = raw.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut idx = 0;
-    while idx < bytes.len() {
-        if bytes[idx] == b'%' {
-            if idx + 2 >= bytes.len() {
-                return Err(ContractError::invalid(format!("{address} names no object")));
-            }
-            let (Some(hi), Some(lo)) = (hex_val(bytes[idx + 1]), hex_val(bytes[idx + 2])) else {
-                return Err(ContractError::invalid(format!("{address} names no object")));
-            };
-            out.push((hi << 4) | lo);
-            idx += 3;
-        } else {
-            out.push(bytes[idx]);
-            idx += 1;
-        }
-    }
-    String::from_utf8(out).map_err(|_| ContractError::invalid(format!("{address} names no object")))
-}
-
 /// The address the node gives the coordinator for a stored object version.
 pub fn address_of(bucket: &str, key: &str, version: Option<Ulid>) -> String {
-    let key = encode_key(key);
+    let key = aruna_workflow_contract::host::encode_key(key);
     match version {
         Some(version) => format!("aruna://{bucket}/{key}?version={version}"),
         None => format!("aruna://{bucket}/{key}"),
@@ -146,7 +102,7 @@ pub fn address_of(bucket: &str, key: &str, version: Option<Ulid>) -> String {
 
 /// The address of an object that `node` holds, like a task output in its run area there.
 pub fn address_on(bucket: &str, key: &str, version: Option<Ulid>, node: NodeId) -> String {
-    let key = encode_key(key);
+    let key = aruna_workflow_contract::host::encode_key(key);
     match version {
         Some(version) => format!("aruna://{bucket}/{key}?version={version}&node={node}"),
         None => format!("aruna://{bucket}/{key}?node={node}"),
@@ -180,7 +136,8 @@ pub(crate) fn parse_address(
         }
     }
     let (bucket, raw_key) = path.split_once('/').unwrap_or((path, ""));
-    let key = decode_key(raw_key, address)?;
+    let key = aruna_workflow_contract::host::decode_key(raw_key)
+        .ok_or_else(|| ContractError::invalid(format!("{address} names no object")))?;
     if bucket.is_empty() || key.split('/').any(|part| part == "..") {
         return Err(ContractError::invalid(format!("{address} names no object")));
     }

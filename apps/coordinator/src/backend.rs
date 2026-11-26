@@ -310,7 +310,7 @@ impl CoordinatorBackend {
                 if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
                     return Err(engine_error(format!("the listing names {name:?}")));
                 }
-                let (child, path) = (format!("{folder}/{name}"), target.join(name));
+                let (child, path) = (child_address(&folder, name), target.join(name));
                 if entry.directory {
                     pending.push((child, path));
                 } else {
@@ -537,6 +537,16 @@ fn segment(text: &str) -> String {
         .collect()
 }
 
+/// Joins one listed child name onto a folder address, percent-encoding special key characters
+/// while leaving any query suffix intact.
+fn child_address(folder: &str, name: &str) -> String {
+    let encoded = aruna_workflow_contract::host::encode_key(name);
+    match folder.split_once('?') {
+        Some((base, query)) => format!("{}/{encoded}?{query}", base.trim_end_matches('/')),
+        None => format!("{}/{encoded}", folder.trim_end_matches('/')),
+    }
+}
+
 fn engine_error(message: String) -> ExecutorError {
     ExecutorError::Engine {
         engine: "aruna".into(),
@@ -653,5 +663,17 @@ mod tests {
             EnvironmentValue::Literal(format!("Bearer {}", secret.placeholder)),
         );
         assert!(extract_secrets(&secrets, &partial).is_err());
+    }
+
+    #[test]
+    fn encodes_child_address() {
+        assert_eq!(
+            child_address("aruna://results/dir", "score%20.csv"),
+            "aruna://results/dir/score%2520.csv"
+        );
+        assert_eq!(
+            child_address("aruna://results/dir/", "what?#1.csv"),
+            "aruna://results/dir/what%3F%231.csv"
+        );
     }
 }

@@ -1304,4 +1304,22 @@ async fn round_trips_addresses() {
     assert_eq!(remote_target.node, Some(peer));
     assert!(resolve(&record, "aruna://results/%2E%2E/secret.txt").is_err());
     assert!(resolve(&record, "aruna://results/bad%2").is_err());
+
+    // Admission rejects malformed `aruna://` and `s3://` values instead of dropping their checks.
+    for bad in [
+        "aruna://results/%2E%2E/secret.txt",
+        "s3://results/bad%2",
+        "aruna://results/ok.txt?unknown=1",
+    ] {
+        let req = runs.request(None, json!({ "input": bad }));
+        let err = drive(
+            StartRunOperation::new(&runs.fixture.alice, runs.serving(), req),
+            &runs.fixture.context,
+        )
+        .await;
+        assert!(
+            matches!(err, Err(CatalogError::Invalid(_))),
+            "{bad} => {err:?}"
+        );
+    }
 }

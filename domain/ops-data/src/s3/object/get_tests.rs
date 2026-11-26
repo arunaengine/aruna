@@ -1670,6 +1670,21 @@ fn read_drift_restarts() {
     assert!(restarted(&turn, &operation));
     assert_eq!(operation.state, GetObjectState::Restarted);
     assert!(operation.advance_observation.is_none());
+    assert_eq!(operation.drift_attempts, 1);
+
+    // Exhausted drift budget fails with ReferenceSourceChanged instead of recursing unboundedly.
+    let mut exhausted = drifted_operation();
+    let headed = observation(9);
+    let mut changed = headed.clone();
+    changed.etag = Some("changed-etag".to_string());
+    exhausted.drift_attempts = MAX_DRIFT_ATTEMPTS;
+    exhausted.advance_observation = None;
+    exhausted.source_metadata = Some(headed);
+    exhausted.state = GetObjectState::ReadReferenceSource;
+    assert_eq!(
+        step(&mut exhausted, source_read(changed)).err(),
+        Some(GetObjectError::ReferenceSourceChanged)
+    );
 }
 
 #[test]
