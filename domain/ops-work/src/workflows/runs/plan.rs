@@ -234,6 +234,7 @@ impl PlanRunOperation {
             used_tools: Vec::new(),
             limits: None,
             automation: None,
+            applet: None,
         }
     }
 

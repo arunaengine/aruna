@@ -11,7 +11,7 @@ use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::job_request::{self, SubmissionScope, SubmitJobError, SubmitJobResult};
 use aruna_core::keyspaces::{
-    BUCKET_ENCRYPTION_KEYSPACE, RUN_IDEMPOTENCY_KEYSPACE, WORKFLOW_RUN_KEYSPACE,
+    BUCKET_ENCRYPTION_KEYSPACE, RUN_EVENT_KEYSPACE, RUN_IDEMPOTENCY_KEYSPACE, WORKFLOW_RUN_KEYSPACE,
 };
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::{Operation, TransactionMode};
@@ -22,9 +22,9 @@ use aruna_core::structs::execution::job::input::{
 };
 use aruna_core::structs::execution::job::local::{WorkspaceMode, user_dedup_key};
 use aruna_core::structs::execution::workflow_run::{
-    AutomationOrigin, CacheScope, DirectoryPin, DirectoryRoot, PrecapturedInput, RunKeyRecord,
-    RunLimits, RunOutput, RunState, WorkflowRunRecord, WorkflowRunSpec, WorkflowSecretBinding,
-    WorkflowSecretScope, run_key, run_key_row,
+    AppletOrigin, AutomationOrigin, CacheScope, DirectoryPin, DirectoryRoot, PrecapturedInput,
+    RunKeyRecord, RunLimits, RunOutput, RunState, WorkflowRunRecord, WorkflowRunSpec,
+    WorkflowSecretBinding, WorkflowSecretScope, event_key, run_key, run_key_row,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -250,6 +250,7 @@ enum AdmitStep {
     Submit(Box<WorkflowRunRecord>),
     Job(Box<WorkflowRunRecord>),
     Failed(CatalogError),
+    Rollback(CatalogError),
 }
 
 /// Admits one run on this node; see the module comment for the checks, in that order.
@@ -262,6 +263,7 @@ pub struct StartRunOperation {
     lineage: Lineage,
     limits: Option<RunLimits>,
     automation: Option<AutomationOrigin>,
+    applet: Option<AppletOrigin>,
     bad_address: Option<String>,
     pending: Vec<PinnedInput>,
     value_heads: Vec<(String, String)>,
@@ -325,6 +327,7 @@ impl StartRunOperation {
             lineage: Lineage::default(),
             limits: None,
             automation: None,
+            applet: None,
             bad_address,
             remote: BTreeMap::new(),
             asked: Vec::new(),
@@ -404,6 +407,12 @@ impl StartRunOperation {
     /// Marks this run as started by an automation firing and stage.
     pub fn with_automation(mut self, origin: AutomationOrigin) -> Self {
         self.automation = Some(origin);
+        self
+    }
+
+    /// Marks this run as started directly through an applet.
+    pub fn with_applet(mut self, origin: AppletOrigin) -> Self {
+        self.applet = Some(origin);
         self
     }
 
@@ -663,6 +672,7 @@ impl StartRunOperation {
             used_tools: self.lineage.used_tools.clone(),
             limits: self.limits,
             automation: self.automation.clone(),
+            applet: self.applet,
         };
         let key = request.idempotency_key.as_ref().map(|key| {
             let row = self.key_row(key);
@@ -863,7 +873,7 @@ impl Operation for StartRunOperation {
         }
         if let Some(limits) = self.limits {
             if limits.active_cap == Some(0) {
-                return Err(CatalogError::Conflict(
+                return Err(CatalogError::Capacity(
                     "active workflow run limit reached".into(),
                 ));
             }
@@ -1202,19 +1212,24 @@ impl Operation for StartRunOperation {
                     let change = RunChange::Job(submitted.job_id);
                     Ok(Next::Call(change_call(run_id, vec![change])))
                 }
+                Err(error @ SubmitJobError::ActiveJobLimit { .. }) => {
+                    let mut drops = vec![
+                        (WORKFLOW_RUN_KEYSPACE.to_string(), run_key(record.run_id)),
+                        (RUN_EVENT_KEYSPACE.to_string(), event_key(record.run_id, 1)),
+                    ];
+                    if let Some(key) = self.request.idempotency_key.as_deref() {
+                        drops.push((RUN_IDEMPOTENCY_KEYSPACE.to_string(), self.key_row(key)));
+                    }
+                    self.step = AdmitStep::Rollback(CatalogError::Capacity(error.to_string()));
+                    Ok(Next::Call(IoCall::Delete(drops)))
+                }
                 Err(error) => {
                     let message = format!("the run could not be queued: {error}");
-                    let returned = match error {
-                        SubmitJobError::ActiveJobLimit { .. } => {
-                            CatalogError::Conflict(error.to_string())
-                        }
-                        _ => CatalogError::Storage(message.clone()),
-                    };
                     let change = RunChange::State {
                         state: RunState::Failed,
-                        error: Some(message),
+                        error: Some(message.clone()),
                     };
-                    self.step = AdmitStep::Failed(returned);
+                    self.step = AdmitStep::Failed(CatalogError::Storage(message));
                     Ok(Next::Call(change_call(record.run_id, vec![change])))
                 }
             },
@@ -1229,6 +1244,10 @@ impl Operation for StartRunOperation {
                 changed(result)?;
                 Err(error)
             }
+            AdmitStep::Rollback(error) => {
+                result.done()?;
+                Err(error)
+            }
         }
     }
 
@@ -1239,6 +1258,7 @@ impl Operation for StartRunOperation {
                 | CatalogError::Forbidden
                 | CatalogError::Invalid(_)
                 | CatalogError::Conflict(_)
+                | CatalogError::Capacity(_)
         )
     }
 }

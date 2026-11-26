@@ -56,6 +56,8 @@ pub enum CatalogError {
     Unsupported(String),
     #[error("{0}")]
     Conflict(String),
+    #[error("{0}")]
+    Capacity(String),
     #[error(transparent)]
     Coordinator(WorkflowError),
     #[error("storage failed: {0}")]

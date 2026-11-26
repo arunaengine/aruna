@@ -201,6 +201,9 @@ impl FollowRunOperation {
         if let Some(limits) = source.limits {
             start = start.with_limits(limits);
         }
+        if let Some(applet) = source.applet {
+            start = start.with_applet(applet);
+        }
         if source.created_by == self.auth.user_id && self.auth.path_restrictions.is_none() {
             start = start.with_captured(source.captured_remote.clone());
         }

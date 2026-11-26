@@ -973,6 +973,7 @@ mod tests {
             used_tools: Vec::new(),
             limits: None,
             automation: None,
+            applet: None,
         };
         let link_target = Target {
             bucket: "data".into(),
@@ -1108,6 +1109,7 @@ mod tests {
             used_tools: Vec::new(),
             limits: None,
             automation: None,
+            applet: None,
         };
         let child = Target {
             bucket: "data".into(),

@@ -5,7 +5,7 @@
 
 use std::cmp::Reverse;
 
-use aruna_core::applet::record::{Applet, StartGrant};
+use aruna_core::applet::record::{Access, Applet, StartGrant};
 use aruna_core::applet::usage::{caps, run_limits};
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
@@ -13,7 +13,9 @@ use aruna_core::keyspaces::WORKFLOW_RUN_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::permission_path::{escape_permission_path, pattern_overlaps_subtree};
 use aruna_core::structs::execution::workflow::workflow_permission_path;
-use aruna_core::structs::execution::workflow_run::{RunOutput, WorkflowRunRecord, run_key};
+use aruna_core::structs::execution::workflow_run::{
+    AppletOrigin, RunOutput, WorkflowRunRecord, run_key,
+};
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
@@ -250,7 +252,9 @@ pub(crate) fn catalog_error(error: CatalogError) -> AppletError {
         CatalogError::Invalid(reason) | CatalogError::Unsupported(reason) => {
             AppletError::Invalid(reason)
         }
-        CatalogError::Conflict(reason) => AppletError::Conflict(reason),
+        CatalogError::Conflict(reason) | CatalogError::Capacity(reason) => {
+            AppletError::Conflict(reason)
+        }
         other => AppletError::Storage(other.to_string()),
     }
 }
@@ -346,7 +350,16 @@ impl Operation for VisitRunOperation {
         result.child::<(), AppletError>()??;
         let auth = self.visitor_auth()?;
         let limits = run_limits(&self.applet, self.visit.guest);
-        let start = StartRunOperation::new(&auth, self.node, request).with_limits(limits);
+        let outside_input = self.visit.guest
+            || self.applet.access == Access::Public
+            || self.applet.guests.is_some();
+        let origin = AppletOrigin {
+            applet_id: self.applet.applet_id,
+            outside_input,
+        };
+        let start = StartRunOperation::new(&auth, self.node, request)
+            .with_limits(limits)
+            .with_applet(origin);
         Ok(Next::Call(IoCall::child(start)))
     }
 

@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::applet::record::{
-    Applet, Folder, SubmissionFile, SubmissionReceipt, submission_key,
+    Access, Applet, Folder, SubmissionFile, SubmissionReceipt, submission_key,
 };
 use aruna_core::applet::usage::caps;
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
@@ -248,11 +248,15 @@ impl Operation for IntakeOperation {
                     return Ok(Next::Done(stored));
                 }
                 let auth = self.auth.as_ref().ok_or(IoError::Unfinished)?;
+                let outside_input = self.visit.guest
+                    || self.applet.access == Access::Public
+                    || self.applet.guests.is_some();
                 let receipt = SubmissionReceipt {
                     applet_id: self.applet.applet_id,
                     version_id: stored.version_id,
                     pseudonym: self.visit.pseudonym.clone(),
                     guest: self.visit.guest,
+                    outside_input,
                     bucket: stored.bucket.clone(),
                     key: stored.key.clone(),
                     files: std::mem::take(&mut self.verified),

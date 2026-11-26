@@ -3,10 +3,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::automation::keys::active_key;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{
-    RUN_EVENT_KEYSPACE, RUN_LOG_KEYSPACE, WORKFLOW_CACHE_KEYSPACE, WORKFLOW_CRATE_KEYSPACE,
-    WORKFLOW_RUN_KEYSPACE, WORKFLOW_TASK_KEYSPACE,
+    AUTOMATION_RUNS_KEYSPACE, RUN_EVENT_KEYSPACE, RUN_LOG_KEYSPACE, WORKFLOW_CACHE_KEYSPACE,
+    WORKFLOW_CRATE_KEYSPACE, WORKFLOW_RUN_KEYSPACE, WORKFLOW_TASK_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::identity::RETENTION_MS;
@@ -35,8 +36,9 @@ pub struct PruneReport {
 #[derive(Debug, PartialEq)]
 enum PruneStep {
     ScanRuns,
-    DropRun,
+    CheckFiring(Ulid),
     DropRows,
+    DropRun,
     ScanCache,
     DropCache(Option<Key>),
 }
@@ -48,7 +50,7 @@ pub struct PruneRunsOperation {
     retention_ms: u64,
     run_cap: usize,
     cache_cap: usize,
-    pending: Vec<Ulid>,
+    pending: Vec<(Ulid, Option<Ulid>)>,
     current: Option<Ulid>,
     spaces: Vec<KeySpace>,
     report: PruneReport,
@@ -105,10 +107,7 @@ impl PruneRunsOperation {
         }))
     }
 
-    fn next_run(&mut self) -> PruneNext {
-        let Some(run_id) = self.pending.pop() else {
-            return self.scan_cache(None);
-        };
+    fn start_run_drop(&mut self, run_id: Ulid) -> PruneNext {
         self.current = Some(run_id);
         self.spaces = vec![
             WORKFLOW_CRATE_KEYSPACE.to_string(),
@@ -116,11 +115,21 @@ impl PruneRunsOperation {
             RUN_EVENT_KEYSPACE.to_string(),
             WORKFLOW_TASK_KEYSPACE.to_string(),
         ];
-        self.step = PruneStep::DropRun;
-        Ok(Next::Call(IoCall::Delete(vec![(
-            WORKFLOW_RUN_KEYSPACE.to_string(),
-            run_key(run_id),
-        )])))
+        self.next_space()
+    }
+
+    fn next_run(&mut self) -> PruneNext {
+        let Some((run_id, firing_id)) = self.pending.pop() else {
+            return self.scan_cache(None);
+        };
+        if let Some(firing_id) = firing_id {
+            self.step = PruneStep::CheckFiring(run_id);
+            return Ok(Next::Call(IoCall::Read(vec![(
+                AUTOMATION_RUNS_KEYSPACE.to_string(),
+                active_key(firing_id),
+            )])));
+        }
+        self.start_run_drop(run_id)
     }
 
     fn next_space(&mut self) -> PruneNext {
@@ -128,9 +137,12 @@ impl PruneRunsOperation {
             return self.next_run();
         };
         let Some(space) = self.spaces.last() else {
-            self.current = None;
-            self.report.runs += 1;
-            return self.next_run();
+            // Delete the parent run row last so an interrupted pass can finish dropping child rows.
+            self.step = PruneStep::DropRun;
+            return Ok(Next::Call(IoCall::Delete(vec![(
+                WORKFLOW_RUN_KEYSPACE.to_string(),
+                run_key(run_id),
+            )])));
         };
         self.step = PruneStep::DropRows;
         Ok(Next::Call(IoCall::Page {
@@ -163,7 +175,8 @@ impl Operation for PruneRunsOperation {
                     };
                     let ended = record.finished_at_ms.unwrap_or(record.created_at_ms);
                     if record.state.is_terminal() && self.expired(ended) {
-                        self.pending.push(record.run_id);
+                        let firing = record.automation.as_ref().map(|o| o.firing_id);
+                        self.pending.push((record.run_id, firing));
                     }
                 }
                 if self.pending.len() < self.run_cap
@@ -173,9 +186,17 @@ impl Operation for PruneRunsOperation {
                 }
                 self.next_run()
             }
+            PruneStep::CheckFiring(run_id) => {
+                if result.value()?.is_some() {
+                    return self.next_run();
+                }
+                self.start_run_drop(run_id)
+            }
             PruneStep::DropRun => {
                 result.done()?;
-                self.next_space()
+                self.current = None;
+                self.report.runs += 1;
+                self.next_run()
             }
             PruneStep::DropRows => match result {
                 IoResult::Done => self.next_space(),
@@ -391,6 +412,105 @@ mod tests {
             )
             .await
             .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn drops_run_last() {
+        use aruna_core::structs::execution::workflow_run::AutomationOrigin;
+
+        // Child keyspaces are scanned/deleted before WORKFLOW_RUN_KEYSPACE is deleted.
+        let run_id = Ulid::from_bytes([40; 16]);
+        let mut run = sample_run();
+        run.run_id = run_id;
+        run.state = RunState::Succeeded;
+        run.finished_at_ms = Some(100);
+        let mut op = PruneRunsOperation::new(10_000).with_retention(1_000);
+        op.first().unwrap();
+        let next = op
+            .next(IoResult::Page {
+                rows: vec![(run_key(run_id), run.to_bytes().unwrap().into())],
+                next: None,
+            })
+            .unwrap();
+        let mut deleted_spaces = Vec::new();
+        let mut task_sent = false;
+        let mut step = next;
+        for _ in 0..16 {
+            match step {
+                Next::Call(IoCall::Page { space, .. }) if space == WORKFLOW_CACHE_KEYSPACE => {
+                    break;
+                }
+                Next::Call(IoCall::Page { space, .. }) => {
+                    if space == WORKFLOW_TASK_KEYSPACE && !task_sent {
+                        task_sent = true;
+                        step = op
+                            .next(IoResult::Page {
+                                rows: vec![(task_key(run_id, 1), b"t".to_vec().into())],
+                                next: None,
+                            })
+                            .unwrap();
+                    } else {
+                        step = op
+                            .next(IoResult::Page {
+                                rows: Vec::new(),
+                                next: None,
+                            })
+                            .unwrap();
+                    }
+                }
+                Next::Call(IoCall::Delete(keys)) => {
+                    for (space, _) in &keys {
+                        deleted_spaces.push(space.clone());
+                    }
+                    step = op.next(IoResult::Done).unwrap();
+                }
+                other => panic!("unexpected step: {other:?}"),
+            }
+        }
+        assert_eq!(
+            deleted_spaces,
+            vec![
+                WORKFLOW_TASK_KEYSPACE.to_string(),
+                WORKFLOW_RUN_KEYSPACE.to_string()
+            ]
+        );
+
+        // An automation child run is retained while its firing's active row still exists.
+        let ctx = memory_context();
+        let store = &ctx.storage_handle;
+        let firing_id = Ulid::from_bytes([41; 16]);
+        let auto_id = Ulid::from_bytes([42; 16]);
+        run.automation = Some(AutomationOrigin {
+            automation_id: auto_id,
+            firing_id,
+            stage: "run".into(),
+            applet_id: None,
+            outside_input: false,
+            depth: 0,
+        });
+        write_value(
+            store,
+            WORKFLOW_RUN_KEYSPACE,
+            run_key(run_id),
+            run.to_bytes().unwrap(),
+        )
+        .await;
+        write_value(
+            store,
+            AUTOMATION_RUNS_KEYSPACE,
+            active_key(firing_id),
+            auto_id.to_bytes().to_vec(),
+        )
+        .await;
+        let kept = drive(PruneRunsOperation::new(10_000).with_retention(1_000), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(kept.runs, 0);
+        assert!(
+            read_value(store, WORKFLOW_RUN_KEYSPACE, run_key(run_id).to_vec())
+                .await
+                .is_some()
         );
     }
 }

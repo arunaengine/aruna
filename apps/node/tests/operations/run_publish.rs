@@ -599,6 +599,7 @@ async fn publishes_local_workflow() -> TestResult<()> {
         used_tools: Vec::new(),
         limits: None,
         automation: None,
+        applet: None,
     };
     device
         .context

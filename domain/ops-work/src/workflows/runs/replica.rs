@@ -177,6 +177,7 @@ fn stub_run(run: &WorkflowRunRecord) -> WorkflowRunRecord {
         used_tools: Vec::new(),
         limits: run.limits,
         automation: run.automation.clone(),
+        applet: run.applet,
     }
 }
 

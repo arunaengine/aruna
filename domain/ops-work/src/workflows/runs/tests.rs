@@ -698,6 +698,7 @@ pub(super) fn sample_run() -> WorkflowRunRecord {
         used_tools: Vec::new(),
         limits: None,
         automation: None,
+        applet: None,
     }
 }
 
@@ -2856,7 +2857,14 @@ async fn enforces_run_limits() {
     )
     .await;
     assert!(
-        matches!(second, Err(CatalogError::Conflict(_))),
+        matches!(second, Err(CatalogError::Capacity(_))),
         "{second:?}"
     );
+    let stored = aruna_runner::testing::scan_prefix(
+        &runs.fixture.context.storage_handle,
+        aruna_core::keyspaces::WORKFLOW_RUN_KEYSPACE,
+        &[],
+    )
+    .await;
+    assert_eq!(stored.len(), 1, "capacity refusal leaves no failed run");
 }
