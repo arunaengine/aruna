@@ -107,7 +107,7 @@ pub fn job_manifest(
     }
     if spec.staging_mode == StagingMode::S3Mount {
         let mut buckets = mount_buckets(layout);
-        let share = csi::input_source(config, &spec.attempt.job_id, &buckets)?;
+        let share = csi::input_source(config, spec, &spec.attempt.job_id, &buckets)?;
         if let Some(source) = share.filter(|_| !layout.mounts.is_empty()) {
             let volume = csi::share_input_name(&name);
             nfs |= matches!(source, csi::ShareSource::Nfs { .. });
@@ -196,7 +196,10 @@ pub fn job_manifest(
             .workspace
             .as_ref()
             .map(|workspace| &workspace.bucket_name);
-        let share = bucket.and_then(|bucket| csi::session_source(config, bucket, mount));
+        let share = bucket
+            .map(|bucket| csi::session_source(config, spec, bucket, mount))
+            .transpose()?
+            .flatten();
         let volume = match share {
             Some(_) => csi::share_data_name(&name),
             None => data_name(&name),

@@ -97,6 +97,42 @@ pub(super) fn asked(turn: &Result<Next<impl std::fmt::Debug>, VfsError>) -> VfsE
     }
 }
 
+/// The adapter's answer that no open instance holds the looked-up name.
+pub(super) fn no_open() -> IoResult {
+    vfs(VfsEvent::Instance(None))
+}
+
+/// The live instance 1 of committed file `p/a` with one open and one writer.
+pub(super) fn instance() -> InstanceSummary {
+    InstanceSummary {
+        instance_id: 1,
+        key: "p/a".to_string(),
+        kind: aruna_core::structs::storage::vfs::HandleKind::File,
+        handle_id: Some(4),
+        identity: HandleIdentity::File(FileIdentity::Committed { life_id: id(4) }),
+        logical_size: 5,
+        base_limit: 5,
+        dirty: true,
+        delete_pending: false,
+        disposition_owner: None,
+        open_count: 1,
+        writer_count: 1,
+        detached: None,
+        stage_id: None,
+        generation: 0,
+        change: 0,
+        base_version: Some(id(2)),
+        edit_generation: 3,
+        allows_delete: true,
+    }
+}
+
+pub(super) fn denied() -> IoResult {
+    IoResult::Child(ChildOutcome::new(Err::<VfsGrant, VfsError>(
+        VfsError::Denied,
+    )))
+}
+
 pub(super) fn head(version: u8, life: Option<u8>) -> Value {
     let pointer = CurrentVersionPointer::new(id(version)).with_life(life.map(id));
     Value::from(pointer.to_bytes().unwrap())
@@ -224,22 +260,9 @@ fn tombstones_name_errors() {
 #[test]
 fn detached_serves_holders() {
     let summary = InstanceSummary {
-        instance_id: 1,
-        key: "a".to_string(),
-        kind: aruna_core::structs::storage::vfs::HandleKind::File,
-        handle_id: Some(3),
-        identity: HandleIdentity::File(FileIdentity::Committed { life_id: id(4) }),
-        logical_size: 0,
-        base_limit: 0,
-        dirty: false,
-        delete_pending: false,
-        disposition_owner: None,
-        open_count: 1,
         writer_count: 0,
         detached: Some(aruna_core::structs::storage::vfs::DetachReason::Unlinked),
-        stage_id: None,
-        generation: 0,
-        change: 0,
+        ..instance()
     };
     assert!(detached_allows(&summary, HandleUse::ExistingOpen));
     for usage in [
@@ -483,6 +506,7 @@ fn staged_names_merge() {
     let turn = operation.next(vfs(VfsEvent::StagedList {
         entries,
         sequence: 4,
+        truncated: false,
     }));
     assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
     let page = crate::s3::object::visible::VisiblePage::<crate::s3::object::list::ListedObject> {
@@ -494,7 +518,13 @@ fn staged_names_merge() {
         crate::s3::object::list::ListBucketError,
     >;
     let answer = IoResult::Child(ChildOutcome::new(Ok::<_, Failure>(page)));
-    let Ok(Next::Done(listed)) = operation.next(answer) else {
+    // Each staged name and each directory is admitted on its own before it shows.
+    let mut turn = operation.next(answer);
+    for _ in 0..3 {
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        turn = operation.next(granted());
+    }
+    let Ok(Next::Done(listed)) = turn else {
         panic!("expected the listing");
     };
     let names: Vec<_> = listed
@@ -506,4 +536,100 @@ fn staged_names_merge() {
     assert_eq!(listed.next, ListNext::End);
     assert_eq!(listed.sequence, 4);
     assert!(listed.entries[0].staged && listed.entries[0].handle_id == Some(4));
+}
+
+type Failure =
+    crate::s3::object::visible::VisibleError<VfsError, crate::s3::object::list::ListBucketError>;
+
+/// A staged file entry at `key`.
+fn staged_file(key: &str) -> StagedEntry {
+    StagedEntry {
+        key: key.to_string(),
+        instance_id: 1,
+        handle_id: Some(4),
+        kind: aruna_core::structs::storage::vfs::HandleKind::File,
+        size: 3,
+        dirty: true,
+        delete_pending: false,
+        unpublished_token: Some(id(6)),
+        change: 1,
+    }
+}
+
+/// Answers the visible page of `listing` with the common prefixes `prefixes`.
+fn page_with(
+    listing: &mut VfsListOperation,
+    prefixes: &[&str],
+) -> Result<Next<VfsListing>, VfsError> {
+    let page = crate::s3::object::visible::VisiblePage::<crate::s3::object::list::ListedObject> {
+        prefixes: prefixes.iter().map(|prefix| prefix.to_string()).collect(),
+        ..Default::default()
+    };
+    listing.next(IoResult::Child(ChildOutcome::new(Ok::<_, Failure>(page))))
+}
+
+#[test]
+fn hidden_entries_dropped() {
+    // A staged file and a directory the caller may not see add no name to the page.
+    let mut operation = listing(ListResume::Start);
+    operation.first().unwrap();
+    operation.next(granted()).unwrap();
+    let entries = vec![staged_file("d/new.txt"), staged_file("d/secret.txt")];
+    let staged = VfsEvent::StagedList {
+        entries,
+        sequence: 4,
+        truncated: false,
+    };
+    operation.next(vfs(staged)).unwrap();
+    // Entries are admitted in key order: hidden/, new.txt, open/, secret.txt.
+    let mut turn = page_with(&mut operation, &["d/hidden/", "d/open/"]);
+    for hide in [true, false, false, true] {
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        turn = operation.next(if hide { denied() } else { granted() });
+    }
+    let Ok(Next::Done(listed)) = turn else {
+        panic!("expected the listing");
+    };
+    let names: Vec<_> = listed
+        .entries
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+    assert_eq!(names, ["new.txt", "open"]);
+    assert_eq!(listed.next, ListNext::End);
+}
+
+#[test]
+fn staged_names_paged() {
+    // A resumed directory skips its staged subtree, and a full staged page ends the listing
+    // page at its last name, past which committed names wait for the next page.
+    let mut operation = listing(ListResume::After("c/".to_string()));
+    operation.first().unwrap();
+    let turn = operation.next(granted());
+    let VfsEffect::ListStaged { after, limit, .. } = asked(&turn) else {
+        panic!("expected one staged page");
+    };
+    assert_eq!(after, Some(format!("d/c/{}", char::MAX)));
+    assert_eq!(limit, Some(10));
+    let staged = VfsEvent::StagedList {
+        entries: vec![staged_file("d/k.txt"), staged_file("d/m/deep")],
+        sequence: 4,
+        truncated: true,
+    };
+    operation.next(vfs(staged)).unwrap();
+    let mut turn = page_with(&mut operation, &["d/z/"]);
+    for _ in 0..2 {
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        turn = operation.next(granted());
+    }
+    let Ok(Next::Done(listed)) = turn else {
+        panic!("expected the listing");
+    };
+    let names: Vec<_> = listed
+        .entries
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+    assert_eq!(names, ["k.txt", "m"]);
+    assert_eq!(listed.next, ListNext::After("m/".to_string()));
 }

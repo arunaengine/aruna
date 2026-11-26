@@ -18,8 +18,14 @@ pub(crate) struct Permits {
     held: HashMap<Ulid, OwnedSemaphorePermit>,
     /// Instance ids never repeat on one node, so they key the guards of every bucket.
     guards: HashMap<u64, Arc<Semaphore>>,
-    guarded: HashMap<Ulid, Vec<OwnedSemaphorePermit>>,
+    guarded: HashMap<Ulid, HeldGuard>,
     attempts: HashMap<Ulid, Attempt>,
+}
+
+/// The file guards one caller holds and the bucket it took them for.
+struct HeldGuard {
+    scope: BucketScope,
+    permits: Vec<OwnedSemaphorePermit>,
 }
 
 struct Attempt {
@@ -34,7 +40,12 @@ impl Permits {
     }
 
     pub(crate) fn take_guard(&mut self, guard_id: &Ulid) -> Option<Vec<OwnedSemaphorePermit>> {
-        self.guarded.remove(guard_id)
+        self.guarded.remove(guard_id).map(|held| held.permits)
+    }
+
+    /// Whether a caller holds file guards of `scope`, which a vault fence must wait for.
+    pub(crate) fn has_guards(&self, scope: &BucketScope) -> bool {
+        self.guarded.values().any(|held| held.scope == *scope)
     }
 
     /// Whether an unfinished attempt of `scope` exists, which a vault fence must wait for.
@@ -95,7 +106,7 @@ impl VfsHandle {
 
     /// Takes the guards of `instances` lowest id first, so two callers can never deadlock. A
     /// pending attempt on any of them yields its id instead, holding no guard.
-    pub(crate) async fn acquire_guards(&self, _scope: BucketScope, instances: Vec<u64>) -> Answer {
+    pub(crate) async fn acquire_guards(&self, scope: BucketScope, instances: Vec<u64>) -> Answer {
         let mut ordered = instances;
         ordered.sort_unstable();
         ordered.dedup();
@@ -123,7 +134,8 @@ impl VfsHandle {
             return Ok(VfsEvent::PendingMutation { attempt_id });
         }
         let guard_id = Ulid::generate();
-        state.permits.guarded.insert(guard_id, permits);
+        let held = HeldGuard { scope, permits };
+        state.permits.guarded.insert(guard_id, held);
         Ok(VfsEvent::GuardAcquired { guard_id })
     }
 

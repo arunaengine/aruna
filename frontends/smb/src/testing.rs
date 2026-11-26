@@ -752,6 +752,7 @@ pub(crate) fn negotiated_choice(raw: &[u8]) -> (Cipher, Signing) {
 
 pub(crate) fn ntlm_negotiate() -> Vec<u8> {
     let flags = ntlm::REQUIRED
+        | ntlm::KEY_EXCHANGE
         | ntlm::REQUEST_TARGET
         | ntlm::NTLM
         | ntlm::ALWAYS_SIGN

@@ -6,7 +6,10 @@
 use super::*;
 use crate::access::{FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_WRITE_DATA, GENERIC_WRITE};
 use crate::backend::ObjectKind;
-use crate::crypto::{CIPHER_AES128_CCM, CIPHER_AES256_CCM, Cipher, HASH_SHA512, Signing};
+use crate::crypto::{
+    CIPHER_AES128_CCM, CIPHER_AES256_CCM, CIPHER_AES256_GCM, Cipher, HASH_SHA512, SIGNING_HMAC,
+    Signing,
+};
 use crate::messages::{LOCK_EXCLUSIVE, LOCK_IMMEDIATE, LOCK_UNLOCK};
 use crate::spnego::{ClientToken, NTLMSSP_OID, parse_client};
 use crate::testing::{
@@ -94,6 +97,30 @@ async fn refuses_ccm_ciphers() {
     ];
     let response = client
         .negotiate_with(&[0x0311], &contexts)
+        .await
+        .expect("answer");
+    assert_eq!(response.status(), status::NOT_SUPPORTED);
+    assert_closed(&mut client).await;
+}
+
+#[tokio::test]
+async fn signing_offer_honoured() {
+    let (mut client, _harness) = start(MockBackend::new(), SmbConfig::default(), test_limits());
+    let absent = vec![
+        list_context(0x0001, &[HASH_SHA512]),
+        list_context(0x0002, &[CIPHER_AES256_GCM]),
+    ];
+    let response = client
+        .negotiate_with(&[0x0311], &absent)
+        .await
+        .expect("answer");
+    assert_eq!(response.status(), status::SUCCESS);
+    assert_eq!(client.signing, Signing::AesCmac, "the dialect default");
+    let (mut client, _harness) = start(MockBackend::new(), SmbConfig::default(), test_limits());
+    let mut offered = absent.clone();
+    offered.push(list_context(0x0008, &[SIGNING_HMAC]));
+    let response = client
+        .negotiate_with(&[0x0311], &offered)
         .await
         .expect("answer");
     assert_eq!(response.status(), status::NOT_SUPPORTED);
@@ -449,6 +476,66 @@ async fn cancel_ends_pending() {
         .call(Command::Echo, &crate::messages::empty_body())
         .await;
     assert_eq!(still.status(), status::SUCCESS, "CANCEL consumed no credit");
+}
+
+#[tokio::test(start_paused = true)]
+async fn plaintext_cancel_ignored() {
+    let (mut client, _harness, backend) = logged_in().await;
+    let (holder, waiter) = two_opens(&mut client, &backend).await;
+    let taken = client
+        .call(
+            Command::Lock,
+            &lock_body(holder, &[(0, 8, LOCK_EXCLUSIVE | LOCK_IMMEDIATE)]),
+        )
+        .await;
+    assert_eq!(taken.status(), status::SUCCESS);
+    let interim = client
+        .call(Command::Lock, &lock_body(waiter, &[(0, 8, LOCK_EXCLUSIVE)]))
+        .await;
+    assert_eq!(interim.status(), status::PENDING);
+    let cancel = Header {
+        command: Command::Cancel.code(),
+        flags: FLAG_ASYNC,
+        message_id: interim.header.message_id,
+        async_id: interim.header.async_id,
+        session_id: client.session_id,
+        ..Header::default()
+    };
+    let message = TestClient::message(&cancel, &crate::messages::empty_body());
+    client.send_raw(&message).await;
+    let still = client
+        .call(Command::Echo, &crate::messages::empty_body())
+        .await;
+    assert_eq!(still.status(), status::SUCCESS);
+    assert!(backend.state.lock().cancelled.is_empty(), "still waiting");
+    client.send_sealed(&message).await;
+    let last = client.receive().await.expect("final response");
+    assert_eq!(last.header.message_id, interim.header.message_id);
+    assert_eq!(last.status(), status::CANCELLED);
+}
+
+#[tokio::test(start_paused = true)]
+async fn disconnect_ends_lock() {
+    let (mut client, harness, backend) = logged_in().await;
+    let (holder, waiter) = two_opens(&mut client, &backend).await;
+    let taken = client
+        .call(
+            Command::Lock,
+            &lock_body(holder, &[(0, 8, LOCK_EXCLUSIVE | LOCK_IMMEDIATE)]),
+        )
+        .await;
+    assert_eq!(taken.status(), status::SUCCESS);
+    let interim = client
+        .call(Command::Lock, &lock_body(waiter, &[(0, 8, LOCK_EXCLUSIVE)]))
+        .await;
+    assert_eq!(interim.status(), status::PENDING);
+    drop(client);
+    let ended = tokio::time::timeout(Duration::from_secs(60), harness.task).await;
+    assert!(ended.is_ok(), "a waiting LOCK does not hold the connection");
+    assert!(
+        backend.state.lock().handles.is_empty(),
+        "the disconnect closes every open"
+    );
 }
 
 #[tokio::test]

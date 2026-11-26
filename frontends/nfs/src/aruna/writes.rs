@@ -7,7 +7,7 @@ use aruna_core::structs::storage::vfs::{
     DirectoryWitness, FileIdentity, HandleIdentity, HandleKind, NfsMountBinding, NfsStageRecord,
     StageBase, StageDisposition, StageOwner, StageScope,
 };
-use aruna_core::vfs_effects::{ByteLock, VfsProtocol};
+use aruna_core::vfs_effects::{ByteLock, InstanceSummary, VfsFailure, VfsProtocol};
 use aruna_ops_data::s3::object::put::PutObjectConfig;
 use aruna_ops_data::vfs::handles::HandleClaim;
 use aruna_ops_data::vfs::io::{
@@ -16,11 +16,11 @@ use aruna_ops_data::vfs::io::{
 };
 use aruna_ops_data::vfs::mutate::{MkdirInput, RemoveInput, RenameInput};
 use aruna_ops_data::vfs::path::{NameUse, check_component, child_key, split_parent};
-use aruna_ops_data::vfs::publish::{CloseInput, PublishInput};
+use aruna_ops_data::vfs::publish::{CloseInput, CloseOutcome, PublishInput};
 use aruna_ops_data::vfs::{
-    AllocateHandleOperation, LiveStageOperation, VfsCloseOperation, VfsCommitOperation,
-    VfsLockOperation, VfsMkdirOperation, VfsOpenOperation, VfsReadOperation, VfsRemoveOperation,
-    VfsRenameOperation, VfsWriteOperation,
+    AllocateHandleOperation, InstanceTarget, LiveStageOperation, LookupInstanceOperation,
+    VfsCloseOperation, VfsCommitOperation, VfsError, VfsLockOperation, VfsMkdirOperation,
+    VfsOpenOperation, VfsReadOperation, VfsRemoveOperation, VfsRenameOperation, VfsWriteOperation,
 };
 use aruna_runner::driver::drive;
 use bytes::Bytes;
@@ -51,6 +51,39 @@ pub(super) fn owner_number(owner: &OwnerKey) -> u64 {
 /// The writer number of an open the backend holds for itself.
 fn open_number(open_id: Ulid) -> u64 {
     open_id.0 as u64
+}
+
+/// The byte I/O owner of a stateid: its lock owner, else its open owner.
+fn io_owner(owner: &OwnerKey, lock_owner: Option<&OwnerKey>) -> u64 {
+    owner_number(lock_owner.unwrap_or(owner))
+}
+
+/// `slot` with the name, identity, base version and size its shared instance has now.
+fn current_slot(slot: &OpenSlot, summary: Option<&InstanceSummary>) -> OpenSlot {
+    let mut slot = slot.clone();
+    if let Some(summary) = summary {
+        slot.key = summary.key.clone();
+        slot.identity = summary.identity.clone();
+        slot.version_id = summary.base_version.or(slot.version_id);
+        slot.size = summary.logical_size;
+    }
+    slot
+}
+
+/// The answer to a close whose open ended; a publication that did not happen is an error,
+/// except for a detached instance, which has no name left to publish to.
+fn close_status(outcome: CloseOutcome, detached: bool) -> Result<(), NfsStat4> {
+    match outcome {
+        CloseOutcome::Published(_)
+        | CloseOutcome::Closed
+        | CloseOutcome::Deleted
+        | CloseOutcome::Discarded => Ok(()),
+        CloseOutcome::Pending if detached => Ok(()),
+        CloseOutcome::Pending => Err(NfsStat4::Delay),
+        CloseOutcome::QuotaBlocked => Err(NfsStat4::QuotaExceeded),
+        // The acknowledged bytes stay retained for recovery, but the name did not get them.
+        CloseOutcome::Retained(_) => Err(NfsStat4::Io),
+    }
 }
 
 fn stable_level(stable: StableHow) -> WriteStable {
@@ -176,22 +209,11 @@ impl ArunaNfsBackend {
         object: ObjectRef,
         share: &ShareRequest,
     ) -> Result<(), NfsStat4> {
-        let located = self.locate(binding, object).await?;
-        if located.kind == HandleKind::Directory {
-            return Err(NfsStat4::IsDirectory);
-        }
-        // A detached file serves its existing opens only.
-        if located.detached.is_some() {
-            return Err(NfsStat4::Stale);
-        }
-        if share.access & share::WRITE != 0 && binding.read_only {
-            return Err(NfsStat4::ReadOnly);
-        }
         let key = (object, share.owner.clone());
-        // The OPEN that created the file takes over the creating writer.
+        // The creating owner's OPEN takes over the open that already holds its modes.
         let leftover = {
             let mut tables = self.tables.lock();
-            match tables.created.remove(&object) {
+            match tables.created.remove(&key) {
                 Some(mut slot) if !tables.opens.contains_key(&key) => {
                     (slot.access, slot.deny) = (share.access, share.deny);
                     tables.opens.insert(key, slot);
@@ -202,6 +224,17 @@ impl ArunaNfsBackend {
         };
         if let Some(slot) = leftover {
             self.release_quietly(binding, object, slot).await;
+        }
+        let located = self.locate(binding, object).await?;
+        if located.kind == HandleKind::Directory {
+            return Err(NfsStat4::IsDirectory);
+        }
+        // A detached file serves its existing opens only.
+        if located.detached.is_some() {
+            return Err(NfsStat4::Stale);
+        }
+        if share.access & share::WRITE != 0 && binding.read_only {
+            return Err(NfsStat4::ReadOnly);
         }
         let existing = self.tables.lock().opens.get(&key).cloned();
         if existing
@@ -236,20 +269,20 @@ impl ArunaNfsBackend {
         owner: &OwnerKey,
     ) -> Result<(), NfsStat4> {
         let key = (object, owner.clone());
-        let slot = self.tables.lock().opens.remove(&key);
+        // The slot stays until its open has ended, so a CLOSE that failed first can be retried.
+        let slot = self.tables.lock().opens.get(&key).cloned();
         let Some(slot) = slot else {
             return Ok(());
         };
-        let input = match self.close_input(binding, object, &slot).await {
-            Ok(input) => input,
-            // An unprepared close keeps the open, so a retried CLOSE prepares again.
-            Err(status) => {
-                self.tables.lock().opens.insert(key, slot);
-                return Err(status);
-            }
+        let (input, detached) = self.close_input(binding, object, &slot).await?;
+        let status = match drive(VfsCloseOperation::new(input), &self.context).await {
+            Ok(outcome) => close_status(outcome, detached),
+            // An earlier attempt ended the open, but its outcome never reached the client.
+            Err(VfsError::Vfs(VfsFailure::NotFound)) => Err(NfsStat4::Io),
+            Err(error) => return Err(status_of(error)),
         };
-        let closed = drive(VfsCloseOperation::new(input), &self.context).await;
-        closed.map(|_| ()).map_err(status_of)
+        self.tables.lock().opens.remove(&key);
+        status
     }
 
     /// Ends one VFS open; the last dirty writer publishes the effective image.
@@ -259,37 +292,67 @@ impl ArunaNfsBackend {
         object: ObjectRef,
         slot: OpenSlot,
     ) -> Result<(), NfsStat4> {
-        let input = self.close_input(binding, object, &slot).await?;
+        let (input, detached) = self.close_input(binding, object, &slot).await?;
         let closed = drive(VfsCloseOperation::new(input), &self.context).await;
-        closed.map(|_| ()).map_err(status_of)
+        close_status(closed.map_err(status_of)?, detached)
     }
 
-    /// The close of one open, with the publication a last dirty writer runs.
+    /// The shared instance of an open of this server now, by handle or else by name; another
+    /// protocol may have published, renamed or detached it since the open.
+    async fn shared_of(
+        &self,
+        binding: &NfsMountBinding,
+        object: ObjectRef,
+        slot: &OpenSlot,
+    ) -> Result<Option<InstanceSummary>, NfsStat4> {
+        let scope = bucket_scope(binding).map_err(status_of)?;
+        let targets = [
+            InstanceTarget::Handle(object.object_id),
+            InstanceTarget::Key(slot.key.clone()),
+        ];
+        for target in targets {
+            let lookup = LookupInstanceOperation::new(scope.clone(), target);
+            let summary = drive(lookup, &self.context).await.map_err(status_of)?;
+            if let Some(summary) = summary.filter(|found| found.instance_id == slot.instance_id) {
+                return Ok(Some(summary));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The close of one open, with the publication a last close of a dirty instance runs, and
+    /// whether the instance is detached.
     async fn close_input(
         &self,
         binding: &NfsMountBinding,
         object: ObjectRef,
         slot: &OpenSlot,
-    ) -> Result<CloseInput, NfsStat4> {
+    ) -> Result<(CloseInput, bool), NfsStat4> {
         let scope = bucket_scope(binding).map_err(status_of)?;
-        let (publish, stage) = match slot.write {
+        let summary = self.shared_of(binding, object, slot).await?;
+        let detached = summary
+            .as_ref()
+            .is_some_and(|found| found.detached.is_some());
+        let dirty = summary.as_ref().is_some_and(|found| found.dirty);
+        let (publish, stage) = match slot.write || dirty {
             true => {
                 let read = LiveStageOperation::new(scope.clone(), object.object_id);
                 let stage = drive(read, &self.context).await.map_err(status_of)?;
                 let publish = self
-                    .publication(binding, object, slot, stage.clone())
+                    .publication(binding, object, slot, (stage.clone(), summary))
                     .await?;
                 (publish, stage)
             }
             false => (None, None),
         };
-        Ok(CloseInput {
+        let input = CloseInput {
             context: self.access_context(binding),
             scope,
             open_id: slot.open_id,
             publish,
             stage,
-        })
+        };
+        Ok((input, detached))
     }
 
     async fn release_quietly(&self, binding: &NfsMountBinding, object: ObjectRef, slot: OpenSlot) {
@@ -298,23 +361,27 @@ impl ArunaNfsBackend {
         }
     }
 
-    /// The publication a last writer close runs: the stage image as the body of an ordinary
-    /// write, read in bounded chunks only while the write consumes it.
+    /// The publication a last close of a dirty instance runs: the stage image as the body of an
+    /// ordinary write, read in bounded chunks only while the write consumes it. A detached
+    /// instance has no name left, so its close prepares none.
     async fn publication(
         &self,
         binding: &NfsMountBinding,
         object: ObjectRef,
         slot: &OpenSlot,
-        stage: Option<NfsStageRecord>,
+        (stage, summary): (Option<NfsStageRecord>, Option<InstanceSummary>),
     ) -> Result<Option<(PublishInput, PutObjectConfig)>, NfsStat4> {
-        let Some(base) = stage_base(slot) else {
+        if summary
+            .as_ref()
+            .is_some_and(|found| found.detached.is_some())
+        {
+            return Ok(None);
+        }
+        let slot = current_slot(slot, summary.as_ref());
+        let Some(base) = stage_base(&slot) else {
             return Ok(None);
         };
-        let summary = self
-            .instance_at(binding, &slot.key, Some(&slot.identity))
-            .await?;
-        let summary = summary.filter(|summary| summary.instance_id == slot.instance_id);
-        let size = summary.map_or(slot.size, |summary| summary.logical_size);
+        let size = slot.size;
         let read = ReadInput {
             context: self.access_context(binding),
             key: slot.key.clone(),
@@ -322,6 +389,7 @@ impl ArunaNfsBackend {
             version_id: slot.version_id,
             offset: 0,
             length: 0,
+            owner_id: None,
         };
         let body = image_body(self.context.clone(), read, size);
         let exists = matches!(base, StageBase::Committed { .. });
@@ -339,6 +407,8 @@ impl ArunaNfsBackend {
             logical_size: size,
             attempt_id: Ulid::generate(),
             updates: Vec::new(),
+            expected_edit: summary.map(|found| found.edit_generation),
+            require_writerless: false,
         };
         Ok(Some((input, put)))
     }
@@ -356,10 +426,7 @@ impl ArunaNfsBackend {
         let scope = bucket_scope(binding).map_err(status_of)?;
         let read = LiveStageOperation::new(scope, object.object_id);
         let previous = drive(read, &self.context).await.map_err(status_of)?;
-        let summary = self
-            .instance_at(binding, &slot.key, Some(&slot.identity))
-            .await?;
-        let summary = summary.filter(|summary| summary.instance_id == slot.instance_id);
+        let summary = self.shared_of(binding, object, slot).await?;
         let now_ms = aruna_clock::unix_timestamp_millis();
         let owner = StageOwner {
             user: binding.owner,
@@ -420,7 +487,7 @@ impl ArunaNfsBackend {
             return Err(NfsStat4::ReadOnly);
         }
         match state {
-            IoState::Open(owner) => {
+            IoState::Open { owner, lock_owner } => {
                 let slot = self
                     .tables
                     .lock()
@@ -428,7 +495,9 @@ impl ArunaNfsBackend {
                     .get(&(object, owner.clone()))
                     .cloned();
                 let slot = slot.filter(|slot| slot.write).ok_or(NfsStat4::OpenMode)?;
-                Ok((slot, owner_number(owner), false))
+                let summary = self.shared_of(binding, object, &slot).await?;
+                let slot = current_slot(&slot, summary.as_ref());
+                Ok((slot, io_owner(owner, lock_owner.as_ref()), false))
             }
             IoState::Anonymous | IoState::Bypass => {
                 let slot = self.open_slot(binding, located, (share::WRITE, 0)).await?;
@@ -502,39 +571,51 @@ impl ArunaNfsBackend {
         if located.kind == HandleKind::Directory {
             return Err(NfsStat4::IsDirectory);
         }
-        let own = match state {
-            IoState::Open(owner) => self
-                .tables
-                .lock()
-                .opens
-                .get(&(object, owner.clone()))
-                .cloned(),
-            IoState::Anonymous | IoState::Bypass => None,
+        let (own, owner_id) = match state {
+            IoState::Open { owner, lock_owner } => {
+                let slot = self
+                    .tables
+                    .lock()
+                    .opens
+                    .get(&(object, owner.clone()))
+                    .cloned();
+                (slot, Some(io_owner(owner, lock_owner.as_ref())))
+            }
+            IoState::Anonymous | IoState::Bypass => (None, None),
         };
+        let mut key = located.key;
         let (instance_id, version_id) = match (own, &located.detached) {
-            (Some(slot), _) => (Some(slot.instance_id), slot.version_id),
+            (Some(slot), _) => {
+                let summary = self.shared_of(binding, object, &slot).await?;
+                let slot = current_slot(&slot, summary.as_ref());
+                key = slot.key;
+                (Some(slot.instance_id), slot.version_id)
+            }
             (None, Some(_)) => return Err(NfsStat4::Stale),
             (None, None) => {
                 let identity = located.identity.as_ref();
-                let summary = self.instance_at(binding, &located.key, identity).await?;
+                let summary = self.instance_at(binding, &key, identity).await?;
                 let committed = matches!(
                     identity,
                     Some(HandleIdentity::File(FileIdentity::Committed { .. }))
                 );
-                let version_id = match committed {
-                    true => self.head_info(binding, &located.key).await?.0,
-                    false => None,
+                let base = summary.as_ref().and_then(|found| found.base_version);
+                let version_id = match (committed, base) {
+                    (true, Some(base)) => Some(base),
+                    (true, None) => self.head_info(binding, &key).await?.0,
+                    (false, _) => None,
                 };
                 (summary.map(|summary| summary.instance_id), version_id)
             }
         };
         let input = ReadInput {
             context: self.access_context(binding),
-            key: located.key,
+            key,
             instance_id,
             version_id,
             offset,
             length: count.min(IO_LIMIT),
+            owner_id,
         };
         let read = drive(VfsReadOperation::new(input), &self.context).await;
         let read = read.map_err(status_of)?;
@@ -597,6 +678,8 @@ impl ArunaNfsBackend {
             let tables = self.tables.lock();
             return Ok(tables.write_verifier.unwrap_or(self.verifier));
         };
+        let summary = self.shared_of(binding, object, &slot).await?;
+        let slot = current_slot(&slot, summary.as_ref());
         let checkpoint = self.checkpoint(binding, object, &slot).await?;
         let checkpoint = checkpoint.ok_or(NfsStat4::Delay)?;
         let committed = drive(VfsCommitOperation::new(checkpoint), &self.context).await;
@@ -608,11 +691,9 @@ impl ArunaNfsBackend {
     /// Any writer open of this server on `object`.
     fn writer_slot(&self, object: ObjectRef) -> Option<OpenSlot> {
         let tables = self.tables.lock();
-        let opens = tables.opens.iter().filter(|((open, _), _)| *open == object);
-        let mut slots = opens
-            .map(|(_, slot)| slot)
-            .chain(tables.created.get(&object));
-        slots.find(|slot| slot.write).cloned()
+        let mut slots = tables.opens.iter().chain(tables.created.iter());
+        let found = slots.find(|((open, _), slot)| *open == object && slot.write);
+        found.map(|(_, slot)| slot.clone())
     }
 
     pub(super) async fn live_setattr(
@@ -660,6 +741,7 @@ impl ArunaNfsBackend {
         binding: &NfsMountBinding,
         directory: ObjectRef,
         (name, mode, change): (&str, CreateMode, &AttributeChange),
+        share: &ShareRequest,
     ) -> Result<CreateReply, NfsStat4> {
         if binding.read_only {
             return Err(NfsStat4::ReadOnly);
@@ -693,6 +775,8 @@ impl ArunaNfsBackend {
             });
         }
         let open_id = Ulid::generate();
+        // The creating open writes the new file and holds the deny bits the OPEN asked for.
+        let modes = (share.access | share::WRITE, share.deny);
         let input = OpenInput {
             context: self.access_context(binding),
             key: key.clone(),
@@ -700,7 +784,7 @@ impl ArunaNfsBackend {
             create: true,
             exclusive: !matches!(mode, CreateMode::Unchecked),
             write: true,
-            share: share_mode(share::WRITE, 0),
+            share: share_mode(modes.0, modes.1),
             delete_on_close: false,
             open_id,
             stable: true,
@@ -711,7 +795,7 @@ impl ArunaNfsBackend {
         let opened = drive(VfsOpenOperation::new(input), &self.context).await;
         let opened = opened.map_err(status_of)?;
         let settled = self
-            .settle_create(binding, (&key, open_id), &opened, change)
+            .settle_create(binding, (&key, open_id, modes), &opened, change)
             .await;
         let (object, slot) = match settled {
             Ok(settled) => settled,
@@ -725,7 +809,8 @@ impl ArunaNfsBackend {
         {
             self.tables.lock().exclusive.insert(remembered, verifier);
         }
-        let replaced = self.tables.lock().created.insert(object, slot);
+        let created = (object, share.owner.clone());
+        let replaced = self.tables.lock().created.insert(created, slot);
         if let Some(old) = replaced {
             self.release_quietly(binding, object, old).await;
         }
@@ -746,7 +831,7 @@ impl ArunaNfsBackend {
     async fn settle_create(
         &self,
         binding: &NfsMountBinding,
-        (key, open_id): (&str, Ulid),
+        (key, open_id, modes): (&str, Ulid, (u32, u32)),
         opened: &OpenResult,
         change: &AttributeChange,
     ) -> Result<(ObjectRef, OpenSlot), NfsStat4> {
@@ -764,9 +849,7 @@ impl ArunaNfsBackend {
             }
         };
         let object = self.object_ref(binding, handle_id);
-        let mut slot = self
-            .slot_of(binding, key, open_id, opened, (share::WRITE, 0))
-            .await?;
+        let mut slot = self.slot_of(binding, key, open_id, opened, modes).await?;
         if opened.created {
             let checkpoint = self.checkpoint(binding, object, &slot).await?;
             let checkpoint = checkpoint.ok_or(NfsStat4::Delay)?;
@@ -911,6 +994,15 @@ impl ArunaNfsBackend {
         };
         let stage_size = stage.as_ref().map(|record| record.logical_size);
         let target_exists = self.head_info(binding, &to).await?.0.is_some();
+        let (head_version, head_size) = match &identity {
+            HandleIdentity::File(FileIdentity::Committed { .. }) => {
+                self.head_info(binding, &from).await?
+            }
+            _ => (None, 0),
+        };
+        // A committed file moves as its committed base, and the source fence expects exactly it.
+        let base_version = instance.as_ref().and_then(|summary| summary.base_version);
+        let source_version = base_version.or(head_version);
         let input = RenameInput {
             context: self.access_context(binding),
             from: from.clone(),
@@ -922,20 +1014,24 @@ impl ArunaNfsBackend {
             replace: true,
             attempt_id: Ulid::generate(),
             stage,
+            source_version,
         };
         let mut rename = VfsRenameOperation::new(input);
         match &identity {
-            // A committed file moves as its exact image written at the destination.
+            // The destination gets the committed bytes only; an unflushed overlay stays staged.
             HandleIdentity::File(FileIdentity::Committed { .. }) => {
-                let (version_id, head_size) = self.head_info(binding, &from).await?;
-                let size = instance.map_or(head_size, |summary| summary.logical_size);
+                let size = match source_version == head_version {
+                    true => head_size,
+                    false => instance.map_or(head_size, |summary| summary.base_limit),
+                };
                 let read = ReadInput {
                     context: self.access_context(binding),
                     key: from.clone(),
-                    instance_id,
-                    version_id,
+                    instance_id: None,
+                    version_id: source_version,
                     offset: 0,
                     length: 0,
+                    owner_id: None,
                 };
                 let body = image_body(self.context.clone(), read, size);
                 let put = self
@@ -954,6 +1050,7 @@ impl ArunaNfsBackend {
                     version_id: None,
                     offset: 0,
                     length: 0,
+                    owner_id: None,
                 };
                 let body = image_body(self.context.clone(), read, size);
                 let put = self.put_config(binding, &to, body, (size, true)).await?;

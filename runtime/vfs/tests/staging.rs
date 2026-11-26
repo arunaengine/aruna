@@ -4,11 +4,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::structs::storage::vfs::{
-    BucketScope, FileIdentity, HandleIdentity, HeadChangeObserver,
+    BucketScope, DetachReason, FileIdentity, HandleIdentity, HeadChangeObserver,
 };
 use aruna_core::vfs_effects::{
-    ByteRange, DiskStage, OpenRequest, RestoreRequest, ShareMode, StageSlice, VfsEffect, VfsEvent,
-    VfsFailure, VfsProtocol,
+    ByteRange, DiskStage, OpenRequest, RebindRequest, RestoreRequest, ShareMode, StageSlice,
+    VfsEffect, VfsEvent, VfsFailure, VfsProtocol,
 };
 use aruna_vfs::{VfsConfig, VfsHandle};
 use std::path::Path;
@@ -82,6 +82,7 @@ async fn opened(handle: &VfsHandle, key: &str, identity: HandleIdentity, base_si
         owner: None,
         base_size,
         group_id: group(),
+        base_version: None,
     };
     match handle.execute(VfsEffect::OpenInstance(request)).await {
         VfsEvent::Opened { instance_id, .. } => instance_id,
@@ -132,6 +133,7 @@ async fn read(handle: &VfsHandle, instance_id: u64, offset: u64, length: u32) ->
         instance_id,
         offset,
         length,
+        owner_id: None,
     };
     match handle.execute(effect).await {
         VfsEvent::StageRead { slices, .. } => slices,
@@ -438,6 +440,7 @@ async fn restore_after_restart() {
         identity: unpublished(),
         detached: None,
         owner: None,
+        base_version: None,
     });
     let VfsEvent::Opened { instance_id, .. } = handle.execute(restore).await else {
         panic!("the stage was not restored");
@@ -446,6 +449,175 @@ async fn restore_after_restart() {
         read(&handle, instance_id, 0, 16).await,
         vec![written(0, b"hello")]
     );
+}
+
+#[tokio::test]
+async fn checkpoint_claims_exclusive() {
+    let (_folder, handle) = booted(MIB).await;
+    let stage_id = Ulid::generate();
+    let first = opened(&handle, "f.txt", unpublished(), 0).await;
+    let second = opened(&handle, "g.txt", unpublished(), 0).await;
+    write(&handle, first, 0, b"first").await;
+    write(&handle, second, 0, b"second").await;
+    let plan = begin(&handle, first, stage_id, 1).await;
+    assert!(matches!(plan, VfsEvent::CheckpointPlan { .. }));
+    let collision = begin(&handle, second, stage_id, 1).await;
+    assert_eq!(collision, VfsEvent::Failed(VfsFailure::Conflict));
+    let overlapping = begin(&handle, first, stage_id, 2).await;
+    assert_eq!(overlapping, VfsEvent::Failed(VfsFailure::Conflict));
+    let abort = |instance_id, generation| VfsEffect::AbortCheckpoint {
+        scope: scope(),
+        instance_id,
+        stage_id,
+        generation,
+    };
+    let foreign = handle.execute(abort(second, 1)).await;
+    assert_eq!(foreign, VfsEvent::Failed(VfsFailure::NotFound));
+    assert_eq!(handle.execute(abort(first, 1)).await, VfsEvent::Done);
+    checkpoint(&handle, first, stage_id, 1).await;
+    let promoted = handle.execute(abort(first, 1)).await;
+    assert_eq!(promoted, VfsEvent::Failed(VfsFailure::NotFound));
+    let kept = read_sealed(&handle, stage_id, 1).await;
+    assert_eq!(
+        kept,
+        VfsEvent::CheckpointData {
+            data: b"first".to_vec(),
+            eof: true
+        }
+    );
+    let remove = VfsEffect::RemoveCheckpoint {
+        stage_id,
+        generation: 1,
+    };
+    let in_use = handle.execute(remove).await;
+    assert_eq!(in_use, VfsEvent::Failed(VfsFailure::Conflict));
+}
+
+#[tokio::test]
+async fn rebind_keeps_edits() {
+    let (_folder, handle) = booted(MIB).await;
+    let instance_id = opened(&handle, "h.txt", committed(), 0).await;
+    write(&handle, instance_id, 0, b"abc").await;
+    let lookup = VfsEffect::LookupInstance {
+        scope: scope(),
+        key: "h.txt".to_string(),
+    };
+    let VfsEvent::Instance(Some(captured)) = handle.execute(lookup).await else {
+        panic!("the instance is missing");
+    };
+    write(&handle, instance_id, 3, b"d").await;
+    let version = Ulid::generate();
+    let rebind = |expected_edit| {
+        VfsEffect::RebindInstance(RebindRequest {
+            scope: scope(),
+            instance_id,
+            key: "h.txt".to_string(),
+            handle_id: Some(11),
+            identity: committed(),
+            base_size: Some(3),
+            clear_dirty: true,
+            stage_id: None,
+            generation: None,
+            base_version: Some(version),
+            expected_edit: Some(expected_edit),
+        })
+    };
+    let answer = handle.execute(rebind(captured.edit_generation)).await;
+    let VfsEvent::Instance(Some(stale)) = answer else {
+        panic!("unexpected answer {answer:?}");
+    };
+    assert!(stale.dirty, "a newer edit must keep the overlay");
+    assert_eq!(stale.base_version, Some(version));
+    assert_eq!(stale.edit_generation, captured.edit_generation + 1);
+    let slices = read(&handle, instance_id, 0, 8).await;
+    assert_eq!(slices, vec![written(0, b"abcd")]);
+    let answer = handle.execute(rebind(stale.edit_generation)).await;
+    let VfsEvent::Instance(Some(current)) = answer else {
+        panic!("unexpected answer {answer:?}");
+    };
+    assert!(!current.dirty);
+    assert_eq!(current.edit_generation, stale.edit_generation);
+    let base = StageSlice::Base {
+        offset: 0,
+        length: 3,
+    };
+    assert_eq!(read(&handle, instance_id, 0, 8).await, vec![base]);
+}
+
+#[tokio::test]
+async fn detached_restore_collects() {
+    let folder = tempfile::tempdir().unwrap();
+    let stage_id = Ulid::generate();
+    {
+        let handle = handle_at(folder.path(), MIB);
+        configure(&handle, 1).await;
+        let instance_id = opened(&handle, "r.txt", unpublished(), 0).await;
+        write(&handle, instance_id, 0, b"kept!").await;
+        checkpoint(&handle, instance_id, stage_id, 1).await;
+    }
+    let handle = handle_at(folder.path(), 8);
+    configure(&handle, 2).await;
+    let restore = VfsEffect::RestoreStage(RestoreRequest {
+        scope: scope(),
+        handle_id: 11,
+        key: "r.txt".to_string(),
+        stage_id,
+        generation: 1,
+        logical_size: 5,
+        group_id: group(),
+        identity: unpublished(),
+        detached: Some(DetachReason::Unlinked),
+        owner: None,
+        base_version: None,
+    });
+    assert_eq!(handle.execute(restore).await, VfsEvent::Done);
+    let lookup = VfsEffect::LookupHandle {
+        scope: scope(),
+        handle_id: 11,
+    };
+    assert_eq!(handle.execute(lookup).await, VfsEvent::Instance(None));
+    let other = opened(&handle, "s.txt", unpublished(), 0).await;
+    let charged = write(&handle, other, 0, b"fives").await;
+    assert_eq!(charged, VfsEvent::Failed(VfsFailure::NoSpace));
+    let remove = VfsEffect::RemoveCheckpoint {
+        stage_id,
+        generation: 1,
+    };
+    assert_eq!(handle.execute(remove).await, VfsEvent::Done);
+    let inventory = handle.execute(VfsEffect::ScanStages).await;
+    assert_eq!(inventory, VfsEvent::StageInventory { files: Vec::new() });
+    let refunded = write(&handle, other, 0, b"fives").await;
+    assert!(matches!(refunded, VfsEvent::StageWritten { .. }));
+}
+
+#[tokio::test]
+async fn staged_list_pages() {
+    let (_folder, handle) = booted(MIB).await;
+    for key in ["d/a", "d/b", "d/c", "e/x"] {
+        opened(&handle, key, unpublished(), 0).await;
+    }
+    opened(&handle, "d/z", committed(), 4).await;
+    let list = |after: Option<&str>, limit| VfsEffect::ListStaged {
+        scope: scope(),
+        prefix: "d/".to_string(),
+        after: after.map(String::from),
+        limit: Some(limit),
+    };
+    let page = |event: VfsEvent| match event {
+        VfsEvent::StagedList {
+            entries, truncated, ..
+        } => {
+            let keys: Vec<String> = entries.into_iter().map(|entry| entry.key).collect();
+            (keys, truncated)
+        }
+        other => panic!("unexpected answer {other:?}"),
+    };
+    let first = page(handle.execute(list(None, 2)).await);
+    assert_eq!(first, (vec!["d/a".to_string(), "d/b".to_string()], true));
+    let last = page(handle.execute(list(Some("d/b"), 2)).await);
+    assert_eq!(last, (vec!["d/c".to_string()], false));
+    let before = page(handle.execute(list(Some("a"), 1)).await);
+    assert_eq!(before, (vec!["d/a".to_string()], true));
 }
 
 #[tokio::test]

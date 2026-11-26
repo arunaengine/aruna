@@ -2,8 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeSet;
+
 use aruna_core::compute::{
-    AttemptRef, S3Mount, Secret as SecretValue, StagingMode, WorkspaceBinding,
+    AttemptRef, NfsBindings, S3Mount, Secret as SecretValue, StagingMode, WorkspaceBinding,
 };
 use k8s_openapi::api::core::v1::PodSpec;
 
@@ -262,6 +264,32 @@ fn input_spec(bucket: &str) -> TaskSpec {
     spec
 }
 
+fn session_spec(mount: &SessionMount) -> TaskSpec {
+    let mut spec = TaskSpec::new(context(1, 7).attempt, "registry.example/session:latest");
+    spec.session = true;
+    spec.workspace = Some(WorkspaceBinding {
+        s3_endpoint: "https://s3.example".to_string(),
+        bucket_name: "notebooks".to_string(),
+        region: "us-east-1".to_string(),
+    });
+    spec.session_mount = Some(mount.clone());
+    spec
+}
+
+fn raw_mount() -> SessionMount {
+    SessionMount {
+        prefix: "raw/".to_string(),
+        path: "/work/raw".to_string(),
+    }
+}
+
+fn nfs_bindings(input: &str, session: &str) -> NfsBindings {
+    NfsBindings {
+        input: Some(input.to_string()),
+        session: Some(session.to_string()),
+    }
+}
+
 fn pod_value(
     config: &KubernetesConfig,
     spec: &TaskSpec,
@@ -303,7 +331,8 @@ fn mounts_smb_inputs() {
     assert_eq!(mount["readOnly"], true);
 
     // The share takes the view bucket's name, which lowercases the job ID.
-    let source = input_source(&config, "JOB", &["in-job".to_string()]).unwrap();
+    let spec = input_spec("in-job");
+    let source = input_source(&config, &spec, "JOB", &["in-job".to_string()]).unwrap();
     assert_eq!(
         source,
         Some(ShareSource::smb_inputs("node-a.example", "job"))
@@ -319,18 +348,8 @@ fn mounts_smb_session() {
         inputs: false,
         sessions: true,
     });
-    let mut spec = TaskSpec::new(context(1, 7).attempt, "registry.example/session:latest");
-    spec.session = true;
-    spec.workspace = Some(WorkspaceBinding {
-        s3_endpoint: "https://s3.example".to_string(),
-        bucket_name: "notebooks".to_string(),
-        region: "us-east-1".to_string(),
-    });
-    let mount = SessionMount {
-        prefix: "raw/".to_string(),
-        path: "/work/raw".to_string(),
-    };
-    spec.session_mount = Some(mount.clone());
+    let mount = raw_mount();
+    let spec = session_spec(&mount);
     let pod = pod_value(&config, &spec).unwrap();
     let share = volume(&pod, "aruna-job-a1-share-data").unwrap();
     assert_eq!(
@@ -342,7 +361,7 @@ fn mounts_smb_session() {
     assert_eq!(data["name"], "aruna-job-a1-share-data");
     assert_eq!(data["readOnly"], false);
     assert_eq!(
-        session_source(&config, "notebooks", &mount),
+        session_source(&config, &spec, "notebooks", &mount).unwrap(),
         Some(ShareSource::smb_session(
             "node-a.example",
             "notebooks",
@@ -350,23 +369,25 @@ fn mounts_smb_session() {
         ))
     );
     // Inputs stay off the share when only sessions use it.
-    assert_eq!(input_source(&config, "job", &[]).unwrap(), None);
+    assert_eq!(input_source(&config, &spec, "job", &[]).unwrap(), None);
 }
 
 #[test]
 fn mounts_nfs_inputs() {
     let config = share_config(ShareDriver::Nfs {
-        inputs: Some("Zx81mQ".to_string()),
-        sessions: None,
+        inputs: true,
+        sessions: false,
     });
+    let mut spec = input_spec("in-job");
+    spec.nfs_mounts.input = Some("Zx81mQ".to_string());
     // The NFS binding names its own target, so the manifest maps the keys below it.
-    let pod = pod_value(&config, &input_spec("in-job")).unwrap();
+    let pod = pod_value(&config, &spec).unwrap();
     assert!(volume(&pod, "aruna-job-a1-share-in").is_some());
     assert_eq!(mount_at(&pod, "/input.txt")["subPath"], "data/input.txt");
     let pod: PodSpec = serde_json::from_value(pod).unwrap();
     check_isolation(&pod).unwrap();
     assert_eq!(
-        input_source(&config, "job", &["in-job".to_string()]).unwrap(),
+        input_source(&config, &spec, "job", &["in-job".to_string()]).unwrap(),
         Some(ShareSource::Nfs {
             host: "node-a.example".to_string(),
             mount_id: "Zx81mQ".to_string(),
@@ -387,7 +408,8 @@ fn keeps_default_mounts() {
         "aruna-job-a1-s3-0"
     );
     assert!(volume(&pod, "aruna-job-a1-share-in").is_none());
-    assert_eq!(input_source(&config, "job", &[]).unwrap(), None);
+    let spec = input_spec("in-job");
+    assert_eq!(input_source(&config, &spec, "job", &[]).unwrap(), None);
     assert_eq!(share_driver(&config), None);
 
     // A share for sessions only leaves inputs on the S3 driver.
@@ -415,10 +437,10 @@ fn checks_share_config() {
         );
     }
     let nfs = share_config(ShareDriver::Nfs {
-        inputs: None,
-        sessions: Some("../x".to_string()),
+        inputs: true,
+        sessions: true,
     });
-    assert!(check_config(&nfs).is_err());
+    check_config(&nfs).unwrap();
 
     // A KubeDAL session would take the mount Secret the SMB input login needs.
     let mut kubedal = smb(true, false);
@@ -431,4 +453,83 @@ fn checks_share_config() {
     assert!(check_config(&kubedal).is_err());
     kubedal.share_mount = smb(true, true).share_mount;
     check_config(&kubedal).unwrap();
+}
+
+/// The export and volume handle of one attempt's NFS share volume.
+fn nfs_volume(
+    context: &FenceContext,
+    name: &str,
+    source: &ShareSource,
+    read_only: bool,
+) -> (String, String) {
+    let csi = pv_value(context, name, source, read_only)["spec"]["csi"].clone();
+    assert_eq!(csi["readOnly"], read_only);
+    let text = |value: &serde_json::Value| value.as_str().unwrap().to_string();
+    (
+        text(&csi["volumeAttributes"]["share"]),
+        text(&csi["volumeHandle"]),
+    )
+}
+
+#[test]
+fn isolates_nfs_attempts() {
+    let config = share_config(ShareDriver::Nfs {
+        inputs: true,
+        sessions: true,
+    });
+    let mount = raw_mount();
+    let buckets = ["in-job".to_string()];
+    let (mut exports, mut handles) = (BTreeSet::new(), BTreeSet::new());
+    // Two attempts run on one worker at once, each with its own bindings.
+    for (attempt, input, session) in [(1, "in-one", "ws-one"), (2, "in-two", "ws-two")] {
+        let context = context(attempt, 7);
+        let mut spec = session_spec(&mount);
+        spec.attempt = context.attempt.clone();
+        spec.nfs_mounts = nfs_bindings(input, session);
+        let name = context.attempt.external_name();
+        let inputs = input_source(&config, &spec, "job", &buckets)
+            .unwrap()
+            .unwrap();
+        let data = session_source(&config, &spec, "notebooks", &mount)
+            .unwrap()
+            .unwrap();
+        let (export, handle) = nfs_volume(&context, &share_input_name(&name), &inputs, true);
+        assert_eq!(export, format!("/m/{input}"));
+        exports.insert(export);
+        handles.insert(handle);
+        let (export, handle) = nfs_volume(&context, &share_data_name(&name), &data, false);
+        assert_eq!(export, format!("/m/{session}"));
+        exports.insert(export);
+        handles.insert(handle);
+    }
+    // Neither the read-only inputs nor the writable workspaces share an export or handle.
+    assert_eq!((exports.len(), handles.len()), (4, 4));
+}
+
+#[test]
+fn refuses_unbound_nfs() {
+    let config = share_config(ShareDriver::Nfs {
+        inputs: true,
+        sessions: true,
+    });
+    let mount = raw_mount();
+    let buckets = ["in-job".to_string()];
+    let refused = |bindings: NfsBindings| {
+        let mut spec = session_spec(&mount);
+        spec.nfs_mounts = bindings;
+        let input = input_source(&config, &spec, "job", &buckets);
+        let data = session_source(&config, &spec, "notebooks", &mount);
+        matches!(input, Err(BackendError::InvalidSpec(_)))
+            && matches!(data, Err(BackendError::InvalidSpec(_)))
+    };
+    assert!(refused(NfsBindings::default()));
+    assert!(refused(nfs_bindings("", ".")));
+    assert!(refused(nfs_bindings("../x", "a,ro")));
+    // One export serving both mounts would let the workspace reach the inputs.
+    assert!(refused(nfs_bindings("shared", "shared")));
+    // The manifests refuse the attempt rather than mount a missing binding.
+    for spec in [input_spec("in-job"), session_spec(&mount)] {
+        let error = pod_value(&config, &spec).unwrap_err();
+        assert!(matches!(error, BackendError::InvalidSpec(text) if text.contains("per-attempt")));
+    }
 }

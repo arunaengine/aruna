@@ -43,7 +43,7 @@ enum Ready {
     Later,
     /// The owner's mount is gone, so the checkpoint leaves the namespace.
     Lost,
-    /// A writer holds the stage again, so its own close publishes it.
+    /// A writer holds the stage again, or the instance no longer carries this generation.
     Held,
 }
 
@@ -159,7 +159,9 @@ async fn prepare(
     let Some(instance) = drive(lookup, context).await.map_err(failed("instance"))? else {
         return Ok(Ready::Later);
     };
-    if instance.writer_count > 0 {
+    let bound =
+        instance.stage_id == Some(stage.stage_id) && instance.generation == stage.generation;
+    if instance.writer_count > 0 || !bound {
         return Ok(Ready::Held);
     }
     let bucket = GetBucketOperation::new(scope.bucket.clone());
@@ -213,6 +215,8 @@ async fn prepare(
         logical_size: stage.logical_size,
         attempt_id: Ulid::generate(),
         updates: Vec::new(),
+        expected_edit: Some(instance.edit_generation),
+        require_writerless: true,
     };
     Ok(Ready::Publish(Box::new((input, put))))
 }
@@ -243,6 +247,11 @@ async fn publish(
             );
             reschedule(context, scope, stage).await;
         }
+        Err(VfsError::Conflict) => debug!(
+            bucket = %scope.bucket,
+            stage_id = %stage.stage_id,
+            "A writer returned or edited the quota-blocked checkpoint before publication"
+        ),
         Err(
             error @ (VfsError::Denied
             | VfsError::VaultLocked

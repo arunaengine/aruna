@@ -102,6 +102,34 @@ fn verifies_with_mic() {
 }
 
 #[test]
+fn verifies_without_exchange() {
+    let mut negotiate = ntlm_negotiate();
+    let flags = read_u32(&negotiate, 12).expect("flags") & !KEY_EXCHANGE;
+    negotiate[12..16].copy_from_slice(&flags.to_le_bytes());
+    let challenge = Challenge::answer(&negotiate, [0x01; 8], 0x01D9_0000_0000_0000, &names())
+        .expect("challenge");
+    let message_flags = read_u32(challenge.message(), 20).expect("flags");
+    assert_eq!(
+        message_flags & KEY_EXCHANGE,
+        0,
+        "no key exchange is offered"
+    );
+    let (bytes, _) = ntlm_authenticate(
+        &challenge.negotiate,
+        challenge.message(),
+        options("secret", false),
+    );
+    let auth = parse_authenticate(&bytes).expect("parses");
+    let hash = nt_hash("secret");
+    let key = response_key(&hash, "AKIA-tester", "WORKGROUP").expect("NTOWFv2");
+    let base = hmac_md5(key.as_slice(), &[&auth.nt_response[..16]]).expect("base key");
+    let verified = challenge
+        .verify(&auth, "secret", MicPolicy::AllowMissing)
+        .expect("verifies");
+    assert_eq!(*verified.session_key, base, "the base key is exported");
+}
+
+#[test]
 fn rejects_wrong_secret() {
     let challenge = answered();
     let (bytes, _) = ntlm_authenticate(
@@ -217,7 +245,7 @@ fn refuses_anonymous_logons() {
 
 #[test]
 fn requires_negotiate_flags() {
-    for missing in [EXTENDED_SECURITY, NEGOTIATE_128, KEY_EXCHANGE, UNICODE] {
+    for missing in [EXTENDED_SECURITY, NEGOTIATE_128, UNICODE] {
         let mut negotiate = ntlm_negotiate();
         let flags = read_u32(&negotiate, 12).expect("flags") & !missing;
         negotiate[12..16].copy_from_slice(&flags.to_le_bytes());

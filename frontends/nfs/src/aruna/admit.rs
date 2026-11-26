@@ -1,5 +1,5 @@
 //! Admission of NFS peers: enrolled hosts by key and network, mount bindings with their live
-//! credential and target, and the recheck before a cached reply is released again.
+//! credential and target, and the recheck of each object use before a cached reply is resent.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -7,14 +7,15 @@ use std::net::IpAddr;
 use std::time::SystemTime;
 
 use aruna_core::structs::execution::job::identity::JobId;
-use aruna_core::structs::storage::encryption::EncryptionMode;
-use aruna_core::structs::storage::vfs::{EnrolledHostRecord, NfsMountBinding, NfsMountTarget};
+use aruna_core::structs::storage::vfs::{
+    EnrolledHostRecord, HandleKind, NfsMountBinding, NfsMountTarget,
+};
 use aruna_core::vfs_effects::VfsProtocol;
 use aruna_ops_data::s3::access::admit::{
     AdmitOwnerConfig, AdmitOwnerOperation, check_credential_usable, is_local_access,
 };
 use aruna_ops_data::s3::access::get::GetAccessOperation;
-use aruna_ops_data::transfer::key_status::KeyStatusOperation;
+use aruna_ops_data::vfs::path::children_prefix;
 use aruna_ops_data::vfs::policy::{
     AuthorizeVfsOperation, VfsAccess, VfsAccessContext, VfsGrant, VfsRequest,
 };
@@ -27,8 +28,9 @@ use ipnet::IpNet;
 use tracing::debug;
 use ulid::Ulid;
 
-use super::{ArunaNfsBackend, LIVE_ROOT, vfs_status};
-use crate::backend::{HostIdentity, MountExport, ReplayGrant};
+use super::exports::object_key;
+use super::{ArunaNfsBackend, LIVE_ROOT, job_view, vfs_status};
+use crate::backend::{HostIdentity, IoState, MountExport, ReplayAccess, ReplayCheck, ReplayGrant};
 use crate::types::NfsStat4;
 
 /// Whether `peer` lies in one of `networks`; a malformed network admits nothing.
@@ -43,6 +45,13 @@ pub fn network_allows(networks: &[String], peer: IpAddr) -> bool {
 /// An enrolled host serves only while it is not revoked and the peer is in its networks.
 pub(super) fn host_allows(host: &EnrolledHostRecord, peer: IpAddr) -> bool {
     host.revoked_at_ms.is_none() && network_allows(&host.allowed_networks, peer)
+}
+
+/// A TLS connection keeps serving only while its proven key is still enrolled for the host.
+pub(super) fn key_allows(host: &EnrolledHostRecord, identity: &HostIdentity) -> bool {
+    identity
+        .fingerprint
+        .is_none_or(|pin| host.fingerprints.contains(&pin))
 }
 
 /// A binding without networks follows its host's; otherwise the peer must be in one.
@@ -103,6 +112,7 @@ impl ArunaNfsBackend {
         host_allows(&host, peer).then_some(HostIdentity {
             host_id: host.host_id,
             owner: host.owner,
+            fingerprint: Some(fingerprint),
         })
     }
 
@@ -122,6 +132,7 @@ impl ArunaNfsBackend {
         host_allows(&host, peer).then_some(HostIdentity {
             host_id: host.host_id,
             owner: host.owner,
+            fingerprint: None,
         })
     }
 
@@ -139,7 +150,7 @@ impl ArunaNfsBackend {
         )
         .await
         .map_err(|error| hidden_status(&error))?;
-        if !host_allows(&record, peer) {
+        if !host_allows(&record, peer) || !key_allows(&record, host) {
             return Err(NfsStat4::Access);
         }
         let binding = drive(LookupMountOperation::new(mount_id), &self.context)
@@ -204,62 +215,97 @@ impl ArunaNfsBackend {
             .map_err(|_| NfsStat4::Access)
     }
 
-    /// Before a cached reply leaves again: the host, peer network, every binding and its
-    /// credential, and for data replies the live read policy and vault unlock.
+    /// Before a cached reply leaves again: the host, its key and peer network, every binding
+    /// and its credential, then each object use the reply carries, admitted from live state.
     pub(super) async fn recheck_grant(&self, grant: &ReplayGrant) -> Result<(), NfsStat4> {
+        let host = GetHostOperation::new(grant.host.host_id, grant.host.owner);
+        let record = drive(host, &self.context)
+            .await
+            .map_err(|_| NfsStat4::Access)?;
+        if !host_allows(&record, grant.peer) || !key_allows(&record, &grant.host) {
+            return Err(NfsStat4::Access);
+        }
         for mount_id in &grant.mounts {
             self.admit_mount(&grant.host, grant.peer, *mount_id)
                 .await
                 .map_err(|_| NfsStat4::Access)?;
-            if !grant.reads {
-                continue;
-            }
-            let binding = self.tables.lock().mounts.get(mount_id).cloned();
-            let binding = binding.ok_or(NfsStat4::Access)?;
-            if !matches!(binding.target, NfsMountTarget::JobInputView { .. }) {
-                self.recheck_reads(&binding).await?;
-            }
         }
-        if grant.mounts.is_empty() {
-            let host = GetHostOperation::new(grant.host.host_id, grant.host.owner);
-            let record = drive(host, &self.context)
-                .await
-                .map_err(|_| NfsStat4::Access)?;
-            if !host_allows(&record, grant.peer) {
+        for check in &grant.checks {
+            if !grant.mounts.contains(&check.object.mount_id) {
                 return Err(NfsStat4::Access);
             }
+            let binding = self
+                .tables
+                .lock()
+                .mounts
+                .get(&check.object.mount_id)
+                .cloned();
+            let binding = binding.ok_or(NfsStat4::Access)?;
+            let admitted = match job_view(&binding) {
+                true => self.recheck_view(&binding, check).await,
+                false => self.recheck_live(&binding, check).await,
+            };
+            admitted.map_err(|status| {
+                debug!(?status, "An NFS replay lost its object admission");
+                NfsStat4::Access
+            })?;
         }
         Ok(())
     }
 
-    /// Read authority on the export root and, for a `vault_locked` bucket, a live unlock of
-    /// its active key on this node.
-    async fn recheck_reads(&self, binding: &NfsMountBinding) -> Result<(), NfsStat4> {
-        let grant = self
-            .authorize_root(binding, VfsAccess::List)
-            .await
-            .map_err(|_| NfsStat4::Access)?;
-        if grant.encryption.mode != EncryptionMode::VaultLocked {
-            return Ok(());
-        }
-        let active = grant.encryption.active_key().ok_or(NfsStat4::Access)?;
-        let bucket = match &binding.target {
-            NfsMountTarget::Bucket { bucket, .. } | NfsMountTarget::Folder { bucket, .. } => {
-                bucket.clone()
+    /// One object use of a bucket or folder export, as a fresh request would admit it; a read
+    /// runs again through the live read path with its exact range.
+    pub(super) async fn recheck_live(
+        &self,
+        binding: &NfsMountBinding,
+        check: &ReplayCheck,
+    ) -> Result<(), NfsStat4> {
+        let object = check.object;
+        match check.access {
+            ReplayAccess::Head => self.live_attributes(binding, object).await.map(|_| ()),
+            ReplayAccess::Read { offset, length } => {
+                let read = self.live_read(binding, object, &IoState::Bypass, offset, length);
+                read.await.map(|_| ())
             }
-            NfsMountTarget::JobInputView { .. } => return Err(NfsStat4::Access),
-        };
-        let status = KeyStatusOperation::new(bucket, self.realm_id, grant.bucket.group_id);
-        let snapshot = drive(status, &self.context)
-            .await
-            .map_err(|_| NfsStat4::Access)?;
-        let unlocked = snapshot
-            .unlocks
-            .iter()
-            .any(|unlock| unlock.key == active && unlock.active);
-        match unlocked {
-            true => Ok(()),
-            false => Err(NfsStat4::Access),
+            ReplayAccess::List => {
+                let located = self.directory_of(binding, object).await?;
+                let prefix = Some(children_prefix(&located.key));
+                let listed = self.authorize(binding, VfsAccess::List, None, prefix).await;
+                listed.map(|_| ()).map_err(|error| vfs_status(&error))
+            }
+            ReplayAccess::Write => {
+                if binding.read_only {
+                    return Err(NfsStat4::ReadOnly);
+                }
+                let located = self.locate(binding, object).await?;
+                let key = match located.kind {
+                    HandleKind::File => object_key(&located.key, located.kind),
+                    HandleKind::Directory if located.key.is_empty() => None,
+                    HandleKind::Directory => Some(children_prefix(&located.key)),
+                };
+                let written = self.authorize(binding, VfsAccess::Put, key, None).await;
+                written.map(|_| ()).map_err(|error| vfs_status(&error))
+            }
+        }
+    }
+
+    /// One object use of a job input view: the run, the attempt credential and the entry's
+    /// visibility to the run's creator, and for a read the exact captured bytes again.
+    pub(super) async fn recheck_view(
+        &self,
+        binding: &NfsMountBinding,
+        check: &ReplayCheck,
+    ) -> Result<(), NfsStat4> {
+        let object = check.object;
+        match check.access {
+            ReplayAccess::Head | ReplayAccess::List => {
+                self.view_attributes(binding, object).await.map(|_| ())
+            }
+            ReplayAccess::Read { offset, length } => {
+                let read = self.view_read(binding, object, offset, length);
+                read.await.map(|_| ())
+            }
+            ReplayAccess::Write => Err(NfsStat4::ReadOnly),
         }
     }
 }

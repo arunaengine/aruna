@@ -11,7 +11,7 @@ use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::vfs::{
     EnrolledHostRecord, NfsMountBinding, NfsMountTarget, NfsStageRecord, StageBase,
-    StageDisposition, StageOwner, StageScope, VfsRecord,
+    StageDisposition, StageOwner, StageScope, VfsKey, VfsRecord,
 };
 use aruna_core::types::{Key, Value};
 use aruna_core::user::id::UserId;
@@ -35,6 +35,19 @@ fn host(owner: UserId) -> EnrolledHostRecord {
 
 fn row<T: VfsRecord>(record: &T) -> Option<Value> {
     Some(Value::from(record.to_bytes().unwrap()))
+}
+
+/// One page of host rows; `more` marks a full page with rows after it.
+fn hosts(records: Vec<EnrolledHostRecord>, more: bool) -> IoResult {
+    let rows: Vec<(Key, Value)> = records
+        .iter()
+        .map(|host| {
+            let key = Key::from(VfsKey::Host(host.host_id).to_bytes().unwrap());
+            (key, row(host).unwrap())
+        })
+        .collect();
+    let next = more.then(|| rows.last().map(|row| row.0.clone())).flatten();
+    IoResult::Page { rows, next }
 }
 
 #[test]
@@ -68,7 +81,12 @@ fn enrollment_needs_possession() {
     operation.seed(7);
     operation.stamp(5);
     assert_eq!(operation.transaction(), TransactionMode::Write);
-    assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Read(_)))));
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Page { .. }))
+    ));
+    let turn = operation.next(hosts(Vec::new(), false));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
     let turn = operation.next(IoResult::Values(vec![None]));
     assert!(matches!(turn, Ok(Next::Call(IoCall::Write(_)))));
     let Ok(Next::Done(enrolled)) = operation.next(IoResult::Done) else {
@@ -310,4 +328,85 @@ fn remote_peer_skipped() {
     // A peer off the loopback range never reads the host rows.
     let mut operation = LoopbackHostOperation::new("10.1.2.3".parse().unwrap());
     assert_eq!(operation.first(), Ok(Next::Done(None)));
+}
+
+fn enrolling(fingerprints: Vec<[u8; 32]>) -> EnrollHostOperation {
+    EnrollHostOperation::new(EnrollInput {
+        owner: user(),
+        fingerprints,
+        proven: [1; 32],
+        allowed_networks: Vec::new(),
+        worker_pool: false,
+    })
+}
+
+#[test]
+fn enrollment_one_key() {
+    // An enrollment names exactly the key it proved, nothing more.
+    for fingerprints in [vec![], vec![[1; 32], [2; 32]], vec![[1; 32], [1; 32]]] {
+        let mut operation = enrolling(fingerprints);
+        assert_eq!(operation.first(), Err(VfsError::Denied));
+    }
+}
+
+#[test]
+fn enrollment_unique_key() {
+    // A key another live host holds is refused on any page; a revoked holder does not count.
+    let mut operation = enrolling(vec![[1; 32]]);
+    operation.seed(7);
+    operation.first().unwrap();
+    let mut revoked = host(stranger());
+    revoked.revoked_at_ms = Some(3);
+    let mut filler: Vec<_> = (0..super::STATE_PAGE)
+        .map(|index| {
+            let mut other = host(stranger());
+            other.host_id = ulid::Ulid::from_parts(u64::try_from(index).unwrap(), 1);
+            other.fingerprints = vec![[9; 32]];
+            other
+        })
+        .collect();
+    filler[0] = revoked;
+    let turn = operation.next(hosts(filler, true));
+    assert!(matches!(
+        turn,
+        Ok(Next::Call(IoCall::Page { after: Some(_), .. }))
+    ));
+    let turn = operation.next(hosts(vec![host(stranger())], false));
+    assert_eq!(turn, Err(VfsError::Exists));
+}
+
+#[test]
+fn rotation_proves_new() {
+    // A rotation keeps old keys and adds only the proven one, which no other live host holds.
+    let rotate = |fingerprints| HostChange::Rotate {
+        fingerprints,
+        proven: [2; 32],
+    };
+    let mut extra = HostChangeOperation::new(id(30), user(), rotate(vec![[2; 32], [3; 32]]));
+    extra.first().unwrap();
+    let turn = extra.next(IoResult::Values(vec![row(&host(user()))]));
+    assert_eq!(turn, Err(VfsError::Denied));
+
+    let mut taken = HostChangeOperation::new(id(30), user(), rotate(vec![[1; 32], [2; 32]]));
+    taken.first().unwrap();
+    let turn = taken.next(IoResult::Values(vec![row(&host(user()))]));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Page { .. }))));
+    let mut other = host(stranger());
+    other.host_id = id(31);
+    other.fingerprints = vec![[2; 32]];
+    // The host's own row does not count against its kept key.
+    let turn = taken.next(hosts(vec![host(user()), other], false));
+    assert_eq!(turn, Err(VfsError::Exists));
+
+    let mut operation = HostChangeOperation::new(id(30), user(), rotate(vec![[1; 32], [2; 32]]));
+    operation.first().unwrap();
+    operation
+        .next(IoResult::Values(vec![row(&host(user()))]))
+        .unwrap();
+    let turn = operation.next(hosts(vec![host(user())], false));
+    let Ok(Next::Call(IoCall::Write(writes))) = turn else {
+        panic!("expected the host row");
+    };
+    let stored = EnrolledHostRecord::from_bytes(&writes[0].2).unwrap();
+    assert_eq!(stored.fingerprints, vec![[1; 32], [2; 32]]);
 }

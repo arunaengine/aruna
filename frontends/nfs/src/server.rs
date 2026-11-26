@@ -310,7 +310,9 @@ async fn run_server<B: NfsBackend>(
                     shared.engine.revoke(&revocation).await;
                 }
                 Err(RecvError::Lagged(missed)) => {
-                    warn!(missed, "NFS revocations lagged; each request still checks its binding");
+                    // A missed host revocation or key rotation fails closed: clients reconnect.
+                    warn!(missed, "NFS revocations lagged; closing every connection");
+                    shared.registry.close_all();
                 }
                 Err(RecvError::Closed) => subscribed = false,
             },
@@ -432,6 +434,16 @@ async fn serve_rpc<B, S>(
 {
     let (id, revoked) = shared.registry.register(host.host_id);
     let connection = ConnectionInfo { id, host, peer: ip };
+    // A rotation or revocation before registration reached no token, so admit once more.
+    let current = match host.fingerprint {
+        Some(pin) => shared.engine.backend.enrolled_host(pin, ip).await,
+        None => shared.engine.backend.loopback_host(ip).await,
+    };
+    if current != Some(host) {
+        debug!("Closed an NFS connection whose host changed during admission");
+        pending = None;
+        revoked.cancel();
+    }
     loop {
         let record = match pending.take() {
             Some(record) => record,

@@ -134,6 +134,7 @@ impl From<VfsFailure> for VfsError {
             VfsFailure::DeletePending => Self::DeletePending,
             VfsFailure::VaultFenced(_) => Self::VaultLocked,
             VfsFailure::CorruptStage(_) => Self::CorruptStage,
+            VfsFailure::Conflict => Self::Conflict,
             other => Self::Vfs(other),
         }
     }

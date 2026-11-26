@@ -20,6 +20,8 @@ use crate::types::{NfsStat4, NfsTime, NfsType4, StableHow};
 pub struct HostIdentity {
     pub host_id: Ulid,
     pub owner: UserId,
+    /// The SPKI digest a TLS peer proved; `None` for a cleartext loopback connection.
+    pub fingerprint: Option<[u8; 32]>,
 }
 
 /// A live mount binding as one request sees it, after the host, network and grant checks.
@@ -178,7 +180,12 @@ pub enum IoState {
     Anonymous,
     /// The READ bypass stateid: deny reservations do not apply.
     Bypass,
-    Open(OwnerKey),
+    /// An open, and the lock owner when the stateid was a lock stateid; byte I/O runs as the
+    /// lock owner, share checks as the open owner.
+    Open {
+        owner: OwnerKey,
+        lock_owner: Option<OwnerKey>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -235,6 +242,22 @@ pub enum Revocation {
     AccessKey(String),
 }
 
+/// How one operation of a cached reply used an object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplayAccess {
+    Head,
+    List,
+    Read { offset: u64, length: u32 },
+    Write,
+}
+
+/// One object use of a cached reply, admitted again from live state before a replay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplayCheck {
+    pub object: ObjectRef,
+    pub access: ReplayAccess,
+}
+
 /// What a cached reply was produced under; checked again before its bytes are released.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplayGrant {
@@ -243,9 +266,8 @@ pub struct ReplayGrant {
     pub principal: RpcPrincipal,
     /// Every binding the original compound used.
     pub mounts: Vec<Ulid>,
-    /// Whether the reply carries file data or names that need live read authority.
-    pub reads: bool,
-    pub writes: bool,
+    /// Every object use whose names, metadata or bytes the reply carries.
+    pub checks: Vec<ReplayCheck>,
 }
 
 /// Every Aruna interaction of the NFS engine. Each call checks the live binding, grants,
@@ -375,12 +397,14 @@ pub trait NfsBackend: Send + Sync + 'static {
         count: u32,
     ) -> impl Future<Output = Result<[u8; 8], NfsStat4>> + Send;
 
+    /// Creates or opens `name` and holds `share` for its owner until the OPEN takes it over.
     fn create_file(
         &self,
         caller: &Caller,
         directory: ObjectRef,
         name: &str,
         mode: CreateMode,
+        share: &ShareRequest,
         change: &AttributeChange,
     ) -> impl Future<Output = Result<CreateReply, NfsStat4>> + Send;
 

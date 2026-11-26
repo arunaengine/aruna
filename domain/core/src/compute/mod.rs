@@ -439,6 +439,17 @@ pub struct SessionMount {
     pub path: String,
 }
 
+/// Per-attempt NFS mount binding ids provisioned for one worker and target; never shared.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NfsBindings {
+    /// Binding id for this attempt's read-only job input view.
+    #[serde(default)]
+    pub input: Option<String>,
+    /// Binding id for this attempt's scoped workspace session folder.
+    #[serde(default)]
+    pub session: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct S3Mount {
     pub bucket: String,
@@ -723,6 +734,8 @@ pub struct TaskSpec {
     pub session: bool,
     /// Set for a session only: where its workspace bucket is mounted.
     pub session_mount: Option<SessionMount>,
+    /// The NFS bindings made for this attempt alone; an NFS share mount refuses without one.
+    pub nfs_mounts: NfsBindings,
 }
 
 impl TaskSpec {
@@ -746,6 +759,7 @@ impl TaskSpec {
             log_limits: LogLimits::default(),
             session: false,
             session_mount: None,
+            nfs_mounts: NfsBindings::default(),
         }
     }
 

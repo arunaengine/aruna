@@ -302,13 +302,17 @@ impl ArunaSmbBackend {
         if open.kind == HandleKind::Directory {
             return Err(BackendError::IsDirectory);
         }
+        // The shared instance names the base the other protocol last published or renamed to.
+        let summary = self.summary(open).await?;
+        let base = summary.as_ref().and_then(|summary| summary.base_version);
         let input = ReadInput {
             context: self.open_context(open),
-            key: open.key.clone(),
+            key: summary.map_or_else(|| open.key.clone(), |summary| summary.key),
             instance_id: Some(open.instance_id),
-            version_id: open.version_id,
+            version_id: base.or(open.version_id),
             offset,
             length,
+            owner_id: Some(lock_owner(open.open_id)),
         };
         let read = drive(VfsReadOperation::new(input), &self.driver)
             .await
@@ -401,7 +405,7 @@ impl ArunaSmbBackend {
             return Err(BackendError::Denied);
         }
         let summary = self.summary(open).await?.ok_or(BackendError::NotFound)?;
-        let time = shown_time(open.version_id, open.opened_ms);
+        let time = shown_time(summary.base_version.or(open.version_id), open.opened_ms);
         let size = match open.kind {
             HandleKind::File => summary.logical_size,
             HandleKind::Directory => 0,

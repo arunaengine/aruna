@@ -93,12 +93,12 @@ fn grant() -> ReplayGrant {
         host: HostIdentity {
             host_id: host(),
             owner: crate::mock::user(),
+            fingerprint: None,
         },
         peer: IpAddr::V4(Ipv4Addr::LOCALHOST),
         principal: principal(),
         mounts: Vec::new(),
-        reads: false,
-        writes: true,
+        checks: Vec::new(),
     }
 }
 
@@ -115,7 +115,7 @@ async fn slot_sequencing_rules() {
     let cached = SlotReply::Cached {
         digest: [1; 32],
         bytes: Bytes::from_static(b"reply"),
-        grant: grant(),
+        grant: Box::new(grant()),
     };
     table.finish(&SESSION, 0, cached);
     match table.begin(sender(&caller, 1), slot(1, 1), now) {
@@ -140,10 +140,7 @@ async fn slot_sequencing_rules() {
     );
     table.finish(&SESSION, 0, SlotReply::Uncached { digest: [4; 32] });
     let decision = table.begin(sender(&caller, 1), slot(2, 4), now);
-    assert!(matches!(
-        decision,
-        SlotDecision::Fail(NfsStat4::RetryUncached)
-    ));
+    assert!(matches!(decision, SlotDecision::Uncached { .. }));
 }
 
 #[tokio::test]

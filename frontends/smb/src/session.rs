@@ -3,11 +3,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use tokio_util::sync::CancellationToken;
 
-use crate::backend::{Credential, DirectoryEntry, ObjectKind, Scope, ShareTarget, TreeGrant};
+use crate::backend::{Credential, ObjectKind, Scope, ShareTarget, TreeGrant};
 use crate::crypto::{Cipher, PreauthHash, Sealer, SessionKeys, Signing};
 use crate::ntlm::Challenge;
 use crate::status;
@@ -81,11 +81,12 @@ impl Session {
     }
 }
 
-/// Directory enumeration state kept on an open between QUERY_DIRECTORY requests.
+/// Directory enumeration state kept on an open between QUERY_DIRECTORY requests. It holds no
+/// entry: `cursor` starts the current page and `emitted` names what it already returned.
 #[derive(Debug, Default)]
 pub(crate) struct Listing {
     pub pattern: String,
-    pub buffered: VecDeque<DirectoryEntry>,
+    pub emitted: HashSet<String>,
     pub cursor: Option<String>,
     pub exhausted: bool,
     pub returned: bool,
@@ -121,6 +122,8 @@ pub(crate) struct Waiting {
     pub session_id: u64,
     pub async_id: Option<u64>,
     pub token: CancellationToken,
+    /// A waiting LOCK, which a disconnect cancels since it may wait on opens cleanup releases.
+    pub lock: bool,
 }
 
 /// Granted MessageIds: `[start, end)` minus the ones already used. Each request consumes

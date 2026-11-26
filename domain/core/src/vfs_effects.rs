@@ -88,6 +88,12 @@ pub struct InstanceSummary {
     pub stage_id: Option<Ulid>,
     pub generation: u64,
     pub change: u64,
+    /// The committed object version the base bytes come from; `None` for an unpublished name.
+    pub base_version: Option<Ulid>,
+    /// Counts every staged write and resize; it never goes back, even across a rebind.
+    pub edit_generation: u64,
+    /// Whether every open of this instance shares delete access.
+    pub allows_delete: bool,
 }
 
 /// One directory witness update applied to open directory instances after a mutation.
@@ -122,6 +128,7 @@ pub struct OpenRequest {
     pub owner: Option<StageOwner>,
     pub base_size: u64,
     pub group_id: GroupId,
+    pub base_version: Option<Ulid>,
 }
 
 /// Inputs for rebinding a shared instance after a committed publish or rename.
@@ -136,6 +143,10 @@ pub struct RebindRequest {
     pub clear_dirty: bool,
     pub stage_id: Option<Ulid>,
     pub generation: Option<u64>,
+    /// Replaces the base version of the instance, like `identity`.
+    pub base_version: Option<Ulid>,
+    /// With `clear_dirty`, the overlay clears only if no edit followed this edit generation.
+    pub expected_edit: Option<u64>,
 }
 
 /// State returned when an open handle closes so the operation can decide final cleanup.
@@ -155,6 +166,10 @@ pub struct CloseSummary {
     pub logical_size: u64,
     pub handle_id: Option<u64>,
     pub identity: HandleIdentity,
+    pub base_version: Option<Ulid>,
+    pub edit_generation: u64,
+    /// The owner of the earliest remaining writer open that has one, to take over the stage.
+    pub successor_owner: Option<StageOwner>,
 }
 
 /// Inputs for restoring a durable stage row into memory during cold-start reconciliation.
@@ -170,6 +185,7 @@ pub struct RestoreRequest {
     pub identity: HandleIdentity,
     pub detached: Option<DetachReason>,
     pub owner: Option<StageOwner>,
+    pub base_version: Option<Ulid>,
 }
 
 /// One call to the file server adapter of this node; never persisted.
@@ -206,8 +222,14 @@ pub enum VfsEffect {
     LookupInstance { scope: BucketScope, key: String },
     /// Looks up a live or detached shared instance by durable NFS handle id.
     LookupHandle { scope: BucketScope, handle_id: u64 },
-    /// Lists staged and unpublished entries under `prefix` together with the observer sequence.
-    ListStaged { scope: BucketScope, prefix: String },
+    /// Lists staged and unpublished entries under `prefix` in key order, strictly after `after`
+    /// and at most `limit` of them, together with the observer sequence.
+    ListStaged {
+        scope: BucketScope,
+        prefix: String,
+        after: Option<String>,
+        limit: Option<usize>,
+    },
     /// Rebinds a surviving instance after a committed publish or rename.
     RebindInstance(RebindRequest),
     /// Moves the open instance of a handle off its name; its holders keep reading it.
@@ -249,12 +271,14 @@ pub enum VfsEffect {
         instance_id: u64,
         lock: ByteLock,
     },
-    /// Reads staged slices and reports untouched base ranges and zero holes.
+    /// Reads staged slices and reports untouched base ranges and zero holes. With `owner_id`,
+    /// an exclusive byte-range lock of another owner over the range refuses the read.
     ReadStage {
         scope: BucketScope,
         instance_id: u64,
         offset: u64,
         length: u32,
+        owner_id: Option<u64>,
     },
     /// Writes bytes to the volatile stage overlay under the instance guard.
     WriteStage {
@@ -274,7 +298,8 @@ pub enum VfsEffect {
         new_size: u64,
         group_id: GroupId,
     },
-    /// Starts a fresh immutable checkpoint generation and reports untouched base ranges to fill.
+    /// Claims the one in-progress generation of the instance, creates its new file and reports
+    /// untouched base ranges to fill; an existing generation or claim is a `Conflict`.
     BeginCheckpoint {
         scope: BucketScope,
         instance_id: u64,
@@ -296,13 +321,21 @@ pub enum VfsEffect {
         stage_id: Ulid,
         generation: u64,
     },
-    /// Switches the instance to the synced checkpoint generation and removes the superseded one.
+    /// Switches the instance to its claimed, synced generation and removes the superseded one
+    /// unless another instance or claim still references it.
     PromoteCheckpoint {
         scope: BucketScope,
         instance_id: u64,
         stage_id: Ulid,
         generation: u64,
         old_generation: Option<u64>,
+    },
+    /// Drops the generation the instance claimed and its files; any other generation is `NotFound`.
+    AbortCheckpoint {
+        scope: BucketScope,
+        instance_id: u64,
+        stage_id: Ulid,
+        generation: u64,
     },
     /// Reads a bounded chunk from a sealed live or retained checkpoint file.
     ReadCheckpoint {
@@ -311,7 +344,8 @@ pub enum VfsEffect {
         offset: u64,
         length: u32,
     },
-    /// Removes a checkpoint file no stage row names any more.
+    /// Removes a checkpoint file no stage row names any more; a generation an instance reads or
+    /// claims is a `Conflict`.
     RemoveCheckpoint { stage_id: Ulid, generation: u64 },
     /// Releases the quota and scratch reservations of a finished attempt.
     ReleaseAttempt { attempt_id: Ulid },
@@ -346,7 +380,8 @@ pub enum VfsEffect {
         boot_generation: u64,
         verifier: [u8; 8],
     },
-    /// Reconstructs in-memory stage tracking and budgets for a surviving durable stage row.
+    /// Reconstructs in-memory stage tracking and budgets for a surviving durable stage row. A
+    /// detached row only charges its checkpoint and answers `Done`, with no instance.
     RestoreStage(RestoreRequest),
     /// Revokes live sessions, opens and connections bound to a revoked host, mount or key.
     RevokeGrant {
@@ -383,6 +418,8 @@ pub enum VfsEvent {
     StagedList {
         entries: Vec<StagedEntry>,
         sequence: u64,
+        /// More matching entries follow the last one returned.
+        truncated: bool,
     },
     LockFree,
     LockConflict {
@@ -458,5 +495,7 @@ pub enum VfsFailure {
     CorruptStage(String),
     /// Caller violated the permit-before-guard lock ordering rule.
     LockOrder,
+    /// Another request claimed this checkpoint generation, or an instance still references it.
+    Conflict,
     Io(String),
 }

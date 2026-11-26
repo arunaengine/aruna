@@ -9,7 +9,7 @@ mod exports;
 mod views;
 mod writes;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -38,6 +38,8 @@ pub use admit::network_allows;
 pub const LIVE_ROOT: u64 = 0;
 /// Revocations a slow server task may lag behind before it resubscribes.
 const REVOCATION_BACKLOG: usize = 256;
+/// Directory cookie names kept in memory; an evicted cookie resumes from its durable position.
+const COOKIE_CACHE: usize = 65_536;
 
 /// What the node supplies to the NFS backend.
 #[derive(Clone)]
@@ -62,16 +64,49 @@ struct OpenSlot {
     deny: u32,
 }
 
+/// The name each issued directory cookie was emitted for, by mount and cookie, oldest first
+/// out once full.
+#[derive(Default)]
+struct CookieCache {
+    names: HashMap<(Ulid, u64), String>,
+    order: VecDeque<(Ulid, u64)>,
+}
+
+impl CookieCache {
+    fn insert(&mut self, cookie: (Ulid, u64), name: String) {
+        if self.names.insert(cookie, name).is_none() {
+            self.order.push_back(cookie);
+        }
+        while self.names.len() > COOKIE_CACHE {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.names.remove(&oldest);
+        }
+    }
+
+    fn get(&self, cookie: &(Ulid, u64)) -> Option<String> {
+        self.names.get(cookie).cloned()
+    }
+
+    fn forget(&mut self, mount_id: Ulid) {
+        self.names.retain(|(mount, _), _| *mount != mount_id);
+        self.order.retain(|(mount, _)| *mount != mount_id);
+    }
+}
+
 /// Protocol bookkeeping only; every request admits its caller again from live state.
 #[derive(Default)]
 struct Tables {
     /// The binding each export of the current compounds was admitted with.
     mounts: HashMap<Ulid, NfsMountBinding>,
+    /// Deleted bindings whose opens and locks the engine still releases.
+    closing: HashMap<Ulid, NfsMountBinding>,
     opens: HashMap<(ObjectRef, OwnerKey), OpenSlot>,
-    /// The writer open of a new file, until the OPEN that created it takes it over.
-    created: HashMap<ObjectRef, OpenSlot>,
-    /// The name each issued directory cookie was emitted for, by mount and cookie.
-    cookies: HashMap<(Ulid, u64), String>,
+    /// The open of a new file with its creating owner's modes, until that owner's OPEN takes
+    /// it over.
+    created: HashMap<(ObjectRef, OwnerKey), OpenSlot>,
+    cookies: CookieCache,
     /// The verifier of an exclusive create, by mount and key, so a retry finds its file.
     exclusive: HashMap<(Ulid, String), [u8; 8]>,
     locks: HashMap<(ObjectRef, OwnerKey), Vec<LockRange>>,
@@ -107,12 +142,14 @@ impl ArunaNfsBackend {
     }
 
     /// Forwards one revocation from the node's file server adapter to every NFS server task,
-    /// and drops the bookkeeping of a deleted binding.
+    /// and drops the bookkeeping of a deleted binding; its opens and locks stay releasable.
     pub fn publish_revocation(&self, event: Revocation) {
         if let Revocation::Mount(mount_id) = &event {
             let mut tables = self.tables.lock();
-            tables.mounts.remove(mount_id);
-            tables.cookies.retain(|(mount, _), _| mount != mount_id);
+            if let Some(binding) = tables.mounts.remove(mount_id) {
+                tables.closing.insert(*mount_id, binding);
+            }
+            tables.cookies.forget(*mount_id);
             tables.exclusive.retain(|(mount, _), _| mount != mount_id);
         }
         // No subscriber means no server runs yet; nothing holds state to revoke.
@@ -124,6 +161,30 @@ impl ArunaNfsBackend {
         let tables = self.tables.lock();
         let binding = tables.mounts.get(&caller.export.mount_id).cloned();
         binding.ok_or(NfsStat4::Stale)
+    }
+
+    /// The binding a close or unlock releases through, also after the binding was deleted.
+    fn release_binding(&self, caller: &Caller) -> Result<NfsMountBinding, NfsStat4> {
+        let tables = self.tables.lock();
+        let mount_id = caller.export.mount_id;
+        let binding = tables.mounts.get(&mount_id);
+        let binding = binding.or_else(|| tables.closing.get(&mount_id)).cloned();
+        binding.ok_or(NfsStat4::Stale)
+    }
+
+    /// Forgets a deleted binding once none of its opens or locks remain.
+    fn settle_closing(&self, mount_id: Ulid) {
+        let mut tables = self.tables.lock();
+        if !tables.closing.contains_key(&mount_id) {
+            return;
+        }
+        let held = |object: &ObjectRef| object.mount_id == mount_id;
+        let busy = tables.opens.keys().any(|(object, _)| held(object))
+            || tables.created.keys().any(|(object, _)| held(object))
+            || tables.locks.keys().any(|(object, _)| held(object));
+        if !busy {
+            tables.closing.remove(&mount_id);
+        }
     }
 }
 
@@ -298,11 +359,13 @@ impl NfsBackend for ArunaNfsBackend {
         object: ObjectRef,
         owner: &OwnerKey,
     ) -> Result<(), NfsStat4> {
-        let binding = self.binding(caller)?;
-        match job_view(&binding) {
+        let binding = self.release_binding(caller)?;
+        let closed = match job_view(&binding) {
             true => Ok(()),
             false => self.live_close(&binding, object, owner).await,
-        }
+        };
+        self.settle_closing(binding.mount_id);
+        closed
     }
 
     async fn read(
@@ -359,6 +422,7 @@ impl NfsBackend for ArunaNfsBackend {
         directory: ObjectRef,
         name: &str,
         mode: CreateMode,
+        share: &ShareRequest,
         change: &AttributeChange,
     ) -> Result<CreateReply, NfsStat4> {
         let binding = self.binding(caller)?;
@@ -366,7 +430,7 @@ impl NfsBackend for ArunaNfsBackend {
             true => Err(NfsStat4::ReadOnly),
             false => {
                 let request = (name, mode, change);
-                self.live_create(&binding, directory, request).await
+                self.live_create(&binding, directory, request, share).await
             }
         }
     }
@@ -454,11 +518,13 @@ impl NfsBackend for ArunaNfsBackend {
         owner: &OwnerKey,
         range: LockRange,
     ) -> Result<bool, NfsStat4> {
-        let binding = self.binding(caller)?;
-        match job_view(&binding) {
+        let binding = self.release_binding(caller)?;
+        let remaining = match job_view(&binding) {
             true => Ok(self.forget_lock(object, owner, range)),
             false => self.live_unlock(&binding, object, owner, range).await,
-        }
+        };
+        self.settle_closing(binding.mount_id);
+        remaining
     }
 
     fn revocations(&self) -> broadcast::Receiver<Revocation> {

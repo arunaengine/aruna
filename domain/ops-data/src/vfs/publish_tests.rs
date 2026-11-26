@@ -3,12 +3,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::super::handles_tests::{asked, child, context, granted, id, scope, user, vfs};
-use super::super::mutate::tests::prepared;
+use super::super::handles_tests::{
+    asked, child, context, denied, granted, id, instance, scope, user, vfs,
+};
+use super::super::mutate::tests::{prepared, put_done, stored};
 use super::*;
 use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::storage::vfs::{HandleKind, LiveHandle, VfsRecord, decode_handle_id};
-use aruna_core::vfs_effects::CloseSummary;
+use aruna_core::vfs_effects::{CloseSummary, InstanceSummary};
 
 fn owner(access_key: &str, scope: StageScope) -> StageOwner {
     StageOwner {
@@ -69,7 +71,26 @@ fn waiting() -> DirectoryWitness {
 /// A publication of the new name `p/a` whose parent handle 8 rests on it, run up to its
 /// attempt registration.
 fn publishing() -> VfsPublishOperation {
-    let input = PublishInput {
+    let mut operation = guarded(publish_input());
+    let turn = operation.next(vfs(VfsEvent::GuardAcquired { guard_id: id(10) }));
+    answer_rows(&mut operation, turn);
+    operation
+}
+
+/// Runs a publication through admission and the permit up to its guard.
+fn guarded(input: PublishInput) -> VfsPublishOperation {
+    let mut operation = VfsPublishOperation::new(input, prepared("p/a"));
+    operation.seed(5);
+    operation.first().unwrap();
+    operation.next(granted()).unwrap();
+    operation
+        .next(vfs(VfsEvent::PermitAcquired { permit_id: id(9) }))
+        .unwrap();
+    operation
+}
+
+fn publish_input() -> PublishInput {
+    PublishInput {
         context: context(),
         instance_id: 1,
         key: "p/a".to_string(),
@@ -84,15 +105,13 @@ fn publishing() -> VfsPublishOperation {
             handle_id: Some(8),
             witness: waiting(),
         }],
-    };
-    let mut operation = VfsPublishOperation::new(input, prepared("p/a"));
-    operation.seed(5);
-    operation.first().unwrap();
-    operation.next(granted()).unwrap();
-    operation
-        .next(vfs(VfsEvent::PermitAcquired { permit_id: id(9) }))
-        .unwrap();
-    let turn = operation.next(vfs(VfsEvent::GuardAcquired { guard_id: id(10) }));
+        expected_edit: None,
+        require_writerless: false,
+    }
+}
+
+/// Answers the rows a publication reads under its guard, up to its attempt registration.
+fn answer_rows(operation: &mut VfsPublishOperation, turn: Result<Next<Published>, VfsError>) {
     // The reverse row and the parent's handle are read with the stage and the file handle.
     let Ok(Next::Call(IoCall::Read(reads))) = turn else {
         panic!("the publication reads its rows");
@@ -111,7 +130,6 @@ fn publishing() -> VfsPublishOperation {
     ];
     let turn = operation.next(IoResult::Values(rows));
     assert!(matches!(asked(&turn), VfsEffect::BeginAttempt { .. }));
-    operation
 }
 
 #[test]
@@ -173,6 +191,9 @@ fn summary(remaining_writers: usize) -> CloseSummary {
             token: id(6),
             predecessor: None,
         }),
+        base_version: None,
+        edit_generation: 3,
+        successor_owner: None,
     }
 }
 
@@ -201,6 +222,9 @@ fn owner_hands_over() {
     assert_eq!(handed_over(&stage(), owner("KEY2", job(5)), 70), None);
     let mut operation = departing(next);
     let turn = operation.next(vfs(VfsEvent::Closed(summary(1))));
+    // The successor's own credential is admitted to write the name first.
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    let turn = operation.next(granted());
     assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
     assert_eq!(operation.next(child(())), Ok(Next::Call(IoCall::Sync)));
     let turn = operation.next(IoResult::Done);
@@ -314,4 +338,128 @@ fn changed_stage_conflicts() {
         VfsError::Conflict,
     )));
     assert_eq!(failing.next(refused), Err(VfsError::Conflict));
+}
+
+/// The guarded instance check of a publication with `input`, answered with `summary`.
+fn checked(input: PublishInput, summary: InstanceSummary) -> Result<Next<Published>, VfsError> {
+    let mut operation = guarded(input);
+    let turn = operation.next(vfs(VfsEvent::GuardAcquired { guard_id: id(10) }));
+    assert!(matches!(
+        asked(&turn),
+        VfsEffect::LookupHandle { handle_id: 4, .. }
+    ));
+    operation.next(vfs(VfsEvent::Instance(Some(summary))))
+}
+
+#[test]
+fn stale_edit_refused() {
+    // An edit or a size change after the image was read refuses the publication before any put.
+    let input = PublishInput {
+        expected_edit: Some(2),
+        ..publish_input()
+    };
+    assert_eq!(checked(input, instance()), Err(VfsError::Conflict));
+    let input = PublishInput {
+        expected_edit: Some(3),
+        ..publish_input()
+    };
+    let resized = InstanceSummary {
+        logical_size: 9,
+        ..instance()
+    };
+    assert_eq!(checked(input.clone(), resized), Err(VfsError::Conflict));
+    let turn = checked(input, instance());
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
+}
+
+#[test]
+fn returned_writer_refused() {
+    // A writerless retry refuses once a writer returned or the stage generation moved on.
+    let input = PublishInput {
+        require_writerless: true,
+        ..publish_input()
+    };
+    assert_eq!(checked(input.clone(), instance()), Err(VfsError::Conflict));
+    let idle = InstanceSummary {
+        writer_count: 0,
+        stage_id: Some(id(12)),
+        generation: 2,
+        ..instance()
+    };
+    let moved = InstanceSummary {
+        generation: 3,
+        ..idle.clone()
+    };
+    assert_eq!(checked(input.clone(), moved), Err(VfsError::Conflict));
+    let turn = checked(input, idle);
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
+}
+
+#[test]
+fn publish_completes_put() {
+    // A settled publication runs the ordinary post-PUT completion after its releases.
+    let mut operation = publishing();
+    operation.next(vfs(VfsEvent::Done)).unwrap();
+    let turn = operation.next(put_done(Ok(stored())));
+    assert_eq!(turn, Ok(Next::Call(IoCall::Sync)));
+    operation.next(IoResult::Done).unwrap();
+    let settled = ReceiptOutcome::Applied {
+        life_id: Some(id(31)),
+    };
+    let Ok(Next::Then { calls, .. }) = operation.next(child(settled)) else {
+        panic!("the publication settles with its follow-up calls");
+    };
+    assert_eq!(calls.len(), 3);
+    assert!(matches!(calls.last(), Some(IoCall::Child(_))));
+}
+
+#[test]
+fn successor_from_summary() {
+    // Without a prepared successor the earliest remaining writer is chosen and admitted; a
+    // denied one leaves the stage retained.
+    let input = CloseInput {
+        context: context(),
+        scope: scope(),
+        open_id: id(22),
+        publish: None,
+        stage: Some(stage()),
+    };
+    let mut operation = VfsCloseOperation::new(input);
+    operation.first().unwrap();
+    let leaving = CloseSummary {
+        successor_owner: Some(owner("KEY2", StageScope::User)),
+        ..summary(1)
+    };
+    let turn = operation.next(vfs(VfsEvent::Closed(leaving)));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    let turn = operation.next(denied());
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    operation.next(child(())).unwrap();
+    let turn = operation.next(IoResult::Done);
+    assert_eq!(turn, Ok(Next::Done(CloseOutcome::Retained(id(12)))));
+}
+
+#[test]
+fn refused_publish_errs() {
+    // A dirty close with no durable checkpoint reports the refused publication.
+    let input = CloseInput {
+        context: context(),
+        scope: scope(),
+        open_id: id(22),
+        publish: Some((publish_input(), prepared("p/a"))),
+        stage: None,
+    };
+    let mut operation = VfsCloseOperation::new(input);
+    operation.first().unwrap();
+    let last = CloseSummary {
+        remaining_opens: 0,
+        ..summary(0)
+    };
+    let turn = operation.next(vfs(VfsEvent::Closed(last)));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    let refused = IoResult::Child(aruna_core::calls::ChildOutcome::new(Err::<
+        Published,
+        VfsError,
+    >(VfsError::Denied)));
+    assert_eq!(operation.next(refused), Err(VfsError::Denied));
 }

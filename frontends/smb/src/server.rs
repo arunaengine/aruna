@@ -364,6 +364,11 @@ pub(crate) async fn serve_stream<B, S>(
         }
     }
     reader_task.abort();
+    for waiting in connection.state.lock().waiting.values() {
+        if waiting.lock {
+            waiting.token.cancel();
+        }
+    }
     connection.tasks.close();
     tokio::select! {
         _ = connection.tasks.wait() => {}
@@ -495,8 +500,11 @@ impl<B: SmbBackend> Connection<B> {
                 }
                 self.transmit(message, None).await
             }
+            // Plaintext never reaches the requests of an encrypted session; CANCEL has no reply.
             Some(Command::Cancel) => {
-                self.cancel(&element, header.session_id);
+                if !self.is_ready(header.session_id) {
+                    self.cancel(&element, header.session_id);
+                }
                 Ok(())
             }
             Some(Command::Echo) if header.session_id == 0 => {
@@ -505,14 +513,7 @@ impl<B: SmbBackend> Connection<B> {
                 self.transmit(message, None).await
             }
             _ => {
-                let ready = matches!(
-                    self.state
-                        .lock()
-                        .sessions
-                        .get(&header.session_id)
-                        .map(|session| &session.stage),
-                    Some(Stage::Ready(_))
-                );
+                let ready = self.is_ready(header.session_id);
                 let code = if ready {
                     status::ACCESS_DENIED
                 } else {
@@ -610,6 +611,7 @@ impl<B: SmbBackend> Connection<B> {
                 session_id,
                 async_id: None,
                 token: token.clone(),
+                lock: element.header.command == Command::Lock.code(),
             },
         );
         let connection = Arc::clone(self);
@@ -697,6 +699,18 @@ impl<B: SmbBackend> Connection<B> {
                 None
             }
         }
+    }
+
+    /// Whether `session_id` names an authenticated session, which takes encrypted requests only.
+    fn is_ready(&self, session_id: u64) -> bool {
+        matches!(
+            self.state
+                .lock()
+                .sessions
+                .get(&session_id)
+                .map(|session| &session.stage),
+            Some(Stage::Ready(_))
+        )
     }
 
     /// Cancels the waiting request a CANCEL names by AsyncId or MessageId in its session.

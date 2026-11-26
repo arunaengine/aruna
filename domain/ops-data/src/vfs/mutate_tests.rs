@@ -3,7 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::super::handles_tests::{asked, child, context, granted, head, id, scope, user, vfs};
+use super::super::handles_tests::{
+    asked, child, context, denied, granted, head, id, instance, no_open, scope, user, vfs,
+};
 use super::super::recovery::ReceiptOutcome;
 use super::super::{VfsError, head_key, state_key};
 use super::*;
@@ -61,6 +63,7 @@ fn moving(kind: HandleKind) -> RenameInput {
         replace: false,
         attempt_id: id(20),
         stage: None,
+        source_version: None,
     }
 }
 
@@ -93,7 +96,7 @@ fn rows(kind: HandleKind) -> Vec<Option<Value>> {
     ]
 }
 
-fn dirty_stage() -> NfsStageRecord {
+pub(in crate::vfs) fn dirty_stage() -> NfsStageRecord {
     NfsStageRecord {
         stage_id: id(12),
         handle_id: 4,
@@ -128,7 +131,7 @@ fn written(plan: &MovePlan, key: &VfsKey) -> Option<Value> {
     row.map(|row| row.2.clone())
 }
 
-fn stored() -> PutObjectResult {
+pub(in crate::vfs) fn stored() -> PutObjectResult {
     PutObjectResult {
         location: BackendLocation {
             backend: BackendRef::node_default(),
@@ -150,7 +153,7 @@ fn stored() -> PutObjectResult {
     }
 }
 
-fn put_done(result: Result<PutObjectResult, PutObjectError>) -> IoResult {
+pub(in crate::vfs) fn put_done(result: Result<PutObjectResult, PutObjectError>) -> IoResult {
     IoResult::Child(ChildOutcome::new(result))
 }
 
@@ -238,11 +241,15 @@ fn marker_directory_plan() {
 
 /// Runs a committed move up to its rows read, through the parent marker admission.
 fn admitted(kind: HandleKind) -> VfsRenameOperation {
-    let target = match kind {
+    admitted_as(moving(kind))
+}
+
+fn admitted_as(input: RenameInput) -> VfsRenameOperation {
+    let target = match input.kind {
         HandleKind::File => "q/b".to_string(),
         HandleKind::Directory => "q/b/".to_string(),
     };
-    let mut operation = VfsRenameOperation::new(moving(kind))
+    let mut operation = VfsRenameOperation::new(input)
         .with_destination_put(prepared(&target))
         .with_parent_marker(prepared("p/"));
     operation.first().unwrap();
@@ -254,14 +261,24 @@ fn admitted(kind: HandleKind) -> VfsRenameOperation {
     let turn = operation.next(granted());
     assert!(matches!(asked(&turn), VfsEffect::AcquirePermit { .. }));
     let turn = operation.next(vfs(VfsEvent::PermitAcquired { permit_id: id(9) }));
-    assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
+    shared(&mut operation, turn);
     operation
+}
+
+/// Answers both share lookups of a move under its permit with no open; the rows come next.
+fn shared(operation: &mut VfsRenameOperation, turn: Result<Next<()>, VfsError>) {
+    assert!(matches!(asked(&turn), VfsEffect::LookupInstance { key, .. } if key == "p/a"));
+    let turn = operation.next(no_open());
+    assert!(matches!(asked(&turn), VfsEffect::LookupInstance { key, .. } if key == "q/b"));
+    let turn = operation.next(no_open());
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
 }
 
 fn staged_none() -> IoResult {
     vfs(VfsEvent::StagedList {
         entries: Vec::new(),
         sequence: 1,
+        truncated: false,
     })
 }
 
@@ -366,6 +383,14 @@ fn denied_marker_skipped() {
     let turn = operation.next(denied);
     assert!(matches!(asked(&turn), VfsEffect::AcquirePermit { .. }));
     assert_eq!(operation.marker, None);
+    // The parent already has a live marker, so the move needs none.
+    let turn = operation.next(vfs(VfsEvent::PermitAcquired { permit_id: id(9) }));
+    operation.next(no_open()).unwrap();
+    assert!(turn.is_ok());
+    let turn = operation.next(no_open());
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Read(ref reads))) if reads.len() == 1));
+    let turn = operation.next(IoResult::Values(vec![Some(head(1, Some(3)))]));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Read(ref reads))) if reads.len() > 1));
 }
 
 #[test]
@@ -387,6 +412,8 @@ fn last_child_removed() {
     let turn = operation.next(granted());
     assert!(matches!(asked(&turn), VfsEffect::AcquirePermit { .. }));
     let turn = operation.next(vfs(VfsEvent::PermitAcquired { permit_id: id(9) }));
+    assert!(matches!(asked(&turn), VfsEffect::LookupInstance { .. }));
+    let turn = operation.next(no_open());
     assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
     let turn = operation.next(IoResult::Values(vec![
         None,
@@ -419,6 +446,7 @@ fn live_marker_kept() {
     operation
         .next(vfs(VfsEvent::PermitAcquired { permit_id: id(9) }))
         .unwrap();
+    operation.next(no_open()).unwrap();
     let turn = operation.next(IoResult::Values(vec![
         None,
         Some(head(2, Some(4))),
@@ -531,7 +559,7 @@ fn replace_admitted() -> VfsRenameOperation {
     let turn = operation.next(granted());
     assert!(matches!(asked(&turn), VfsEffect::AcquirePermit { .. }));
     let turn = operation.next(vfs(VfsEvent::PermitAcquired { permit_id: id(9) }));
-    assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
+    shared(&mut operation, turn);
     operation
 }
 
@@ -540,6 +568,9 @@ fn unpublished_replaces_live() {
     // An unpublished file over a live destination is one put that settles like a publication.
     let mut operation = replace_admitted();
     let turn = operation.next(IoResult::Values(replaced_rows(token_row())));
+    // The replaced destination is admitted for deletion first.
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    let turn = operation.next(granted());
     assert!(matches!(asked(&turn), VfsEffect::ListStaged { prefix, .. } if prefix == "q/b/"));
     let turn = operation.next(staged_none());
     assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
@@ -575,7 +606,189 @@ fn replaced_token_refused() {
     operation
         .next(IoResult::Values(replaced_rows(token_row())))
         .unwrap();
+    operation.next(granted()).unwrap();
     operation.next(staged_none()).unwrap();
     let turn = operation.next(put_done(Err(PutObjectError::FenceTaken)));
     assert_eq!(turn, Err(VfsError::Conflict));
+}
+
+fn removing(kind: HandleKind) -> RemoveInput {
+    RemoveInput {
+        context: context(),
+        key: "p/a".to_string(),
+        kind,
+        handle_id: None,
+        identity: identity(kind),
+        instance_id: None,
+        attempt_id: id(21),
+    }
+}
+
+fn permitted() -> IoResult {
+    vfs(VfsEvent::PermitAcquired { permit_id: id(9) })
+}
+
+#[test]
+fn stale_source_refused() {
+    // A same-life S3 overwrite after the copy refuses the move instead of deleting newer bytes.
+    let mut input = moving(HandleKind::File);
+    input.source_version = Some(id(8));
+    let mut operation = admitted_as(input);
+    operation
+        .next(IoResult::Values(rows(HandleKind::File)))
+        .unwrap();
+    assert_eq!(operation.next(staged_none()), Err(VfsError::Conflict));
+    let mut input = moving(HandleKind::File);
+    input.source_version = Some(id(2));
+    let mut operation = admitted_as(input);
+    operation
+        .next(IoResult::Values(rows(HandleKind::File)))
+        .unwrap();
+    let turn = operation.next(staged_none());
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+}
+
+#[test]
+fn destination_delete_needed() {
+    // Replacing a live destination needs delete rights on it, checked under the permit.
+    let mut input = moving(HandleKind::File);
+    input.replace = true;
+    let mut operation = admitted_as(input);
+    let mut rows = rows(HandleKind::File);
+    rows[2] = Some(head(3, Some(5)));
+    let turn = operation.next(IoResult::Values(rows));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    assert_eq!(operation.next(denied()), Err(VfsError::Denied));
+}
+
+#[test]
+fn share_delete_refused() {
+    // An open that does not share delete access blocks both a move and a removal.
+    let locked = || {
+        let summary = aruna_core::vfs_effects::InstanceSummary {
+            allows_delete: false,
+            ..instance()
+        };
+        vfs(VfsEvent::Instance(Some(summary)))
+    };
+    let mut operation =
+        VfsRenameOperation::new(moving(HandleKind::File)).with_destination_put(prepared("q/b"));
+    operation.first().unwrap();
+    for _ in 0..3 {
+        operation.next(granted()).unwrap();
+    }
+    operation.next(permitted()).unwrap();
+    operation.next(no_open()).unwrap();
+    assert_eq!(operation.next(locked()), Err(VfsError::ShareViolation));
+    let mut remove = VfsRemoveOperation::new(removing(HandleKind::File));
+    remove.first().unwrap();
+    remove.next(granted()).unwrap();
+    remove.next(permitted()).unwrap();
+    assert_eq!(remove.next(locked()), Err(VfsError::ShareViolation));
+}
+
+/// An NFS directory move onto the live marker `q/b/`, up to the probe of its destination.
+fn replacing_directory() -> VfsRenameOperation {
+    let mut input = moving(HandleKind::Directory);
+    input.replace = true;
+    let mut operation = admitted_as(input);
+    let mut rows = rows(HandleKind::Directory);
+    rows[4] = Some(head(7, Some(8)));
+    let turn = operation.next(IoResult::Values(rows));
+    // The replaced directory is admitted for deletion first.
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    let turn = operation.next(granted());
+    assert!(matches!(asked(&turn), VfsEffect::ListStaged { prefix, .. } if prefix == "q/b/"));
+    let turn = operation.next(staged_none());
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Page { .. }))));
+    operation
+}
+
+#[test]
+fn nfs_replaces_empty() {
+    // NFS moves a directory onto an empty one; the destination's own marker is no child.
+    let mut operation = replacing_directory();
+    let own = head_key("bucket", "q/b/").unwrap();
+    let page = IoResult::Page {
+        rows: vec![(own, head(7, Some(8)))],
+        next: None,
+    };
+    let turn = operation.next(page);
+    assert!(matches!(asked(&turn), VfsEffect::ListStaged { prefix, .. } if prefix == "p/a/"));
+    operation.next(staged_none()).unwrap();
+    let own = head_key("bucket", "p/a/").unwrap();
+    let page = IoResult::Page {
+        rows: vec![(own, head(2, Some(4)))],
+        next: None,
+    };
+    assert!(matches!(
+        operation.next(page),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+}
+
+#[test]
+fn nfs_keeps_nonempty() {
+    // A destination directory with a live child is not replaced.
+    let mut operation = replacing_directory();
+    let child_key = head_key("bucket", "q/b/x").unwrap();
+    let page = IoResult::Page {
+        rows: vec![(child_key, head(6, Some(7)))],
+        next: None,
+    };
+    assert_eq!(operation.next(page), Err(VfsError::NotEmpty));
+}
+
+#[test]
+fn tombstones_page_on() {
+    // A full page of delete markers decides nothing; the probe reads on until a live child.
+    let mut operation = VfsRemoveOperation::new(removing(HandleKind::Directory));
+    operation.first().unwrap();
+    operation.next(granted()).unwrap();
+    operation.next(permitted()).unwrap();
+    let turn = operation.next(no_open());
+    assert!(matches!(asked(&turn), VfsEffect::ListStaged { prefix, .. } if prefix == "p/a/"));
+    let turn = operation.next(staged_none());
+    assert!(matches!(
+        turn,
+        Ok(Next::Call(IoCall::Page { after: None, .. }))
+    ));
+    let rows: Vec<_> = (0..STATE_PAGE)
+        .map(|index| {
+            let key = head_key("bucket", &format!("p/a/{index:03}")).unwrap();
+            (key, head(2, None))
+        })
+        .collect();
+    let last = rows.last().map(|row| row.0.clone());
+    let turn = operation.next(IoResult::Page {
+        rows,
+        next: last.clone(),
+    });
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Page { ref after, .. })) if *after == last));
+    let live = vec![(head_key("bucket", "p/a/zz").unwrap(), head(6, Some(7)))];
+    let page = IoResult::Page {
+        rows: live,
+        next: None,
+    };
+    assert_eq!(operation.next(page), Err(VfsError::NotEmpty));
+}
+
+#[test]
+fn refused_marker_denies() {
+    // Without the right to write the parent marker, the last route to an implicit parent is
+    // not removed; a parent with a live marker needs no write.
+    let run = |parent: Option<Value>| {
+        let mut operation =
+            VfsRemoveOperation::new(removing(HandleKind::File)).with_parent_marker(prepared("p/"));
+        operation.first().unwrap();
+        operation.next(granted()).unwrap();
+        operation.next(denied()).unwrap();
+        operation.next(permitted()).unwrap();
+        operation.next(no_open()).unwrap();
+        let rows = vec![None, Some(head(2, Some(4))), None, parent];
+        operation.next(IoResult::Values(rows))
+    };
+    assert_eq!(run(None), Err(VfsError::Denied));
+    let kept = run(Some(head(1, Some(3))));
+    assert!(matches!(kept, Ok(Next::Call(IoCall::Child(_)))));
 }

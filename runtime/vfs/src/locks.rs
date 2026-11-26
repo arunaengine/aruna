@@ -77,12 +77,30 @@ pub(crate) fn write_conflict(
     start: u64,
     end: u64,
 ) -> Option<ByteLock> {
+    first_overlap(held.iter().filter(|lock| lock.owner != owner), start, end)
+}
+
+/// The first exclusive lock of another owner over `[start, end)`; shared locks admit reads.
+pub(crate) fn read_conflict(
+    held: &[ByteLock],
+    owner: u64,
+    start: u64,
+    end: u64,
+) -> Option<ByteLock> {
+    let exclusive = held.iter().filter(|lock| lock.exclusive);
+    first_overlap(exclusive.filter(|lock| lock.owner != owner), start, end)
+}
+
+fn first_overlap<'a>(
+    mut locks: impl Iterator<Item = &'a ByteLock>,
+    start: u64,
+    end: u64,
+) -> Option<ByteLock> {
     let span = Span { start, end };
     if start == end {
         return None;
     }
-    held.iter()
-        .filter(|lock| lock.owner != owner)
+    locks
         .find(|lock| Span::of(lock).is_ok_and(|held| held.overlaps(span)))
         .copied()
 }

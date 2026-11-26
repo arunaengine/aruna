@@ -11,7 +11,9 @@ use crate::attributes::{
     AttributeView, ClientAttributes, decode_change, requests_write_only, same_values, write_bitmap,
     write_fattr,
 };
-use crate::backend::{HandleStatus, IoState, NfsBackend, ObjectAttributes, ObjectRef};
+use crate::backend::{
+    HandleStatus, IoState, NfsBackend, ObjectAttributes, ObjectRef, ReplayAccess,
+};
 use crate::compound::{Context, Current, Engine, OpError, OpResult, Target, put_change};
 use crate::filehandle::{Filehandle, FilehandleKind, MOUNTS_FILEID, MOUNTS_NAME, ROOT_FILEID};
 use crate::rpc::flavor;
@@ -178,7 +180,7 @@ impl<B: NfsBackend> Engine<B> {
                 if found.mount_id != export.mount_id {
                     return Err(NfsStat4::Access.into());
                 }
-                ctx.grant.reads = true;
+                ctx.grant.record(found, ReplayAccess::Head);
                 Current::Object {
                     export,
                     object: found,
@@ -202,6 +204,7 @@ impl<B: NfsBackend> Engine<B> {
                 if parent.mount_id != export.mount_id {
                     return Err(NfsStat4::Access.into());
                 }
+                ctx.grant.record(parent, ReplayAccess::Head);
                 Current::Object {
                     export,
                     object: parent,
@@ -230,6 +233,7 @@ impl<B: NfsBackend> Engine<B> {
                 if export.read_only {
                     allowed &= !access::MUTATING;
                 }
+                ctx.grant.record(object, ReplayAccess::Head);
                 allowed
             }
         };
@@ -259,8 +263,10 @@ impl<B: NfsBackend> Engine<B> {
             },
             Target::Object { export, object } => {
                 let caller = ctx.caller(export);
+                let attributes = self.backend.attributes(&caller, *object).await?;
+                ctx.grant.record(*object, ReplayAccess::Head);
                 Described {
-                    attributes: self.backend.attributes(&caller, *object).await?,
+                    attributes,
                     handle,
                     fsid: export.fsid(),
                     expire: expire_of(export.persistent),
@@ -327,7 +333,7 @@ impl<B: NfsBackend> Engine<B> {
         self.backend
             .set_attributes(&caller, object, &state, &change)
             .await?;
-        ctx.grant.writes = true;
+        ctx.grant.record(object, ReplayAccess::Write);
         Ok(mask)
     }
 
@@ -374,10 +380,11 @@ impl<B: NfsBackend> Engine<B> {
         if entry.object != object {
             return Err(NfsStat4::BadStateid);
         }
-        let open = match &entry.kind {
-            crate::state::StateKind::Open { .. } => entry,
+        let (open, lock_owner) = match &entry.kind {
+            crate::state::StateKind::Open { .. } => (entry, None),
             crate::state::StateKind::Lock { open, .. } => {
-                tables.states.get(open).ok_or(NfsStat4::BadStateid)?
+                let open = tables.states.get(open).ok_or(NfsStat4::BadStateid)?;
+                (open, Some(entry.owner.clone()))
             }
         };
         let crate::state::StateKind::Open { access, .. } = open.kind else {
@@ -391,7 +398,10 @@ impl<B: NfsBackend> Engine<B> {
         if !allowed {
             return Err(NfsStat4::OpenMode);
         }
-        Ok(IoState::Open(open.owner.clone()))
+        Ok(IoState::Open {
+            owner: open.owner.clone(),
+            lock_owner,
+        })
     }
 
     pub(crate) async fn read(
@@ -406,7 +416,7 @@ impl<B: NfsBackend> Engine<B> {
             return Err(NfsStat4::IsDirectory.into());
         };
         let state = self.io_state(ctx, stateid, object, share::READ)?;
-        let budget = ctx.max_response.saturating_sub(out.len() + READ_RESERVE);
+        let budget = ctx.reply_limit().saturating_sub(out.len() + READ_RESERVE);
         let count = count
             .min(IO_LIMIT)
             .min(u32::try_from(budget).unwrap_or(u32::MAX));
@@ -415,7 +425,11 @@ impl<B: NfsBackend> Engine<B> {
             .backend
             .read(&caller, object, &state, offset, count)
             .await?;
-        ctx.grant.reads = true;
+        let read = ReplayAccess::Read {
+            offset,
+            length: count,
+        };
+        ctx.grant.record(object, read);
         out.put_bool(reply.eof);
         out.put_opaque(&reply.data);
         Ok(())
@@ -445,7 +459,7 @@ impl<B: NfsBackend> Engine<B> {
             .backend
             .write(&caller, object, &state, offset, data, stable)
             .await?;
-        ctx.grant.writes = true;
+        ctx.grant.record(object, ReplayAccess::Write);
         out.put_u32(reply.count);
         out.put_u32(reply.committed as u32);
         out.put_fixed(&reply.verifier);
@@ -468,7 +482,7 @@ impl<B: NfsBackend> Engine<B> {
         }
         let caller = ctx.caller(&export);
         let verifier = self.backend.commit(&caller, object, offset, count).await?;
-        ctx.grant.writes = true;
+        ctx.grant.record(object, ReplayAccess::Write);
         out.put_fixed(&verifier);
         Ok(())
     }
@@ -501,7 +515,7 @@ impl<B: NfsBackend> Engine<B> {
         if reply.object.mount_id != export.mount_id {
             return Err(NfsStat4::ServerFault.into());
         }
-        ctx.grant.writes = true;
+        ctx.grant.record(object, ReplayAccess::Write);
         put_change(out, &reply.change);
         let applied: &[u32] = if reply.created { &mask } else { &[] };
         write_bitmap(out, applied);
@@ -528,7 +542,7 @@ impl<B: NfsBackend> Engine<B> {
         let name = component(name)?;
         let caller = ctx.caller(&export);
         let change = self.backend.remove(&caller, object, name).await?;
-        ctx.grant.writes = true;
+        ctx.grant.record(object, ReplayAccess::Write);
         put_change(out, &change);
         Ok(())
     }
@@ -565,7 +579,8 @@ impl<B: NfsBackend> Engine<B> {
             .backend
             .rename(&caller, source, old, object, new)
             .await?;
-        ctx.grant.writes = true;
+        ctx.grant.record(source, ReplayAccess::Write);
+        ctx.grant.record(object, ReplayAccess::Write);
         put_change(out, &from);
         put_change(out, &to);
         Ok(())
@@ -586,7 +601,7 @@ impl<B: NfsBackend> Engine<B> {
         if args.cookie == 1 || args.cookie == 2 {
             return Err(NfsStat4::BadCookie.into());
         }
-        let maxcount = (args.maxcount as usize).min(ctx.max_response.saturating_sub(out.len()));
+        let maxcount = (args.maxcount as usize).min(ctx.reply_limit().saturating_sub(out.len()));
         if maxcount < READDIR_MINIMUM {
             return Err(NfsStat4::TooSmall.into());
         }
@@ -605,7 +620,7 @@ impl<B: NfsBackend> Engine<B> {
             .backend
             .read_directory(&caller, object, args.cookie, args.verifier, limit)
             .await?;
-        ctx.grant.reads = true;
+        ctx.grant.record(object, ReplayAccess::List);
         let mut body = XdrWriter::new();
         body.put_fixed(&page.verifier);
         let mut emitted = 0usize;
@@ -634,6 +649,8 @@ impl<B: NfsBackend> Engine<B> {
             }
             body.put_raw(item.as_slice());
             emitted += 1;
+            // Each name the reply shows must still be visible when the reply is replayed.
+            ctx.grant.record(entry.object, ReplayAccess::Head);
         }
         if emitted == 0 && !complete {
             return Err(NfsStat4::TooSmall.into());

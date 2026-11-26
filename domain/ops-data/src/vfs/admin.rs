@@ -66,6 +66,44 @@ fn check_proof(fingerprints: &[[u8; 32]], proven: &[u8; 32]) -> Result<(), VfsEr
     }
 }
 
+/// A new enrollment names exactly the one key whose possession it proved.
+fn check_single(fingerprints: &[[u8; 32]], proven: &[u8; 32]) -> Result<(), VfsError> {
+    match fingerprints == [*proven] {
+        true => Ok(()),
+        false => Err(VfsError::Denied),
+    }
+}
+
+/// Pages through every host row; a key an unrevoked other host holds refuses with `Exists`.
+/// The pages are read inside the writing transaction, so a concurrent claim conflicts.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct KeyScan {
+    after: Option<Key>,
+}
+
+impl KeyScan {
+    fn page(&self) -> IoCall {
+        state_page(vec![HOST_TAG], self.after.clone(), STATE_PAGE)
+    }
+
+    /// Whether every host row was read.
+    fn read(&mut self, result: IoResult, own: Ulid, keys: &[[u8; 32]]) -> Result<bool, VfsError> {
+        let (rows, next) = result.page()?;
+        let full = rows.len() >= STATE_PAGE;
+        for (key, value) in rows {
+            self.after = Some(key);
+            let Some(host) = record_of::<EnrolledHostRecord>(Some(&value))? else {
+                continue;
+            };
+            let live = host.host_id != own && host.revoked_at_ms.is_none();
+            if live && host.fingerprints.iter().any(|held| keys.contains(held)) {
+                return Err(VfsError::Exists);
+            }
+        }
+        Ok(next.is_none() || !full)
+    }
+}
+
 /// The host row of `host_id`, live and owned by `caller`.
 fn owned_host(value: Option<&Value>, caller: UserId) -> Result<EnrolledHostRecord, VfsError> {
     let host = record_of::<EnrolledHostRecord>(value)?.ok_or(VfsError::NotFound)?;
@@ -97,15 +135,23 @@ pub struct EnrollInput {
     pub worker_pool: bool,
 }
 
-/// Enrolls a host for its verified owner after the proof of possession; one transaction
-/// writes its row under a fresh host id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EnrollStep {
+    Scan,
+    Row,
+    Written,
+}
+
+/// Enrolls a host for its verified owner with the one key it proved; one transaction checks
+/// that no other live host holds that key and writes its row under a fresh host id.
 #[derive(Debug, PartialEq)]
 pub struct EnrollHostOperation {
     input: EnrollInput,
     ids: IdMint,
     now_ms: u64,
     host: Option<EnrolledHostRecord>,
-    written: bool,
+    step: EnrollStep,
+    scan: KeyScan,
 }
 
 impl EnrollHostOperation {
@@ -115,7 +161,8 @@ impl EnrollHostOperation {
             ids: IdMint::default(),
             now_ms: 0,
             host: None,
-            written: false,
+            step: EnrollStep::Scan,
+            scan: KeyScan::default(),
         }
     }
 }
@@ -125,7 +172,7 @@ impl Operation for EnrollHostOperation {
     type Error = VfsError;
 
     fn first(&mut self) -> Result<Next<EnrolledHostRecord>, VfsError> {
-        check_proof(&self.input.fingerprints, &self.input.proven)?;
+        check_single(&self.input.fingerprints, &self.input.proven)?;
         check_networks(&self.input.allowed_networks)?;
         let host_id = self.ids.mint(self.now_ms);
         let host = EnrolledHostRecord {
@@ -138,22 +185,33 @@ impl Operation for EnrollHostOperation {
             revoked_at_ms: None,
         };
         self.host = Some(host);
-        Ok(Next::Call(state_read(&[VfsKey::Host(host_id)])?))
+        Ok(Next::Call(self.scan.page()))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<EnrolledHostRecord>, VfsError> {
-        if self.written {
-            result.done()?;
-            return self.host.take().map(Next::Done).ok_or(VfsError::Conflict);
-        }
-        let [row] = aruna_core::rows::values::<1>(result)?;
-        if row.is_some() {
-            return Err(VfsError::Exists);
-        }
         let host = self.host.as_ref().ok_or(VfsError::Conflict)?;
-        self.written = true;
-        let write = state_row(&VfsKey::Host(host.host_id), host)?;
-        Ok(Next::Call(IoCall::Write(vec![write])))
+        match self.step {
+            EnrollStep::Scan => {
+                if !self.scan.read(result, host.host_id, &host.fingerprints)? {
+                    return Ok(Next::Call(self.scan.page()));
+                }
+                self.step = EnrollStep::Row;
+                Ok(Next::Call(state_read(&[VfsKey::Host(host.host_id)])?))
+            }
+            EnrollStep::Row => {
+                let [row] = aruna_core::rows::values::<1>(result)?;
+                if row.is_some() {
+                    return Err(VfsError::Exists);
+                }
+                let write = state_row(&VfsKey::Host(host.host_id), host)?;
+                self.step = EnrollStep::Written;
+                Ok(Next::Call(IoCall::Write(vec![write])))
+            }
+            EnrollStep::Written => {
+                result.done()?;
+                self.host.take().map(Next::Done).ok_or(VfsError::Conflict)
+            }
+        }
     }
 
     fn transaction(&self) -> TransactionMode {
@@ -181,7 +239,15 @@ pub enum HostChange {
     Revoke,
 }
 
-/// Changes a host for its verified owner only, then revokes the live grants it held.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChangeStep {
+    Row,
+    Scan,
+    Written,
+}
+
+/// Changes a host for its verified owner only, then revokes the live grants it held. A
+/// rotation keeps old keys or adds only the proven one, which no other live host may hold.
 #[derive(Debug, PartialEq)]
 pub struct HostChangeOperation {
     host_id: Ulid,
@@ -189,6 +255,8 @@ pub struct HostChangeOperation {
     change: HostChange,
     now_ms: u64,
     host: Option<EnrolledHostRecord>,
+    step: ChangeStep,
+    scan: KeyScan,
 }
 
 /// Rotates the certificate keys of a host; see [`HostChangeOperation`].
@@ -204,7 +272,16 @@ impl HostChangeOperation {
             change,
             now_ms: 0,
             host: None,
+            step: ChangeStep::Row,
+            scan: KeyScan::default(),
         }
+    }
+
+    fn write_host(&mut self) -> Result<Next<EnrolledHostRecord>, VfsError> {
+        let host = self.host.as_ref().ok_or(VfsError::Conflict)?;
+        let write = state_row(&VfsKey::Host(self.host_id), host)?;
+        self.step = ChangeStep::Written;
+        Ok(Next::Call(IoCall::Write(vec![write])))
     }
 }
 
@@ -224,23 +301,47 @@ impl Operation for HostChangeOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<EnrolledHostRecord>, VfsError> {
-        if let Some(host) = self.host.take() {
-            result.done()?;
-            let revoke = revoke_call(Some(host.host_id), None);
-            return Ok(Next::Then {
-                output: host,
-                calls: vec![revoke],
-            });
+        match self.step {
+            ChangeStep::Row => {
+                let [row] = aruna_core::rows::values::<1>(result)?;
+                let mut host = owned_host(row.as_ref(), self.caller)?;
+                let HostChange::Rotate {
+                    fingerprints,
+                    proven,
+                } = &self.change
+                else {
+                    host.revoked_at_ms = Some(self.now_ms);
+                    self.host = Some(host);
+                    return self.write_host();
+                };
+                // Every key the rotation adds must be the one it proved.
+                let kept = |key: &[u8; 32]| host.fingerprints.contains(key) || key == proven;
+                if !fingerprints.iter().all(kept) {
+                    return Err(VfsError::Denied);
+                }
+                host.fingerprints = fingerprints.clone();
+                self.host = Some(host);
+                self.step = ChangeStep::Scan;
+                Ok(Next::Call(self.scan.page()))
+            }
+            ChangeStep::Scan => {
+                let keys =
+                    (self.host.as_ref()).map_or_else(Vec::new, |host| host.fingerprints.clone());
+                if !self.scan.read(result, self.host_id, &keys)? {
+                    return Ok(Next::Call(self.scan.page()));
+                }
+                self.write_host()
+            }
+            ChangeStep::Written => {
+                result.done()?;
+                let host = self.host.take().ok_or(VfsError::Conflict)?;
+                let revoke = revoke_call(Some(host.host_id), None);
+                Ok(Next::Then {
+                    output: host,
+                    calls: vec![revoke],
+                })
+            }
         }
-        let [row] = aruna_core::rows::values::<1>(result)?;
-        let mut host = owned_host(row.as_ref(), self.caller)?;
-        match &self.change {
-            HostChange::Rotate { fingerprints, .. } => host.fingerprints = fingerprints.clone(),
-            HostChange::Revoke => host.revoked_at_ms = Some(self.now_ms),
-        }
-        let write = state_row(&VfsKey::Host(self.host_id), &host)?;
-        self.host = Some(host);
-        Ok(Next::Call(IoCall::Write(vec![write])))
     }
 
     fn transaction(&self) -> TransactionMode {

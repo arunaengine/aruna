@@ -14,6 +14,7 @@ use rustls::sign::CertifiedKey;
 use rustls::{ClientConfig, RootCertStore, SignatureScheme};
 use tokio::io::AsyncWriteExt;
 use tokio_rustls::TlsConnector;
+use ulid::Ulid;
 
 use super::*;
 use crate::backend::Revocation;
@@ -286,6 +287,11 @@ async fn cleartext_refused() {
 async fn loopback_cleartext_allowed() {
     let running = start(true).await;
     let host = running.backend.state.lock().hosts.values().next().copied();
+    // A cleartext loopback connection proves no key.
+    let host = host.map(|host| HostIdentity {
+        fingerprint: None,
+        ..host
+    });
     running.backend.state.lock().loopback = host;
     let mut tcp = TcpStream::connect(running.address).await.expect("connect");
     let reply = call(&mut tcp, 4, NULL_PROCEDURE, &[]).await.expect("reply");
@@ -326,6 +332,30 @@ async fn host_revocation_disconnects() {
         !matches!(read, Ok(Some(_))),
         "the revoked connection closed"
     );
+}
+
+// Revocations missed by a lagging listener close every connection, so a lost host revocation
+// or key rotation never leaves one admitted.
+#[tokio::test]
+async fn lagged_revocations_disconnect() {
+    let running = start(false).await;
+    let tcp = probe(running.address).await;
+    let config = client_config(
+        &running.ca_pem,
+        Identity::Key(running.certificate.clone(), private_key(&running.key)),
+        true,
+    );
+    let mut stream = upgrade(tcp, config).await.expect("TLS");
+    assert!(call(&mut stream, 2, NULL_PROCEDURE, &[]).await.is_some());
+    // The listener runs only when this test awaits, so it misses all but the newest events.
+    for mount in 0..64 {
+        let revocation = Revocation::Mount(Ulid::from_parts(9, mount));
+        running.backend.events.send(revocation).expect("subscriber");
+    }
+    let read = tokio::time::timeout(STEP, read_record(&mut stream, 1 << 20))
+        .await
+        .expect("closed in time");
+    assert!(!matches!(read, Ok(Some(_))), "the connection closed");
 }
 
 // A declared record beyond the limit closes the connection before any of it is buffered.

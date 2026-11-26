@@ -580,8 +580,12 @@ fn bridge_revocations(
             let revocation = match received {
                 Ok(revocation) => revocation,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
-                    // Each request admits its grant again, so a missed revocation ends later.
-                    warn!(missed, "File server revocations were missed");
+                    // Every mount and replay admission rechecks the grant and the host key
+                    // fingerprint, so a missed revocation ends at the next request.
+                    warn!(
+                        missed,
+                        "File server revocations were missed; live admission ends them"
+                    );
                     continue;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return,

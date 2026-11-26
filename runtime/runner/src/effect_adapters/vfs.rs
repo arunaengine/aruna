@@ -11,7 +11,8 @@ use crate::driver::DriverContext;
 pub(super) async fn dispatch_vfs(effect: VfsEffect, context: &DriverContext) -> VfsEvent {
     match (context.vfs_handle.as_ref(), effect) {
         (Some(handle), effect) => handle.execute(effect).await,
-        // No file server holds plaintext stages here, so nothing can block the transition.
+        // No handle means both listeners are off and startup found no stage folder, since
+        // `open_vfs` opens one whenever it exists. No plaintext scratch file can block it.
         (None, VfsEffect::FenceVault { .. }) => VfsEvent::VaultFenced {
             fence_id: Ulid::nil(),
         },

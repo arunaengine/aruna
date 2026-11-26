@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::compute::{BackendError, FenceContext, SessionMount, TaskSpec};
+use aruna_core::compute::{BackendError, FenceContext, NfsBindings, SessionMount, TaskSpec};
 use k8s_openapi::api::core::v1::{PersistentVolume, PersistentVolumeClaim, PodSpec, Secret};
 use serde_json::json;
 
@@ -53,21 +53,19 @@ impl ShareSource {
 }
 
 /// The share a run's mounted inputs come from, when a share takes them over. An SMB
-/// share serves only the run's own input view, which every mounted bucket must be.
+/// share serves only the run's own input view; NFS needs the attempt's own binding.
 pub fn input_source(
     config: &KubernetesConfig,
+    spec: &TaskSpec,
     job_id: &str,
     buckets: &[String],
 ) -> Result<Option<ShareSource>, BackendError> {
-    let Some(share) = config.share_inputs() else {
+    let Some(share) = config.share_inputs().filter(|_| !buckets.is_empty()) else {
         return Ok(None);
     };
     let source = match &share.driver {
         ShareDriver::Smb { .. } => ShareSource::smb_inputs(&share.host, job_id),
-        ShareDriver::Nfs { inputs, .. } => ShareSource::Nfs {
-            host: share.host.clone(),
-            mount_id: inputs.clone().unwrap_or_default(),
-        },
+        ShareDriver::Nfs { .. } => nfs_source(&share.host, spec, false)?,
     };
     if let ShareSource::Smb { share, .. } = &source
         && buckets.iter().any(|bucket| bucket != share)
@@ -79,20 +77,47 @@ pub fn input_source(
     Ok(Some(source))
 }
 
-/// The share a session's workspace data comes from, when a share takes it over. An NFS
-/// binding already names the session's folder, so it ignores the mount prefix.
+/// The share a session's workspace data comes from, when a share takes it over. The
+/// attempt's NFS binding already names the session's folder, so it ignores the prefix.
 pub fn session_source(
     config: &KubernetesConfig,
+    spec: &TaskSpec,
     bucket: &str,
     mount: &SessionMount,
-) -> Option<ShareSource> {
-    let share = config.share_sessions()?;
-    Some(match &share.driver {
+) -> Result<Option<ShareSource>, BackendError> {
+    let Some(share) = config.share_sessions() else {
+        return Ok(None);
+    };
+    Ok(Some(match &share.driver {
         ShareDriver::Smb { .. } => ShareSource::smb_session(&share.host, bucket, mount),
-        ShareDriver::Nfs { sessions, .. } => ShareSource::Nfs {
-            host: share.host.clone(),
-            mount_id: sessions.clone().unwrap_or_default(),
-        },
+        ShareDriver::Nfs { .. } => nfs_source(&share.host, spec, true)?,
+    }))
+}
+
+/// The export of one attempt's own NFS binding. The worker's mTLS identity covers every
+/// pod there, so a missing, malformed or reused binding is refused, never shared.
+fn nfs_source(host: &str, spec: &TaskSpec, session: bool) -> Result<ShareSource, BackendError> {
+    let NfsBindings {
+        input,
+        session: data,
+    } = &spec.nfs_mounts;
+    if input.is_some() && input == data {
+        return Err(BackendError::InvalidSpec(
+            "NFS input and session shares need distinct mount bindings".to_string(),
+        ));
+    }
+    let (binding, what) = match session {
+        true => (data, "session"),
+        false => (input, "input"),
+    };
+    let mount_id = binding.as_deref().ok_or_else(|| {
+        BackendError::InvalidSpec(format!(
+            "NFS {what} share requires a per-attempt mount binding"
+        ))
+    })?;
+    Ok(ShareSource::Nfs {
+        host: host.to_string(),
+        mount_id: plain_part(mount_id, "mount ID")?.to_string(),
     })
 }
 
@@ -118,11 +143,8 @@ pub fn check_config(config: &KubernetesConfig) -> Result<(), BackendError> {
     }
     plain_part(&share.host, "host")?;
     match &share.driver {
-        ShareDriver::Nfs { inputs, sessions } => {
-            for mount_id in inputs.iter().chain(sessions) {
-                plain_part(mount_id, "mount ID")?;
-            }
-        }
+        // Each attempt brings its own NFS bindings, which the volumes check.
+        ShareDriver::Nfs { .. } => {}
         // A KubeDAL session takes the mount Secret that the SMB login of inputs needs.
         ShareDriver::Smb {
             inputs: true,

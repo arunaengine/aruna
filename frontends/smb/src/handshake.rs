@@ -105,12 +105,14 @@ impl<B: SmbBackend> Connection<B> {
         else {
             return Ok(Reply::fail(status::NOT_SUPPORTED));
         };
-        let signing = signings
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .find_map(|code| Signing::from_code(*code))
-            .unwrap_or(Signing::AesCmac);
+        // Without a signing context the dialect default applies; an offer is honoured or refused.
+        let signing = match signings.as_deref() {
+            None => Signing::AesCmac,
+            Some(offered) => match offered.iter().find_map(|code| Signing::from_code(*code)) {
+                Some(signing) => signing,
+                None => return Ok(Reply::fail(status::NOT_SUPPORTED)),
+            },
+        };
         let salt: [u8; SALT_SIZE] = random_bytes()?;
         let mut contexts = vec![
             context(PREAUTH_CONTEXT, &[HASH_SHA512], Some(salt.as_slice())),

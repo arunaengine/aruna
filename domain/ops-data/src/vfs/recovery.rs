@@ -18,9 +18,10 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::{BucketInfo, incarnation};
 use aruna_core::structs::storage::vfs::{
-    BucketScope, CookiePosition, DetachReason, DirectoryWitness, FileIdentity, HandleIdentity,
-    NfsStageRecord, RECEIPT_TAG, ReceiptChange, STAGE_TAG, StageBase, StageDisposition,
-    VfsBootState, VfsHandleRow, VfsKey, VfsReceipt, VfsWatchKey, decode_handle_id,
+    BucketScope, CookiePosition, DetachReason, DirectoryWitness, EnrolledHostRecord, FileIdentity,
+    HandleIdentity, NfsMountBinding, NfsMountTarget, NfsStageRecord, RECEIPT_TAG, ReceiptChange,
+    STAGE_TAG, StageBase, StageDisposition, VfsBootState, VfsHandleRow, VfsKey, VfsReceipt,
+    VfsWatchKey, decode_handle_id,
 };
 use aruna_core::types::{Key, Value};
 use aruna_core::vfs_effects::{
@@ -49,6 +50,8 @@ pub struct ReceiptInput {
     pub updates: Vec<WitnessUpdate>,
     /// The logical size a publication left, which becomes the instance's base.
     pub logical_size: Option<u64>,
+    /// The edit generation a publication streamed; a later edit keeps the overlay dirty.
+    pub expected_edit: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -243,9 +246,15 @@ impl VfsReceiptOperation {
         let scope = self.input.scope.clone();
         let mut calls = Vec::new();
         match &receipt.change {
-            ReceiptChange::FilePublish { key, handle_id, .. } => {
+            ReceiptChange::FilePublish {
+                key,
+                handle_id,
+                version_id,
+                ..
+            } => {
                 if let Some(instance_id) = self.input.instance_id {
                     let effect = match self.life_id {
+                        // Every open of the shared instance reads its base from the new version.
                         Some(life_id) => VfsEffect::RebindInstance(RebindRequest {
                             scope: scope.clone(),
                             instance_id,
@@ -257,6 +266,8 @@ impl VfsReceiptOperation {
                             clear_dirty: self.input.logical_size.is_some(),
                             stage_id: None,
                             generation: None,
+                            base_version: Some(*version_id),
+                            expected_edit: self.input.expected_edit,
                         }),
                         // A newer S3 write replaced the name meanwhile: the instance detaches.
                         None => VfsEffect::DetachInstance {
@@ -298,6 +309,8 @@ impl VfsReceiptOperation {
                         clear_dirty: false,
                         stage_id: None,
                         generation: None,
+                        base_version: None,
+                        expected_edit: None,
                     })));
                 }
             }
@@ -315,6 +328,8 @@ impl VfsReceiptOperation {
                         clear_dirty: false,
                         stage_id: None,
                         generation: None,
+                        base_version: None,
+                        expected_edit: None,
                     })));
                 }
             }
@@ -418,6 +433,8 @@ enum ColdStep {
     Stages,
     Bucket,
     Head,
+    Mount,
+    Host,
     Stage,
     Restored,
     Orphan,
@@ -512,6 +529,7 @@ impl ColdStartOperation {
             instance_id: None,
             updates: Vec::new(),
             logical_size: None,
+            expected_edit: None,
         };
         self.call(
             ColdStep::Receipt,
@@ -609,29 +627,85 @@ impl ColdStartOperation {
         self.call(ColdStep::Head, IoCall::Read(reads))
     }
 
+    /// A derived checkpoint holds its name only on the exact base version it captured: an S3
+    /// overwrite keeps the life, so the newer head stays visible and the bytes are retained.
     fn head_read(&mut self, result: IoResult) -> ColdTurn {
         let [head, token] = aruna_core::rows::values::<2>(result)?;
         let (head, token) = (head_of(head.as_ref())?, token_of(token.as_ref())?);
         let (key, record) = self.current.clone().ok_or(VfsError::Conflict)?;
         let holds = match record.base {
-            StageBase::Committed { life_id, .. } => {
-                super::live_life(head.as_ref()) == Some(life_id)
+            StageBase::Committed {
+                life_id,
+                version_id,
+            } => {
+                let version = head.as_ref().map(|head| head.version_id);
+                super::live_life(head.as_ref()) == Some(life_id) && version == Some(version_id)
             }
             StageBase::Unpublished { token: bound, .. } => token == Some(bound),
         };
-        let live = matches!(key, VfsKey::LiveStage(..));
-        if live && !holds {
-            // The foreign-life user checkpoint is kept by its stage id before anything else.
-            let scope = Self::scope_of(&key)
-                .cloned()
-                .ok_or(VfsError::CorruptStage)?;
-            let kept = retained(&record, DetachReason::LostLife, self.now_ms);
-            self.report.retained += 1;
-            let change = StageMoveOperation::new(scope, record.clone(), Some(kept));
-            let seed = record.stage_id.to_bytes();
-            return self.call(ColdStep::Stage, IoCall::retry(change, &seed));
+        if !matches!(key, VfsKey::LiveStage(..)) {
+            return self.restore(key, record);
         }
+        if !holds {
+            return self.retain_current();
+        }
+        // A writer's stage shows again only while its mount binding and host still stand.
+        match record.owner.mount_id.is_nil() {
+            true => self.restore(key, record),
+            false => {
+                let read = state_read(&[VfsKey::Mount(record.owner.mount_id)])?;
+                self.call(ColdStep::Mount, read)
+            }
+        }
+    }
+
+    fn mount_read(&mut self, result: IoResult) -> ColdTurn {
+        let [row] = aruna_core::rows::values::<1>(result)?;
+        let (key, _) = self.current.as_ref().ok_or(VfsError::Conflict)?;
+        let scope = Self::scope_of(key).ok_or(VfsError::CorruptStage)?;
+        let binding = record_of::<NfsMountBinding>(row.as_ref())?;
+        let bound = binding.filter(|binding| match &binding.target {
+            NfsMountTarget::Bucket {
+                bucket,
+                bucket_incarnation,
+            }
+            | NfsMountTarget::Folder {
+                bucket,
+                bucket_incarnation,
+                ..
+            } => *bucket == scope.bucket && *bucket_incarnation == scope.incarnation,
+            NfsMountTarget::JobInputView { .. } => false,
+        });
+        match bound {
+            Some(binding) => self.call(
+                ColdStep::Host,
+                state_read(&[VfsKey::Host(binding.host_id)])?,
+            ),
+            None => self.retain_current(),
+        }
+    }
+
+    fn host_read(&mut self, result: IoResult) -> ColdTurn {
+        let [row] = aruna_core::rows::values::<1>(result)?;
+        let host = record_of::<EnrolledHostRecord>(row.as_ref())?;
+        if !host.is_some_and(|host| host.revoked_at_ms.is_none()) {
+            return self.retain_current();
+        }
+        let (key, record) = self.current.clone().ok_or(VfsError::Conflict)?;
         self.restore(key, record)
+    }
+
+    /// The live checkpoint that may not show again is kept by its stage id before anything else.
+    fn retain_current(&mut self) -> ColdTurn {
+        let (key, record) = self.current.clone().ok_or(VfsError::Conflict)?;
+        let scope = Self::scope_of(&key)
+            .cloned()
+            .ok_or(VfsError::CorruptStage)?;
+        let kept = retained(&record, DetachReason::LostLife, self.now_ms);
+        self.report.retained += 1;
+        let change = StageMoveOperation::new(scope, record.clone(), Some(kept));
+        let seed = record.stage_id.to_bytes();
+        self.call(ColdStep::Stage, IoCall::retry(change, &seed))
     }
 
     fn restore(&mut self, key: VfsKey, record: NfsStageRecord) -> ColdTurn {
@@ -642,10 +716,13 @@ impl ColdStartOperation {
         let group_id = group_id
             .map(|(_, info)| info.group_id)
             .ok_or(VfsError::CorruptStage)?;
-        let identity = match record.base {
-            StageBase::Committed { life_id, .. } => FileIdentity::Committed { life_id },
+        let (identity, base_version) = match record.base {
+            StageBase::Committed {
+                life_id,
+                version_id,
+            } => (FileIdentity::Committed { life_id }, Some(version_id)),
             StageBase::Unpublished { token, predecessor } => {
-                FileIdentity::Unpublished { token, predecessor }
+                (FileIdentity::Unpublished { token, predecessor }, None)
             }
         };
         let detached = match record.disposition {
@@ -663,6 +740,7 @@ impl ColdStartOperation {
             identity: HandleIdentity::File(identity),
             detached,
             owner: Some(record.owner.clone()),
+            base_version,
         };
         self.report.restored += 1;
         self.call(
@@ -729,16 +807,21 @@ impl Operation for ColdStartOperation {
             ColdStep::Stages => self.stages_read(result),
             ColdStep::Bucket => self.bucket_read(result),
             ColdStep::Head => self.head_read(result),
+            ColdStep::Mount => self.mount_read(result),
+            ColdStep::Host => self.host_read(result),
             ColdStep::Stage => {
                 result.child::<(), VfsError>()??;
                 self.current = None;
                 self.next_stage()
             }
-            ColdStep::Restored => {
-                vfs_event(result)?;
-                self.current = None;
-                self.next_stage()
-            }
+            // A live row reopens its instance; a retained one is only charged and answers done.
+            ColdStep::Restored => match vfs_event(result)? {
+                VfsEvent::Opened { .. } | VfsEvent::Done => {
+                    self.current = None;
+                    self.next_stage()
+                }
+                other => Err(unexpected(&other)),
+            },
             ColdStep::Orphan => {
                 vfs_event(result)?;
                 self.next_orphan()
@@ -916,6 +999,7 @@ impl SweepTombstonesOperation {
                 instance_id: None,
                 updates: Vec::new(),
                 logical_size: None,
+                expected_edit: None,
             };
             let finish = VfsReceiptOperation::new(input);
             return self.call(SweepStep::Receipt, IoCall::child(finish));

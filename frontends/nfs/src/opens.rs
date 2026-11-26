@@ -9,7 +9,7 @@ use crate::arguments::{LockArgs, Locker, OpenArgs, OpenClaim, OpenCreate};
 use crate::attributes::{decode_change, exclusive_settable, write_bitmap};
 use crate::backend::{
     AttributeChange, Caller, ChangeInfo, CreateMode, LockDenial, LockError, LockKind, LockRange,
-    NfsBackend, ObjectRef, OwnerKey, ShareRequest,
+    NfsBackend, ObjectRef, OwnerKey, ReplayAccess, ShareRequest,
 };
 use crate::compound::{
     Context, Current, Engine, OpError, OpResult, Target, put_change, put_stateid,
@@ -109,17 +109,26 @@ impl<B: NfsBackend> Engine<B> {
             return Err(NfsStat4::ReadOnly.into());
         }
         let caller = ctx.caller(&export);
-        let (object, change, applied) = match name {
-            None => (base, ChangeInfo::default(), Vec::new()),
-            Some(name) => self.open_name(&caller, base, &name, &args.create).await?,
-        };
-        if object.mount_id != export.mount_id {
-            return Err(NfsStat4::ServerFault.into());
-        }
         let owner = OwnerKey {
             client_id,
             owner: args.owner.clone(),
         };
+        // A created file holds the requested reservation from its creation on.
+        let requested = ShareRequest {
+            owner: owner.clone(),
+            access,
+            deny: args.deny,
+        };
+        let (object, change, applied) = match name {
+            None => (base, ChangeInfo::default(), Vec::new()),
+            Some(name) => {
+                let create = (&args.create, &requested);
+                self.open_name(&caller, base, &name, create).await?
+            }
+        };
+        if object.mount_id != export.mount_id {
+            return Err(NfsStat4::ServerFault.into());
+        }
         let combined = {
             let tables = self.tables.lock();
             tables
@@ -140,7 +149,11 @@ impl<B: NfsBackend> Engine<B> {
                 .lock()
                 .states
                 .record_open(owner, object, caller, (access, args.deny));
-        ctx.grant.writes = true;
+        let used = match access & share::WRITE {
+            0 => ReplayAccess::Head,
+            _ => ReplayAccess::Write,
+        };
+        ctx.grant.record(object, used);
         ctx.set_current(Current::Object {
             export,
             object,
@@ -172,7 +185,7 @@ impl<B: NfsBackend> Engine<B> {
         caller: &Caller,
         directory: ObjectRef,
         name: &Bytes,
-        create: &OpenCreate,
+        (create, share): (&OpenCreate, &ShareRequest),
     ) -> Result<(ObjectRef, ChangeInfo, Vec<u32>), NfsStat4> {
         let name = component(name)?;
         let (mode, change, mask) = match create {
@@ -209,7 +222,7 @@ impl<B: NfsBackend> Engine<B> {
         };
         let reply = self
             .backend
-            .create_file(caller, directory, name, mode, &change)
+            .create_file(caller, directory, name, mode, share, &change)
             .await?;
         let applied = if reply.created { mask } else { Vec::new() };
         Ok((reply.object, reply.change, applied))
@@ -278,7 +291,7 @@ impl<B: NfsBackend> Engine<B> {
             .lock()
             .states
             .downgrade(&stateid.other, (access, deny))?;
-        ctx.grant.writes = true;
+        ctx.grant.record(object, ReplayAccess::Head);
         ctx.current_stateid = Some(stateid);
         put_stateid(out, &stateid);
         Ok(())
@@ -298,7 +311,7 @@ impl<B: NfsBackend> Engine<B> {
         }
         self.backend.close(&caller, object, &owner).await?;
         self.tables.lock().states.close(&stateid.other);
-        ctx.grant.writes = true;
+        ctx.grant.record(object, ReplayAccess::Head);
         ctx.current_stateid = Some(Stateid::INVALID);
         put_stateid(out, &Stateid::INVALID);
         Ok(())
@@ -375,7 +388,7 @@ impl<B: NfsBackend> Engine<B> {
             Err(LockError::Status(status)) => return Err(status.into()),
         }
         let stateid = self.tables.lock().states.mark_lock(&lock_other, true)?;
-        ctx.grant.writes = true;
+        ctx.grant.record(object, ReplayAccess::Head);
         ctx.current_stateid = Some(stateid);
         put_stateid(out, &stateid);
         Ok(())
@@ -456,7 +469,7 @@ impl<B: NfsBackend> Engine<B> {
         let (other, owner, _) = self.lock_entry(ctx, stateid, object)?;
         let remaining = self.backend.unlock(&caller, object, &owner, range).await?;
         let stateid = self.tables.lock().states.mark_lock(&other, remaining)?;
-        ctx.grant.writes = true;
+        ctx.grant.record(object, ReplayAccess::Head);
         ctx.current_stateid = Some(stateid);
         put_stateid(out, &stateid);
         Ok(())
@@ -486,7 +499,6 @@ impl<B: NfsBackend> Engine<B> {
         let stateid = owned_stateid(ctx, stateid)?;
         let client_id = ctx.client_id()?;
         self.tables.lock().states.free(&stateid, client_id)?;
-        ctx.grant.writes = true;
         Ok(())
     }
 }

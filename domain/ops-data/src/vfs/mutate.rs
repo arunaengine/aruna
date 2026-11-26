@@ -107,10 +107,13 @@ impl VfsMkdirOperation {
         }
         self.marker = marker;
         let (scope, prefix) = (self.scope()?, self.key.clone());
-        self.call(
-            MkdirStep::Staged,
-            vfs_call(VfsEffect::ListStaged { scope, prefix }),
-        )
+        let list = VfsEffect::ListStaged {
+            scope,
+            prefix,
+            after: None,
+            limit: None,
+        };
+        self.call(MkdirStep::Staged, vfs_call(list))
     }
 
     fn staged_read(&mut self, result: IoResult) -> MkdirTurn {
@@ -239,6 +242,7 @@ enum RemoveStep {
     Authorize,
     Marker,
     Permit,
+    Share,
     Staged,
     Probe,
     Rows,
@@ -264,8 +268,11 @@ pub struct VfsRemoveOperation {
     ids: aruna_core::id_mint::IdMint,
     /// The prepared write of the source parent's marker, used when it is admitted.
     marker: Option<PutObjectConfig>,
+    /// The caller may not write the parent marker, so an implicit parent may not lose a child.
+    refused: bool,
     /// The removal commits as the marker's put with the target's delete marker.
     joint: bool,
+    probe_after: Option<Key>,
 }
 
 impl VfsRemoveOperation {
@@ -280,7 +287,9 @@ impl VfsRemoveOperation {
             now_ms: 0,
             ids: aruna_core::id_mint::IdMint::default(),
             marker: None,
+            refused: false,
             joint: false,
+            probe_after: None,
         }
     }
 
@@ -318,26 +327,27 @@ impl VfsRemoveOperation {
         if entries.iter().any(|entry| entry.key.starts_with(&below)) {
             return Err(VfsError::NotEmpty);
         }
+        self.probe()
+    }
+
+    fn probe(&mut self) -> RemoveTurn {
         let bucket = bucket_of(&self.input.context)?;
-        let prefix = BlobHeadKey::object_prefix(&bucket, &below)?;
-        self.call(
-            RemoveStep::Probe,
-            IoCall::Page {
-                space: BLOB_HEAD_KEYSPACE.to_string(),
-                prefix: prefix.into(),
-                after: None,
-                limit: STATE_PAGE,
-            },
-        )
+        let below = marker_key(&self.input.key);
+        let call = head_page(&bucket, &below, self.probe_after.clone())?;
+        self.call(RemoveStep::Probe, call)
     }
 
     /// Hidden S3 descendants still make a directory nonempty; only the marker may be live.
     fn probed(&mut self, result: IoResult) -> RemoveTurn {
         let marker = head_key(&bucket_of(&self.input.context)?, &self.target())?;
-        if !page_empty(result, &marker)? {
-            return Err(VfsError::NotEmpty);
+        match page_scan(result, &marker)? {
+            Scan::Live => Err(VfsError::NotEmpty),
+            Scan::More(after) => {
+                self.probe_after = Some(after);
+                self.probe()
+            }
+            Scan::Empty => self.read_rows(),
         }
-        self.read_rows()
     }
 
     /// The parent marker key when an admitted marker write is prepared for a non-root parent.
@@ -351,7 +361,7 @@ impl VfsRemoveOperation {
     /// The prepared parent marker write, when admitted and the parent is a directory.
     fn marker_write(&mut self) -> Option<PutObjectConfig> {
         let (parent, _) = split_parent(&self.input.key)?;
-        let config = self.marker.take()?;
+        let config = self.marker.take().filter(|_| !self.refused)?;
         let fits = !parent.is_empty() && config.request.key == marker_key(parent);
         fits.then_some(config)
     }
@@ -415,6 +425,10 @@ impl VfsRemoveOperation {
             HandleIdentity::File(FileIdentity::Unpublished { .. })
         );
         let parent_live = live_life(head_of(parent_row.as_ref())?.as_ref()).is_some();
+        // The last route to an implicit parent never goes without its admitted marker.
+        if committed && !parent_live && self.refused && parent_marker.is_some() {
+            return Err(VfsError::Denied);
+        }
         let mut marker = self.marker_write().filter(|_| committed && !parent_live);
         if committed
             && parent_live
@@ -534,6 +548,7 @@ impl VfsRemoveOperation {
             instance_id: self.input.instance_id,
             updates: Vec::new(),
             logical_size: None,
+            expected_edit: None,
         };
         self.call(
             RemoveStep::Receipt,
@@ -574,22 +589,29 @@ impl Operation for VfsRemoveOperation {
                 }
             }
             RemoveStep::Marker => {
-                // A marker the caller may not write is left out, as an S3 delete leaves it.
-                if !marker_admitted(result)? {
-                    self.marker = None;
-                }
+                // A refused marker is needed only when the parent has no live marker yet.
+                self.refused = !marker_admitted(result)?;
                 self.permit()
             }
             RemoveStep::Permit => {
                 self.held.permit_taken(result)?;
+                let (scope, key) = (self.scope()?, self.input.key.clone());
+                let lookup = VfsEffect::LookupInstance { scope, key };
+                self.call(RemoveStep::Share, vfs_call(lookup))
+            }
+            RemoveStep::Share => {
+                share_checked(result, false)?;
                 if self.input.kind == HandleKind::File {
                     return self.read_rows();
                 }
                 let (scope, prefix) = (self.scope()?, marker_key(&self.input.key));
-                self.call(
-                    RemoveStep::Staged,
-                    vfs_call(VfsEffect::ListStaged { scope, prefix }),
-                )
+                let list = VfsEffect::ListStaged {
+                    scope,
+                    prefix,
+                    after: None,
+                    limit: Some(1),
+                };
+                self.call(RemoveStep::Staged, vfs_call(list))
             }
             RemoveStep::Staged => self.staged_read(result),
             RemoveStep::Probe => self.probed(result),
@@ -647,14 +669,51 @@ fn marker_admitted(result: IoResult) -> Result<bool, VfsError> {
     }
 }
 
-/// Whether one head page below a directory holds no live head besides `marker`.
-fn page_empty(result: IoResult, marker: &Key) -> Result<bool, VfsError> {
+/// What one head page below a directory holds besides its own marker.
+enum Scan {
+    Live,
+    /// Only delete markers so far; the probe goes on after this key.
+    More(Key),
+    Empty,
+}
+
+/// Reads one head page below a directory, paging on through delete markers.
+fn page_scan(result: IoResult, own: &Key) -> Result<Scan, VfsError> {
     let (rows, next) = result.page()?;
     let live = rows.iter().any(|(key, value)| {
         let head = CurrentVersionPointer::from_bytes(value.as_ref());
-        key != marker && head.is_ok_and(|head| head.life_id.is_some())
+        key != own && head.is_ok_and(|head| head.life_id.is_some())
     });
-    Ok(!live && next.is_none())
+    let full = rows.len() >= STATE_PAGE;
+    match (live, rows.last(), next) {
+        (true, _, _) => Ok(Scan::Live),
+        (false, Some((last, _)), Some(_)) if full => Ok(Scan::More(last.clone())),
+        _ => Ok(Scan::Empty),
+    }
+}
+
+/// One page of raw heads below the directory `below`, after `after` when given.
+fn head_page(bucket: &str, below: &str, after: Option<Key>) -> Result<IoCall, VfsError> {
+    Ok(IoCall::Page {
+        space: BLOB_HEAD_KEYSPACE.to_string(),
+        prefix: BlobHeadKey::object_prefix(bucket, below)?.into(),
+        after,
+        limit: STATE_PAGE,
+    })
+}
+
+/// An open whose holders do not all share delete access refuses a removal or a move; an SMB
+/// handle that is the sole open on the file may still rename itself.
+fn share_checked(result: IoResult, own_smb: bool) -> Result<(), VfsError> {
+    match vfs_event(result)? {
+        VfsEvent::Instance(Some(summary))
+            if !summary.allows_delete && !(own_smb && summary.open_count <= 1) =>
+        {
+            Err(VfsError::ShareViolation)
+        }
+        VfsEvent::Instance(_) => Ok(()),
+        other => Err(unexpected(&other)),
+    }
 }
 
 /// The head range below `prefix` of `bucket`, which must hold no live head but `exclude`.
@@ -834,6 +893,9 @@ pub struct RenameInput {
     pub attempt_id: Ulid,
     /// The source's live checkpoint row, moved with it.
     pub stage: Option<NfsStageRecord>,
+    /// The committed source version the destination body was copied from; the move refuses
+    /// when the source head moved on.
+    pub source_version: Option<Ulid>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -843,8 +905,15 @@ enum RenameStep {
     Target,
     Marker,
     Permit,
+    ShareFrom,
+    ShareTo,
+    Parent,
     Rows,
+    /// Live `s3.DeleteObject` admission of the destination the move replaces.
+    Displace,
     Staged,
+    /// Live S3 descendants below a replaced NFS directory make it nonempty.
+    TargetProbe,
     /// Staged names below a moved directory make it nonempty.
     Emptied,
     Probe,
@@ -873,11 +942,16 @@ pub struct VfsRenameOperation {
     destination: Option<PutObjectConfig>,
     /// The prepared write of the source parent's marker, used when it is admitted.
     marker: Option<PutObjectConfig>,
+    /// The caller may not write the parent marker, so an implicit parent may not lose a child.
+    refused: bool,
     /// The move is one put: a committed source with its delete, or an unpublished source whose
     /// stage publishes over a live destination.
     committed: bool,
+    /// An NFS directory move replaces the empty directory marker at its destination.
+    replacing: bool,
     /// The destination's handle the move displaced, detached once the move is settled.
     displaced: Option<u64>,
+    probe_after: Option<Key>,
 }
 
 impl VfsRenameOperation {
@@ -894,8 +968,11 @@ impl VfsRenameOperation {
             now_ms: 0,
             destination: None,
             marker: None,
+            refused: false,
             committed: false,
+            replacing: false,
             displaced: None,
+            probe_after: None,
         }
     }
 
@@ -1008,20 +1085,27 @@ impl VfsRenameOperation {
         let marker = head_of(to_marker.as_ref())?;
         let head = head_of(to_head.as_ref())?;
         let directory = self.input.kind == HandleKind::Directory;
+        let nfs = self.input.context.protocol == VfsProtocol::Nfs;
         if live_life(marker.as_ref()).is_some() {
-            return Err(match directory {
-                true => VfsError::Exists,
-                false => VfsError::IsDirectory,
-            });
+            // NFS replaces an empty directory with a directory; any other move collides.
+            if !(directory && nfs && self.input.replace) {
+                return Err(match directory {
+                    true => VfsError::Exists,
+                    false => VfsError::IsDirectory,
+                });
+            }
+            self.replacing = true;
+            return self.displace(marker_key(&self.input.to));
         }
+        let to = self.input.to.clone();
         if live_life(head.as_ref()).is_some() {
             // A committed file replaces a live destination in its own put transaction.
             match (self.input.replace, self.committed, directory) {
-                (true, true, false) => return self.list_target(),
+                (true, true, false) => return self.displace(to),
                 // An unpublished file publishes its prepared stage image over the destination.
                 (true, false, false) if self.destination.is_some() => {
                     self.committed = true;
-                    return self.list_target();
+                    return self.displace(to);
                 }
                 (true, false, false) => {
                     return Err(VfsError::Unavailable(JOINT_MOVE.to_string()));
@@ -1030,40 +1114,58 @@ impl VfsRenameOperation {
             }
         }
         let staged = token_of(to_watch.as_ref())?;
-        if staged.is_some()
-            && !self.input.replace
-            && self.input.context.protocol == VfsProtocol::Smb
-        {
+        if staged.is_some() && !self.input.replace && !nfs {
             return Err(VfsError::Exists);
         }
-        self.list_target()
+        match staged {
+            Some(_) => self.displace(to),
+            None => self.list_target(),
+        }
+    }
+
+    /// The destination the move replaces is admitted for deletion as it reads now, under the
+    /// permit, so a destination that appeared after the first checks is admitted too.
+    fn displace(&mut self, key: String) -> RenameTurn {
+        self.authorize(RenameStep::Displace, VfsAccess::Delete, &key)
     }
 
     fn list_target(&mut self) -> RenameTurn {
         let (scope, prefix) = (self.scope()?, marker_key(&self.input.to));
-        self.call(
-            RenameStep::Staged,
-            vfs_call(VfsEffect::ListStaged { scope, prefix }),
-        )
+        let list = VfsEffect::ListStaged {
+            scope,
+            prefix,
+            after: None,
+            limit: Some(1),
+        };
+        self.call(RenameStep::Staged, vfs_call(list))
     }
 
-    /// A file never moves onto a projected directory, staged ones included; a directory never
-    /// moves onto one either.
+    /// A file never moves onto a projected directory, staged ones included; a directory moves
+    /// onto one only when NFS replaces it empty.
     fn staged_read(&mut self, result: IoResult) -> RenameTurn {
         if !staged_entries(result)?.is_empty() {
-            return Err(match self.input.kind {
-                HandleKind::File => VfsError::IsDirectory,
-                HandleKind::Directory => VfsError::Exists,
+            return Err(match (self.input.kind, self.replacing) {
+                (HandleKind::File, _) => VfsError::IsDirectory,
+                (HandleKind::Directory, true) => VfsError::NotEmpty,
+                (HandleKind::Directory, false) => VfsError::Exists,
             });
         }
-        if self.input.kind == HandleKind::File {
-            return self.change();
+        match (self.input.kind, self.replacing) {
+            (HandleKind::File, _) => self.change(),
+            (HandleKind::Directory, true) => self.probe(RenameStep::TargetProbe),
+            (HandleKind::Directory, false) => self.list_source(),
         }
+    }
+
+    fn list_source(&mut self) -> RenameTurn {
         let (scope, prefix) = (self.scope()?, marker_key(&self.input.from));
-        self.call(
-            RenameStep::Emptied,
-            vfs_call(VfsEffect::ListStaged { scope, prefix }),
-        )
+        let list = VfsEffect::ListStaged {
+            scope,
+            prefix,
+            after: None,
+            limit: Some(1),
+        };
+        self.call(RenameStep::Emptied, vfs_call(list))
     }
 
     /// A moved directory must be empty of staged names and of live S3 descendants.
@@ -1071,26 +1173,71 @@ impl VfsRenameOperation {
         if !staged_entries(result)?.is_empty() {
             return Err(VfsError::NotEmpty);
         }
+        self.probe(RenameStep::Probe)
+    }
+
+    /// The directory a probe step pages below: the replaced destination or the moved source.
+    fn probed_key(&self, step: RenameStep) -> &str {
+        match step {
+            RenameStep::TargetProbe => &self.input.to,
+            _ => &self.input.from,
+        }
+    }
+
+    fn probe(&mut self, step: RenameStep) -> RenameTurn {
         let bucket = bucket_of(&self.input.context)?;
-        let prefix = BlobHeadKey::object_prefix(&bucket, &marker_key(&self.input.from))?;
-        self.call(
-            RenameStep::Probe,
-            IoCall::Page {
-                space: BLOB_HEAD_KEYSPACE.to_string(),
-                prefix: prefix.into(),
-                after: None,
-                limit: STATE_PAGE,
-            },
-        )
+        let below = marker_key(self.probed_key(step));
+        let call = head_page(&bucket, &below, self.probe_after.clone())?;
+        self.call(step, call)
     }
 
     fn probed(&mut self, result: IoResult) -> RenameTurn {
-        let (source, _) = self.heads();
-        let marker = head_key(&bucket_of(&self.input.context)?, &source)?;
-        if !page_empty(result, &marker)? {
-            return Err(VfsError::NotEmpty);
+        let step = self.step;
+        let marker = marker_key(self.probed_key(step));
+        let marker = head_key(&bucket_of(&self.input.context)?, &marker)?;
+        match page_scan(result, &marker)? {
+            Scan::Live => Err(VfsError::NotEmpty),
+            Scan::More(after) => {
+                self.probe_after = Some(after);
+                self.probe(step)
+            }
+            Scan::Empty if step == RenameStep::TargetProbe => {
+                self.probe_after = None;
+                self.list_source()
+            }
+            Scan::Empty => self.change(),
         }
-        self.change()
+    }
+
+    /// The source parent's marker key, when the move leaves a non-root parent.
+    fn left_parent(&self) -> Option<String> {
+        let (parent, _) = split_parent(&self.input.from)?;
+        let (target, _) = split_parent(&self.input.to)?;
+        (!parent.is_empty() && parent != target).then(|| marker_key(parent))
+    }
+
+    /// A committed source moving out of a parent without a live marker needs that marker.
+    fn parent_read(&mut self, result: IoResult) -> RenameTurn {
+        let [row] = aruna_core::rows::values::<1>(result)?;
+        if live_life(head_of(row.as_ref())?.as_ref()).is_none() {
+            return Err(VfsError::Denied);
+        }
+        self.read_rows()
+    }
+
+    /// After the share checks, a refused marker write is checked against the live parent.
+    fn shared(&mut self) -> RenameTurn {
+        let unpublished = matches!(
+            self.input.identity,
+            HandleIdentity::File(FileIdentity::Unpublished { .. })
+        );
+        let parent = self.left_parent().filter(|_| self.refused && !unpublished);
+        let Some(parent) = parent else {
+            return self.read_rows();
+        };
+        let bucket = bucket_of(&self.input.context)?;
+        let read = (BLOB_HEAD_KEYSPACE.to_string(), head_key(&bucket, &parent)?);
+        self.call(RenameStep::Parent, IoCall::Read(vec![read]))
     }
 
     /// The source parent's marker, when admitted and the move leaves that parent.
@@ -1127,6 +1274,12 @@ impl VfsRenameOperation {
             true => None,
             false => Some(live_life(source_head.as_ref()).ok_or(VfsError::StaleHandle)?),
         };
+        // An S3 overwrite keeps the life: the copied version must still be the source head.
+        let current = source_head.as_ref().map(|head| head.version_id);
+        let copied = self.input.source_version.filter(|_| life_id.is_some());
+        if copied.is_some_and(|copied| current != Some(copied)) {
+            return Err(VfsError::Conflict);
+        }
         let target_head = match self.input.kind {
             HandleKind::File => head_of(at(2).as_ref())?,
             HandleKind::Directory => head_of(at(4).as_ref())?,
@@ -1147,10 +1300,15 @@ impl VfsRenameOperation {
             self.now_ms,
         )?;
         self.displaced = plan.displaced;
+        // A replaced NFS directory keeps only its own marker, which the put overwrites.
+        let kept = match self.replacing {
+            true => Some(head_key(&scope.bucket, &target)?),
+            false => None,
+        };
         let mut ranges = vec![head_range(
             &scope.bucket,
             &marker_key(&self.input.to),
-            None,
+            kept,
         )?];
         if self.input.kind == HandleKind::Directory {
             let own = head_key(&scope.bucket, &source)?;
@@ -1164,7 +1322,7 @@ impl VfsRenameOperation {
         let delete = life_id.map(|life_id| SourceDelete {
             key: source,
             expected_life: Some(life_id),
-            expected_version: source_head.map(|head| head.version_id),
+            expected_version: self.input.source_version.or(current),
             deleted_by: grant.owner,
             marker_version,
         });
@@ -1242,6 +1400,7 @@ impl VfsRenameOperation {
             instance_id: self.input.instance_id,
             updates: Vec::new(),
             logical_size: None,
+            expected_edit: None,
         };
         self.call(
             RenameStep::Receipt,
@@ -1298,18 +1457,36 @@ impl Operation for VfsRenameOperation {
             }
             RenameStep::Marker => {
                 if !marker_admitted(result)? {
-                    self.marker = None;
+                    (self.marker, self.refused) = (None, true);
                 }
                 self.permit()
             }
             RenameStep::Permit => {
                 self.held.permit_taken(result)?;
-                self.read_rows()
+                let (scope, key) = (self.scope()?, self.input.from.clone());
+                let lookup = VfsEffect::LookupInstance { scope, key };
+                self.call(RenameStep::ShareFrom, vfs_call(lookup))
             }
+            RenameStep::ShareFrom => {
+                let own_smb = self.input.context.protocol == VfsProtocol::Smb;
+                share_checked(result, own_smb)?;
+                let (scope, key) = (self.scope()?, self.input.to.clone());
+                let lookup = VfsEffect::LookupInstance { scope, key };
+                self.call(RenameStep::ShareTo, vfs_call(lookup))
+            }
+            RenameStep::ShareTo => {
+                share_checked(result, false)?;
+                self.shared()
+            }
+            RenameStep::Parent => self.parent_read(result),
             RenameStep::Rows => self.rows_read(result),
+            RenameStep::Displace => {
+                grant_of(result)?;
+                self.list_target()
+            }
             RenameStep::Staged => self.staged_read(result),
+            RenameStep::TargetProbe | RenameStep::Probe => self.probed(result),
             RenameStep::Emptied => self.emptied_read(result),
-            RenameStep::Probe => self.probed(result),
             RenameStep::Change => self.changed(result),
             RenameStep::Synced => {
                 result.done()?;

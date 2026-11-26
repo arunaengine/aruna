@@ -75,6 +75,12 @@ impl Body {
     }
 }
 
+/// A LOCK request body for one range of `file`.
+fn lock_body(file: FileId, (at, length): (u64, u64), flags: u32) -> Vec<u8> {
+    let body = Body::default().u16(48).u16(1).u32(0).file(file);
+    body.u64(at).u64(length).u32(flags).u32(0).0
+}
+
 /// A buffer offset counted from the start of the SMB2 header.
 fn offset(body_bytes: usize) -> u16 {
     (HEADER_SIZE + body_bytes) as u16
@@ -234,7 +240,8 @@ fn rc4(key: &[u8], data: &mut [u8]) {
 }
 
 fn ntlm_negotiate() -> Vec<u8> {
-    let flags = ntlm::REQUIRED | ntlm::REQUEST_TARGET | ntlm::NTLM | ntlm::ALWAYS_SIGN;
+    let flags =
+        ntlm::REQUIRED | ntlm::KEY_EXCHANGE | ntlm::REQUEST_TARGET | ntlm::NTLM | ntlm::ALWAYS_SIGN;
     let flags = flags | ntlm::SIGN | ntlm::SEAL | ntlm::VERSION;
     let mut out = ntlm::SIGNATURE.to_vec();
     out.extend_from_slice(&1u32.to_le_bytes());
@@ -600,22 +607,73 @@ impl SmbClient {
         Ok(())
     }
 
+    /// One READ of `length` bytes at `at`, whatever its status.
+    pub(crate) async fn read_at(
+        &mut self,
+        file: FileId,
+        at: u64,
+        length: u32,
+    ) -> TestResult<Reply> {
+        let body = Body::default().u16(49).u8(0x50).u8(0).u32(length).u64(at);
+        let body = body.file(file).u32(0).u32(0).u32(0).u16(0).u16(0).u8(0);
+        self.call(Command::Read, &body.0).await
+    }
+
     /// Reads `size` bytes from offset zero in READ requests of at most `IO_CHUNK` bytes.
     pub(crate) async fn read_all(&mut self, file: FileId, size: usize) -> TestResult<Vec<u8>> {
         let mut out = Vec::with_capacity(size);
         while out.len() < size {
             let length = (size - out.len()).min(IO_CHUNK) as u32;
-            let body = Body::default()
-                .u16(49)
-                .u8(0x50)
-                .u8(0)
-                .u32(length)
-                .u64(out.len() as u64);
-            let body = body.file(file).u32(0).u32(0).u32(0).u16(0).u16(0).u8(0);
-            let reply = self.call(Command::Read, &body.0).await?.checked("READ")?;
-            out.extend_from_slice(&reply.data());
+            let reply = self.read_at(file, out.len() as u64, length).await?;
+            out.extend_from_slice(&reply.checked("READ")?.data());
         }
         Ok(out)
+    }
+
+    /// Sends one LOCK request for `range` without waiting and returns its MessageId.
+    pub(crate) async fn lock_start(
+        &mut self,
+        file: FileId,
+        range: (u64, u64),
+        flags: u32,
+    ) -> TestResult<u64> {
+        let message_id = self.message_id;
+        let message = [self.header(Command::Lock), lock_body(file, range, flags)].concat();
+        self.send(&message).await?;
+        Ok(message_id)
+    }
+
+    /// Locks or unlocks `range` and returns the final status.
+    pub(crate) async fn lock(
+        &mut self,
+        file: FileId,
+        range: (u64, u64),
+        flags: u32,
+    ) -> TestResult<u32> {
+        self.lock_start(file, range, flags).await?;
+        let answer = self.answer().await?;
+        answer.ok_or_else(|| "SMB server closed during LOCK".into())
+    }
+
+    /// The status of the next final response, or `None` once the server closed.
+    pub(crate) async fn answer(&mut self) -> TestResult<Option<u32>> {
+        Ok(self.receive().await?.map(|reply| reply.status()))
+    }
+
+    /// Sends an unsealed CANCEL for `message_id` that names this encrypted session.
+    pub(crate) async fn cancel_plain(&mut self, message_id: u64) -> TestResult<()> {
+        let header = Header {
+            command: Command::Cancel.code(),
+            message_id,
+            session_id: self.session_id,
+            tree_id: self.tree_id,
+            ..Header::default()
+        };
+        let mut message = Vec::new();
+        header.encode(&mut message);
+        let message = Body(message).u16(4).u16(0).0;
+        self.stream.write_all(&wire::frame(&message)?).await?;
+        Ok(())
     }
 
     async fn set_info(&mut self, file: FileId, class: u8, buffer: &[u8]) -> TestResult<Reply> {

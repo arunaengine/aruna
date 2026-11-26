@@ -238,6 +238,14 @@ impl ConnectionRegistry {
         }
     }
 
+    /// Closes every live connection, when a missed revocation could leave one admitted.
+    pub fn close_all(&self) {
+        let hosts = std::mem::take(&mut *self.hosts.lock());
+        for token in hosts.into_values().flat_map(HashMap::into_values) {
+            token.cancel();
+        }
+    }
+
     pub fn count(&self, host_id: Ulid) -> usize {
         self.hosts.lock().get(&host_id).map_or(0, HashMap::len)
     }

@@ -94,7 +94,7 @@ pub(super) fn holds(binding: &NfsMountBinding, key: &str) -> bool {
 
 /// The key an action on an object is admitted on: a file, a directory's marker, or the
 /// bucket itself for the bucket root.
-fn object_key(key: &str, kind: HandleKind) -> Option<String> {
+pub(super) fn object_key(key: &str, kind: HandleKind) -> Option<String> {
     match (kind, key.is_empty()) {
         (HandleKind::File, _) => Some(key.to_string()),
         (HandleKind::Directory, true) => None,
@@ -280,7 +280,7 @@ impl ArunaNfsBackend {
     }
 
     /// Admits one action on `key` (or on the bucket) from live state.
-    async fn authorize(
+    pub(super) async fn authorize(
         &self,
         binding: &NfsMountBinding,
         access: VfsAccess,
@@ -292,6 +292,45 @@ impl ArunaNfsBackend {
         request.prefix = prefix;
         let operation = AuthorizeVfsOperation::new(self.access_context(binding), request);
         drive(operation, &self.context).await
+    }
+
+    /// A directory without a live marker shows only while the caller can list one child of it,
+    /// so children hidden by policy never reveal their parent.
+    async fn implicit_shows(
+        &self,
+        binding: &NfsMountBinding,
+        key: &str,
+        identity: Option<&HandleIdentity>,
+    ) -> Result<(), VfsError> {
+        let implicit = matches!(
+            identity,
+            Some(HandleIdentity::Directory(
+                DirectoryWitness::Descendant { .. } | DirectoryWitness::Unpublished { .. }
+            ))
+        );
+        if !implicit {
+            return Ok(());
+        }
+        let mut resume = ListResume::Start;
+        loop {
+            let request = ListRequest {
+                context: self.access_context(binding),
+                directory: key.to_string(),
+                witness: None,
+                resume,
+                max_entries: 1,
+                deadline_ms: None,
+            };
+            let listing = drive(VfsListOperation::new(request), &self.context).await?;
+            if !listing.entries.is_empty() {
+                return Ok(());
+            }
+            resume = match listing.next {
+                ListNext::End => return Err(VfsError::NotFound),
+                ListNext::After(name) => ListResume::After(name),
+                ListNext::Sealed(sealed) => ListResume::Sealed(sealed.into_bytes()),
+            };
+        }
     }
 
     /// The change counter of `key`; also advances with staged and descendant changes.
@@ -408,6 +447,8 @@ impl ArunaNfsBackend {
             let admitted = object_key(key, summary.kind);
             self.authorize(binding, VfsAccess::Head, admitted, None)
                 .await?;
+            self.implicit_shows(binding, key, Some(&summary.identity))
+                .await?;
             return Ok(Probe {
                 identity: summary.identity,
                 kind: summary.kind,
@@ -422,6 +463,8 @@ impl ArunaNfsBackend {
         for kind in kinds {
             match self.probe_open(binding, key, kind).await {
                 Ok(opened) => {
+                    self.implicit_shows(binding, key, Some(&opened.identity))
+                        .await?;
                     return Ok(Probe {
                         identity: opened.identity,
                         kind,
@@ -514,6 +557,10 @@ impl ArunaNfsBackend {
         self.authorize(binding, VfsAccess::Head, admitted, None)
             .await
             .map_err(status_of)?;
+        let identity = located.identity.as_ref();
+        self.implicit_shows(binding, &located.key, identity)
+            .await
+            .map_err(|error| lookup_status(&error))?;
         let (size, change) = match located.kind {
             HandleKind::Directory => (0, self.change_of(binding, &located.key).await?),
             HandleKind::File => {
@@ -540,6 +587,12 @@ impl ArunaNfsBackend {
     ) -> Result<u32, NfsStat4> {
         let located = self.locate(binding, object).await?;
         let key = located.key.clone();
+        if located.detached.is_none() {
+            let identity = located.identity.as_ref();
+            self.implicit_shows(binding, &key, identity)
+                .await
+                .map_err(|error| lookup_status(&error))?;
+        }
         let own = object_key(&key, located.kind);
         let children = (!key.is_empty()).then(|| children_prefix(&key));
         type Check = (u32, VfsAccess, Option<String>, Option<String>);
@@ -598,12 +651,7 @@ impl ArunaNfsBackend {
             0 => ListResume::Start,
             1 | 2 => return Err(NfsStat4::BadCookie),
             cookie => {
-                let name = self
-                    .tables
-                    .lock()
-                    .cookies
-                    .get(&(binding.mount_id, cookie))
-                    .cloned();
+                let name = self.tables.lock().cookies.get(&(binding.mount_id, cookie));
                 ListResume::Cookie {
                     cookie,
                     name: name.unwrap_or_default(),
@@ -612,7 +660,7 @@ impl ArunaNfsBackend {
         };
         let limit = limit.max(1);
         let mut entries = Vec::new();
-        let mut eof = loop {
+        let eof = loop {
             let request = ListRequest {
                 context: self.access_context(binding),
                 directory: located.key.clone(),
@@ -623,7 +671,13 @@ impl ArunaNfsBackend {
             };
             let listing = drive(VfsListOperation::new(request), &self.context).await;
             let listing = listing.map_err(status_of)?;
+            let mut full = false;
             for entry in listing.entries {
+                // Entries past the page get no handle; the next page lists them again.
+                if entries.len() == limit {
+                    full = true;
+                    break;
+                }
                 let key = child_key(&located.key, &entry.name);
                 let claimed = match self.claim(binding, &key, Some(entry.kind)).await {
                     Ok(claimed) => claimed,
@@ -652,6 +706,7 @@ impl ArunaNfsBackend {
                 });
             }
             match listing.next {
+                _ if full => break false,
                 ListNext::End => break true,
                 // Hidden entries alone continue the scan instead of ending the page early.
                 ListNext::Sealed(sealed) if entries.is_empty() => {
@@ -660,10 +715,6 @@ impl ArunaNfsBackend {
                 _ => break false,
             }
         };
-        if entries.len() > limit {
-            entries.truncate(limit);
-            eof = false;
-        }
         Ok(DirectoryPage {
             entries,
             verifier: self.verifier,

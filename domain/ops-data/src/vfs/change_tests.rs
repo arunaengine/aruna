@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::handles_tests::{asked, child, context, granted, head, id, scope, user, vfs};
+use super::handles_tests::{asked, child, context, granted, head, id, no_open, scope, user, vfs};
 use super::mutate::*;
 use super::publish::*;
 use super::recovery::ReceiptOutcome;
@@ -115,6 +115,7 @@ fn rename(handle: bool) -> RenameInput {
         replace: false,
         attempt_id: id(20),
         stage: Some(stage("p/a")),
+        source_version: None,
     }
 }
 
@@ -221,6 +222,8 @@ fn committed_move_refused() {
     operation
         .next(vfs(VfsEvent::PermitAcquired { permit_id: id(9) }))
         .unwrap();
+    operation.next(no_open()).unwrap();
+    operation.next(no_open()).unwrap();
     let rows = vec![
         Some(head(2, Some(4))),
         None,
@@ -249,6 +252,8 @@ fn unprepared_replace_refused() {
     operation
         .next(vfs(VfsEvent::PermitAcquired { permit_id: id(9) }))
         .unwrap();
+    operation.next(no_open()).unwrap();
+    operation.next(no_open()).unwrap();
     let token = Value::from(encode_token(id(6)).to_vec());
     let rows = vec![
         None,
@@ -281,6 +286,8 @@ fn unpublished_remove_settles() {
     let turn = operation.next(granted());
     assert!(matches!(asked(&turn), VfsEffect::AcquirePermit { .. }));
     let turn = operation.next(vfs(VfsEvent::PermitAcquired { permit_id: id(9) }));
+    assert!(matches!(asked(&turn), VfsEffect::LookupInstance { .. }));
+    let turn = operation.next(no_open());
     assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
     let token = Value::from(encode_token(id(6)).to_vec());
     let rows = vec![None, None, Some(token)];
@@ -314,6 +321,7 @@ fn rolled_back_remove() {
     operation
         .next(vfs(VfsEvent::PermitAcquired { permit_id: id(9) }))
         .unwrap();
+    operation.next(no_open()).unwrap();
     let token = Value::from(encode_token(id(6)).to_vec());
     operation
         .next(IoResult::Values(vec![None, None, Some(token)]))
@@ -395,6 +403,9 @@ fn summary(remaining_opens: usize, detached: Option<DetachReason>) -> CloseSumma
         logical_size: 5,
         handle_id: Some(4),
         identity: live("p/a").identity,
+        base_version: None,
+        edit_generation: 1,
+        successor_owner: None,
     }
 }
 

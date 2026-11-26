@@ -80,7 +80,47 @@ fn busy_reason(state: &State, scope: &BucketScope) -> Option<&'static str> {
     if state.permits.busy(scope) {
         return Some("a mutation attempt is unfinished");
     }
+    if state.permits.has_guards(scope) {
+        return Some("a file guard is held");
+    }
+    if state
+        .in_flight_writes
+        .get(scope)
+        .is_some_and(|count| *count > 0)
+    {
+        return Some("a stage write is in flight");
+    }
     None
+}
+
+/// Counts one stage write of a bucket from its fence check until it settles, so a vault fence
+/// refuses meanwhile; create it last under the state lock and drop it with the lock free.
+pub(crate) struct WriteAdmission {
+    shared: Arc<Shared>,
+    scope: BucketScope,
+}
+
+impl WriteAdmission {
+    /// Counts the write in; the caller checked the fence under the same lock.
+    pub(crate) fn enter(shared: &Arc<Shared>, state: &mut State, scope: &BucketScope) -> Self {
+        *state.in_flight_writes.entry(scope.clone()).or_insert(0) += 1;
+        Self {
+            shared: Arc::clone(shared),
+            scope: scope.clone(),
+        }
+    }
+}
+
+impl Drop for WriteAdmission {
+    fn drop(&mut self) {
+        let mut state = self.shared.state.lock();
+        if let Some(count) = state.in_flight_writes.get_mut(&self.scope) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                state.in_flight_writes.remove(&self.scope);
+            }
+        }
+    }
 }
 
 impl VfsHandle {
@@ -164,5 +204,32 @@ impl VfsHandle {
             false => state.fences.open(&scope, fence_id),
         }
         Ok(VfsEvent::Done)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::VfsConfig;
+
+    #[tokio::test]
+    async fn fence_waits_writes() {
+        let folder = tempfile::tempdir().unwrap();
+        let handle = VfsHandle::open(VfsConfig {
+            stage_dir: folder.path().join("stage"),
+            node_stage_bytes: 1 << 20,
+            group_stage_bytes: 1 << 20,
+        })
+        .unwrap();
+        let scope = BucketScope::new("bucket", 7);
+        let admission = {
+            let mut state = handle.shared.state.lock();
+            WriteAdmission::enter(&handle.shared, &mut state, &scope)
+        };
+        let refused = handle.fence_vault(scope.clone()).await;
+        assert!(matches!(refused, Err(VfsFailure::VaultFenced(_))));
+        drop(admission);
+        let granted = handle.fence_vault(scope).await;
+        assert!(matches!(granted, Ok(VfsEvent::VaultFenced { .. })));
     }
 }

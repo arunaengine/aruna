@@ -238,26 +238,21 @@ pub struct ShareMount {
 pub enum ShareDriver {
     /// `csi-driver-smb`: each attempt logs in with its own access key.
     Smb { inputs: bool, sessions: bool },
-    /// `csi-driver-nfs` on trusted, enrolled workers: the NFS bindings for inputs and
-    /// sessions. The worker's mTLS identity logs in, so only isolated pods may mount them.
-    Nfs {
-        inputs: Option<String>,
-        sessions: Option<String>,
-    },
+    /// `csi-driver-nfs` on trusted, enrolled workers. Each attempt brings its own NFS
+    /// bindings; the worker's mTLS identity logs in, so only isolated pods may mount them.
+    Nfs { inputs: bool, sessions: bool },
 }
 
 impl ShareMount {
     pub fn inputs(&self) -> bool {
         match &self.driver {
-            ShareDriver::Smb { inputs, .. } => *inputs,
-            ShareDriver::Nfs { inputs, .. } => inputs.is_some(),
+            ShareDriver::Smb { inputs, .. } | ShareDriver::Nfs { inputs, .. } => *inputs,
         }
     }
 
     pub fn sessions(&self) -> bool {
         match &self.driver {
-            ShareDriver::Smb { sessions, .. } => *sessions,
-            ShareDriver::Nfs { sessions, .. } => sessions.is_some(),
+            ShareDriver::Smb { sessions, .. } | ShareDriver::Nfs { sessions, .. } => *sessions,
         }
     }
 }

@@ -11,7 +11,8 @@ use aruna_core::vfs_effects::{
     ByteLock, CloseSummary, InstanceSummary, OpenRequest, RebindRequest, ShareMode, StagedEntry,
     VfsEvent, VfsFailure, VfsProtocol, WitnessUpdate,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::ops::Bound;
 use ulid::Ulid;
 
 use crate::locks::open_owner;
@@ -21,7 +22,7 @@ use crate::{Answer, State, VfsHandle};
 #[derive(Default)]
 pub(crate) struct Bucket {
     pub(crate) instances: HashMap<u64, Instance>,
-    pub(crate) by_key: HashMap<String, u64>,
+    pub(crate) by_key: BTreeMap<String, u64>,
     pub(crate) by_handle: HashMap<u64, u64>,
     pub(crate) by_open: HashMap<Ulid, u64>,
 }
@@ -53,6 +54,9 @@ pub(crate) struct Instance {
     pub(crate) stage: Stage,
     pub(crate) stage_id: Option<Ulid>,
     pub(crate) generation: u64,
+    pub(crate) base_version: Option<Ulid>,
+    /// The one checkpoint generation this instance began and has not promoted or aborted.
+    pub(crate) draft: Option<(Ulid, u64)>,
 }
 
 impl Instance {
@@ -75,6 +79,8 @@ impl Instance {
             stage: Stage::default(),
             stage_id: None,
             generation: 0,
+            base_version: None,
+            draft: None,
         }
     }
 
@@ -83,6 +89,18 @@ impl Instance {
             .values()
             .filter(|open| open.share.write_access)
             .count()
+    }
+
+    fn allows_delete(&self) -> bool {
+        self.opens.values().all(|open| open.share.share_delete)
+    }
+
+    /// The owner of the earliest writer open that names one.
+    fn successor(&self) -> Option<StageOwner> {
+        let writers = (self.opens.iter()).filter(|(_, open)| open.share.write_access);
+        let owned = writers.filter_map(|(open_id, open)| Some((open_id, open.owner.as_ref()?)));
+        let earliest = owned.min_by_key(|(open_id, _)| **open_id);
+        earliest.map(|(_, owner)| owner.clone())
     }
 
     /// Whether this instance holds plaintext that is not published yet.
@@ -119,6 +137,9 @@ impl Instance {
             stage_id: self.stage_id,
             generation: self.generation,
             change: self.change,
+            base_version: self.base_version,
+            edit_generation: self.stage.edits,
+            allows_delete: self.allows_delete(),
         }
     }
 
@@ -138,6 +159,9 @@ impl Instance {
             logical_size: self.stage.logical_size,
             handle_id: self.handle_id,
             identity: self.identity.clone(),
+            base_version: self.base_version,
+            edit_generation: self.stage.edits,
+            successor_owner: self.successor(),
         }
     }
 }
@@ -230,6 +254,23 @@ fn reclaim(state: &mut State, scope: &BucketScope, instance_id: u64) -> Option<S
     Some(stages::volatile_name(instance_id))
 }
 
+/// Drops the stage reference of a writerless detached instance and reclaims it once idle; the
+/// caller unlinks the returned volatile file.
+pub(crate) fn release_stage(
+    state: &mut State,
+    scope: &BucketScope,
+    instance_id: u64,
+) -> Option<String> {
+    let instance = instance_mut(state, scope, instance_id).ok()?;
+    instance.stage_id = None;
+    instance.generation = 0;
+    instance.stage.sealed = None;
+    match instance.idle() {
+        true => reclaim(state, scope, instance_id),
+        false => None,
+    }
+}
+
 impl VfsHandle {
     pub(crate) fn open_instance(&self, request: OpenRequest) -> Answer {
         let changes = &self.shared.changes;
@@ -277,6 +318,7 @@ impl VfsHandle {
                 Instance::new(candidate, request.key.clone(), identity, request.group_id);
             instance.stage = Stage::over(request.base_size);
             instance.change = change;
+            instance.base_version = request.base_version;
             bucket.instances.insert(candidate, instance);
             bucket.by_key.insert(request.key.clone(), candidate);
         }
@@ -377,20 +419,42 @@ impl VfsHandle {
         Ok(VfsEvent::Instance(instance.map(Instance::summary)))
     }
 
-    /// Staged and unpublished names under `prefix`, sampled after the observer sequence.
-    pub(crate) fn list_staged(&self, scope: &BucketScope, prefix: &str) -> Answer {
+    /// Staged and unpublished names under `prefix` in key order, strictly after `after` and at
+    /// most `limit` of them, sampled after the observer sequence.
+    pub(crate) fn list_staged(
+        &self,
+        scope: &BucketScope,
+        prefix: &str,
+        after: Option<&str>,
+        limit: Option<usize>,
+    ) -> Answer {
         let sequence = self.shared.changes.sequence();
         let state = self.shared.state.lock();
         let mut entries: Vec<StagedEntry> = Vec::new();
+        let mut truncated = false;
         let Some(bucket) = state.buckets.get(scope) else {
-            return Ok(VfsEvent::StagedList { entries, sequence });
+            return Ok(VfsEvent::StagedList {
+                entries,
+                sequence,
+                truncated,
+            });
         };
-        for (key, id) in &bucket.by_key {
+        let start = match after {
+            Some(after) if after >= prefix => Bound::Excluded(after),
+            _ => Bound::Included(prefix),
+        };
+        let limit = limit.unwrap_or(usize::MAX);
+        let keys = bucket.by_key.range::<str, _>((start, Bound::Unbounded));
+        for (key, id) in keys.take_while(|(key, _)| key.starts_with(prefix)) {
             let Some(instance) = bucket.instances.get(id) else {
                 continue;
             };
-            if !key.starts_with(prefix) || !instance.unpublished() {
+            if !instance.unpublished() {
                 continue;
+            }
+            if entries.len() == limit {
+                truncated = true;
+                break;
             }
             let unpublished_token = match &instance.identity {
                 HandleIdentity::File(FileIdentity::Unpublished { token, .. }) => Some(*token),
@@ -408,8 +472,11 @@ impl VfsHandle {
                 change: instance.change,
             });
         }
-        entries.sort_by(|left, right| left.key.cmp(&right.key));
-        Ok(VfsEvent::StagedList { entries, sequence })
+        Ok(VfsEvent::StagedList {
+            entries,
+            sequence,
+            truncated,
+        })
     }
 
     /// Moves a surviving instance to its committed name, handle and identity.
@@ -451,16 +518,24 @@ impl VfsHandle {
             instance.identity = request.identity;
             instance.kind = instance.identity.kind();
             instance.detached = None;
+            instance.base_version = request.base_version;
+            let edits = instance.stage.edits;
+            let current = request
+                .expected_edit
+                .is_none_or(|expected| expected == edits);
             let mut cleared = 0;
-            if request.clear_dirty {
+            if request.clear_dirty && current {
                 let size = request.base_size.unwrap_or(instance.stage.logical_size);
                 cleared = instance.stage.extents.total();
                 instance.stage = Stage::over(size);
+                instance.stage.edits = edits;
                 instance.dirty = false;
                 instance.stage_id = None;
                 instance.generation = 0;
             } else if let Some(size) = request.base_size {
-                instance.stage.base_limit = size.min(instance.stage.logical_size);
+                // The new base matches the image only below every resize since it was captured.
+                let stage = &mut instance.stage;
+                stage.base_limit = size.min(stage.base_limit).min(stage.logical_size);
             }
             if let (Some(stage_id), Some(generation)) = (request.stage_id, request.generation) {
                 instance.stage_id = Some(stage_id);

@@ -378,6 +378,38 @@ async fn listing_pages_limits() {
 }
 
 #[tokio::test]
+async fn listing_relists_live() {
+    let (mut client, _harness, backend) = logged_in().await;
+    backend.put("dir", ObjectKind::Directory, b"");
+    for name in ["a", "b", "c"] {
+        backend.put(&format!("dir/{name}"), ObjectKind::File, b"");
+    }
+    let lister = open_directory(&mut client, "dir", FILE_LIST_DIRECTORY).await;
+    let first = client
+        .call(
+            Command::QueryDirectory,
+            &directory_body(
+                class::ID_BOTH_DIRECTORY,
+                messages::SINGLE_ENTRY,
+                lister,
+                "*",
+                LIMIT,
+            ),
+        )
+        .await;
+    assert_eq!(names(&first.output()), vec!["a"]);
+    // An entry the listing no longer shows is not served from the earlier page.
+    backend.state.lock().entries.remove("dir/b");
+    let rest = client
+        .call(
+            Command::QueryDirectory,
+            &directory_body(class::ID_BOTH_DIRECTORY, 0, lister, "*", LIMIT),
+        )
+        .await;
+    assert_eq!(names(&rest.output()), vec!["c"]);
+}
+
+#[tokio::test]
 async fn query_classes_wire() {
     let (mut client, _harness, backend) = logged_in().await;
     backend.put("q.txt", ObjectKind::File, b"hello");

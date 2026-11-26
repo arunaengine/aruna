@@ -1,4 +1,4 @@
-//! Tests of the Aruna NFS backend: error mapping, host networks and revocation, folder
+//! Tests of the Aruna NFS backend: error mapping, host networks, keys and revocation, folder
 //! confinement, refused writes on job views and the replay recheck against live state.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
@@ -10,13 +10,14 @@ use aruna_core::structs::storage::vfs::EnrolledHostRecord;
 use aruna_core::user::id::UserId;
 use aruna_core::vfs_effects::VfsFailure;
 use aruna_ops_data::vfs::admin::{EnrollInput, HostChange};
-use aruna_ops_data::vfs::{EnrollHostOperation, RevokeHostOperation};
+use aruna_ops_data::vfs::{EnrollHostOperation, RevokeHostOperation, RotateHostOperation};
 use aruna_runner::driver::drive;
 use aruna_runner::testing::memory_context;
 
 use super::admit::host_allows;
 use super::exports::{holds, root_key};
 use super::*;
+use crate::backend::{ReplayAccess, ReplayCheck};
 use crate::rpc::RpcPrincipal;
 use crate::types::share;
 
@@ -85,6 +86,13 @@ fn peer(last: u8) -> IpAddr {
     IpAddr::V4(Ipv4Addr::new(10, 1, 2, last))
 }
 
+fn principal() -> RpcPrincipal {
+    RpcPrincipal::Sys {
+        uid: 1000,
+        gid: 1000,
+    }
+}
+
 /// A caller of `binding` after the backend admitted it for this compound.
 fn admitted(backend: &ArunaNfsBackend, binding: &NfsMountBinding) -> Caller {
     backend
@@ -95,6 +103,7 @@ fn admitted(backend: &ArunaNfsBackend, binding: &NfsMountBinding) -> Caller {
     let host = HostIdentity {
         host_id: binding.host_id,
         owner: binding.owner,
+        fingerprint: None,
     };
     Caller {
         host,
@@ -244,8 +253,23 @@ async fn views_refuse_writes() {
         Err(NfsStat4::ReadOnly)
     );
     let change = AttributeChange::default();
+    let writer = ShareRequest {
+        owner: OwnerKey {
+            client_id: 1,
+            owner: Bytes::from_static(b"owner"),
+        },
+        access: share::WRITE,
+        deny: 0,
+    };
     let create = backend
-        .create_file(&caller, object, "new", CreateMode::Guarded, &change)
+        .create_file(
+            &caller,
+            object,
+            "new",
+            CreateMode::Guarded,
+            &writer,
+            &change,
+        )
         .await;
     assert_eq!(create, Err(NfsStat4::ReadOnly));
     let mkdir = backend
@@ -258,14 +282,6 @@ async fn views_refuse_writes() {
     );
     let rename = backend.rename(&caller, object, "a", object, "b").await;
     assert_eq!(rename, Err(NfsStat4::ReadOnly));
-    let writer = ShareRequest {
-        owner: OwnerKey {
-            client_id: 1,
-            owner: Bytes::from_static(b"owner"),
-        },
-        access: share::WRITE,
-        deny: 0,
-    };
     assert_eq!(
         backend.open(&caller, object, &writer).await,
         Err(NfsStat4::ReadOnly)
@@ -308,17 +324,14 @@ async fn lapsed_replay_refused() {
     let identity = HostIdentity {
         host_id: host.host_id,
         owner: host.owner,
+        fingerprint: Some([7; 32]),
     };
     let grant = |peer, mounts| ReplayGrant {
         host: identity,
         peer,
-        principal: RpcPrincipal::Sys {
-            uid: 1000,
-            gid: 1000,
-        },
+        principal: principal(),
         mounts,
-        reads: true,
-        writes: false,
+        checks: Vec::new(),
     };
     assert_eq!(
         backend.recheck_replay(&grant(peer(4), Vec::new())).await,
@@ -335,6 +348,7 @@ async fn lapsed_replay_refused() {
     let unknown = HostIdentity {
         host_id: Ulid::from_parts(6, 6),
         owner: owner(),
+        fingerprint: None,
     };
     let mut lost = grant(peer(4), Vec::new());
     lost.host = unknown;
@@ -371,4 +385,120 @@ async fn revoked_loopback_refused() {
     drive(revoke, &backend.context).await.expect("host revoked");
     let local = IpAddr::V4(Ipv4Addr::LOCALHOST);
     assert_eq!(backend.loopback_host(local).await, None);
+}
+
+// A rotated key ends what its connection may do at once, even with no revocation event: replays
+// and mount admission check the proven key against the host record.
+#[tokio::test]
+async fn rotated_key_refused() {
+    let backend = backend();
+    let host = enroll_host(&backend, 7, &["10.1.0.0/16"]).await;
+    let found = backend.enrolled_host([7; 32], peer(4)).await;
+    let found = found.expect("the enrolled key admits");
+    assert_eq!(found.fingerprint, Some([7; 32]));
+    let grant = ReplayGrant {
+        host: found,
+        peer: peer(4),
+        principal: principal(),
+        mounts: Vec::new(),
+        checks: Vec::new(),
+    };
+    assert_eq!(backend.recheck_replay(&grant).await, Ok(()));
+    let rotate = HostChange::Rotate {
+        fingerprints: vec![[8; 32]],
+        proven: [8; 32],
+    };
+    let rotate = RotateHostOperation::new(host.host_id, owner(), rotate);
+    drive(rotate, &backend.context).await.expect("key rotated");
+    assert_eq!(backend.recheck_replay(&grant).await, Err(NfsStat4::Access));
+    let mount = backend
+        .mount_export(&found, peer(4), Ulid::from_parts(5, 5))
+        .await;
+    assert_eq!(mount, Err(NfsStat4::Access));
+}
+
+// A replay is admitted again for each object use: a gone run, a missing bucket, a write on a
+// view or a use outside the grant's bindings refuses it.
+#[tokio::test]
+async fn replay_checks_objects() {
+    let backend = backend();
+    let host = enroll_host(&backend, 7, &["10.1.0.0/16"]).await;
+    let view = binding(NfsMountTarget::JobInputView {
+        job_id: JobId::from_bytes([8; 16]),
+    });
+    let root = ObjectRef {
+        mount_id: view.mount_id,
+        object_id: aruna_ops_data::vfs::path::JOB_ROOT,
+    };
+    let check = |access| ReplayCheck {
+        object: root,
+        access,
+    };
+    let head = backend
+        .recheck_view(&view, &check(ReplayAccess::Head))
+        .await;
+    assert!(head.is_err(), "a view of a gone run shows nothing");
+    let write = backend
+        .recheck_view(&view, &check(ReplayAccess::Write))
+        .await;
+    assert_eq!(write, Err(NfsStat4::ReadOnly));
+    let bucket = binding(NfsMountTarget::for_bucket("data", 7).expect("a bucket"));
+    let live = ReplayCheck {
+        object: ObjectRef {
+            mount_id: bucket.mount_id,
+            object_id: LIVE_ROOT,
+        },
+        access: ReplayAccess::List,
+    };
+    let listed = backend.recheck_live(&bucket, &live).await;
+    assert!(listed.is_err(), "a missing bucket lists nothing");
+    let grant = ReplayGrant {
+        host: HostIdentity {
+            host_id: host.host_id,
+            owner: host.owner,
+            fingerprint: Some([7; 32]),
+        },
+        peer: peer(4),
+        principal: principal(),
+        mounts: Vec::new(),
+        checks: vec![check(ReplayAccess::Head)],
+    };
+    assert_eq!(backend.recheck_replay(&grant).await, Err(NfsStat4::Access));
+}
+
+// A deleted binding stops serving at once, but the engine's cleanup still releases the opens
+// and locks made through it; the binding is forgotten once nothing holds it.
+#[tokio::test]
+async fn revoked_mount_releases() {
+    let backend = backend();
+    let view = binding(NfsMountTarget::JobInputView {
+        job_id: JobId::from_bytes([8; 16]),
+    });
+    let caller = admitted(&backend, &view);
+    let object = ObjectRef {
+        mount_id: view.mount_id,
+        object_id: aruna_ops_data::vfs::path::JOB_ROOT,
+    };
+    let owner = OwnerKey {
+        client_id: 1,
+        owner: Bytes::from_static(b"owner"),
+    };
+    let locked = backend
+        .lock(&caller, object, &owner, LockKind::Read, LockRange::ALL)
+        .await;
+    assert_eq!(locked, Ok(()));
+    backend.publish_revocation(Revocation::Mount(view.mount_id));
+    let shown = backend.attributes(&caller, object).await;
+    assert_eq!(shown, Err(NfsStat4::Stale));
+    assert_eq!(backend.close(&caller, object, &owner).await, Ok(()));
+    assert!(
+        backend.tables.lock().closing.contains_key(&view.mount_id),
+        "a lock still holds the binding"
+    );
+    let range = LockRange::ALL;
+    let unlocked = backend.unlock(&caller, object, &owner, range).await;
+    assert_eq!(unlocked, Ok(false));
+    assert!(backend.tables.lock().closing.is_empty());
+    let again = backend.unlock(&caller, object, &owner, range).await;
+    assert_eq!(again, Err(NfsStat4::Stale));
 }

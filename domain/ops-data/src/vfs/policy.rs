@@ -84,6 +84,7 @@ pub fn vfs_policy_extras(
     prefix: Option<&str>,
     version_id: Option<Ulid>,
     length: Option<u64>,
+    range: Option<(u64, u64)>,
 ) -> PolicyRequestExtras {
     let mut params = BTreeMap::new();
     if let Some(prefix) = prefix.filter(|_| access == VfsAccess::List) {
@@ -96,6 +97,9 @@ pub fn vfs_policy_extras(
     let mut headers = BTreeMap::new();
     if let Some(length) = length.filter(|_| access == VfsAccess::Put) {
         headers.insert("content-length".to_string(), length.to_string());
+    }
+    if let Some((start, end)) = range.filter(|_| access == VfsAccess::Get) {
+        headers.insert("range".to_string(), format!("bytes={start}-{end}"));
     }
     PolicyRequestExtras {
         operation: format!("s3.{}", access.operation()),
@@ -153,6 +157,8 @@ pub struct VfsRequest {
     pub length: Option<u64>,
     /// The listed directory prefix of an enumeration.
     pub prefix: Option<String>,
+    /// The inclusive byte range `(first, last)` a read asks for.
+    pub range: Option<(u64, u64)>,
 }
 
 impl VfsRequest {
@@ -164,6 +170,7 @@ impl VfsRequest {
             version_id: None,
             length: None,
             prefix: None,
+            range: None,
         }
     }
 }
@@ -243,7 +250,8 @@ impl AuthorizeVfsOperation {
     fn extras(&self) -> PolicyRequestExtras {
         let request = &self.request;
         let prefix = request.prefix.as_deref();
-        vfs_policy_extras(request.access, prefix, request.version_id, request.length)
+        let (version_id, length) = (request.version_id, request.length);
+        vfs_policy_extras(request.access, prefix, version_id, length, request.range)
     }
 
     /// The export confines every key it serves by whole components.

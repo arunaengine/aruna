@@ -28,9 +28,9 @@ pub const VERSION: u32 = 0x0200_0000;
 pub const NEGOTIATE_128: u32 = 0x2000_0000;
 pub const KEY_EXCHANGE: u32 = 0x4000_0000;
 pub const NEGOTIATE_56: u32 = 0x8000_0000;
-/// Flags every accepted client must offer: Unicode, extended session security, 128-bit
-/// keys and key exchange.
-pub const REQUIRED: u32 = UNICODE | EXTENDED_SECURITY | NEGOTIATE_128 | KEY_EXCHANGE;
+/// Flags every accepted client must offer: Unicode, extended session security and 128-bit
+/// keys. Key exchange is optional, as Linux SMB3 clients may leave it out.
+pub const REQUIRED: u32 = UNICODE | EXTENDED_SECURITY | NEGOTIATE_128;
 const OFFERED: u32 = UNICODE
     | REQUEST_TARGET
     | SIGN
@@ -310,12 +310,15 @@ impl Challenge {
         }
         let base = Zeroizing::new(hmac_md5(key.as_slice(), &[proof])?);
         drop(key);
-        if auth.encrypted_key.len() != 16 {
-            return Err(NtlmError::Malformed("encrypted session key length"));
+        // Without key exchange the session base key is the exported key (MS-NLMP 3.3.2).
+        let mut session_key = Zeroizing::new(*base);
+        if auth.flags & KEY_EXCHANGE != 0 {
+            if auth.encrypted_key.len() != 16 {
+                return Err(NtlmError::Malformed("encrypted session key length"));
+            }
+            session_key.copy_from_slice(&auth.encrypted_key);
+            rc4_apply(base.as_slice(), session_key.as_mut_slice())?;
         }
-        let mut session_key = Zeroizing::new([0u8; 16]);
-        session_key.copy_from_slice(&auth.encrypted_key);
-        rc4_apply(base.as_slice(), session_key.as_mut_slice())?;
         let mic_present = blob_flags(blob)? & MIC_PRESENT != 0;
         if mic_present {
             let mut zeroed = auth.raw.clone();

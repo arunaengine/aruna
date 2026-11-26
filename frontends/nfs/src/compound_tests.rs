@@ -35,8 +35,9 @@ fn empty_fattr(writer: &mut XdrWriter) {
     writer.put_u32(0);
 }
 
-fn put_channel(writer: &mut XdrWriter) {
-    for value in [0, 1 << 20, 1 << 20, 8192, 16, 4, 0] {
+/// Channel attributes asking for `cached` bytes of cached reply.
+fn put_channel(writer: &mut XdrWriter, cached: u32) {
+    for value in [0, 1 << 20, 1 << 20, cached, 16, 4, 0] {
         writer.put_u32(value);
     }
 }
@@ -108,10 +109,20 @@ impl Ops {
 
     /// OPEN of `name` under the current directory; `create` writes the `openflag4`.
     fn open(self, owner: &[u8], name: &str, create: impl FnOnce(&mut XdrWriter)) -> Self {
+        self.open_deny(owner, (name, 0), create)
+    }
+
+    /// OPEN for reading and writing that denies `deny` to other owners.
+    fn open_deny(
+        self,
+        owner: &[u8],
+        (name, deny): (&str, u32),
+        create: impl FnOnce(&mut XdrWriter),
+    ) -> Self {
         self.op(NfsOp4::Open, |writer| {
             writer.put_u32(0);
             writer.put_u32(share::BOTH);
-            writer.put_u32(0);
+            writer.put_u32(deny);
             writer.put_u64(0);
             writer.put_opaque(owner);
             create(writer);
@@ -239,13 +250,13 @@ impl Ops {
         })
     }
 
-    fn create_session(self, client_id: u64, sequence: u32) -> Self {
+    fn create_session(self, client_id: u64, sequence: u32, cached: u32) -> Self {
         self.op(NfsOp4::CreateSession, |writer| {
             writer.put_u64(client_id);
             writer.put_u32(sequence);
             writer.put_u32(0);
-            put_channel(writer);
-            put_channel(writer);
+            put_channel(writer, cached);
+            put_channel(writer, cached);
             writer.put_u32(0);
             writer.put_u32(1);
             writer.put_u32(0);
@@ -389,6 +400,11 @@ struct Harness {
 
 impl Harness {
     async fn new() -> Self {
+        Self::cached(8192).await
+    }
+
+    /// A harness whose session keeps cached replies of at most `cached` bytes.
+    async fn cached(cached: u32) -> Self {
         let (backend, fixture) = MockBackend::with_host([1; 32]);
         let engine = Engine::new(
             backend.clone(),
@@ -423,7 +439,7 @@ impl Harness {
         let client_id = exchange.u64();
         let sequence = exchange.u32();
         let mut created = harness
-            .run(Ops::new().create_session(client_id, sequence))
+            .run(Ops::new().create_session(client_id, sequence, cached))
             .await;
         assert_eq!(created.next(NfsOp4::CreateSession), 0);
         harness.session = created.reader.array::<16>().expect("session");
@@ -901,6 +917,7 @@ async fn bind_same_host() {
         host: HostIdentity {
             host_id: Ulid::from_parts(8, 8),
             owner: harness.fixture.host.owner,
+            fingerprint: None,
         },
         peer: harness.connection.peer,
     };
@@ -968,4 +985,151 @@ async fn readdir_cookies_resume() {
         .putfh(&harness.root())
         .readdir(cookies[0], [1; 8], 4096);
     assert_eq!(harness.run(ops).await.status, NfsStat4::NotSame.code());
+}
+
+// A cached compound stops at the first result its slot cannot keep with REP_TOO_BIG_TO_CACHE,
+// and a retry replays exactly that prefix instead of running anything again.
+#[tokio::test]
+async fn cached_reply_bounded() {
+    let mut harness = Harness::cached(512).await;
+    let mut ops = harness.ops().putfh(&harness.root());
+    for _ in 0..12 {
+        ops = ops.plain(NfsOp4::Getfh);
+    }
+    let body = ops.body();
+    let first = harness.call(body.clone()).await;
+    let CompoundOutcome::Reply(bytes) = &first else {
+        panic!("expected a reply, got {first:?}");
+    };
+    assert!(bytes.len() <= 512, "the reply fits the cached size");
+    let mut result = reply(first.clone());
+    assert_eq!(result.status, NfsStat4::ReplyUncacheable.code());
+    assert!(result.count < 14, "the compound stopped early");
+    result.sequence();
+    assert_eq!(result.next(NfsOp4::Putfh), 0);
+    for _ in 2..result.count - 1 {
+        assert_eq!(result.next(NfsOp4::Getfh), 0);
+        result.opaque();
+    }
+    let last = result.next(NfsOp4::Getfh);
+    assert_eq!(last, NfsStat4::ReplyUncacheable.code());
+    assert_eq!(harness.call(body).await, first, "the slot kept the reply");
+}
+
+// A large READ in a cached compound is shortened to what the slot can keep.
+#[tokio::test]
+async fn cached_read_shortened() {
+    let mut harness = Harness::cached(1024).await;
+    let mount = harness.fixture.export.mount_id;
+    let file = harness.backend.add_file(mount, "big", &[7; 4096]);
+    let handle = harness.handle(&harness.fixture.export, file);
+    let body = harness
+        .ops()
+        .putfh(&handle)
+        .read(&Stateid::ANONYMOUS, 4096)
+        .body();
+    let first = harness.call(body.clone()).await;
+    let mut result = reply(first.clone());
+    assert_eq!(result.status, 0);
+    result.sequence();
+    assert_eq!(result.next(NfsOp4::Putfh), 0);
+    assert_eq!(result.next(NfsOp4::Read), 0);
+    assert!(!result.flag(), "a short read is no eof");
+    let data = result.opaque();
+    assert!(!data.is_empty() && data.len() < 1024);
+    assert_eq!(harness.call(body).await, first, "the slot kept the reply");
+}
+
+// A retry of an uncached reply succeeds its SEQUENCE and fails the next operation with
+// RETRY_UNCACHED_REP (RFC 8881 section 2.10.6.1.3).
+#[tokio::test]
+async fn uncached_retry_placed() {
+    let mut harness = Harness::new().await;
+    harness.sequence += 1;
+    let body = Ops::new()
+        .sequence(harness.session, harness.sequence, false)
+        .putfh(&harness.root())
+        .plain(NfsOp4::Getfh)
+        .body();
+    assert_eq!(reply(harness.call(body.clone()).await).status, 0);
+    let mut retried = reply(harness.call(body).await);
+    assert_eq!(retried.status, NfsStat4::RetryUncached.code());
+    assert_eq!(retried.count, 2);
+    retried.sequence();
+    assert_eq!(retried.next(NfsOp4::Putfh), NfsStat4::RetryUncached.code());
+}
+
+// A cached reply records each object use, so its replay is admitted for exactly those.
+#[tokio::test]
+async fn replay_records_uses() {
+    let mut harness = Harness::new().await;
+    let stateid = harness.open("data").await;
+    let file = harness.backend.state.lock().next_object - 1;
+    let object = ObjectRef {
+        mount_id: harness.fixture.export.mount_id,
+        object_id: file,
+    };
+    let handle = harness.handle(&harness.fixture.export, file);
+    let body = harness
+        .ops()
+        .putfh(&handle)
+        .write(&stateid, 0, b"xy")
+        .read(&stateid, 16)
+        .body();
+    let first = harness.call(body.clone()).await;
+    assert_eq!(harness.call(body).await, first);
+    let grant = harness.backend.state.lock().replayed.clone();
+    let checks = grant.expect("the replay was checked").checks;
+    let read = ReplayAccess::Read {
+        offset: 0,
+        length: 16,
+    };
+    for access in [ReplayAccess::Write, read] {
+        assert!(
+            checks.contains(&ReplayCheck { object, access }),
+            "{access:?}"
+        );
+    }
+}
+
+// OPEN with create hands its deny bits to the creating backend open of the same owner.
+#[tokio::test]
+async fn create_keeps_deny() {
+    let mut harness = Harness::new().await;
+    let ops =
+        harness
+            .ops()
+            .putfh(&harness.root())
+            .open_deny(b"owner", ("new", share::WRITE), unchecked);
+    assert_eq!(harness.run(ops).await.status, 0);
+    let created = harness.backend.state.lock().created.clone();
+    let share = created.last().expect("a create");
+    assert_eq!((share.access, share.deny), (share::BOTH, share::WRITE));
+    assert_eq!(&share.owner.owner[..], b"owner");
+}
+
+// A WRITE with a lock stateid runs as that lock owner, not as the open owner behind it.
+#[tokio::test]
+async fn lock_owner_writes() {
+    let mut harness = Harness::new().await;
+    let open = harness.open("data").await;
+    let file = harness.backend.state.lock().next_object - 1;
+    let handle = harness.handle(&harness.fixture.export, file);
+    let ops = harness
+        .ops()
+        .putfh(&handle)
+        .lock(false, 10, &open, Some(b"lock-a"));
+    let mut result = harness.run(ops).await;
+    assert_eq!(result.status, 0);
+    result.sequence();
+    assert_eq!(result.next(NfsOp4::Putfh), 0);
+    assert_eq!(result.next(NfsOp4::Lock), 0);
+    let lock = result.stateid();
+    let ops = harness.ops().putfh(&handle).write(&lock, 0, b"xy");
+    assert_eq!(harness.run(ops).await.status, 0);
+    let ops = harness.ops().putfh(&handle).write(&open, 2, b"zz");
+    assert_eq!(harness.run(ops).await.status, 0);
+    let writers = harness.backend.state.lock().writers.clone();
+    let owners: Vec<&[u8]> = writers.iter().map(|owner| &owner.owner[..]).collect();
+    assert_eq!(owners, [&b"lock-a"[..], &b"owner"[..]]);
 }

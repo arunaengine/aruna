@@ -49,6 +49,12 @@ pub struct MockState {
     pub shares: HashMap<ObjectRef, HashMap<OwnerKey, (u32, u32)>>,
     pub locks: Vec<(ObjectRef, OwnerKey, LockKind, LockRange)>,
     pub replay_denied: bool,
+    /// The last grant a replay was checked against.
+    pub replayed: Option<ReplayGrant>,
+    /// The share each create held for its owner, in order.
+    pub created: Vec<ShareRequest>,
+    /// The I/O owner of each WRITE: its lock owner when it named one, else its open owner.
+    pub writers: Vec<OwnerKey>,
     pub writes: usize,
     pub creates: usize,
     pub closes: usize,
@@ -102,6 +108,7 @@ impl MockBackend {
         let host = HostIdentity {
             host_id: Ulid::from_parts(2, 1),
             owner: user(),
+            fingerprint: Some(pin),
         };
         let export = export_for(&host, Ulid::from_parts(3, 1), "key-one");
         let other = export_for(&host, Ulid::from_parts(3, 2), "key-two");
@@ -193,7 +200,7 @@ impl MockBackend {
         let own = match io {
             IoState::Bypass => return false,
             IoState::Anonymous => None,
-            IoState::Open(owner) => Some(owner),
+            IoState::Open { owner, .. } => Some(owner),
         };
         state.shares.get(&object).is_some_and(|shares| {
             shares
@@ -290,8 +297,10 @@ impl NfsBackend for MockBackend {
             .ok_or(NfsStat4::Stale)
     }
 
-    async fn recheck_replay(&self, _grant: &ReplayGrant) -> Result<(), NfsStat4> {
-        if self.state.lock().replay_denied {
+    async fn recheck_replay(&self, grant: &ReplayGrant) -> Result<(), NfsStat4> {
+        let mut state = self.state.lock();
+        state.replayed = Some(grant.clone());
+        if state.replay_denied {
             return Err(NfsStat4::Access);
         }
         Ok(())
@@ -511,6 +520,10 @@ impl NfsBackend for MockBackend {
         if Self::denied(&locked, object, state, share::WRITE) {
             return Err(NfsStat4::Locked);
         }
+        if let IoState::Open { owner, lock_owner } = state {
+            let writer = lock_owner.as_ref().unwrap_or(owner);
+            locked.writers.push(writer.clone());
+        }
         locked.writes += 1;
         let node = locked
             .nodes
@@ -545,9 +558,11 @@ impl NfsBackend for MockBackend {
         directory: ObjectRef,
         name: &str,
         mode: CreateMode,
+        share: &ShareRequest,
         change: &AttributeChange,
     ) -> Result<CreateReply, NfsStat4> {
         let mut state = self.state.lock();
+        state.created.push(share.clone());
         if let Some(id) = Self::child(&state, directory, name) {
             let object = ObjectRef {
                 mount_id: directory.mount_id,

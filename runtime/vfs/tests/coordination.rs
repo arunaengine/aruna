@@ -57,6 +57,7 @@ fn request(key: &str, identity: HandleIdentity, share: ShareMode) -> OpenRequest
         owner: None,
         base_size: 0,
         group_id: group(),
+        base_version: None,
     }
 }
 
@@ -377,6 +378,61 @@ async fn fence_excludes_stages() {
     let other = BucketScope::new("other", 1);
     let answer = handle.execute(VfsEffect::FenceVault { scope: other }).await;
     assert!(matches!(answer, VfsEvent::VaultFenced { .. }));
+}
+
+#[tokio::test]
+async fn fence_waits_guards() {
+    let (_folder, handle) = booted().await;
+    let instance_id = opened(&handle, request("a.txt", committed(), reader())).await;
+    let held = guard(&handle, vec![instance_id]).await;
+    let VfsEvent::GuardAcquired { guard_id } = held else {
+        panic!("unexpected answer {held:?}");
+    };
+    let fence = || VfsEffect::FenceVault { scope: scope() };
+    let refused = handle.execute(fence()).await;
+    assert!(matches!(
+        refused,
+        VfsEvent::Failed(VfsFailure::VaultFenced(_))
+    ));
+    let release = VfsEffect::ReleaseGuard { guard_id };
+    assert_eq!(handle.execute(release).await, VfsEvent::Done);
+    let answer = handle.execute(fence()).await;
+    assert!(matches!(answer, VfsEvent::VaultFenced { .. }));
+}
+
+#[tokio::test]
+async fn reads_respect_locks() {
+    let (_folder, handle) = booted().await;
+    let mut open = request("a.txt", committed(), reader());
+    open.base_size = 32;
+    let instance_id = opened(&handle, open).await;
+    let shared = ByteLock {
+        exclusive: false,
+        ..lock(2, 20, 10, VfsProtocol::Smb)
+    };
+    let take = VfsEffect::LockRanges {
+        scope: scope(),
+        instance_id,
+        locks: vec![lock(1, 0, 10, VfsProtocol::Smb), shared],
+        atomic: true,
+    };
+    assert_eq!(handle.execute(take).await, VfsEvent::Done);
+    let read = |owner_id, offset| VfsEffect::ReadStage {
+        scope: scope(),
+        instance_id,
+        offset,
+        length: 5,
+        owner_id,
+    };
+    let blocked = handle.execute(read(Some(9), 0)).await;
+    assert_eq!(blocked, VfsEvent::Failed(VfsFailure::LockConflict));
+    for (owner_id, offset) in [(Some(1), 0), (Some(9), 20), (None, 0)] {
+        let answer = handle.execute(read(owner_id, offset)).await;
+        assert!(
+            matches!(answer, VfsEvent::StageRead { .. }),
+            "owner {owner_id:?} at {offset} was refused"
+        );
+    }
 }
 
 #[tokio::test]

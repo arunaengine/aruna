@@ -1,8 +1,11 @@
-//! SMB 3.1.1 mounts end to end: streamed writes published by FLUSH, renames over live names
-//! and out of implicit directories, deletes, and live sessions ended by S3 key revocation.
+//! SMB 3.1.1 mounts end to end: streamed writes published by FLUSH, renames and deletes that
+//! keep implicit parents, byte-range locks, and live sessions ended by S3 key revocation.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::future::Future;
+
+use aruna_smb::messages::{LOCK_EXCLUSIVE, LOCK_IMMEDIATE, LOCK_UNLOCK};
 use aruna_smb::status;
 
 use super::smb_client::{DELETE, DIRECTORY, FILE_CREATE, FILE_OPEN, NOT_DIRECTORY};
@@ -99,6 +102,105 @@ async fn roundtrip_steps(mounts: &Mounts) -> TestResult<()> {
         mounts.missing("target.bin").await,
         "the delete-on-close removed the object"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn smb_delete_marker() -> TestResult<()> {
+    let mounts = Mounts::start(true, None).await?;
+    let result = marker_steps(&mounts).await;
+    mounts.shutdown().await;
+    result
+}
+
+async fn marker_steps(mounts: &Mounts) -> TestResult<()> {
+    let address = mounts.smb.ok_or("no SMB listener")?;
+    // `implicit` exists only through this object, which makes it an implicit directory.
+    mounts.put("implicit/only.txt", b"the last child").await?;
+    let mut client = SmbClient::login(address, &mounts.keys, BUCKET).await?;
+    let access = DELETE | READ_ATTRIBUTES;
+    let file = client
+        .open("implicit\\only.txt", access, FILE_OPEN, NOT_DIRECTORY)
+        .await?;
+    client.dispose(file).await?;
+    client.close(file).await?;
+    assert!(
+        mounts.missing("implicit/only.txt").await,
+        "the delete-on-close removed the object"
+    );
+    assert!(
+        mounts.exists("implicit/").await,
+        "the parent marker of `implicit` was written"
+    );
+    let parent = client
+        .open("implicit", READ_ATTRIBUTES, FILE_OPEN, DIRECTORY)
+        .await?;
+    client.close(parent).await?;
+    Ok(())
+}
+
+/// The range both opens of `smb_lock_cancel` contend for.
+const LOCKED: (u64, u64) = (0, 16);
+
+#[tokio::test]
+async fn smb_lock_cancel() -> TestResult<()> {
+    let mounts = Mounts::start(true, None).await?;
+    let result = lock_steps(&mounts).await;
+    mounts.shutdown().await;
+    result
+}
+
+/// The status a probe gets within the deadlock cap; a broken connection counts as closed.
+async fn bounded(probe: impl Future<Output = TestResult<Option<u32>>>) -> TestResult<Option<u32>> {
+    match tokio::time::timeout(WAIT_CAP, probe).await {
+        Ok(answer) => Ok(answer.ok().flatten()),
+        Err(_) => Err("the SMB session neither answered nor closed".into()),
+    }
+}
+
+async fn lock_steps(mounts: &Mounts) -> TestResult<()> {
+    let address = mounts.smb.ok_or("no SMB listener")?;
+    mounts.put("locked.bin", &pattern(64)).await?;
+    let mut holder = SmbClient::login(address, &mounts.keys, BUCKET).await?;
+    let mut other = SmbClient::login(address, &mounts.keys, BUCKET).await?;
+    let held = holder
+        .open("locked.bin", WRITER, FILE_OPEN, NOT_DIRECTORY)
+        .await?;
+    let exclusive = LOCK_EXCLUSIVE | LOCK_IMMEDIATE;
+    assert_eq!(holder.lock(held, LOCKED, exclusive).await?, status::SUCCESS);
+    let file = other
+        .open("locked.bin", WRITER, FILE_OPEN, NOT_DIRECTORY)
+        .await?;
+    let read = other.read_at(file, LOCKED.0, LOCKED.1 as u32).await?;
+    assert_eq!(
+        read.status(),
+        status::LOCK_CONFLICT,
+        "an exclusive lock refuses the READ of another open"
+    );
+
+    // The plaintext CANCEL is processed before the probe, and before the holder unlocks.
+    let waiting = other.lock_start(file, LOCKED, LOCK_EXCLUSIVE).await?;
+    other.cancel_plain(waiting).await?;
+    let first = bounded(other.probe()).await?;
+    if first == Some(status::CANCELLED) {
+        assert_eq!(
+            bounded(other.probe()).await?,
+            None,
+            "a plaintext CANCEL cancelled a LOCK of a session that serves on"
+        );
+    }
+    assert_eq!(
+        holder.lock(held, LOCKED, LOCK_UNLOCK).await?,
+        status::SUCCESS
+    );
+    if first == Some(status::SUCCESS) {
+        assert_eq!(
+            other.answer().await?,
+            Some(status::SUCCESS),
+            "the waiting LOCK is granted once the holder unlocks"
+        );
+    }
+    holder.close(held).await?;
     Ok(())
 }
 

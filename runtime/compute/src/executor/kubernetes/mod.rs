@@ -366,7 +366,7 @@ impl KubernetesBackend {
             return Ok(());
         };
         let bucket = &workspace.bucket_name;
-        if let Some(source) = csi::session_source(&self.config, bucket, mount) {
+        if let Some(source) = csi::session_source(&self.config, spec, bucket, mount)? {
             let name = csi::share_data_name(&context.attempt.external_name());
             return self
                 .ensure_share(context, spec, &name, &source, false)
@@ -1267,7 +1267,8 @@ impl ExecutorBackend for KubernetesBackend {
                 if !spec.s3_mounts.is_empty() {
                     self.ensure_secret(context, spec).await?;
                     let buckets = mount_buckets(&layout);
-                    let share = csi::input_source(&self.config, &spec.attempt.job_id, &buckets)?;
+                    let share =
+                        csi::input_source(&self.config, spec, &spec.attempt.job_id, &buckets)?;
                     match (share, self.config.kubedal.is_some()) {
                         (Some(source), _) => {
                             let name = csi::share_input_name(&context.attempt.external_name());

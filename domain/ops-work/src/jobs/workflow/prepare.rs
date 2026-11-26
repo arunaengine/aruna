@@ -528,6 +528,7 @@ pub fn build_task_spec(
         log_limits: Default::default(),
         session: session.is_some(),
         session_mount: session.and_then(|session| session.mount),
+        nfs_mounts: Default::default(),
         inputs,
         s3_mounts: mounts,
         staging_mode: staging,

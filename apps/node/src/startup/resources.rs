@@ -652,20 +652,21 @@ async fn fill(
     Ok(())
 }
 
-/// Opens the stage folder when SMB or NFS is on and has storage report every committed head
-/// change to it. `None` when both are off.
+/// Opens the stage folder when SMB or NFS is on, or when an earlier run left it on disk, and
+/// has storage report every committed head change to it. Recovery and vault fences then see
+/// its scratch files with both listeners off. `None` only when both are off and it is absent.
 fn open_vfs(
     vfs: &VfsSettings,
     config: &Config,
     storage_handle: &StorageHandle,
 ) -> Result<Option<VfsHandle>, Box<dyn std::error::Error>> {
-    if !vfs.enabled() {
-        return Ok(None);
-    }
     let stage_dir = vfs
         .stage_dir
         .clone()
         .unwrap_or_else(|| std::path::PathBuf::from(&config.storage_path).join("vfs-stage"));
+    if !vfs.enabled() && !stage_dir.exists() {
+        return Ok(None);
+    }
     let vfs_handle = VfsHandle::open(VfsConfig {
         stage_dir,
         node_stage_bytes: vfs.node_stage_bytes,

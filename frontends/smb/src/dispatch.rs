@@ -761,39 +761,38 @@ impl<B: SmbBackend> Connection<B> {
     ) -> Result<Vec<u8>, u32> {
         let mut buffer = Vec::new();
         let mut last = None;
-        let pattern = listing.pattern.clone();
-        loop {
-            if listing.buffered.is_empty() && !listing.exhausted {
-                let page = self
-                    .backend
-                    .list(&open.scope, open.handle, listing.cursor.take())
-                    .await
-                    .map_err(backend_status)?;
-                listing.buffered.extend(
-                    page.entries
-                        .into_iter()
-                        .filter(|entry| info::pattern_matches(&pattern, &entry.name)),
-                );
-                listing.exhausted = page.next.is_none();
-                listing.cursor = page.next;
-                continue;
+        // Each request lists the current page again under live admission and skips the names
+        // it already returned, so a continuation never shows an entry it could not list now.
+        while !listing.exhausted {
+            let page = self
+                .backend
+                .list(&open.scope, open.handle, listing.cursor.clone())
+                .await
+                .map_err(backend_status)?;
+            for entry in &page.entries {
+                if listing.emitted.contains(&entry.name)
+                    || !info::pattern_matches(&listing.pattern, &entry.name)
+                {
+                    continue;
+                }
+                let attributes = info::attributes(&entry.info, open.read_only);
+                let encoded =
+                    info::directory_entry(file_class, &entry.name, &entry.info, attributes)
+                        .ok_or(status::INVALID_INFO_CLASS)?;
+                match info::append_entry(&mut buffer, last, &encoded, limit) {
+                    Some(offset) => last = Some(offset),
+                    None if last.is_none() => return Err(status::INFO_LENGTH_MISMATCH),
+                    None => return Ok(buffer),
+                }
+                listing.emitted.insert(entry.name.clone());
+                listing.returned = true;
+                if flags & messages::SINGLE_ENTRY != 0 {
+                    return Ok(buffer);
+                }
             }
-            let Some(entry) = listing.buffered.front() else {
-                break;
-            };
-            let attributes = info::attributes(&entry.info, open.read_only);
-            let encoded = info::directory_entry(file_class, &entry.name, &entry.info, attributes)
-                .ok_or(status::INVALID_INFO_CLASS)?;
-            match info::append_entry(&mut buffer, last, &encoded, limit) {
-                Some(offset) => last = Some(offset),
-                None if last.is_none() => return Err(status::INFO_LENGTH_MISMATCH),
-                None => break,
-            }
-            listing.buffered.pop_front();
-            listing.returned = true;
-            if flags & messages::SINGLE_ENTRY != 0 {
-                break;
-            }
+            listing.exhausted = page.next.is_none();
+            listing.cursor = page.next;
+            listing.emitted.clear();
         }
         Ok(buffer)
     }

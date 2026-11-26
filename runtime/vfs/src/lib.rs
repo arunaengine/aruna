@@ -109,6 +109,8 @@ pub(crate) struct State {
     budget: Budget,
     checkpoints: HashMap<(Ulid, u64), Checkpoint>,
     fences: Fences,
+    /// Stage writes per bucket between their fence check and their last file step.
+    in_flight_writes: HashMap<BucketScope, usize>,
     next_instance: u64,
 }
 
@@ -145,6 +147,7 @@ impl VfsHandle {
             budget: Budget::new(config.node_stage_bytes, config.group_stage_bytes),
             checkpoints: HashMap::new(),
             fences: Fences::default(),
+            in_flight_writes: HashMap::new(),
             next_instance: 1,
         };
         Ok(Self {
@@ -199,7 +202,12 @@ impl VfsHandle {
             VfsEffect::CloseOpen { scope, open_id } => self.close_open(&scope, open_id).await,
             VfsEffect::LookupInstance { scope, key } => self.lookup_instance(&scope, &key),
             VfsEffect::LookupHandle { scope, handle_id } => self.lookup_handle(&scope, handle_id),
-            VfsEffect::ListStaged { scope, prefix } => self.list_staged(&scope, &prefix),
+            VfsEffect::ListStaged {
+                scope,
+                prefix,
+                after,
+                limit,
+            } => self.list_staged(&scope, &prefix, after.as_deref(), limit),
             VfsEffect::RebindInstance(request) => self.rebind_instance(request).await,
             VfsEffect::DetachInstance {
                 scope,
@@ -236,7 +244,11 @@ impl VfsHandle {
                 instance_id,
                 offset,
                 length,
-            } => self.read_stage(&scope, instance_id, offset, length).await,
+                owner_id,
+            } => {
+                self.read_stage(&scope, instance_id, offset, length, owner_id)
+                    .await
+            }
             VfsEffect::WriteStage {
                 scope,
                 instance_id,
@@ -305,6 +317,15 @@ impl VfsHandle {
                     old_generation,
                 };
                 self.promote_checkpoint(&scope, instance_id, promotion)
+                    .await
+            }
+            VfsEffect::AbortCheckpoint {
+                scope,
+                instance_id,
+                stage_id,
+                generation,
+            } => {
+                self.abort_checkpoint(&scope, instance_id, (stage_id, generation))
                     .await
             }
             VfsEffect::ReadCheckpoint {

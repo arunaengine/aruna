@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use ulid::Ulid;
 
 use crate::checkpoints::sealed_name;
+use crate::fence::WriteAdmission;
 use crate::instances::{fenced, instance_mut};
 use crate::{Answer, Reservation, VfsHandle};
 
@@ -275,10 +276,17 @@ impl VfsHandle {
         instance_id: u64,
         offset: u64,
         length: u32,
+        owner_id: Option<u64>,
     ) -> Answer {
         let (plan, logical_size, base_limit) = {
             let mut state = self.shared.state.lock();
             let instance = instance_mut(&mut state, scope, instance_id)?;
+            let asked = offset.saturating_add(u64::from(length));
+            if let Some(owner) = owner_id
+                && crate::locks::read_conflict(&instance.locks, owner, offset, asked).is_some()
+            {
+                return Err(VfsFailure::LockConflict);
+            }
             let stage = &instance.stage;
             let end = offset
                 .saturating_add(u64::from(length))
@@ -307,7 +315,7 @@ impl VfsHandle {
         write: StageWrite,
     ) -> Answer {
         let length = u32::try_from(write.data.len()).map_err(|_| VfsFailure::Overflow)?;
-        let (offset, end, group_id, reservation) = {
+        let (offset, end, group_id, reservation, _admission) = {
             let mut state = self.shared.state.lock();
             if state.fences.closed(scope) {
                 return Err(fenced());
@@ -328,7 +336,8 @@ impl VfsHandle {
             let fresh = (end - offset) - instance.stage.extents.covered(offset, end);
             let group_id = instance.group_id;
             let reservation = Reservation::take(&self.shared, &mut state, group_id, fresh)?;
-            (offset, end, group_id, reservation)
+            let admission = WriteAdmission::enter(&self.shared, &mut state, scope);
+            (offset, end, group_id, reservation, admission)
         };
         let path = self.path(&volatile_name(instance_id));
         let data = write.data;
@@ -372,7 +381,7 @@ impl VfsHandle {
         if new_size > OFFSET_LIMIT {
             return Err(VfsFailure::Overflow);
         }
-        let (change, trimmed) = {
+        let (change, trimmed, _admission) = {
             let mut state = self.shared.state.lock();
             if state.fences.closed(scope) {
                 return Err(fenced());
@@ -405,7 +414,9 @@ impl VfsHandle {
                 instance.change = value;
             }
             state.budget.release(group_id, trimmed);
-            (change?, trimmed)
+            let change = change?;
+            let admission = WriteAdmission::enter(&self.shared, &mut state, scope);
+            (change, trimmed, admission)
         };
         if trimmed > 0 {
             let path = self.path(&volatile_name(instance_id));

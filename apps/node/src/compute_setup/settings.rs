@@ -299,19 +299,11 @@ pub(super) fn share_mount(
             ));
         }
     };
+    let inputs = share_switch(SHARE_INPUTS, inputs.as_deref())?;
+    let sessions = share_switch(SHARE_SESSIONS, sessions.as_deref())?;
     let driver = match driver.as_str() {
-        "smb" => ShareDriver::Smb {
-            inputs: share_switch(SHARE_INPUTS, inputs.as_deref())?,
-            sessions: share_switch(SHARE_SESSIONS, sessions.as_deref())?,
-        },
-        "nfs" => ShareDriver::Nfs {
-            inputs: inputs
-                .map(|id| share_binding(SHARE_INPUTS, id))
-                .transpose()?,
-            sessions: sessions
-                .map(|id| share_binding(SHARE_SESSIONS, id))
-                .transpose()?,
-        },
+        "smb" => ShareDriver::Smb { inputs, sessions },
+        "nfs" => ShareDriver::Nfs { inputs, sessions },
         other => return Err(format!("{SHARE_DRIVER} must be smb or nfs, not {other:?}")),
     };
     let share = ShareMount { host, driver };
@@ -334,24 +326,13 @@ fn share_host(host: &str) -> Result<String, String> {
     }
 }
 
-/// An SMB switch: an exact boolean spelling, since a typo must not silently disable it.
+/// A share switch: an exact boolean spelling, since a typo must not silently disable it.
+/// NFS bindings come per attempt, so a node setting never names one.
 fn share_switch(key: &str, value: Option<&str>) -> Result<bool, String> {
     match value {
         None | Some("0" | "false" | "no") => Ok(false),
         Some("1" | "true" | "yes") => Ok(true),
-        Some(other) => Err(format!(
-            "{key} must be true or false for smb, not {other:?}"
-        )),
-    }
-}
-
-/// An NFS mount binding id as the binding routes return it.
-fn share_binding(key: &str, value: String) -> Result<String, String> {
-    match ulid::Ulid::from_string(&value) {
-        Ok(_) => Ok(value),
-        Err(_) => Err(format!(
-            "{key} must be an NFS mount binding id for nfs, not {value:?}"
-        )),
+        Some(other) => Err(format!("{key} must be true or false, not {other:?}")),
     }
 }
 
@@ -1018,12 +999,11 @@ mod pure_tests {
             },
         };
         assert_eq!(share_mount(&smb), Ok(Some(expected)));
-        let binding = "01JABCDEF0123456789ABCDEFG";
-        let nfs = share_env(&[host, (SHARE_DRIVER, "nfs"), (SHARE_SESSIONS, binding)]);
+        let nfs = share_env(&[host, (SHARE_DRIVER, "nfs"), (SHARE_SESSIONS, "true")]);
         let share = share_mount(&nfs).unwrap().unwrap();
         let driver = ShareDriver::Nfs {
-            inputs: None,
-            sessions: Some(binding.to_string()),
+            inputs: false,
+            sessions: true,
         };
         assert_eq!(share.driver, driver);
     }
@@ -1046,10 +1026,11 @@ mod pure_tests {
             (SHARE_DRIVER, "smb"),
             (SHARE_INPUTS, "TRUE")
         ]));
+        // A static binding id would hand one export to every attempt.
         assert!(refused(&[
             host,
             (SHARE_DRIVER, "nfs"),
-            (SHARE_INPUTS, "true")
+            (SHARE_INPUTS, "01JABCDEF0123456789ABCDEFG")
         ]));
         let url = (SHARE_HOST, "smb://node-2.example.test");
         assert!(refused(&[url, (SHARE_DRIVER, "smb"), (SHARE_INPUTS, "1")]));

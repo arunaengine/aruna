@@ -17,8 +17,8 @@ use ulid::Ulid;
 
 use crate::arguments::{self, ExchangeArgs, Operation, SequenceArgs, SessionArgs};
 use crate::backend::{
-    Caller, ChangeInfo, HostIdentity, LockRange, MountExport, NfsBackend, ObjectRef, ReplayGrant,
-    Revocation,
+    Caller, ChangeInfo, HostIdentity, LockRange, MountExport, NfsBackend, ObjectRef, ReplayAccess,
+    ReplayCheck, ReplayGrant, Revocation,
 };
 use crate::filehandle::{Filehandle, FilehandleKey};
 use crate::rpc::{AuthStat, RpcPrincipal};
@@ -34,6 +34,10 @@ use crate::xdr::{XdrReader, XdrWriter};
 const IDLE_LEASES: u32 = 8;
 /// Room kept for the compound header and one status when checking the reply size.
 const REPLY_RESERVE: usize = 512;
+/// Room a cached compound keeps for the result of a non-read operation before running it.
+const OPERATION_RESERVE: usize = 128;
+/// An operation code and status, the result of a failed operation without a body.
+const STATUS_SIZE: usize = 8;
 /// `channel_dir_from_server4` value for the fore channel.
 const FORE_CHANNEL: u32 = 1;
 /// `channel_dir_from_client4` value asking for the back channel only.
@@ -158,8 +162,17 @@ struct SessionUse {
 #[derive(Default)]
 pub struct GrantTrace {
     pub mounts: Vec<Ulid>,
-    pub reads: bool,
-    pub writes: bool,
+    pub checks: Vec<ReplayCheck>,
+}
+
+impl GrantTrace {
+    /// Records one object use that a replay of the reply must be admitted for again.
+    pub fn record(&mut self, object: ObjectRef, access: ReplayAccess) {
+        let check = ReplayCheck { object, access };
+        if !self.checks.contains(&check) {
+            self.checks.push(check);
+        }
+    }
 }
 
 pub struct Context<'a> {
@@ -174,6 +187,8 @@ pub struct Context<'a> {
     pub now: Instant,
     pub max_response: usize,
     session: Option<SessionUse>,
+    /// A retry of an uncached reply: the operation after SEQUENCE answers RETRY_UNCACHED_REP.
+    uncached: bool,
 }
 
 impl Context<'_> {
@@ -202,6 +217,18 @@ impl Context<'_> {
             peer: self.connection.peer,
             export: export.clone(),
         }
+    }
+
+    /// The cached reply size when the client asked to cache this compound.
+    fn cache_limit(&self) -> Option<usize> {
+        let session = self.session.as_ref().filter(|session| session.cache)?;
+        Some(session.max_cached)
+    }
+
+    /// The largest reply this compound may build, which a cached compound also keeps to.
+    pub fn reply_limit(&self) -> usize {
+        let limit = self.cache_limit().unwrap_or(usize::MAX);
+        self.max_response.min(limit)
     }
 
     pub fn client_id(&self) -> Result<u64, NfsStat4> {
@@ -301,6 +328,7 @@ impl<B: NfsBackend> Engine<B> {
             now,
             max_response: self.limits.max_response as usize,
             session: None,
+            uncached: false,
         };
         let shape = RequestShape {
             size,
@@ -321,6 +349,7 @@ impl<B: NfsBackend> Engine<B> {
             let result: OpResult = match arguments::decode(code, &mut reader) {
                 Err(error) => Err(error.into()),
                 Ok(_) if !admitted && index == 0 => Err(NfsStat4::Delay.into()),
+                Ok(_) if ctx.uncached => Err(NfsStat4::RetryUncached.into()),
                 Ok(operation) => match position(&operation, index, count) {
                     Err(error) => Err(error.into()),
                     Ok(()) => match operation {
@@ -343,8 +372,22 @@ impl<B: NfsBackend> Engine<B> {
                                     | Operation::Readdir(_)
                                     | Operation::Getattr(_)
                             );
-                            let result = self.execute(&mut ctx, operation, &mut results).await;
-                            if result.is_ok()
+                            // A cached compound never runs a change whose result it cannot keep.
+                            let tight = ctx.cache_limit().is_some_and(|limit| {
+                                !large
+                                    && reply_size(&tag, results.len()) + OPERATION_RESERVE > limit
+                            });
+                            let result = match tight {
+                                true => Err(NfsStat4::ReplyUncacheable.into()),
+                                false => self.execute(&mut ctx, operation, &mut results).await,
+                            };
+                            let kept = result.as_ref().err().is_none_or(|error| error.keep);
+                            let uncacheable = ctx.cache_limit().is_some_and(|limit| {
+                                reply_size(&tag, results.len()) + STATUS_SIZE > limit
+                            });
+                            if kept && uncacheable {
+                                Err(NfsStat4::ReplyUncacheable.into())
+                            } else if result.is_ok()
                                 && large
                                 && results.len() + REPLY_RESERVE > ctx.max_response
                             {
@@ -371,7 +414,7 @@ impl<B: NfsBackend> Engine<B> {
                 SlotReply::Cached {
                     digest,
                     bytes: reply.clone(),
-                    grant: replay_grant(connection, &ctx.principal, &ctx.grant),
+                    grant: Box::new(replay_grant(connection, &ctx.principal, &ctx.grant)),
                 }
             } else {
                 SlotReply::Uncached { digest }
@@ -540,6 +583,12 @@ impl<B: NfsBackend> Engine<B> {
                     }
                 }
             }
+            SlotDecision::Uncached { client_id, highest } => {
+                ctx.uncached = true;
+                let flags = self.tables.lock().states.status_flags(client_id);
+                put_sequence(out, args, highest, flags);
+                SequenceFlow::Run(Ok(()))
+            }
             SlotDecision::Execute {
                 client_id,
                 fore,
@@ -559,12 +608,7 @@ impl<B: NfsBackend> Engine<B> {
                 });
                 ctx.max_response = fore.max_response as usize;
                 let flags = self.tables.lock().states.status_flags(client_id);
-                out.put_fixed(&args.session);
-                out.put_u32(args.sequence);
-                out.put_u32(args.slot);
-                out.put_u32(highest);
-                out.put_u32(highest);
-                out.put_u32(flags);
+                put_sequence(out, args, highest, flags);
                 SequenceFlow::Run(Ok(()))
             }
         }
@@ -794,9 +838,23 @@ fn replay_grant(
         peer: connection.peer,
         principal: principal.clone(),
         mounts: trace.mounts.clone(),
-        reads: trace.reads,
-        writes: trace.writes,
+        checks: trace.checks.clone(),
     }
+}
+
+/// The encoded size of a COMPOUND4res with `tag` and `results` bytes of results.
+fn reply_size(tag: &[u8], results: usize) -> usize {
+    12 + tag.len().div_ceil(4) * 4 + results
+}
+
+/// The SEQUENCE4resok body.
+fn put_sequence(out: &mut XdrWriter, args: &SequenceArgs, highest: u32, flags: u32) {
+    out.put_fixed(&args.session);
+    out.put_u32(args.sequence);
+    out.put_u32(args.slot);
+    out.put_u32(highest);
+    out.put_u32(highest);
+    out.put_u32(flags);
 }
 
 fn encode_compound(status: NfsStat4, tag: &[u8], count: u32, results: &[u8]) -> Bytes {

@@ -1,5 +1,5 @@
-//! One bucket through SMB, NFS and S3 at once: published bytes and S3 overwrites seen by both
-//! file servers, NFS deny modes refusing SMB writers, and cold start over a corrupt checkpoint.
+//! One bucket through SMB, NFS and S3 at once: publications seen by fresh and open handles, NFS
+//! deny modes and host revocation against SMB writers, and cold start over a corrupt checkpoint.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -10,13 +10,14 @@ use aruna_ops_data::vfs::recovery::{ColdStart, ColdStartOperation};
 use aruna_runner::driver::{DriverContext, drive};
 use aruna_smb::status;
 use aruna_vfs::{VfsConfig, VfsHandle};
+use rustls::pki_types::CertificateDer;
 use ulid::Ulid;
 
-use super::nfs_client::{self, CREATOR, FILE_SYNC, Share};
+use super::nfs_client::{self, CREATOR, FILE_SYNC, NfsClient, READER, Share, UNSTABLE};
 use super::smb_client::{FILE_CREATE, FILE_OPEN, NOT_DIRECTORY, READ_ATTRIBUTES, READ_DATA};
 use super::smb_client::{SmbClient, WRITER};
-use super::{BUCKET, HostKey, Mounts, loopback_tls};
-use crate::shared::TestResult;
+use super::{BUCKET, HostKey, Mounts, loopback_tls, server_tls};
+use crate::shared::{TestResult, WAIT_CAP, wait_until};
 
 #[tokio::test]
 async fn cross_protocol_mount() -> TestResult<()> {
@@ -89,6 +90,102 @@ async fn cross_steps(mounts: &Mounts) -> TestResult<()> {
         .await?;
     smb.close(file).await?;
     Ok(())
+}
+
+#[tokio::test]
+async fn live_shared_opens() -> TestResult<()> {
+    let (tls, authority) = server_tls()?;
+    let mounts = Mounts::start(true, Some(tls)).await?;
+    let result = live_steps(&mounts, &authority).await;
+    mounts.shutdown().await;
+    result
+}
+
+/// Whether an SMB writer open of `name` is granted now; a granted open is closed again.
+async fn writer_opens(client: &mut SmbClient, name: &str) -> bool {
+    match client.open(name, WRITER, FILE_OPEN, NOT_DIRECTORY).await {
+        Ok(file) => client.close(file).await.is_ok(),
+        Err(_) => false,
+    }
+}
+
+async fn live_steps(mounts: &Mounts, authority: &CertificateDer<'static>) -> TestResult<()> {
+    let smb_address = mounts.smb.ok_or("no SMB listener")?;
+    let nfs_address = mounts.nfs.ok_or("no NFS listener")?;
+    let host = HostKey::generate()?;
+    let (enrolled, mount) = mounts.bind_host(&host).await?;
+    let mut smb = SmbClient::login(smb_address, &mounts.keys, BUCKET).await?;
+    let stream = nfs_client::secure(nfs_address, authority, &host).await?;
+    let mut nfs = NfsClient::start(stream).await?;
+    let root = nfs.export_root(&mount.mount_id).await?;
+
+    // An NFS reader kept open across an SMB FLUSH reads the published bytes without reopening.
+    let first = b"committed before either open".to_vec();
+    mounts.put("live.txt", &first).await?;
+    let (reader, live) = nfs.open(&root, "live.txt", READER).await?;
+    assert_eq!(nfs.read(&live, &reader).await?, first, "NFS reads the base");
+    let second = b"written over SMB while the NFS handle stays open".to_vec();
+    let file = smb
+        .open("live.txt", WRITER, FILE_OPEN, NOT_DIRECTORY)
+        .await?;
+    smb.write(file, 0, &second).await?;
+    smb.flush(file).await?;
+    assert_eq!(
+        nfs.read(&live, &reader).await?,
+        second,
+        "the open NFS handle reads the SMB publication"
+    );
+    smb.close(file).await?;
+    nfs.close(&live, &reader).await?;
+    assert_eq!(mounts.get("live.txt").await?, second, "S3 reads SMB bytes");
+
+    // An NFS create that denies writers keeps that deny mode against SMB until it closes.
+    let creator = Share {
+        access: share::BOTH,
+        deny: share::WRITE,
+        create: true,
+    };
+    let (stateid, fresh) = nfs.open(&root, "fresh.txt", creator).await?;
+    nfs.write(&fresh, &stateid, b"created over NFS", UNSTABLE)
+        .await?;
+    let refused = smb
+        .create("fresh.txt", WRITER, FILE_OPEN, NOT_DIRECTORY)
+        .await?;
+    assert_eq!(
+        refused.status(),
+        status::SHARING_VIOLATION,
+        "the NFS create keeps its deny mode"
+    );
+    nfs.close(&fresh, &stateid).await?;
+    assert!(
+        writer_opens(&mut smb, "fresh.txt").await,
+        "SMB writes after the close"
+    );
+
+    // Revoking the host ends its connection and releases its deny-write open for SMB.
+    let holder = Share {
+        access: share::READ,
+        deny: share::WRITE,
+        create: false,
+    };
+    nfs.open(&root, "fresh.txt", holder).await?;
+    assert!(
+        !writer_opens(&mut smb, "fresh.txt").await,
+        "the NFS deny mode holds"
+    );
+    mounts.revoke_host(&enrolled.host_id).await?;
+    assert!(
+        nfs.closed().await,
+        "host revocation closes the NFS connection"
+    );
+    let smb = tokio::sync::Mutex::new(smb);
+    let shared = &smb;
+    wait_until(
+        "an SMB writer opens the file a revoked NFS host held",
+        WAIT_CAP,
+        move || async move { writer_opens(&mut *shared.lock().await, "fresh.txt").await },
+    )
+    .await
 }
 
 #[tokio::test]

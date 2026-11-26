@@ -12,6 +12,7 @@ use super::{
     VfsError, record_of, state_delete, state_key, state_read, state_row, unexpected, vfs_call,
     vfs_event, watch_key,
 };
+use crate::replication::live_queue::{CompletePutInput, CompletePutOperation};
 use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectOperation, PutObjectResult, RowFence,
 };
@@ -87,6 +88,11 @@ pub struct PublishInput {
     pub attempt_id: Ulid,
     /// Ancestor witnesses that rest on this name, advanced with the publication.
     pub updates: Vec<WitnessUpdate>,
+    /// The edit generation the streamed image was read at; a later edit or another size under
+    /// the guard refuses the publication, and the overlay clears only up to this edit.
+    pub expected_edit: Option<u64>,
+    /// A writerless retry refuses when a writer returned or the instance left `stage`.
+    pub require_writerless: bool,
 }
 
 /// How a publication ended.
@@ -102,6 +108,7 @@ enum PublishStep {
     Permit,
     Guard,
     Wait,
+    Instance,
     Rows,
     Attempt,
     Put,
@@ -244,6 +251,44 @@ impl VfsPublishOperation {
         self.call(PublishStep::Guard, vfs_call(effect))
     }
 
+    /// Under the guard, the instance must still be at the edit and size the image was read at,
+    /// and a writerless retry must still find no writer on the same stage generation.
+    fn guarded(&mut self) -> PublishTurn {
+        if self.input.expected_edit.is_none() && !self.input.require_writerless {
+            return self.read_rows();
+        }
+        let scope = self.scope()?;
+        let effect = match self.input.handle_id {
+            Some(handle_id) => VfsEffect::LookupHandle { scope, handle_id },
+            None => VfsEffect::LookupInstance {
+                scope,
+                key: self.input.key.clone(),
+            },
+        };
+        self.call(PublishStep::Instance, vfs_call(effect))
+    }
+
+    fn instance_read(&mut self, result: IoResult) -> PublishTurn {
+        let summary = match vfs_event(result)? {
+            VfsEvent::Instance(Some(summary)) if summary.instance_id == self.input.instance_id => {
+                summary
+            }
+            VfsEvent::Instance(_) => return Err(VfsError::Conflict),
+            other => return Err(unexpected(&other)),
+        };
+        let edited = self.input.expected_edit.is_some_and(|expected| {
+            summary.edit_generation != expected || summary.logical_size != self.input.logical_size
+        });
+        let moved = self.input.stage.as_ref().is_some_and(|stage| {
+            summary.stage_id != Some(stage.stage_id) || summary.generation != stage.generation
+        });
+        let written = self.input.require_writerless && (summary.writer_count > 0 || moved);
+        if edited || written {
+            return Err(VfsError::Conflict);
+        }
+        self.read_rows()
+    }
+
     /// Reads the stage, handle and receipt rows the transaction must still find as they are.
     fn read_rows(&mut self) -> PublishTurn {
         let keys = self.row_keys()?;
@@ -381,6 +426,7 @@ impl VfsPublishOperation {
             instance_id: Some(self.input.instance_id),
             updates: self.input.updates.clone(),
             logical_size: Some(self.input.logical_size),
+            expected_edit: self.input.expected_edit,
         };
         self.call(
             PublishStep::Receipt,
@@ -401,10 +447,27 @@ impl VfsPublishOperation {
             ReceiptOutcome::RolledBack => return Err(VfsError::Conflict),
         };
         self.step = PublishStep::Finalized;
-        Ok(Next::Then {
-            output,
-            calls: self.held.release(),
-        })
+        let mut calls = self.held.release();
+        calls.push(self.completion(version_id)?);
+        Ok(Next::Then { output, calls })
+    }
+
+    /// The ordinary post-PUT completion of a committed publication, after the permit and guard
+    /// go: upload watchers and the prompt live replication queue, as for an S3 PUT.
+    fn completion(&self, version_id: Ulid) -> Result<IoCall, VfsError> {
+        let grant = self.grant.as_ref().ok_or(VfsError::Denied)?;
+        let context = &self.input.context;
+        let complete = CompletePutOperation::new(CompletePutInput {
+            realm_id: context.realm_id,
+            node_id: context.node_id,
+            auth: grant.context.clone(),
+            group_id: grant.bucket.group_id,
+            bucket: self.scope()?.bucket,
+            key: self.input.key.clone(),
+            version_id,
+            size_bytes: self.input.logical_size,
+        });
+        Ok(IoCall::child(complete))
     }
 }
 
@@ -463,12 +526,13 @@ impl Operation for VfsPublishOperation {
                     PublishStep::Wait,
                     vfs_call(VfsEffect::WaitAttempt { attempt_id }),
                 ),
-                None => self.read_rows(),
+                None => self.guarded(),
             },
             PublishStep::Wait => {
                 vfs_event(result)?;
                 self.guard()
             }
+            PublishStep::Instance => self.instance_read(result),
             PublishStep::Rows => self.rows_read(result),
             PublishStep::Attempt => match vfs_event(result)? {
                 VfsEvent::Done => self.dispatch(),
@@ -696,6 +760,7 @@ pub struct CloseInput {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CloseStep {
     Close,
+    Successor,
     Publish,
     Remove,
     Stage,
@@ -748,8 +813,9 @@ impl VfsCloseOperation {
         self
     }
 
-    /// The stage owner left while another writer stays: the stage moves to that writer at its
-    /// exact generation when the scopes allow it, else it is retained for recovery.
+    /// The stage owner left while another writer stays: the stage moves to the earliest
+    /// remaining writer at its exact generation once that writer's own credential is admitted
+    /// to write the name and the scopes allow it, else it is retained for recovery.
     fn writer_left(&mut self) -> CloseTurn {
         let Some(stage) = self.input.stage.clone() else {
             return Ok(Next::Done(CloseOutcome::Closed));
@@ -758,9 +824,35 @@ impl VfsCloseOperation {
             return Ok(Next::Done(CloseOutcome::Closed));
         }
         let successor = self.successor.take();
-        let Some(next) = successor.filter(|next| *next != stage.owner) else {
+        let summary = self.summary.as_ref().ok_or(VfsError::Conflict)?;
+        let (key, length) = (summary.key.clone(), summary.logical_size);
+        let successor = successor.or_else(|| summary.successor_owner.clone());
+        if successor.as_ref() == Some(&stage.owner) {
             return Ok(Next::Done(CloseOutcome::Closed));
+        }
+        let Some(next) = successor.filter(|next| may_transfer(&stage.owner.scope, &next.scope))
+        else {
+            return self.retain(DetachReason::LostLife);
         };
+        let mut context = self.input.context.clone();
+        context.access_key = next.access_key.clone();
+        let bucket = self.input.scope.bucket.clone();
+        let mut request = VfsRequest::new(VfsAccess::Put, &bucket, Some(&key));
+        request.length = Some(length);
+        self.successor = Some(next);
+        self.call(CloseStep::Successor, authorize_call(&context, request))
+    }
+
+    fn successor_admitted(&mut self, result: IoResult) -> CloseTurn {
+        let stage = self.input.stage.clone().ok_or(VfsError::Conflict)?;
+        let next = self.successor.take().ok_or(VfsError::Conflict)?;
+        match grant_of(result) {
+            Ok(_) => {}
+            Err(VfsError::Denied | VfsError::ReadOnly | VfsError::VaultLocked) => {
+                return self.retain(DetachReason::LostLife);
+            }
+            Err(error) => return Err(error),
+        }
         match handed_over(&stage, next, self.now_ms) {
             Some(moved) => self.change_stage(Some(moved), CloseOutcome::Closed),
             None => self.retain(DetachReason::LostLife),
@@ -838,6 +930,8 @@ impl VfsCloseOperation {
         match result.child::<Published, VfsError>()? {
             Ok(published) => Ok(Next::Done(CloseOutcome::Published(published))),
             Err(VfsError::QuotaExceeded) => self.quota_blocked(),
+            // With no durable checkpoint to keep, the refused publication is the close's error.
+            Err(error) if self.input.stage.is_none() => Err(error),
             Err(
                 VfsError::Denied
                 | VfsError::StaleHandle
@@ -930,6 +1024,7 @@ impl Operation for VfsCloseOperation {
     fn next(&mut self, result: IoResult) -> CloseTurn {
         match self.step {
             CloseStep::Close => self.closed(result),
+            CloseStep::Successor => self.successor_admitted(result),
             CloseStep::Publish => self.published(result),
             CloseStep::Remove => self.removed(result),
             CloseStep::Stage => self.stage_changed(result),

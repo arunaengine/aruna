@@ -29,8 +29,8 @@ pub use aruna::{ArunaNfsBackend, ArunaNfsConfig};
 pub use backend::{
     AttributeChange, Caller, ChangeInfo, CreateMode, CreateReply, DirectoryEntry, DirectoryPage,
     HandleStatus, HostIdentity, IoState, LockDenial, LockError, LockKind, LockRange, MountExport,
-    NfsBackend, ObjectAttributes, ObjectRef, OwnerKey, ReadReply, ReplayGrant, Revocation, SetTime,
-    ShareRequest, WriteReply,
+    NfsBackend, ObjectAttributes, ObjectRef, OwnerKey, ReadReply, ReplayAccess, ReplayCheck,
+    ReplayGrant, Revocation, SetTime, ShareRequest, WriteReply,
 };
 pub use rpc::{DisabledGssAcceptor, GssAcceptor};
 pub use server::{NfsServer, NfsServerConfig, NfsServerError, NfsServerHandle};

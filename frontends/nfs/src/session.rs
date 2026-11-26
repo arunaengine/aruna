@@ -87,9 +87,9 @@ pub enum SlotReply {
     Cached {
         digest: [u8; 32],
         bytes: Bytes,
-        grant: ReplayGrant,
+        grant: Box<ReplayGrant>,
     },
-    /// The reply was not kept; a retry gets RETRY_UNCACHED_REP.
+    /// The reply was not kept; a retry gets RETRY_UNCACHED_REP after its SEQUENCE.
     Uncached {
         digest: [u8; 32],
     },
@@ -123,7 +123,13 @@ pub enum SlotDecision {
     /// A retry of a cached reply; its grant must be rechecked before release.
     Replay {
         bytes: Bytes,
-        grant: ReplayGrant,
+        grant: Box<ReplayGrant>,
+    },
+    /// A retry of a reply that was not kept: SEQUENCE succeeds and the next operation gets
+    /// RETRY_UNCACHED_REP (RFC 8881 section 2.10.6.1.3).
+    Uncached {
+        client_id: u64,
+        highest: u32,
     },
     Fail(NfsStat4),
 }
@@ -375,7 +381,10 @@ impl SessionTable {
                     grant: grant.clone(),
                 },
                 SlotReply::Uncached { digest } if *digest == request.digest => {
-                    SlotDecision::Fail(NfsStat4::RetryUncached)
+                    SlotDecision::Uncached {
+                        client_id,
+                        highest: fore.max_requests.saturating_sub(1),
+                    }
                 }
                 SlotReply::Empty => SlotDecision::Fail(NfsStat4::SequenceMisordered),
                 _ => SlotDecision::Fail(NfsStat4::FalseRetry),

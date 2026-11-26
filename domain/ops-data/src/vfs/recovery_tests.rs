@@ -5,13 +5,13 @@
 
 use super::handles_tests::{asked, child, head, id, scope, user, vfs};
 use super::recovery::*;
-use super::{TOMBSTONE_RETENTION_MS, state_key};
+use super::{TOMBSTONE_RETENTION_MS, VfsError, state_key};
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::vfs::{
-    CookiePosition, NfsStageRecord, QuotaRetry, RECEIPT_TAG, ReceiptChange, RetireReason,
-    StageBase, StageDisposition, StageOwner, StageScope, VfsBootState, VfsHandleRow, VfsKey,
-    VfsReceipt, VfsRecord,
+    CookiePosition, EnrolledHostRecord, NfsMountBinding, NfsMountTarget, NfsStageRecord,
+    QuotaRetry, RECEIPT_TAG, ReceiptChange, RetireReason, StageBase, StageDisposition, StageOwner,
+    StageScope, VfsBootState, VfsHandleRow, VfsKey, VfsReceipt, VfsRecord,
 };
 use aruna_core::types::{Key, Value};
 use aruna_core::vfs_effects::{DiskStage, VfsEffect, VfsEvent};
@@ -23,6 +23,7 @@ fn input() -> ReceiptInput {
         instance_id: Some(1),
         updates: Vec::new(),
         logical_size: Some(5),
+        expected_edit: None,
     }
 }
 
@@ -448,4 +449,117 @@ fn failed_removal_keeps() {
     let failed = VfsEvent::Failed(aruna_core::vfs_effects::VfsFailure::Unconfigured);
     let turn = operation.next(vfs(failed));
     assert_eq!(turn, Ok(Next::Call(IoCall::Delete(Vec::new()))));
+}
+
+/// Runs a cold start whose one live stage row is `record` up to its head read.
+fn heading(record: &NfsStageRecord) -> ColdStartOperation {
+    let mut operation = ColdStartOperation::new();
+    operation.first().unwrap();
+    operation.next(IoResult::Values(vec![None])).unwrap();
+    operation.next(IoResult::Done).unwrap();
+    operation.next(IoResult::Done).unwrap();
+    operation.next(vfs(VfsEvent::Done)).unwrap();
+    let empty = IoResult::Page {
+        rows: Vec::new(),
+        next: None,
+    };
+    operation.next(empty).unwrap();
+    let file = DiskStage {
+        stage_id: record.stage_id,
+        generation: record.generation,
+        bytes: record.logical_size,
+        corrupt: false,
+    };
+    let files = vec![file];
+    operation
+        .next(vfs(VfsEvent::StageInventory { files }))
+        .unwrap();
+    let key = Key::from(VfsKey::LiveStage(scope(), 4).to_bytes().unwrap());
+    let rows = vec![(key, row(record).unwrap())];
+    let turn = operation.next(IoResult::Page { rows, next: None });
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
+    let bucket = aruna_test_harness::s3::bucket_info(id(3), user());
+    let bucket = Value::from(bucket.to_bytes().unwrap());
+    let creation = Value::from(7u128.to_be_bytes().to_vec());
+    let turn = operation.next(IoResult::Values(vec![Some(bucket), Some(creation)]));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
+    operation
+}
+
+/// Answers the retention of the current stage and the empty orphan pass with the report.
+fn retained_report(operation: &mut ColdStartOperation, turn: Result<Next<ColdStart>, VfsError>) {
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    let Ok(Next::Done(report)) = operation.next(child(())) else {
+        panic!("expected the report");
+    };
+    assert_eq!((report.retained, report.restored), (1, 0));
+}
+
+#[test]
+fn overwritten_base_retained() {
+    // A same-life S3 overwrite leaves the newer head visible; the checkpoint is retained.
+    let mut operation = heading(&stage(2, None));
+    let turn = operation.next(IoResult::Values(vec![Some(head(9, Some(8))), None]));
+    retained_report(&mut operation, turn);
+}
+
+fn binding() -> NfsMountBinding {
+    NfsMountBinding {
+        mount_id: id(13),
+        host_id: id(30),
+        owner: user(),
+        access_key: "KEY1".to_string(),
+        group_id: id(3),
+        target: NfsMountTarget::for_bucket("bucket", 7).unwrap(),
+        read_only: false,
+        allowed_networks: Vec::new(),
+        display_uid: 1000,
+        display_gid: 1000,
+        mode: 0o750,
+        created_at_ms: 1,
+    }
+}
+
+fn host(revoked_at_ms: Option<u64>) -> EnrolledHostRecord {
+    EnrolledHostRecord {
+        host_id: id(30),
+        owner: user(),
+        fingerprints: vec![[1; 32]],
+        allowed_networks: Vec::new(),
+        worker_pool: false,
+        created_at_ms: 1,
+        revoked_at_ms,
+    }
+}
+
+/// Runs a cold start of a stage on its exact base up to the answer of its host row.
+fn hosted(revoked_at_ms: Option<u64>) -> (ColdStartOperation, Result<Next<ColdStart>, VfsError>) {
+    let mut operation = heading(&stage(2, None));
+    let turn = operation.next(IoResult::Values(vec![Some(head(2, Some(8))), None]));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
+    let turn = operation.next(IoResult::Values(vec![row(&binding())]));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
+    let turn = operation.next(IoResult::Values(vec![row(&host(revoked_at_ms))]));
+    (operation, turn)
+}
+
+#[test]
+fn revoked_host_retained() {
+    // A writer whose host was revoked does not get its stage back on the name.
+    let (mut operation, turn) = hosted(Some(9));
+    retained_report(&mut operation, turn);
+}
+
+#[test]
+fn live_binding_restores() {
+    // A stage on its exact base with a live binding restores with that base version.
+    let (mut operation, turn) = hosted(None);
+    let VfsEffect::RestoreStage(request) = asked(&turn) else {
+        panic!("expected the restore");
+    };
+    assert_eq!(request.base_version, Some(id(2)));
+    let Ok(Next::Done(report)) = operation.next(vfs(VfsEvent::Done)) else {
+        panic!("expected the report");
+    };
+    assert_eq!((report.retained, report.restored), (0, 1));
 }
