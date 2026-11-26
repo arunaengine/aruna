@@ -103,7 +103,9 @@ pub fn address_on(bucket: &str, key: &str, version: Option<Ulid>, node: NodeId) 
     format_address("aruna://", bucket, key, version, Some(node))
 }
 
-/// Formats an `aruna://` or `s3://` address with percent-encoded key and optional query tags.
+/// Formats an `aruna://` or `s3://` address with percent-encoded key and optional version/node.
+/// Unversioned remote addresses place `node` in the RFC 3986 authority (`node@bucket`) so CWL
+/// `loadListing` and IRI joins preserve the holder across child paths.
 pub(crate) fn format_address(
     scheme: &str,
     bucket: &str,
@@ -117,7 +119,7 @@ pub(crate) fn format_address(
             format!("{scheme}{bucket}/{key}?version={version}&node={node}")
         }
         (Some(version), None) => format!("{scheme}{bucket}/{key}?version={version}"),
-        (None, Some(node)) => format!("{scheme}{bucket}/{key}?node={node}"),
+        (None, Some(node)) => format!("{scheme}{node}@{bucket}/{key}"),
         (None, None) => format!("{scheme}{bucket}/{key}"),
     }
 }
@@ -132,7 +134,7 @@ pub(crate) fn parse_address(
             ContractError::unsupported(format!("the address {address} is not served"))
         })?;
     let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
-    let (mut version, mut node) = (None, None);
+    let (mut version, mut query_node) = (None, None);
     for pair in query.split('&').filter(|pair| !pair.is_empty()) {
         match pair.split_once('=') {
             Some(("version", text)) => {
@@ -143,12 +145,28 @@ pub(crate) fn parse_address(
             Some(("node", text)) => {
                 let parsed = (text.parse::<NodeId>())
                     .map_err(|_| ContractError::invalid(format!("{text} is no node id")))?;
-                node = Some(parsed);
+                query_node = Some(parsed);
             }
             _ => return Err(ContractError::invalid(format!("{address} names no object"))),
         }
     }
-    let (bucket, raw_key) = path.split_once('/').unwrap_or((path, ""));
+    let (authority, raw_key) = path.split_once('/').unwrap_or((path, ""));
+    let (auth_node, bucket) = match authority.split_once('@') {
+        Some((node_text, bucket)) => {
+            let parsed = (node_text.parse::<NodeId>())
+                .map_err(|_| ContractError::invalid(format!("{node_text} is no node id")))?;
+            (Some(parsed), bucket)
+        }
+        None => (None, authority),
+    };
+    let node = match (auth_node, query_node) {
+        (Some(a), Some(b)) if a != b => {
+            return Err(ContractError::invalid(format!(
+                "{address} names conflicting nodes"
+            )));
+        }
+        (a, b) => a.or(b),
+    };
     let key = aruna_workflow_contract::host::decode_key(raw_key)
         .ok_or_else(|| ContractError::invalid(format!("{address} names no object")))?;
     if bucket.is_empty() || key.split('/').any(|part| part == "..") {
@@ -393,17 +411,30 @@ impl ReadDataOperation {
                 Ok(Next::Call(IoCall::child(head)))
             }
             DataCall::List { .. } => {
-                if !target.owned {
-                    let captured = remote::captured_entries(
+                if !target.owned
+                    && remote::has_captured_dir(
+                        &self.run,
+                        self.node_id,
+                        self.node_id,
+                        &target.bucket,
+                        &target.key,
+                    )
+                {
+                    let pending = remote::captured_pins(
                         &self.run,
                         self.node_id,
                         self.node_id,
                         &target.bucket,
                         &target.key,
                     );
-                    if !captured.is_empty() {
-                        return Ok(Next::Done(HostRpcResult::StorageList { entries: captured }));
-                    }
+                    return self.check_next(ListState {
+                        target,
+                        info,
+                        stat: false,
+                        pending: pending.into(),
+                        checking: None,
+                        next_token: None,
+                    });
                 }
                 self.list(target, info, None)
             }
@@ -455,6 +486,9 @@ impl ReadDataOperation {
 
     fn headed(&mut self, target: Target, info: BucketInfo, result: IoResult) -> ReadNext {
         match result.child::<HeadObjectResult, HeadObjectError>()? {
+            Ok(_) if target.key.ends_with('/') => Ok(Next::Done(HostRpcResult::StorageStat {
+                entry: Some(Self::folder_entry()),
+            })),
             Ok(head) => {
                 let version = head.resolved_version_id.or(head.version_id);
                 let entry = StorageEntry {
@@ -481,18 +515,35 @@ impl ReadDataOperation {
                 | HeadObjectError::DeleteMarker,
             ) if target.version.is_none() => {
                 if !target.owned
-                    && !remote::captured_entries(
+                    && remote::has_captured_dir(
                         &self.run,
                         self.node_id,
                         self.node_id,
                         &target.bucket,
                         &target.key,
                     )
-                    .is_empty()
                 {
-                    return Ok(Next::Done(HostRpcResult::StorageStat {
-                        entry: Some(Self::folder_entry()),
-                    }));
+                    let pending = remote::captured_pins(
+                        &self.run,
+                        self.node_id,
+                        self.node_id,
+                        &target.bucket,
+                        &target.key,
+                    );
+                    if pending.is_empty() {
+                        // Admitted empty root; ObjectAccessOperation already checked folder READ.
+                        return Ok(Next::Done(HostRpcResult::StorageStat {
+                            entry: Some(Self::folder_entry()),
+                        }));
+                    }
+                    return self.check_next(ListState {
+                        target,
+                        info,
+                        stat: true,
+                        pending: pending.into(),
+                        checking: None,
+                        next_token: None,
+                    });
                 }
                 self.list(target, info, None)
             }
@@ -541,6 +592,9 @@ impl ReadDataOperation {
                     .to_owned()
             };
             for object in &listed.objects {
+                if object.head.key == prefix {
+                    continue;
+                }
                 self.entries.push(ListEntry {
                     name: name(&object.head.key),
                     directory: false,
@@ -569,6 +623,9 @@ impl ReadDataOperation {
         let mut pending =
             VecDeque::with_capacity(listed.objects.len() + listed.common_prefixes.len());
         for object in listed.objects {
+            if !stat && object.head.key == prefix {
+                continue;
+            }
             let display = name(&object.head.key);
             pending.push_back((
                 object.head.key,
@@ -639,7 +696,9 @@ impl ReadDataOperation {
                         entry: Some(Self::folder_entry()),
                     }));
                 }
-                if let Some(entry) = entry {
+                if let Some(entry) = entry
+                    && !self.entries.contains(&entry)
+                {
                     self.entries.push(entry);
                 }
             }
@@ -815,13 +874,17 @@ pub fn upload_target(
 /// Where a delivery goes: the path below the run's output prefix.
 pub fn delivery_target(record: &WorkflowRunRecord, path: &str) -> Result<Target, ContractError> {
     let output = record.output.as_ref().ok_or_else(no_area)?;
-    let path = path.trim_start_matches('/');
-    check_path(path)?;
+    let folder = path.ends_with('/');
+    let clean = path.trim_start_matches('/').trim_end_matches('/');
+    check_path(clean)?;
     let prefix = output.prefix.trim_end_matches('/');
-    let key = match prefix.is_empty() {
-        true => path.to_owned(),
-        false => format!("{prefix}/{path}"),
+    let mut key = match prefix.is_empty() {
+        true => clean.to_owned(),
+        false => format!("{prefix}/{clean}"),
     };
+    if folder {
+        key.push('/');
+    }
     Ok(Target {
         bucket: output.bucket.clone(),
         key,
@@ -987,10 +1050,11 @@ impl WriteObjectOperation {
     }
 
     fn written(&mut self, put: PutObjectResult) -> WriteNext {
+        let version = (!self.target.key.ends_with('/')).then_some(put.version_id);
         let receipt = UploadReceipt {
-            address: address_of(&self.target.bucket, &self.target.key, Some(put.version_id)),
+            address: address_of(&self.target.bucket, &self.target.key, version),
             size: put.location.blob_size,
-            version: Some(put.version_id.to_string()),
+            version: version.map(|v| v.to_string()),
             sha256: sha256_of(&put.location),
         };
         let Some(path) = self.delivered.clone() else {

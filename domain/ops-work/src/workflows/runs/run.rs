@@ -318,6 +318,9 @@ pub(super) fn replay_chunks(pages: &[RunLogPage]) -> Vec<Vec<RunLogPage>> {
 /// node, a list where the request pinned several objects for one input.
 pub(crate) fn run_inputs(record: &WorkflowRunRecord) -> Result<Value, CatalogError> {
     let mut values: Map<String, Value> = crate::workflows::from_text(&record.values_json)?;
+    for value in values.values_mut() {
+        normalize_remote_values(value, record.node_id);
+    }
     let Some(inputs) = record.inputs_json.as_deref() else {
         return Ok(Value::Object(values));
     };
@@ -343,6 +346,39 @@ pub(crate) fn run_inputs(record: &WorkflowRunRecord) -> Result<Value, CatalogErr
         values.insert(name, value);
     }
     Ok(Value::Object(values))
+}
+
+/// Rewrites unversioned remote `aruna://` or `s3://` URIs in `value` to RFC 3986 `node@bucket`
+/// authority form so CWL `loadListing` and IRI joins preserve the holder node across child paths.
+fn normalize_remote_values(value: &mut Value, local: NodeId) {
+    match value {
+        Value::String(text) => {
+            let scheme = if text.starts_with("aruna://") {
+                Some("aruna://")
+            } else if text.starts_with("s3://") {
+                Some("s3://")
+            } else {
+                None
+            };
+            if let Some(scheme) = scheme
+                && let Ok((bucket, key, None, Some(node))) = super::data::parse_address(text)
+                && node != local
+            {
+                *text = super::data::format_address(scheme, &bucket, &key, None, Some(node));
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                normalize_remote_values(item, local);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values_mut() {
+                normalize_remote_values(item, local);
+            }
+        }
+        _ => {}
+    }
 }
 
 impl Operation for PrepareRunOperation {
@@ -736,6 +772,20 @@ impl AnswerCallOperation {
                 source_ref,
                 target_path,
             } => {
+                if target_path.ends_with('/') && source_ref.is_empty() {
+                    let target = match delivery_target(&run, &target_path) {
+                        Ok(target) => target,
+                        Err(error) => return self.answer(HostRpcResult::Failed(error)),
+                    };
+                    let write = WriteObjectOperation::new(
+                        (run, self.node.node_id),
+                        self.node.routing.clone(),
+                        target,
+                        WriteBody::Bytes(Vec::new()),
+                    )
+                    .delivery(target_path);
+                    return self.child(write);
+                }
                 let targets = resolve(&run, &source_ref)
                     .and_then(|source| Ok((source, delivery_target(&run, &target_path)?)));
                 let (source, target) = match targets {
