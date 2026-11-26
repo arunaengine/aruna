@@ -667,6 +667,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: bash scripts/tests/just_recipes.sh
 
+      - name: Run image script contract tests
+        if: ${{ !cancelled() }}
+        run: bash scripts/tests/build_images.sh
+
   clippy:
     runs-on: ubuntu-latest
     env:

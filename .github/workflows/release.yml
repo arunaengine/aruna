@@ -210,9 +210,11 @@ jobs:
         env:
           IMAGE: ${{ matrix.image }}
           IMAGE_TAGS: ${{ needs.plan.outputs.image_tags }}
+          PUBLISH: ${{ needs.plan.outputs.publish }}
         run: |
           set -euo pipefail
           args=(--push --digests "$RUNNER_TEMP/images.jsonl")
+          if [ "$PUBLISH" = "true" ]; then args+=(--fixed-tags); fi
           for tag in $IMAGE_TAGS; do args+=(--tag "$tag"); done
           bash scripts/build_images.sh "${args[@]}" "$IMAGE"
           mkdir -p images && cp "$RUNNER_TEMP/images.jsonl" "images/$IMAGE.jsonl"

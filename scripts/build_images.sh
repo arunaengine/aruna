@@ -26,6 +26,7 @@ IMAGES=(
 
 PUSH=0
 LIST=0
+FIXED_TAGS=0
 PORTAL_TAG=""
 DIGESTS=""
 TAGS=()
@@ -42,9 +43,10 @@ aruna-registry, aruna-session-python, aruna-session-deno, aruna-coordinator and
 aruna-applet-builder.
 
   --push            Push the images. Without it they are loaded into the local Docker.
+  --fixed-tags      With --push, also publish fixed session tags when absent on the registry.
   --tag TAG         Tag every image with TAG; repeatable (default: v<workspace version>).
-                    Session images also get their own fixed version, which a push never
-                    overwrites once it exists.
+                    Local loads also tag session images with their fixed version; pushes do
+                    so only with --fixed-tags and never overwrite an existing fixed tag.
   --portal TAG      Download the portal release TAG of arunaengine/website, check its
                     SHA-256 and unpack it into .portal-embed, replacing what is there. The
                     node image then also gets the tag <first tag>-portal.TAG.
@@ -99,7 +101,7 @@ build_image() {
   if [[ "$name" == "aruna" && -n "$PORTAL_TAG" ]]; then
     tags+=("${TAGS[0]}-portal.$PORTAL_TAG")
   fi
-  if [[ -n "$fixed" ]]; then
+  if [[ -n "$fixed" && ("$PUSH" == "0" || "$FIXED_TAGS" == "1") ]]; then
     if [[ "$PUSH" == "1" ]] && image_exists "$repo:$fixed"; then
       log "$repo:$fixed exists and stays unchanged"
     else
@@ -137,6 +139,7 @@ build_image() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --push) PUSH=1 ;;
+    --fixed-tags) FIXED_TAGS=1 ;;
     --list) LIST=1 ;;
     --tag) [[ $# -ge 2 ]] || die "--tag needs a value"; TAGS+=("$2"); shift ;;
     --portal) [[ $# -ge 2 ]] || die "--portal needs a value"; PORTAL_TAG="$2"; shift ;;
