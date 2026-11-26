@@ -25,7 +25,7 @@ use bytes::Bytes;
 use ulid::Ulid;
 
 use super::names::{Resolution, cursor_of};
-use super::{ArunaSmbBackend, Entry, FileOpen, file_info, object_kind, vfs_failure};
+use super::{ArunaSmbBackend, Entry, FileOpen, RootOpen, file_info, object_kind, vfs_failure};
 use crate::access::{
     DELETE, FILE_APPEND_DATA, FILE_EXECUTE, FILE_READ_DATA, FILE_WRITE_DATA, Rights, WriteMode,
     append_allowed,
@@ -128,18 +128,48 @@ impl ArunaSmbBackend {
                 })
             }
             Resolution::Missing(key) => {
-                let put = VfsRequest::new(VfsAccess::Put, bucket, Some(&key));
-                let write = self.allows(&context, put).await?;
-                Ok(Lookup {
-                    kind: None,
-                    rights: Rights {
-                        read: false,
-                        write,
-                        delete: false,
-                    },
-                })
+                let rights = self
+                    .rights_of(&context, bucket, &key, HandleKind::File)
+                    .await?;
+                Ok(Lookup { kind: None, rights })
             }
         }
+    }
+
+    /// Opens the share root directory without a directory witness, so an empty bucket works.
+    async fn open_root(
+        &self,
+        context: &VfsAccessContext,
+        access_key: String,
+        bucket: &str,
+        incarnation: u128,
+        request: &OpenRequest,
+    ) -> Result<OpenGrant, BackendError> {
+        if request.disposition == Disposition::Create {
+            return Err(BackendError::Exists);
+        }
+        if request.delete_on_close {
+            return Err(BackendError::Denied);
+        }
+        let mut list = VfsRequest::new(VfsAccess::List, bucket, None);
+        list.prefix = Some(String::new());
+        if !self.allows(context, list).await? {
+            return Err(BackendError::Denied);
+        }
+        let opened_ms = aruna_clock::unix_timestamp_millis();
+        let root = RootOpen {
+            access_key,
+            bucket: bucket.to_string(),
+            incarnation,
+            opened_ms,
+        };
+        let info = file_info(ObjectKind::Directory, 0, opened_ms, false);
+        let handle = self.store(Entry::Root(root));
+        Ok(OpenGrant {
+            handle,
+            action: CreateAction::Opened,
+            info,
+        })
     }
 
     pub(super) async fn open_file(
@@ -161,11 +191,20 @@ impl ArunaSmbBackend {
                 (key, kind, None, false)
             }
         };
+        if key.is_empty() {
+            return self
+                .open_root(&context, access_key, bucket, incarnation, &request)
+                .await;
+        }
         match (existed, request.disposition) {
             (false, disposition) if !disposition.creates() => return Err(BackendError::NotFound),
             (true, Disposition::Create) => return Err(BackendError::Exists),
-            (false, _) if kind == HandleKind::Directory => {
-                self.make_directory(&context, &key).await?;
+            (false, disposition) if kind == HandleKind::Directory => {
+                match self.make_directory(&context, &key).await {
+                    Ok(()) => {}
+                    Err(BackendError::Exists) if disposition != Disposition::Create => {}
+                    Err(error) => return Err(error),
+                }
             }
             _ => {}
         }
@@ -179,7 +218,7 @@ impl ArunaSmbBackend {
             key: key.clone(),
             kind,
             create: file && !existed,
-            exclusive: request.disposition == Disposition::Create,
+            exclusive: file && request.disposition == Disposition::Create,
             write,
             share: share_mode(request.granted, request.share_access),
             delete_on_close: request.delete_on_close,
@@ -371,6 +410,42 @@ impl ArunaSmbBackend {
         Ok(file_info(kind, size, time, summary.delete_pending))
     }
 
+    pub(super) async fn root_status(&self, open: &RootOpen) -> Result<FileInfo, BackendError> {
+        let context = self.context(&open.access_key, &open.bucket, open.incarnation);
+        let mut list = VfsRequest::new(VfsAccess::List, &open.bucket, None);
+        list.prefix = Some(String::new());
+        if !self.allows(&context, list).await? {
+            return Err(BackendError::Denied);
+        }
+        Ok(file_info(ObjectKind::Directory, 0, open.opened_ms, false))
+    }
+
+    fn list_page(listing: aruna_ops_data::vfs::handles::VfsListing, opened_ms: u64) -> ListPage {
+        let entries = listing.entries.into_iter().map(|entry| {
+            let time = shown_time(entry.version_id, opened_ms);
+            DirectoryEntry {
+                info: file_info(object_kind(entry.kind), entry.size, time, false),
+                name: entry.name,
+            }
+        });
+        ListPage {
+            entries: entries.collect(),
+            next: cursor_of(&listing.next),
+        }
+    }
+
+    pub(super) async fn list_root(
+        &self,
+        open: &RootOpen,
+        cursor: Option<String>,
+    ) -> Result<ListPage, BackendError> {
+        let context = self.context(&open.access_key, &open.bucket, open.incarnation);
+        let listing = self
+            .list_slice(&context, "", None, cursor.as_deref())
+            .await?;
+        Ok(Self::list_page(listing, open.opened_ms))
+    }
+
     pub(super) async fn list_files(
         &self,
         open: &FileOpen,
@@ -388,17 +463,7 @@ impl ArunaSmbBackend {
                 cursor.as_deref(),
             )
             .await?;
-        let entries = listing.entries.into_iter().map(|entry| {
-            let time = shown_time(entry.version_id, open.opened_ms);
-            DirectoryEntry {
-                info: file_info(object_kind(entry.kind), entry.size, time, false),
-                name: entry.name,
-            }
-        });
-        Ok(ListPage {
-            entries: entries.collect(),
-            next: cursor_of(&listing.next),
-        })
+        Ok(Self::list_page(listing, open.opened_ms))
     }
 
     fn byte_lock(open: &FileOpen, range: &LockRange) -> ByteLock {

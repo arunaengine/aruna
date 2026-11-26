@@ -1,5 +1,5 @@
 //! Hands file server calls to the node's VFS adapter. A node without one lets vault transitions
-//! through and answers every other call as unconfigured.
+//! and grant revocations through and answers every other call as unconfigured.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -16,6 +16,8 @@ pub(super) async fn dispatch_vfs(effect: VfsEffect, context: &DriverContext) -> 
             fence_id: Ulid::nil(),
         },
         (None, VfsEffect::ReleaseFence { .. }) => VfsEvent::Done,
+        // Nothing is served here, so no session or open can hold a revoked grant.
+        (None, VfsEffect::RevokeGrant { .. }) => VfsEvent::Done,
         (None, _) => VfsEvent::Failed(VfsFailure::Unconfigured),
     }
 }

@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 mod admission;
+mod bodies;
 mod files;
 mod jobs;
 mod names;
@@ -65,6 +66,15 @@ struct FileOpen {
     opened_ms: u64,
 }
 
+/// One open of the share root directory, which exists even when the bucket is empty.
+#[derive(Clone, Debug)]
+struct RootOpen {
+    access_key: String,
+    bucket: String,
+    incarnation: u128,
+    opened_ms: u64,
+}
+
 /// One open inside a job input view, by its exact tree path.
 #[derive(Clone, Debug)]
 struct ViewOpen {
@@ -77,6 +87,7 @@ struct ViewOpen {
 #[derive(Clone, Debug)]
 enum Entry {
     Bucket(Box<FileOpen>),
+    Root(RootOpen),
     Job(ViewOpen),
 }
 
@@ -135,6 +146,9 @@ impl ArunaSmbBackend {
         let entry = entry.ok_or(BackendError::Invalid)?;
         let owned = match (&entry, &scope.share) {
             (Entry::Bucket(open), ShareTarget::Bucket(bucket)) => {
+                open.access_key == scope.credential.access_key && open.bucket == *bucket
+            }
+            (Entry::Root(open), ShareTarget::Bucket(bucket)) => {
                 open.access_key == scope.credential.access_key && open.bucket == *bucket
             }
             (Entry::Job(open), ShareTarget::JobView(job)) => {
@@ -292,6 +306,7 @@ impl SmbBackend for ArunaSmbBackend {
         self.opens.lock().remove(&handle);
         match entry {
             Entry::Bucket(open) => self.close_file(*open).await,
+            Entry::Root(open) => Ok(file_info(ObjectKind::Directory, 0, open.opened_ms, false)),
             Entry::Job(open) => self.view_info(scope, &open).await,
         }
     }
@@ -305,6 +320,7 @@ impl SmbBackend for ArunaSmbBackend {
     ) -> Result<Bytes, BackendError> {
         match self.entry(scope, handle)? {
             Entry::Bucket(open) => self.read_file(&open, offset, length).await,
+            Entry::Root(_) => Err(BackendError::IsDirectory),
             Entry::Job(open) => self.read_view(scope, &open, offset, length).await,
         }
     }
@@ -317,6 +333,7 @@ impl SmbBackend for ArunaSmbBackend {
     ) -> Result<u32, BackendError> {
         match self.entry(scope, handle)? {
             Entry::Bucket(open) => self.write_file(&open, request).await,
+            Entry::Root(_) => Err(BackendError::IsDirectory),
             Entry::Job(_) => Err(BackendError::ReadOnly),
         }
     }
@@ -324,6 +341,7 @@ impl SmbBackend for ArunaSmbBackend {
     async fn flush(&self, scope: &Scope, handle: u64) -> Result<(), BackendError> {
         match self.entry(scope, handle)? {
             Entry::Bucket(open) => self.flush_file(&open).await,
+            Entry::Root(_) => Ok(()),
             Entry::Job(_) => Err(BackendError::ReadOnly),
         }
     }
@@ -331,6 +349,7 @@ impl SmbBackend for ArunaSmbBackend {
     async fn query_info(&self, scope: &Scope, handle: u64) -> Result<FileInfo, BackendError> {
         match self.entry(scope, handle)? {
             Entry::Bucket(open) => self.file_status(&open).await,
+            Entry::Root(open) => self.root_status(&open).await,
             Entry::Job(open) => self.view_info(scope, &open).await,
         }
     }
@@ -341,14 +360,20 @@ impl SmbBackend for ArunaSmbBackend {
         handle: u64,
         change: InfoChange,
     ) -> Result<(), BackendError> {
-        let Entry::Bucket(open) = self.entry(scope, handle)? else {
-            return Err(BackendError::ReadOnly);
-        };
-        match change {
-            InfoChange::EndOfFile(size) => self.resize_file(&open, size).await,
-            InfoChange::Basic(change) => self.touch_file(&open, change).await,
-            // The allocation size is a hint; the logical size alone decides the bytes.
-            InfoChange::Allocation(_) => self.touch_file(&open, BasicChange::default()).await,
+        match self.entry(scope, handle)? {
+            Entry::Bucket(open) => match change {
+                InfoChange::EndOfFile(size) => self.resize_file(&open, size).await,
+                InfoChange::Basic(change) => self.touch_file(&open, change).await,
+                // The allocation size is a hint; the logical size alone decides the bytes.
+                InfoChange::Allocation(_) => self.touch_file(&open, BasicChange::default()).await,
+            },
+            Entry::Root(open) => match change {
+                InfoChange::EndOfFile(_) => Err(BackendError::IsDirectory),
+                InfoChange::Basic(_) | InfoChange::Allocation(_) => {
+                    self.root_status(&open).await.map(|_| ())
+                }
+            },
+            Entry::Job(_) => Err(BackendError::ReadOnly),
         }
     }
 
@@ -361,6 +386,7 @@ impl SmbBackend for ArunaSmbBackend {
     ) -> Result<(), BackendError> {
         match self.entry(scope, handle)? {
             Entry::Bucket(open) => self.rename_file(&open, target, replace).await,
+            Entry::Root(_) => Err(BackendError::Denied),
             Entry::Job(_) => Err(BackendError::ReadOnly),
         }
     }
@@ -373,6 +399,7 @@ impl SmbBackend for ArunaSmbBackend {
     ) -> Result<(), BackendError> {
         match self.entry(scope, handle)? {
             Entry::Bucket(open) => self.dispose_file(&open, delete).await,
+            Entry::Root(_) => Err(BackendError::Denied),
             Entry::Job(_) => Err(BackendError::ReadOnly),
         }
     }
@@ -385,6 +412,7 @@ impl SmbBackend for ArunaSmbBackend {
     ) -> Result<ListPage, BackendError> {
         match self.entry(scope, handle)? {
             Entry::Bucket(open) => self.list_files(&open, cursor).await,
+            Entry::Root(open) => self.list_root(&open, cursor).await,
             Entry::Job(open) => self.list_view(scope, &open, cursor).await,
         }
     }
@@ -398,6 +426,7 @@ impl SmbBackend for ArunaSmbBackend {
     ) -> Result<(), BackendError> {
         match self.entry(scope, handle)? {
             Entry::Bucket(open) => self.lock_file(&open, ranges, wait).await,
+            Entry::Root(_) => Err(BackendError::IsDirectory),
             Entry::Job(_) => Err(BackendError::Unsupported),
         }
     }
@@ -410,6 +439,7 @@ impl SmbBackend for ArunaSmbBackend {
     ) -> Result<(), BackendError> {
         match self.entry(scope, handle)? {
             Entry::Bucket(open) => self.unlock_file(&open, ranges).await,
+            Entry::Root(_) => Err(BackendError::IsDirectory),
             Entry::Job(_) => Err(BackendError::Unsupported),
         }
     }

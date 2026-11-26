@@ -176,6 +176,10 @@ impl NfsBackend for ArunaNfsBackend {
         self.admit_host(fingerprint, peer).await
     }
 
+    async fn loopback_host(&self, peer: IpAddr) -> Option<HostIdentity> {
+        self.admit_loopback(peer).await
+    }
+
     async fn mount_export(
         &self,
         host: &HostIdentity,

@@ -340,6 +340,14 @@ impl VfsRemoveOperation {
         self.read_rows()
     }
 
+    /// The parent marker key when an admitted marker write is prepared for a non-root parent.
+    fn marker_needed(&self) -> Option<String> {
+        let (parent, _) = split_parent(&self.input.key)?;
+        let config = self.marker.as_ref()?;
+        (!parent.is_empty() && config.request.key == marker_key(parent))
+            .then(|| config.request.key.clone())
+    }
+
     /// The prepared parent marker write, when admitted and the parent is a directory.
     fn marker_write(&mut self) -> Option<PutObjectConfig> {
         let (parent, _) = split_parent(&self.input.key)?;
@@ -348,7 +356,8 @@ impl VfsRemoveOperation {
         fits.then_some(config)
     }
 
-    /// The receipt, handle and reverse rows, then the target's head and watch rows.
+    /// The receipt, handle and reverse rows, the target's head and watch rows, and any parent
+    /// marker head.
     fn read_rows(&mut self) -> RemoveTurn {
         let scope = self.scope()?;
         let mut keys = vec![VfsKey::Receipt(self.input.attempt_id)];
@@ -360,12 +369,20 @@ impl VfsRemoveOperation {
             return Err(VfsError::Conflict);
         };
         reads.extend(name_reads(&scope.bucket, &self.target())?);
+        if let Some(marker) = self.marker_needed() {
+            reads.push((
+                BLOB_HEAD_KEYSPACE.to_string(),
+                head_key(&scope.bucket, &marker)?,
+            ));
+        }
         self.call(RemoveStep::Rows, IoCall::Read(reads))
     }
 
     /// Builds the one transaction of the removal from the rows as they were read.
     fn rows_read(&mut self, result: IoResult) -> RemoveTurn {
         let mut values = result.values()?;
+        let parent_marker = self.marker_needed();
+        let parent_row = parent_marker.as_ref().and_then(|_| values.pop().flatten());
         let (watch, head) = (values.pop().flatten(), values.pop().flatten());
         if values.first().is_some_and(Option::is_some) {
             return Err(VfsError::Conflict);
@@ -397,7 +414,18 @@ impl VfsRemoveOperation {
             self.input.identity,
             HandleIdentity::File(FileIdentity::Unpublished { .. })
         );
-        let mut marker = self.marker_write().filter(|_| committed);
+        let parent_live = live_life(head_of(parent_row.as_ref())?.as_ref()).is_some();
+        let mut marker = self.marker_write().filter(|_| committed && !parent_live);
+        if committed
+            && parent_live
+            && let Some(key) = parent_marker
+        {
+            plan.guards.push((
+                BLOB_HEAD_KEYSPACE.to_string(),
+                head_key(&scope.bucket, &key)?,
+                parent_row,
+            ));
+        }
         let marker_version = (marker.as_mut()).map(|config| {
             *config
                 .preassigned_version_id
@@ -828,8 +856,8 @@ enum RenameStep {
 type RenameTurn = Result<Next<()>, VfsError>;
 
 /// Renames inside one export in one transaction, never as separate put and delete. An
-/// unpublished file rebinds its stage to a fresh destination token; a committed file or empty
-/// marker directory publishes at the destination under a fresh life and deletes its source.
+/// unpublished file rebinds its stage to a fresh token or publishes it over a live destination;
+/// a committed file or empty marker directory publishes under a fresh life and deletes its source.
 #[derive(Debug, PartialEq)]
 pub struct VfsRenameOperation {
     input: RenameInput,
@@ -845,7 +873,8 @@ pub struct VfsRenameOperation {
     destination: Option<PutObjectConfig>,
     /// The prepared write of the source parent's marker, used when it is admitted.
     marker: Option<PutObjectConfig>,
-    /// The source is committed, so the move is one put with a source delete.
+    /// The move is one put: a committed source with its delete, or an unpublished source whose
+    /// stage publishes over a live destination.
     committed: bool,
     /// The destination's handle the move displaced, detached once the move is settled.
     displaced: Option<u64>,
@@ -870,8 +899,9 @@ impl VfsRenameOperation {
         }
     }
 
-    /// The write of a committed source's pinned version, or a directory's empty marker, under
-    /// the destination key; its body streams the source bytes outside the namespace permit.
+    /// The write of a committed source's pinned version, a directory's empty marker, or an
+    /// unpublished source's stage image when it replaces a live destination, under the
+    /// destination key; its body streams the source bytes outside the namespace permit.
     pub fn with_destination_put(mut self, put: PutObjectConfig) -> Self {
         self.destination = Some(put);
         self
@@ -988,6 +1018,11 @@ impl VfsRenameOperation {
             // A committed file replaces a live destination in its own put transaction.
             match (self.input.replace, self.committed, directory) {
                 (true, true, false) => return self.list_target(),
+                // An unpublished file publishes its prepared stage image over the destination.
+                (true, false, false) if self.destination.is_some() => {
+                    self.committed = true;
+                    return self.list_target();
+                }
                 (true, false, false) => {
                     return Err(VfsError::Unavailable(JOINT_MOVE.to_string()));
                 }
@@ -1076,14 +1111,22 @@ impl VfsRenameOperation {
     }
 
     /// One put transaction: the destination version under a fresh life, the source's delete
-    /// marker, the moved handle, stage and reverse rows, both range checks and the receipt.
+    /// marker, the moved handle, stage and reverse rows, both range checks and the receipt. An
+    /// unpublished source has no head to delete; its token goes with the put instead.
     fn joint_change(&mut self) -> RenameTurn {
         let scope = self.scope()?;
         let grant = self.grant.clone().ok_or(VfsError::Denied)?;
         let (source, target) = self.heads();
         let at = |index: usize| self.rows.get(index).cloned().flatten();
         let source_head = head_of(at(0).as_ref())?;
-        let life_id = live_life(source_head.as_ref()).ok_or(VfsError::StaleHandle)?;
+        let unpublished = matches!(
+            self.input.identity,
+            HandleIdentity::File(FileIdentity::Unpublished { .. })
+        );
+        let life_id = match unpublished {
+            true => None,
+            false => Some(live_life(source_head.as_ref()).ok_or(VfsError::StaleHandle)?),
+        };
         let target_head = match self.input.kind {
             HandleKind::File => head_of(at(2).as_ref())?,
             HandleKind::Directory => head_of(at(4).as_ref())?,
@@ -1118,21 +1161,23 @@ impl VfsRenameOperation {
             .with_writes(plan.rows.writes)
             .with_deletes(plan.rows.deletes)
             .with_range_guards(ranges);
-        let delete = SourceDelete {
+        let delete = life_id.map(|life_id| SourceDelete {
             key: source,
             expected_life: Some(life_id),
             expected_version: source_head.map(|head| head.version_id),
             deleted_by: grant.owner,
             marker_version,
-        };
+        });
         let mut put = PutObjectOperation::new(config)
             .with_bucket_guard(grant.bucket.clone())
             .with_preserve_envelope(true)
             .with_life(fresh)
             .with_expected_head(target_head.as_ref().map(|head| head.version_id))
             .with_expected_life(live_life(target_head.as_ref()))
-            .with_source_delete(delete)
             .with_row_fence(fence);
+        if let Some(delete) = delete {
+            put = put.with_source_delete(delete);
+        }
         if let Some(marker) = self.parent_marker() {
             put = put.with_parent_marker(marker);
         }
@@ -1388,9 +1433,9 @@ pub(crate) struct CommittedMove {
     pub displaced: Option<u64>,
 }
 
-/// The nfs rows a committed file or marker directory move commits in its put transaction:
-/// the moved handle under the destination's new life, reverse rows, stage and receipt. `rows`
-/// are as [`unpublished_move`] reads them; `target` is the destination version and life.
+/// The nfs rows a file or marker directory move commits in its put: the moved handle under the
+/// destination version and life, reverse rows, stage and receipt; an unpublished source's token
+/// and stage row go with it. `rows` are as [`unpublished_move`] reads them.
 pub(crate) fn committed_move(
     input: &RenameInput,
     scope: &BucketScope,
@@ -1418,8 +1463,23 @@ pub(crate) fn committed_move(
         .clone()
         .filter(|_| input.kind == HandleKind::File);
     let stage_id = stage.as_ref().map(|stage| stage.stage_id);
-    // A dirty source keeps its overlay on top of the destination's new version.
-    if let Some(stage) = stage {
+    if let HandleIdentity::File(FileIdentity::Unpublished { .. }) = input.identity {
+        let space = BLOB_HEAD_KEYSPACE.to_string();
+        let source_watch = watch_key(&scope.bucket, &from)?;
+        plan.guards
+            .push((space.clone(), head_key(&scope.bucket, &from)?, at(0)));
+        plan.guards
+            .push((space.clone(), source_watch.clone(), at(1)));
+        plan.deletes.push((space, source_watch));
+        // The put publishes the stage image, so the live stage row goes with it.
+        if let Some(stage) = stage {
+            let key = super::io::stage_key(scope, &stage);
+            let row = aruna_core::structs::storage::vfs::VfsRecord::to_bytes(&stage)?;
+            plan.guard(&key, Some(Value::from(row)))?;
+            plan.deletes.push(state_delete(&key)?);
+        }
+    } else if let Some(stage) = stage {
+        // A dirty source keeps its overlay on top of the destination's new version.
         let key = super::io::stage_key(scope, &stage);
         let row = aruna_core::structs::storage::vfs::VfsRecord::to_bytes(&stage)?;
         plan.guard(&key, Some(Value::from(row)))?;

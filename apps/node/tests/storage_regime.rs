@@ -32,3 +32,5 @@ mod storage_move;
 mod storage_purge;
 #[path = "operations/usage_deltas.rs"]
 mod usage_deltas;
+#[path = "vfs_mounts/mod.rs"]
+mod vfs_mounts;

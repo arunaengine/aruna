@@ -1682,7 +1682,7 @@ impl Operation for VfsDispositionOperation {
                 self.apply_call()
             }
             DispositionStep::Apply => match vfs_event(result)? {
-                VfsEvent::Done => Ok(Next::Then {
+                VfsEvent::Instance(Some(_)) => Ok(Next::Then {
                     output: (),
                     calls: self.held.release(),
                 }),

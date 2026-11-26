@@ -909,6 +909,8 @@ impl ArunaNfsBackend {
             }
             HandleKind::Directory => None,
         };
+        let stage_size = stage.as_ref().map(|record| record.logical_size);
+        let target_exists = self.head_info(binding, &to).await?.0.is_some();
         let input = RenameInput {
             context: self.access_context(binding),
             from: from.clone(),
@@ -936,13 +938,36 @@ impl ArunaNfsBackend {
                     length: 0,
                 };
                 let body = image_body(self.context.clone(), read, size);
-                let put = self.put_config(binding, &to, body, (size, false)).await?;
+                let put = self
+                    .put_config(binding, &to, body, (size, target_exists))
+                    .await?;
+                rename = rename.with_destination_put(put);
+            }
+            // An unpublished file over a live destination replaces it with its staged image.
+            HandleIdentity::File(FileIdentity::Unpublished { .. }) if target_exists => {
+                let size = instance.as_ref().map(|summary| summary.logical_size);
+                let size = size.or(stage_size).unwrap_or(0);
+                let read = ReadInput {
+                    context: self.access_context(binding),
+                    key: from.clone(),
+                    instance_id,
+                    version_id: None,
+                    offset: 0,
+                    length: 0,
+                };
+                let body = image_body(self.context.clone(), read, size);
+                let put = self.put_config(binding, &to, body, (size, true)).await?;
                 rename = rename.with_destination_put(put);
             }
             HandleIdentity::Directory(DirectoryWitness::Marker { .. }) => {
                 rename = rename.with_destination_put(self.marker_put(binding, &to).await?);
             }
             _ => {}
+        }
+        // The source parent keeps existing through a marker once its last child moves away.
+        if !from_parent.key.is_empty() && from_parent.key != to_parent.key {
+            let marker = self.marker_put(binding, &from_parent.key).await?;
+            rename = rename.with_parent_marker(marker);
         }
         drive(rename, &self.context).await.map_err(status_of)?;
         let source_after = self.change_of(binding, &from_parent.key).await;

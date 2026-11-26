@@ -1,15 +1,18 @@
-//! Revokes one S3 access credential and removes its key id from the owner index.
+//! Revokes one S3 access credential, removes its key id from the owner index and ends the file
+//! server sessions bound to it.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::index::{decode_index, encode_index, owner_key, token_deletes, token_pages};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::Effect;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{ACCESS_OWNER_KEYSPACE, USER_ACCESS_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{PrefixPages, read_row};
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::types::Key;
+use aruna_core::vfs_effects::VfsEffect;
 use aruna_ops_identity::auth::epoch_due::DueMarks;
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
@@ -146,10 +149,24 @@ impl RevokeUserOperation {
             .map_err(|error| StorageError::WriteError(error.to_string()))?;
         match next {
             Some(call) => Ok(Next::Call(call)),
-            None => (self.access.take())
-                .map(Next::Done)
-                .ok_or(RevokeUserError::NotFinished),
+            None => {
+                let access = self.access.take().ok_or(RevokeUserError::NotFinished)?;
+                Ok(Next::Then {
+                    output: access,
+                    calls: vec![self.revoke_sessions()],
+                })
+            }
         }
+    }
+
+    /// Ends the file server sessions and opens bound to the key once the revocation committed.
+    fn revoke_sessions(&self) -> IoCall {
+        let revoke = VfsEffect::RevokeGrant {
+            host_id: None,
+            mount_id: None,
+            access_key: Some(self.access_key.clone()),
+        };
+        IoCall::Effect(Box::new(Effect::Vfs(Box::new(revoke))))
     }
 }
 
@@ -264,9 +281,15 @@ mod tests {
         };
         assert_eq!(space, GROUP_ENCRYPTED_KEYSPACE);
         assert_eq!(prefix, Key::from(access.group_id.to_bytes().to_vec()));
+        let revoke = VfsEffect::RevokeGrant {
+            host_id: None,
+            mount_id: None,
+            access_key: Some(access.access_key.clone()),
+        };
+        let revoke = IoCall::Effect(Box::new(Effect::Vfs(Box::new(revoke))));
         match operation.next(no_rows()) {
-            Ok(Next::Done(revoked)) => revoked,
-            other => panic!("expected the revoked credential, got {other:?}"),
+            Ok(Next::Then { output, calls }) if calls == vec![revoke] => output,
+            other => panic!("expected the revocation and its session end, got {other:?}"),
         }
     }
 

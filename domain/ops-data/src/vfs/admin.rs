@@ -1192,6 +1192,86 @@ impl Operation for FindHostOperation {
     }
 }
 
+/// Whether `network` in CIDR notation contains `address`.
+fn network_holds(network: &str, address: IpAddr) -> bool {
+    let Some((base, prefix)) = network.split_once('/') else {
+        return false;
+    };
+    let (Ok(base), Ok(prefix)) = (base.parse::<IpAddr>(), prefix.parse::<u32>()) else {
+        return false;
+    };
+    match (base, address) {
+        (IpAddr::V4(base), IpAddr::V4(address)) if prefix <= 32 => {
+            let mask = u32::MAX.checked_shl(32 - prefix).unwrap_or(0);
+            u32::from(base) & mask == u32::from(address) & mask
+        }
+        (IpAddr::V6(base), IpAddr::V6(address)) if prefix <= 128 => {
+            let mask = u128::MAX.checked_shl(128 - prefix).unwrap_or(0);
+            u128::from(base) & mask == u128::from(address) & mask
+        }
+        _ => false,
+    }
+}
+
+/// Finds the one unrevoked enrolled host whose networks hold a loopback peer. A peer on any
+/// other address, or one that several hosts' networks hold, finds no host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoopbackHostOperation {
+    peer: IpAddr,
+    after: Option<Key>,
+    found: Option<EnrolledHostRecord>,
+}
+
+impl LoopbackHostOperation {
+    pub fn new(peer: IpAddr) -> Self {
+        Self {
+            peer,
+            after: None,
+            found: None,
+        }
+    }
+
+    fn page(&self) -> IoCall {
+        state_page(vec![HOST_TAG], self.after.clone(), STATE_PAGE)
+    }
+}
+
+impl Operation for LoopbackHostOperation {
+    type Output = Option<EnrolledHostRecord>;
+    type Error = VfsError;
+
+    fn first(&mut self) -> Result<Next<Option<EnrolledHostRecord>>, VfsError> {
+        if !self.peer.to_canonical().is_loopback() {
+            return Ok(Next::Done(None));
+        }
+        Ok(Next::Call(self.page()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Option<EnrolledHostRecord>>, VfsError> {
+        let (rows, next) = result.page()?;
+        let full = rows.len() >= STATE_PAGE;
+        let peer = self.peer.to_canonical();
+        for (key, value) in rows {
+            self.after = Some(key);
+            let Some(host) = record_of::<EnrolledHostRecord>(Some(&value))? else {
+                continue;
+            };
+            let mut networks = host.allowed_networks.iter();
+            if host.revoked_at_ms.is_some() || !networks.any(|net| network_holds(net, peer)) {
+                continue;
+            }
+            // A second match is ambiguous, so the lookup fails closed.
+            if self.found.replace(host).is_some() {
+                return Ok(Next::Done(None));
+            }
+        }
+        if next.is_none() || !full {
+            return Ok(Next::Done(self.found.take()));
+        }
+        Ok(Next::Call(self.page()))
+    }
+}
+
 /// Reads one mount binding by mount id without requiring a REST admin caller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LookupMountOperation {

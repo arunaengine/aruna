@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use crate::inbound::initialize_net_holder;
 use crate::tasks::incoming::TaskQueues;
-use crate::tasks::incoming::restore::install_task_queues;
+use crate::tasks::incoming::restore::install_with_retention;
 use aruna_api::monitoring::{MonitoringState, Readiness, serve_ops};
 use aruna_blob::blob::registry::BackendRegistry;
 use aruna_blob::blob::{BlobHandle, BlobHandler};
@@ -634,11 +634,16 @@ async fn fill(
         acquired.jobs_runtime.clone(),
         &acquired.shutdown,
     );
-    let task_queues = install_task_queues(
+    let retention = (
+        vfs.tombstone_retention_secs.saturating_mul(1000),
+        vfs.stage_retention_secs.saturating_mul(1000),
+    );
+    let task_queues = install_with_retention(
         driver_ctx.clone(),
         acquired.task_handle.clone(),
         acquired.jobs_runtime.clone(),
         config.rocrate_limits.clone(),
+        retention,
     )
     .await;
     acquired.task_queues = Some(task_queues);
@@ -673,7 +678,7 @@ fn open_vfs(
 }
 
 /// Syncs a new boot generation and settles receipts, handles and stages from durable rows.
-/// Referenced checkpoints that are missing or corrupt are reported as storage failures.
+/// Referenced checkpoints that are missing or corrupt are storage failures that stop the start.
 async fn recover_vfs(driver_ctx: &DriverContext) -> Result<(), Box<dyn std::error::Error>> {
     use aruna_ops_data::vfs::recovery::ColdStartOperation;
 
@@ -681,8 +686,13 @@ async fn recover_vfs(driver_ctx: &DriverContext) -> Result<(), Box<dyn std::erro
     if !report.corrupt.is_empty() {
         error!(
             stages = ?report.corrupt,
-            "File server checkpoints are missing or corrupt; their stages stay unrestored"
+            "File server checkpoints are missing or corrupt; the node does not start"
         );
+        let message = format!(
+            "file server checkpoints are missing or corrupt: {:?}",
+            report.corrupt
+        );
+        return Err(message.into());
     }
     info!(
         boot_generation = report.boot_generation,

@@ -365,3 +365,87 @@ fn finished_receipts_settle() {
     let turn = busy.next(vfs(VfsEvent::Attempts { ids: vec![id(20)] }));
     assert!(matches!(turn, Ok(Next::Call(IoCall::Delete(_)))));
 }
+
+/// A retained copy of [`stage`] by its stage id, last changed at `updated_at_ms`.
+fn kept(stage_id: u8, updated_at_ms: u64) -> (Key, Value) {
+    let mut record = stage(3, None);
+    record.stage_id = id(stage_id);
+    record.disposition = StageDisposition::Retained {
+        reason: aruna_core::structs::storage::vfs::DetachReason::LostLife,
+    };
+    record.updated_at_ms = updated_at_ms;
+    let key = Key::from(
+        VfsKey::RetainedStage(scope(), id(stage_id))
+            .to_bytes()
+            .unwrap(),
+    );
+    (key, row(&record).unwrap())
+}
+
+#[test]
+fn retained_stage_expires() {
+    // Custom windows: tombstones after 10 ms, retained checkpoints after 20 ms. A live
+    // checkpoint waiting for quota never expires, however old it is.
+    let now = 30;
+    let key = |key: VfsKey| Key::from(key.to_bytes().unwrap());
+    let tombstone = |retired_at_ms| VfsHandleRow::Tombstone {
+        reason: RetireReason::Stale,
+        retired_at_ms,
+    };
+    let (old, fresh) = (
+        key(VfsKey::Handle(scope(), 1)),
+        key(VfsKey::Handle(scope(), 2)),
+    );
+    let (expired, expired_row) = kept(40, 5);
+    let (recent, recent_row) = kept(41, 15);
+    let due = QuotaRetry {
+        attempts: 3,
+        next_at_ms: now,
+    };
+    let live = key(VfsKey::LiveStage(scope(), 4));
+    let rows = vec![
+        (old.clone(), row(&tombstone(15)).unwrap()),
+        (fresh, row(&tombstone(25)).unwrap()),
+        (live, row(&stage(2, Some(due))).unwrap()),
+        (expired.clone(), expired_row),
+        (recent, recent_row),
+    ];
+    let mut operation = SweepTombstonesOperation::new(now, None).with_retention(10, 20);
+    operation.first().unwrap();
+    let turn = operation.next(IoResult::Page { rows, next: None });
+    let remove = VfsEffect::RemoveCheckpoint {
+        stage_id: id(40),
+        generation: 3,
+    };
+    assert_eq!(asked(&turn), remove);
+    let turn = operation.next(vfs(VfsEvent::Done));
+    let Ok(Next::Call(IoCall::Delete(deletes))) = turn else {
+        panic!("expected the expired rows, got {turn:?}");
+    };
+    let deleted: Vec<_> = deletes.iter().map(|(_, key)| key.clone()).collect();
+    assert_eq!(deleted, vec![old, expired]);
+    operation.next(IoResult::Done).unwrap();
+    let Ok(Next::Done(outcome)) = operation.next(IoResult::Page {
+        rows: Vec::new(),
+        next: None,
+    }) else {
+        panic!("expected the sweep outcome");
+    };
+    assert_eq!(outcome.removed, 2);
+    assert_eq!(outcome.due, vec![(scope(), 4)]);
+}
+
+#[test]
+fn failed_removal_keeps() {
+    // A checkpoint file the adapter could not remove keeps its row for the next sweep.
+    let (expired, expired_row) = kept(40, 1);
+    let now = super::STAGE_RETENTION_MS + 1;
+    let mut operation = SweepTombstonesOperation::new(now, None);
+    operation.first().unwrap();
+    let rows = vec![(expired, expired_row)];
+    let turn = operation.next(IoResult::Page { rows, next: None });
+    assert!(matches!(asked(&turn), VfsEffect::RemoveCheckpoint { .. }));
+    let failed = VfsEvent::Failed(aruna_core::vfs_effects::VfsFailure::Unconfigured);
+    let turn = operation.next(vfs(failed));
+    assert_eq!(turn, Ok(Next::Call(IoCall::Delete(Vec::new()))));
+}

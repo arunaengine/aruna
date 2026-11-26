@@ -255,3 +255,59 @@ fn stage_admin_fenced() {
         remove
     );
 }
+
+/// A host of `seed` that allows `network`, revoked when `revoked`.
+fn local_host(seed: u8, network: &str, revoked: bool) -> (Key, Value) {
+    let mut record = host(user());
+    record.host_id = id(seed);
+    record.allowed_networks = vec!["10.0.0.0/8".to_string(), network.to_string()];
+    record.revoked_at_ms = revoked.then_some(5);
+    let key = Key::from(vec![aruna_core::structs::storage::vfs::HOST_TAG, seed]);
+    (key, row(&record).unwrap())
+}
+
+fn loopback_found(peer: &str, rows: Vec<(Key, Value)>) -> Option<EnrolledHostRecord> {
+    let mut operation = LoopbackHostOperation::new(peer.parse().unwrap());
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Page { .. }))
+    ));
+    match operation.next(IoResult::Page { rows, next: None }) {
+        Ok(Next::Done(found)) => found,
+        other => panic!("expected the lookup outcome, got {other:?}"),
+    }
+}
+
+#[test]
+fn loopback_host_unique() {
+    // Only an unrevoked host whose networks hold the peer counts; a mapped address matches too.
+    let rows = vec![
+        local_host(50, "127.0.0.0/8", true),
+        local_host(51, "192.168.0.0/16", false),
+        local_host(52, "127.0.0.1/32", false),
+    ];
+    let found = loopback_found("127.0.0.1", rows.clone()).map(|host| host.host_id);
+    assert_eq!(found, Some(id(52)));
+    let found = loopback_found("::ffff:127.0.0.1", rows.clone()).map(|host| host.host_id);
+    assert_eq!(found, Some(id(52)));
+    assert_eq!(loopback_found("127.0.0.2", rows), None);
+    let rows = vec![local_host(53, "::1/128", false)];
+    assert!(loopback_found("::1", rows).is_some());
+}
+
+#[test]
+fn ambiguous_loopback_refused() {
+    // Two hosts that both hold the peer leave the lookup without a host.
+    let rows = vec![
+        local_host(52, "127.0.0.1/32", false),
+        local_host(53, "127.0.0.0/8", false),
+    ];
+    assert_eq!(loopback_found("127.0.0.1", rows), None);
+}
+
+#[test]
+fn remote_peer_skipped() {
+    // A peer off the loopback range never reads the host rows.
+    let mut operation = LoopbackHostOperation::new("10.1.2.3".parse().unwrap());
+    assert_eq!(operation.first(), Ok(Next::Done(None)));
+}

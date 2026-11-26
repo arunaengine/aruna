@@ -50,6 +50,7 @@ use aruna_ops_data::metadata::prune_queue::PruneTimerOperation as GraphPruneTime
 use aruna_ops_data::replication::drain::RestoreDrainOperation;
 use aruna_ops_data::replication::mirror_repair::drain::RestoreTimerOperation;
 use aruna_ops_data::s3::bucket::key::lock::LockBucketOperation;
+use aruna_ops_data::vfs::{STAGE_RETENTION_MS, TOMBSTONE_RETENTION_MS};
 use aruna_ops_identity::sync::document_outbox::OutboxTimerOperation;
 use aruna_ops_identity::sync::outbox::batches::OutboxLimits;
 use aruna_ops_identity::sync::outbox::rotation::OutboxRotation;
@@ -76,6 +77,7 @@ pub mod folder_pass;
 pub mod git_drain;
 pub mod outbox;
 pub mod restore;
+mod vfs_retry;
 
 /// The logical cores this host offers, as the operating system reports them.
 fn host_cores() -> usize {
@@ -122,6 +124,8 @@ pub(crate) struct OperationsTaskHandler {
     // restart is fine: a restarted timer starts afresh.
     timer_memory: std::sync::Mutex<HashMap<TaskKey, TimerMemory>>,
     outbox_limits: OutboxLimits,
+    tombstone_retention_ms: u64,
+    stage_retention_ms: u64,
 }
 
 impl OperationsTaskHandler {
@@ -132,11 +136,20 @@ impl OperationsTaskHandler {
             rocrate_limits: RoCrateLimits::default(),
             timer_memory: std::sync::Mutex::new(HashMap::new()),
             outbox_limits: OutboxLimits::default(),
+            tombstone_retention_ms: TOMBSTONE_RETENTION_MS,
+            stage_retention_ms: STAGE_RETENTION_MS,
         }
     }
 
     fn with_rocrate_limits(mut self, limits: RoCrateLimits) -> Self {
         self.rocrate_limits = limits;
+        self
+    }
+
+    /// How long file server tombstones and retained checkpoints stay, in milliseconds.
+    fn with_vfs_retention(mut self, tombstone_ms: u64, stage_ms: u64) -> Self {
+        self.tombstone_retention_ms = tombstone_ms;
+        self.stage_retention_ms = stage_ms;
         self
     }
 
@@ -241,6 +254,8 @@ impl OperationsTaskHandler {
             jobs_started: needs.jobs && runtime.is_started(),
             in_process_slots: slots(JobExecutionClass::InProcess).unwrap_or_default(),
             external_slots: slots(JobExecutionClass::ExternalAttempt).unwrap_or_default(),
+            tombstone_retention_ms: self.tombstone_retention_ms,
+            stage_retention_ms: self.stage_retention_ms,
         };
         let Some(operation) = timer_operation(&key, &input) else {
             error!(task_id = ?key, "The trigger table names no operation for this timer");
@@ -295,6 +310,9 @@ impl OperationsTaskHandler {
                 claimed,
                 lost_attempts,
             } => self.start_jobs(claimed, lost_attempts).await,
+            TimerHandoff::RetryVfsStages(due) => {
+                vfs_retry::retry_due_stages(&self.context, due).await
+            }
         }
     }
 

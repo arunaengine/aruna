@@ -18,7 +18,9 @@ use aruna_ops_data::transfer::key_status::KeyStatusOperation;
 use aruna_ops_data::vfs::policy::{
     AuthorizeVfsOperation, VfsAccess, VfsAccessContext, VfsGrant, VfsRequest,
 };
-use aruna_ops_data::vfs::{FindHostOperation, GetHostOperation, LookupMountOperation, VfsError};
+use aruna_ops_data::vfs::{
+    FindHostOperation, GetHostOperation, LookupMountOperation, LoopbackHostOperation, VfsError,
+};
 use aruna_ops_work::jobs::workflow::input_view::{view_bucket, view_job};
 use aruna_runner::driver::drive;
 use ipnet::IpNet;
@@ -95,6 +97,25 @@ impl ArunaNfsBackend {
             Ok(host) => host?,
             Err(error) => {
                 debug!(error = %error, "NFS host lookup failed");
+                return None;
+            }
+        };
+        host_allows(&host, peer).then_some(HostIdentity {
+            host_id: host.host_id,
+            owner: host.owner,
+        })
+    }
+
+    /// The one unrevoked host whose networks hold the loopback `peer`; none or several admit
+    /// nothing.
+    pub(super) async fn admit_loopback(&self, peer: IpAddr) -> Option<HostIdentity> {
+        if !peer.is_loopback() {
+            return None;
+        }
+        let host = match drive(LoopbackHostOperation::new(peer), &self.context).await {
+            Ok(host) => host?,
+            Err(error) => {
+                debug!(error = %error, "NFS loopback host lookup failed");
                 return None;
             }
         };

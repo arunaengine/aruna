@@ -243,3 +243,75 @@ fn reader_close_keeps() {
     let turn = operation.next(vfs(VfsEvent::Closed(summary(1))));
     assert_eq!(turn, Ok(Next::Done(CloseOutcome::Closed)));
 }
+
+/// Runs one stage move against `row` as it reads and answers the row it writes.
+fn moved(mut change: StageMoveOperation, row: &NfsStageRecord) -> (VfsKey, NfsStageRecord) {
+    assert!(matches!(change.first(), Ok(Next::Call(IoCall::Read(_)))));
+    let read = IoResult::Values(vec![Some(Value::from(row.to_bytes().unwrap()))]);
+    let Ok(Next::Call(IoCall::Delete(deletes))) = change.next(read) else {
+        panic!("expected the old row's delete");
+    };
+    let live = state_key(&VfsKey::LiveStage(scope(), 4)).unwrap();
+    assert_eq!(deletes, vec![(NFS_STATE_KEYSPACE.to_string(), live)]);
+    let Ok(Next::Call(IoCall::Write(writes))) = change.next(IoResult::Done) else {
+        panic!("expected the replacement row");
+    };
+    let (_, key, value) = &writes[0];
+    let key = VfsKey::from_bytes(key.as_ref()).unwrap();
+    (key, NfsStageRecord::from_bytes(value.as_ref()).unwrap())
+}
+
+#[test]
+fn quota_backs_off() {
+    // A still-full group keeps the checkpoint live with its next retry doubled.
+    let mut blocked = stage();
+    blocked.quota_retry = Some(next_retry(None, 10));
+    let mut operation = QuotaStageOperation::reschedule(scope(), blocked.clone());
+    operation.stamp(100);
+    let (key, row) = moved(operation.stage_move(), &blocked);
+    assert_eq!(key, VfsKey::LiveStage(scope(), 4));
+    let retry = row.quota_retry.unwrap();
+    assert_eq!(
+        (retry.attempts, retry.next_at_ms),
+        (2, 100 + 2 * QUOTA_WAIT_MS)
+    );
+    assert_eq!(
+        (row.disposition, row.updated_at_ms),
+        (StageDisposition::Live, 100)
+    );
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    assert_eq!(operation.next(child(())), Ok(Next::Done(())));
+}
+
+#[test]
+fn quota_retry_retains() {
+    // A name that can no longer take the checkpoint keeps it by its stage id.
+    let mut blocked = stage();
+    blocked.quota_retry = Some(next_retry(None, 10));
+    let operation = QuotaStageOperation::retain(scope(), blocked.clone(), DetachReason::LostLife);
+    let (key, row) = moved(operation.stage_move(), &blocked);
+    assert_eq!(key, VfsKey::RetainedStage(scope(), id(12)));
+    assert_eq!(row, retained(&blocked, DetachReason::LostLife, 0));
+}
+
+#[test]
+fn changed_stage_conflicts() {
+    // A row that changed since it was read refuses the move.
+    let blocked = stage();
+    let operation = QuotaStageOperation::reschedule(scope(), blocked.clone());
+    let mut change = operation.stage_move();
+    change.first().unwrap();
+    let mut newer = blocked;
+    newer.generation = 3;
+    let read = IoResult::Values(vec![Some(Value::from(newer.to_bytes().unwrap()))]);
+    assert_eq!(change.next(read), Err(VfsError::Conflict));
+    let mut failing = QuotaStageOperation::reschedule(scope(), stage());
+    failing.first().unwrap();
+    let refused = IoResult::Child(aruna_core::calls::ChildOutcome::new(Err::<(), VfsError>(
+        VfsError::Conflict,
+    )));
+    assert_eq!(failing.next(refused), Err(VfsError::Conflict));
+}

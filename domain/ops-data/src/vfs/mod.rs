@@ -16,8 +16,8 @@ pub use admin::{
     BucketScopeOperation, CheckpointChunk, CreateMountOperation, DeleteMountOperation,
     DeleteStageOperation, EnrollHostOperation, FindHostOperation, GetHostOperation,
     GetMountOperation, GetStageOperation, ListHostsOperation, ListMountsOperation,
-    ListStagesOperation, LiveStageOperation, LookupMountOperation, PublishStageOperation,
-    ReadCheckpointOperation, RevokeHostOperation, RotateHostOperation,
+    ListStagesOperation, LiveStageOperation, LookupMountOperation, LoopbackHostOperation,
+    PublishStageOperation, ReadCheckpointOperation, RevokeHostOperation, RotateHostOperation,
 };
 pub use handles::{
     AllocateHandleOperation, ResolveHandleOperation, RetireHandleOperation, VfsListOperation,
@@ -30,7 +30,7 @@ pub use io::{
 pub use mutate::{VfsMkdirOperation, VfsRemoveOperation, VfsRenameOperation};
 pub use path::{JobEntry, JobNodeKind, JobTree, JobTreeItem};
 pub use policy::{AuthorizeVfsOperation, VfsAccessContext, vfs_policy_extras};
-pub use publish::{VfsCloseOperation, VfsPublishOperation};
+pub use publish::{QuotaStageOperation, VfsCloseOperation, VfsPublishOperation};
 pub use recovery::{ColdStartOperation, SweepTombstonesOperation, VfsReceiptOperation};
 
 use aruna_core::calls::{IoCall, IoError, IoResult};
@@ -49,6 +49,8 @@ use ulid::Ulid;
 
 /// How long a retired handle and a displaced cookie position stay readable as tombstones.
 pub const TOMBSTONE_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
+/// How long a retained checkpoint stays recoverable by its stage id before the sweep removes it.
+pub const STAGE_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// Rows one sweep or recovery page reads at most.
 pub const STATE_PAGE: usize = 256;
 /// Bytes one base-object read moves into a checkpoint or a read reply at most.

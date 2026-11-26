@@ -3,9 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::convert::Infallible;
-
-use aruna_core::stream::BackendStream;
+use aruna_core::stream::{BackendStream, ByteStream};
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::vfs::{
     BucketScope, DirectoryWitness, FileIdentity, HandleIdentity, HandleKind, StageBase,
@@ -19,9 +17,8 @@ use aruna_ops_data::vfs::path::{NameUse, check_component, child_key, marker_key,
 use aruna_ops_data::vfs::policy::{VfsAccess, VfsRequest};
 use aruna_ops_data::vfs::publish::{CloseInput, CloseOutcome, PublishInput, Published};
 use aruna_ops_data::vfs::{
-    AuthorizeVfsOperation, CHUNK_BYTES, VfsAccessContext, VfsCloseOperation,
-    VfsDispositionOperation, VfsMkdirOperation, VfsPublishOperation, VfsReadOperation,
-    VfsRenameOperation,
+    AuthorizeVfsOperation, VfsAccessContext, VfsCloseOperation, VfsDispositionOperation,
+    VfsMkdirOperation, VfsPublishOperation, VfsReadOperation, VfsRenameOperation,
 };
 use aruna_ops_identity::document_repository::GetConfigOperation;
 use aruna_ops_identity::groups::routing::{BucketRules, SnapshotOperation};
@@ -29,14 +26,15 @@ use aruna_runner::driver::{drive, node_routing};
 use bytes::Bytes;
 use ulid::Ulid;
 
+use super::bodies::chunked_body;
 use super::names::Resolution;
 use super::{ArunaSmbBackend, FileOpen, file_info, object_kind, vfs_failure};
 use crate::backend::{BackendError, FileInfo};
 
-/// A prepared write: the destination, its body in bounded chunks and what it replaces.
+/// A prepared write: the destination, its lazily read body and what it replaces.
 struct Prepared {
     key: String,
-    chunks: Vec<Bytes>,
+    body: ByteStream,
     length: u64,
     exists: bool,
     version_id: Option<Ulid>,
@@ -60,8 +58,6 @@ impl ArunaSmbBackend {
         let routing = drive(snapshot, &self.driver)
             .await
             .map_err(|error| internal(&error))?;
-        let chunks = prepared.chunks.into_iter().map(Ok::<Bytes, Infallible>);
-        let body = BackendStream::new(futures_util::stream::iter(chunks));
         Ok(PutObjectConfig {
             user_id: user,
             group_id: info.group_id,
@@ -71,7 +67,7 @@ impl ArunaSmbBackend {
                 bucket: name.to_string(),
                 key: prepared.key,
                 content_length: Some(prepared.length),
-                body: Some(body),
+                body: Some(prepared.body),
             },
             expected_checksums: Vec::new(),
             checksum_type: None,
@@ -83,31 +79,26 @@ impl ArunaSmbBackend {
         })
     }
 
-    /// The effective image of an open file, read in bounded chunks before any permit is held.
-    async fn image(&self, open: &FileOpen, size: u64) -> Result<Vec<Bytes>, BackendError> {
-        let context = self.open_context(open);
-        let mut chunks = Vec::new();
-        let mut offset = 0;
-        while offset < size {
-            let length = (size - offset).min(CHUNK_BYTES);
-            let input = ReadInput {
-                context: context.clone(),
-                key: open.key.clone(),
-                instance_id: Some(open.instance_id),
-                version_id: open.version_id,
-                offset,
-                length: u32::try_from(length).map_err(|_| BackendError::Invalid)?,
-            };
-            let read = drive(VfsReadOperation::new(input), &self.driver)
-                .await
-                .map_err(vfs_failure)?;
-            if read.data.len() as u64 != length {
-                return Err(BackendError::Busy);
+    /// The effective image of an open file, each chunk read only when the write consumes it.
+    fn image(&self, open: &FileOpen, size: u64) -> ByteStream {
+        let driver = self.driver.clone();
+        let input = ReadInput {
+            context: self.open_context(open),
+            key: open.key.clone(),
+            instance_id: Some(open.instance_id),
+            version_id: open.version_id,
+            offset: 0,
+            length: 0,
+        };
+        chunked_body(size, move |offset, length| {
+            let (driver, mut input) = (driver.clone(), input.clone());
+            input.offset = offset;
+            input.length = length;
+            async move {
+                let read = drive(VfsReadOperation::new(input), &driver).await;
+                read.map(|read| Bytes::from(read.data))
             }
-            offset += length;
-            chunks.push(Bytes::from(read.data));
-        }
-        Ok(chunks)
+        })
     }
 
     /// Creates the marker `d/` of a new directory as the caller's own write.
@@ -124,7 +115,7 @@ impl ArunaSmbBackend {
         let grant = drive(check, &self.driver).await.map_err(vfs_failure)?;
         let prepared = Prepared {
             key: marker,
-            chunks: Vec::new(),
+            body: BackendStream::empty(),
             length: 0,
             exists: false,
             version_id: None,
@@ -165,7 +156,7 @@ impl ArunaSmbBackend {
         let size = summary.logical_size;
         let prepared = Prepared {
             key: open.key.clone(),
-            chunks: self.image(open, size).await?,
+            body: self.image(open, size),
             length: size,
             exists: matches!(base, StageBase::Committed { .. }),
             version_id: None,
@@ -265,7 +256,8 @@ impl ArunaSmbBackend {
     }
 
     /// Renames the open object, keeping the open. A same-parent case change keeps the new
-    /// spelling; a committed file or marker moves with a prepared destination write.
+    /// spelling; a committed file, an unpublished file replacing a live name, or a marker
+    /// moves with a prepared destination write.
     pub(super) async fn rename_file(
         &self,
         open: &FileOpen,
@@ -306,17 +298,27 @@ impl ArunaSmbBackend {
             attempt_id,
             stage: None,
         };
+        let committed = matches!(
+            summary.identity,
+            HandleIdentity::File(FileIdentity::Committed { .. })
+        );
+        // An unpublished file over a live name publishes its image at the destination.
+        let unpublished = matches!(
+            summary.identity,
+            HandleIdentity::File(FileIdentity::Unpublished { .. })
+        );
+        let replaces = unpublished && exists && replace;
         let moved = match &summary.identity {
-            HandleIdentity::File(FileIdentity::Committed { .. }) => Some(Prepared {
+            HandleIdentity::File(_) if committed || replaces => Some(Prepared {
                 key: to.clone(),
-                chunks: self.image(open, summary.logical_size).await?,
+                body: self.image(open, summary.logical_size),
                 length: summary.logical_size,
                 exists,
                 version_id: Some(attempt_id),
             }),
             HandleIdentity::Directory(DirectoryWitness::Marker { .. }) => Some(Prepared {
                 key: marker_key(&to),
-                chunks: Vec::new(),
+                body: BackendStream::empty(),
                 length: 0,
                 exists: false,
                 version_id: Some(attempt_id),
@@ -336,7 +338,7 @@ impl ArunaSmbBackend {
         if !source_parent.is_empty() && target_parent != source_parent {
             let prepared = Prepared {
                 key: marker_key(source_parent),
-                chunks: Vec::new(),
+                body: BackendStream::empty(),
                 length: 0,
                 exists: false,
                 version_id: None,
@@ -345,14 +347,30 @@ impl ArunaSmbBackend {
             rename = rename.with_parent_marker(put);
         }
         drive(rename, &self.driver).await.map_err(vfs_failure)?;
-        let committed = matches!(
-            summary.identity,
-            HandleIdentity::File(FileIdentity::Committed { .. })
-        );
+        // The instance at the destination tells whether the stage was published or rebound.
+        let identity = match replaces {
+            true => {
+                let moved = FileOpen {
+                    key: to.clone(),
+                    ..open.clone()
+                };
+                let found = self.summary(&moved).await.ok().flatten();
+                found.map(|found| found.identity)
+            }
+            false => None,
+        };
+        let published = committed
+            || matches!(
+                identity,
+                Some(HandleIdentity::File(FileIdentity::Committed { .. }))
+            );
         self.update_opens(&open.bucket, open.instance_id, |other| {
             other.key = to.clone();
-            if committed {
+            if published {
                 other.version_id = Some(attempt_id);
+            }
+            if let Some(identity) = &identity {
+                other.identity = identity.clone();
             }
         });
         Ok(())

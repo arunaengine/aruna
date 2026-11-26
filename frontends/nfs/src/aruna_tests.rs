@@ -9,8 +9,8 @@ use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::storage::vfs::EnrolledHostRecord;
 use aruna_core::user::id::UserId;
 use aruna_core::vfs_effects::VfsFailure;
-use aruna_ops_data::vfs::EnrollHostOperation;
-use aruna_ops_data::vfs::admin::EnrollInput;
+use aruna_ops_data::vfs::admin::{EnrollInput, HostChange};
+use aruna_ops_data::vfs::{EnrollHostOperation, RevokeHostOperation};
 use aruna_runner::driver::drive;
 use aruna_runner::testing::memory_context;
 
@@ -65,6 +65,20 @@ fn host_record(networks: &[&str], revoked: Option<u64>) -> EnrolledHostRecord {
         created_at_ms: 1,
         revoked_at_ms: revoked,
     }
+}
+
+/// Enrolls a host of `owner()` with the certificate key `key` and `networks`.
+async fn enroll_host(backend: &ArunaNfsBackend, key: u8, networks: &[&str]) -> EnrolledHostRecord {
+    let enroll = EnrollHostOperation::new(EnrollInput {
+        owner: owner(),
+        fingerprints: vec![[key; 32]],
+        proven: [key; 32],
+        allowed_networks: networks.iter().map(|network| network.to_string()).collect(),
+        worker_pool: false,
+    });
+    drive(enroll, &backend.context)
+        .await
+        .expect("host enrolled")
 }
 
 fn peer(last: u8) -> IpAddr {
@@ -325,4 +339,36 @@ async fn lapsed_replay_refused() {
     let mut lost = grant(peer(4), Vec::new());
     lost.host = unknown;
     assert_eq!(backend.recheck_replay(&lost).await, Err(NfsStat4::Access));
+}
+
+#[tokio::test]
+async fn loopback_admits_one() {
+    let backend = backend();
+    let host = enroll_host(&backend, 7, &["127.0.0.1/32", "::1/128", "10.1.0.0/16"]).await;
+    let ipv4 = backend.loopback_host(IpAddr::V4(Ipv4Addr::LOCALHOST)).await;
+    assert_eq!(ipv4.map(|found| found.host_id), Some(host.host_id));
+    let ipv6 = backend.loopback_host(IpAddr::V6(Ipv6Addr::LOCALHOST)).await;
+    assert_eq!(ipv6.map(|found| found.host_id), Some(host.host_id));
+    // A peer in the host's networks is still no loopback connection.
+    assert_eq!(backend.loopback_host(peer(4)).await, None);
+}
+
+#[tokio::test]
+async fn loopback_refuses_ambiguity() {
+    let backend = backend();
+    let local = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    assert_eq!(backend.loopback_host(local).await, None);
+    enroll_host(&backend, 7, &["127.0.0.1/32"]).await;
+    enroll_host(&backend, 8, &["127.0.0.0/8"]).await;
+    assert_eq!(backend.loopback_host(local).await, None);
+}
+
+#[tokio::test]
+async fn revoked_loopback_refused() {
+    let backend = backend();
+    let host = enroll_host(&backend, 7, &["127.0.0.1/32"]).await;
+    let revoke = RevokeHostOperation::new(host.host_id, owner(), HostChange::Revoke);
+    drive(revoke, &backend.context).await.expect("host revoked");
+    let local = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    assert_eq!(backend.loopback_host(local).await, None);
 }

@@ -13,7 +13,7 @@ use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
 use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::structs::storage::vfs::{
-    StageDisposition, StageOwner, StageScope, VfsRecord, encode_handle_id,
+    StageDisposition, StageOwner, StageScope, VfsRecord, encode_handle_id, encode_token,
 };
 use std::collections::HashMap;
 
@@ -388,9 +388,194 @@ fn last_child_removed() {
     assert!(matches!(asked(&turn), VfsEffect::AcquirePermit { .. }));
     let turn = operation.next(vfs(VfsEvent::PermitAcquired { permit_id: id(9) }));
     assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
-    let turn = operation.next(IoResult::Values(vec![None, Some(head(2, Some(4))), None]));
+    let turn = operation.next(IoResult::Values(vec![
+        None,
+        Some(head(2, Some(4))),
+        None,
+        None,
+    ]));
     assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
     assert!(operation.joint);
+    let turn = operation.next(put_done(Err(PutObjectError::FenceTaken)));
+    assert_eq!(turn, Err(VfsError::Conflict));
+}
+
+#[test]
+fn live_marker_kept() {
+    // When the parent marker is already live, remove deletes the child without rewriting it.
+    let input = RemoveInput {
+        context: context(),
+        key: "p/a".to_string(),
+        kind: HandleKind::File,
+        handle_id: None,
+        identity: identity(HandleKind::File),
+        instance_id: None,
+        attempt_id: id(22),
+    };
+    let mut operation = VfsRemoveOperation::new(input).with_parent_marker(prepared("p/"));
+    operation.first().unwrap();
+    operation.next(granted()).unwrap();
+    operation.next(granted()).unwrap();
+    operation
+        .next(vfs(VfsEvent::PermitAcquired { permit_id: id(9) }))
+        .unwrap();
+    let turn = operation.next(IoResult::Values(vec![
+        None,
+        Some(head(2, Some(4))),
+        None,
+        Some(head(1, Some(3))),
+    ]));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    assert!(!operation.joint);
+}
+
+fn unpublished() -> HandleIdentity {
+    HandleIdentity::File(FileIdentity::Unpublished {
+        token: id(6),
+        predecessor: None,
+    })
+}
+
+/// An unpublished file with its live stage that replaces the live destination.
+fn replacing() -> RenameInput {
+    let mut stage = dirty_stage();
+    stage.base = StageBase::Unpublished {
+        token: id(6),
+        predecessor: None,
+    };
+    RenameInput {
+        identity: unpublished(),
+        replace: true,
+        stage: Some(stage),
+        ..moving(HandleKind::File)
+    }
+}
+
+/// The rows of [`replacing`]: the source token, a live destination named by handle 5, both
+/// reverse rows and the source handle, as `token` reads.
+fn replaced_rows(token: Option<Value>) -> Vec<Option<Value>> {
+    let name = |handle_id| Some(Value::from(encode_handle_id(handle_id).to_vec()));
+    let live = LiveHandle {
+        key: "p/a".to_string(),
+        identity: unpublished(),
+        mode: 0o644,
+        attribute_change: 1,
+        cookie_id: 9,
+        detached: None,
+    };
+    let handle = Value::from(VfsHandleRow::Live(live).to_bytes().unwrap());
+    vec![
+        None,
+        token,
+        Some(head(3, Some(5))),
+        None,
+        None,
+        None,
+        name(4),
+        name(5),
+        Some(handle),
+    ]
+}
+
+fn token_row() -> Option<Value> {
+    Some(Value::from(encode_token(id(6)).to_vec()))
+}
+
+#[test]
+fn unpublished_publish_plan() {
+    // The stage publishes at the destination: the source token and stage go with the put, and
+    // the handle takes the destination's new life.
+    let rows = replaced_rows(token_row());
+    let moved = committed_move(&replacing(), &scope(), &rows, (id(30), id(31)), 70).unwrap();
+    assert_eq!(moved.displaced, Some(5));
+    let plan = &moved.rows;
+    let source_head = head_key("bucket", "p/a").unwrap();
+    let source_watch = super::super::watch_key("bucket", "p/a").unwrap();
+    let stage = state_key(&VfsKey::LiveStage(scope(), 4)).unwrap();
+    let guard = |key: &Key| plan.guards.iter().find(|(_, row, _)| row == key);
+    assert_eq!(guard(&source_head).map(|row| row.2.clone()), Some(None));
+    assert_eq!(
+        guard(&source_watch).map(|row| row.2.clone()),
+        Some(token_row())
+    );
+    assert!(guard(&stage).is_some_and(|row| row.2.is_some()));
+    let deleted = |key: &Key| plan.deletes.iter().any(|(_, row)| row == key);
+    assert!(deleted(&source_watch) && deleted(&stage));
+    assert!(!deleted(&source_head));
+    assert_eq!(written(plan, &VfsKey::LiveStage(scope(), 4)), None);
+    let handle = written(plan, &VfsKey::Handle(scope(), 4)).unwrap();
+    let VfsHandleRow::Live(handle) = VfsHandleRow::from_bytes(&handle).unwrap() else {
+        panic!("the moved handle stays live");
+    };
+    let life = HandleIdentity::File(FileIdentity::Committed { life_id: id(31) });
+    assert_eq!((handle.key.as_str(), handle.identity), ("q/b", life));
+    let receipt = written(plan, &VfsKey::Receipt(id(20))).unwrap();
+    assert_eq!(
+        VfsReceipt::from_bytes(&receipt).unwrap().change,
+        ReceiptChange::FilePublish {
+            key: "q/b".to_string(),
+            version_id: id(30),
+            life_id: id(31),
+            handle_id: Some(4),
+            stage_id: Some(id(12)),
+        }
+    );
+}
+
+/// Runs [`replacing`] through admission and the permit up to its rows read.
+fn replace_admitted() -> VfsRenameOperation {
+    let mut operation = VfsRenameOperation::new(replacing()).with_destination_put(prepared("q/b"));
+    operation.first().unwrap();
+    operation.next(granted()).unwrap();
+    operation.next(granted()).unwrap();
+    let turn = operation.next(granted());
+    assert!(matches!(asked(&turn), VfsEffect::AcquirePermit { .. }));
+    let turn = operation.next(vfs(VfsEvent::PermitAcquired { permit_id: id(9) }));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
+    operation
+}
+
+#[test]
+fn unpublished_replaces_live() {
+    // An unpublished file over a live destination is one put that settles like a publication.
+    let mut operation = replace_admitted();
+    let turn = operation.next(IoResult::Values(replaced_rows(token_row())));
+    assert!(matches!(asked(&turn), VfsEffect::ListStaged { prefix, .. } if prefix == "q/b/"));
+    let turn = operation.next(staged_none());
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    assert!(operation.committed);
+    assert_eq!(
+        operation.next(put_done(Ok(stored()))),
+        Ok(Next::Call(IoCall::Sync))
+    );
+    let turn = operation.next(IoResult::Done);
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    let settled = ReceiptOutcome::Applied {
+        life_id: Some(id(31)),
+    };
+    let Ok(Next::Then { output: (), calls }) = operation.next(child(settled)) else {
+        panic!("the move settles with its releases");
+    };
+    let detach = vfs_call(VfsEffect::DetachInstance {
+        scope: scope(),
+        handle_id: 5,
+        instance_id: None,
+        reason: DetachReason::Displaced,
+    });
+    assert_eq!(calls.first(), Some(&detach));
+}
+
+#[test]
+fn replaced_token_refused() {
+    // A token gone before the read is a stale handle; one taken before the commit conflicts.
+    let mut operation = replace_admitted();
+    let turn = operation.next(IoResult::Values(replaced_rows(None)));
+    assert_eq!(turn, Err(VfsError::StaleHandle));
+    let mut operation = replace_admitted();
+    operation
+        .next(IoResult::Values(replaced_rows(token_row())))
+        .unwrap();
+    operation.next(staged_none()).unwrap();
     let turn = operation.next(put_done(Err(PutObjectError::FenceTaken)));
     assert_eq!(turn, Err(VfsError::Conflict));
 }

@@ -1,5 +1,5 @@
 //! Unit tests for the Aruna SMB backend: error mapping, exact credential spelling, job view and
-//! distributed bucket refusal, cursors and revocation delivery.
+//! distributed bucket refusal, cursors, revocation delivery and chunked write bodies.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -11,9 +11,11 @@ use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::structs::storage::distribution::{DistributionBinding, DistributionRevision};
 use aruna_core::user::id::UserId;
+use aruna_ops_data::vfs::CHUNK_BYTES;
 use aruna_ops_data::vfs::handles::{ListNext, ListResume};
 use aruna_ops_work::jobs::workflow::input_view::ViewFrom;
 use aruna_storage::storage::memory::MemoryStorage;
+use futures_util::StreamExt;
 
 use super::*;
 
@@ -260,4 +262,74 @@ async fn revocations_reach_subscribers() {
     };
     assert_eq!(first.recv().await.ok(), Some(expected.clone()));
     assert_eq!(second.recv().await.ok(), Some(expected));
+}
+
+/// Collects every item of a body, reporting failures as their text.
+async fn drain(mut body: aruna_core::stream::ByteStream) -> Vec<Result<usize, String>> {
+    let mut items = Vec::new();
+    while let Some(item) = body.next().await {
+        items.push(
+            item.map(|chunk| chunk.len())
+                .map_err(|error| error.to_string()),
+        );
+    }
+    items
+}
+
+#[tokio::test]
+async fn empty_body_ends() {
+    let calls = Arc::new(Mutex::new(0usize));
+    let seen = calls.clone();
+    let body = bodies::chunked_body(0, move |_, _| {
+        *seen.lock() += 1;
+        async { Ok::<Bytes, VfsError>(Bytes::new()) }
+    });
+    assert!(drain(body).await.is_empty());
+    assert_eq!(*calls.lock(), 0);
+}
+
+#[tokio::test]
+async fn body_crosses_chunks() {
+    let chunk = usize::try_from(CHUNK_BYTES).expect("a chunk fits in memory");
+    let size = 2 * CHUNK_BYTES + 5;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let seen = requests.clone();
+    let body = bodies::chunked_body(size, move |offset, length| {
+        seen.lock().push((offset, length));
+        let data = vec![(offset / CHUNK_BYTES) as u8; length as usize];
+        async move { Ok::<Bytes, VfsError>(Bytes::from(data)) }
+    });
+    assert_eq!(drain(body).await, vec![Ok(chunk), Ok(chunk), Ok(5)]);
+    let full = u32::try_from(CHUNK_BYTES).expect("a chunk length fits");
+    let expected = vec![(0, full), (CHUNK_BYTES, full), (2 * CHUNK_BYTES, 5)];
+    assert_eq!(*requests.lock(), expected);
+}
+
+#[tokio::test]
+async fn short_read_fails() {
+    let requests = Arc::new(Mutex::new(0usize));
+    let seen = requests.clone();
+    let body = bodies::chunked_body(CHUNK_BYTES + 1, move |_, length| {
+        *seen.lock() += 1;
+        let data = vec![0; length as usize - 1];
+        async move { Ok::<Bytes, VfsError>(Bytes::from(data)) }
+    });
+    let conflict = VfsError::Conflict.to_string();
+    assert_eq!(drain(body).await, vec![Err(conflict)]);
+    // The reader stops at the first failure and reads nothing after it.
+    assert_eq!(*requests.lock(), 1);
+}
+
+#[tokio::test]
+async fn read_error_propagates() {
+    let body = bodies::chunked_body(CHUNK_BYTES + 3, move |offset, length| {
+        let item = match offset {
+            0 => Ok(Bytes::from(vec![1; length as usize])),
+            _ => Err(VfsError::NotFound),
+        };
+        async move { item }
+    });
+    let chunk = usize::try_from(CHUNK_BYTES).expect("a chunk fits in memory");
+    let missing = VfsError::NotFound.to_string();
+    assert_eq!(drain(body).await, vec![Ok(chunk), Err(missing)]);
 }

@@ -237,6 +237,35 @@ fn committed_move_refused() {
 }
 
 #[test]
+fn unprepared_replace_refused() {
+    // An unpublished file replaces a live destination only by publishing a prepared image.
+    let mut input = rename(true);
+    input.replace = true;
+    let mut operation = VfsRenameOperation::new(input);
+    operation.first().unwrap();
+    operation.next(granted()).unwrap();
+    operation.next(granted()).unwrap();
+    operation.next(granted()).unwrap();
+    operation
+        .next(vfs(VfsEvent::PermitAcquired { permit_id: id(9) }))
+        .unwrap();
+    let token = Value::from(encode_token(id(6)).to_vec());
+    let rows = vec![
+        None,
+        Some(token),
+        Some(head(3, Some(5))),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ];
+    let turn = operation.next(IoResult::Values(rows));
+    assert_eq!(turn, Err(VfsError::Unavailable(JOINT_MOVE.to_string())));
+}
+
+#[test]
 fn unpublished_remove_settles() {
     let input = RemoveInput {
         context: context(),

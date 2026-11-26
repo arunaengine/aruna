@@ -8,8 +8,8 @@ use super::mutate::{GuardedWriteOperation, MovePlan};
 use super::path::{ancestors, marker_key};
 use super::publish::{StageMoveOperation, retained};
 use super::{
-    STATE_PAGE, TOMBSTONE_RETENTION_MS, VfsError, head_key, head_of, record_of, state_delete,
-    state_read, state_row, token_of, unexpected, vfs_call, vfs_event,
+    STAGE_RETENTION_MS, STATE_PAGE, TOMBSTONE_RETENTION_MS, VfsError, head_key, head_of, record_of,
+    state_delete, state_read, state_row, token_of, unexpected, vfs_call, vfs_event,
 };
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{
@@ -774,6 +774,7 @@ enum SweepStep {
     StatePage,
     Attempts,
     Receipt,
+    Checkpoint,
     Delete,
     TokenPage,
     TokenRows,
@@ -783,17 +784,21 @@ enum SweepStep {
 
 type SweepTurn = Result<Next<SweepOutcome>, VfsError>;
 
-/// One bounded page of the `SweepNfsTombstones` timer. The state pass drops expired handle
-/// tombstones and cookie positions, settles receipts whose owner finished and reports due
-/// quota retries; the token pass removes watch keys no stage, handle or instance holds.
+/// One bounded page of the `SweepNfsTombstones` timer. The state pass drops expired tombstones,
+/// cookie positions and retained (never live) checkpoints, settles finished receipts and reports
+/// due quota retries; the token pass removes watch keys no stage, handle or instance holds.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SweepTombstonesOperation {
     now_ms: u64,
+    tombstone_retention_ms: u64,
+    stage_retention_ms: u64,
     cursor: Option<Vec<u8>>,
     step: SweepStep,
     outcome: SweepOutcome,
     deletes: Vec<(String, Key)>,
     receipts: VecDeque<VfsReceipt>,
+    /// Expired retained checkpoints: their row key and record.
+    stages: VecDeque<(Key, NfsStageRecord)>,
     scopes: VecDeque<BucketScope>,
     active: BTreeSet<Ulid>,
     tokens: VecDeque<(VfsWatchKey, Value)>,
@@ -805,11 +810,14 @@ impl SweepTombstonesOperation {
     pub fn new(now_ms: u64, cursor: Option<Vec<u8>>) -> Self {
         Self {
             now_ms,
+            tombstone_retention_ms: TOMBSTONE_RETENTION_MS,
+            stage_retention_ms: STAGE_RETENTION_MS,
             cursor,
             step: SweepStep::StatePage,
             outcome: SweepOutcome::default(),
             deletes: Vec::new(),
             receipts: VecDeque::new(),
+            stages: VecDeque::new(),
             scopes: VecDeque::new(),
             active: BTreeSet::new(),
             tokens: VecDeque::new(),
@@ -818,13 +826,20 @@ impl SweepTombstonesOperation {
         }
     }
 
+    /// How long tombstones and cookie positions, and retained checkpoints, stay before expiry.
+    pub fn with_retention(mut self, tombstone_retention_ms: u64, stage_retention_ms: u64) -> Self {
+        self.tombstone_retention_ms = tombstone_retention_ms;
+        self.stage_retention_ms = stage_retention_ms;
+        self
+    }
+
     fn call(&mut self, step: SweepStep, call: IoCall) -> SweepTurn {
         self.step = step;
         Ok(Next::Call(call))
     }
 
     fn expired(&self, retired_at_ms: u64) -> bool {
-        retired_at_ms.saturating_add(TOMBSTONE_RETENTION_MS) <= self.now_ms
+        retired_at_ms.saturating_add(self.tombstone_retention_ms) <= self.now_ms
     }
 
     fn state_read(&mut self, result: IoResult) -> SweepTurn {
@@ -863,6 +878,15 @@ impl SweepTombstonesOperation {
                         self.outcome.due.push((scope, handle_id));
                     }
                 }
+                VfsKey::RetainedStage(..) => {
+                    let record = record_of::<NfsStageRecord>(Some(&value)).ok().flatten();
+                    if let Some(record) = record
+                        && record.updated_at_ms.saturating_add(self.stage_retention_ms)
+                            <= self.now_ms
+                    {
+                        self.stages.push_back((key, record));
+                    }
+                }
                 _ => {}
             }
         }
@@ -895,6 +919,18 @@ impl SweepTombstonesOperation {
             };
             let finish = VfsReceiptOperation::new(input);
             return self.call(SweepStep::Receipt, IoCall::child(finish));
+        }
+        self.next_stage()
+    }
+
+    /// An expired retained checkpoint loses its file first; only a removed file drops its row.
+    fn next_stage(&mut self) -> SweepTurn {
+        if let Some((_, record)) = self.stages.front() {
+            let remove = VfsEffect::RemoveCheckpoint {
+                stage_id: record.stage_id,
+                generation: record.generation,
+            };
+            return self.call(SweepStep::Checkpoint, vfs_call(remove));
         }
         let deletes = std::mem::take(&mut self.deletes);
         self.outcome.removed += deletes.len();
@@ -1020,6 +1056,14 @@ impl Operation for SweepTombstonesOperation {
                 let _settled = result.child::<ReceiptOutcome, VfsError>()?;
                 self.outcome.removed += 1;
                 self.next_receipt()
+            }
+            SweepStep::Checkpoint => {
+                let (key, _) = self.stages.pop_front().ok_or(VfsError::Conflict)?;
+                // A checkpoint the adapter could not remove keeps its row for the next sweep.
+                if vfs_event(result).is_ok() {
+                    self.deletes.push((NFS_STATE_KEYSPACE.to_string(), key));
+                }
+                self.next_stage()
             }
             SweepStep::Delete => {
                 result.done()?;

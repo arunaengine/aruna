@@ -587,6 +587,82 @@ pub fn retained(stage: &NfsStageRecord, reason: DetachReason, now_ms: u64) -> Nf
     kept
 }
 
+/// The live checkpoint with its next quota retry after one more refusal.
+fn rescheduled(stage: &NfsStageRecord, now_ms: u64) -> NfsStageRecord {
+    let mut waiting = stage.clone();
+    waiting.quota_retry = Some(next_retry(stage.quota_retry, now_ms));
+    waiting.updated_at_ms = now_ms;
+    waiting
+}
+
+/// How a quota retry changes its writerless checkpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuotaChange {
+    Reschedule,
+    Retain(DetachReason),
+}
+
+/// Settles one quota retry of a writerless checkpoint: a still-full group moves its next retry
+/// out, a name that can no longer take it keeps it outside the namespace by its stage id. Both
+/// compare the row against the record as read, so a concurrent change refuses with a conflict.
+#[derive(Debug, PartialEq)]
+pub struct QuotaStageOperation {
+    scope: BucketScope,
+    stage: NfsStageRecord,
+    change: QuotaChange,
+    now_ms: u64,
+}
+
+impl QuotaStageOperation {
+    /// The group is still full: the checkpoint stays live with its next retry backed off.
+    pub fn reschedule(scope: BucketScope, stage: NfsStageRecord) -> Self {
+        Self {
+            scope,
+            stage,
+            change: QuotaChange::Reschedule,
+            now_ms: 0,
+        }
+    }
+
+    /// The name can no longer take the checkpoint: it is retained for recovery.
+    pub fn retain(scope: BucketScope, stage: NfsStageRecord, reason: DetachReason) -> Self {
+        Self {
+            scope,
+            stage,
+            change: QuotaChange::Retain(reason),
+            now_ms: 0,
+        }
+    }
+
+    fn stage_move(&self) -> StageMoveOperation {
+        let replacement = match self.change {
+            QuotaChange::Reschedule => rescheduled(&self.stage, self.now_ms),
+            QuotaChange::Retain(reason) => retained(&self.stage, reason, self.now_ms),
+        };
+        StageMoveOperation::new(self.scope.clone(), self.stage.clone(), Some(replacement))
+    }
+}
+
+impl Operation for QuotaStageOperation {
+    type Output = ();
+    type Error = VfsError;
+
+    fn first(&mut self) -> Result<Next<()>, VfsError> {
+        let mut seed = self.stage.stage_id.to_bytes().to_vec();
+        seed.extend(self.stage.generation.to_be_bytes());
+        Ok(Next::Call(IoCall::retry(self.stage_move(), &seed)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, VfsError> {
+        result.child::<(), VfsError>()??;
+        Ok(Next::Done(()))
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+}
+
 /// What the last close of an open did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CloseOutcome {
@@ -802,9 +878,7 @@ impl VfsCloseOperation {
         let Some(stage) = self.input.stage.as_ref() else {
             return Err(VfsError::QuotaExceeded);
         };
-        let mut waiting = stage.clone();
-        waiting.quota_retry = Some(next_retry(stage.quota_retry, self.now_ms));
-        waiting.updated_at_ms = self.now_ms;
+        let waiting = rescheduled(stage, self.now_ms);
         self.change_stage(Some(waiting), CloseOutcome::QuotaBlocked)
     }
 
