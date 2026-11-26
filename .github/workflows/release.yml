@@ -45,7 +45,6 @@ jobs:
       tag: ${{ steps.plan.outputs.tag }}
       base_tag: ${{ steps.plan.outputs.base_tag }}
       image_tags: ${{ steps.plan.outputs.image_tags }}
-      node_tags: ${{ steps.plan.outputs.node_tags }}
       publish: ${{ steps.plan.outputs.publish }}
       prerelease: ${{ steps.plan.outputs.prerelease }}
       build_helpers: ${{ steps.plan.outputs.build_helpers }}
@@ -122,14 +121,11 @@ jobs:
           set -euo pipefail
           version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
           sha_tag="sha-${GITHUB_SHA::7}"
-          # A test run keeps the release tags free; only a release moves v3 and v3-beta.
+          # A test run keeps release tags free; floating tags move only after release publication.
           if [ "$PUBLISH" = "true" ]; then
             image_tags="v$version $sha_tag"
-            node_tags="$image_tags v3"
-            case "$version" in *-beta.*) node_tags="$node_tags v3-beta" ;; esac
           else
             image_tags="$sha_tag"
-            node_tags="$sha_tag"
           fi
           companions="$(bash scripts/build_images.sh --list | { grep -vx aruna || true; } | jq -R . | jq -sc .)"
           prerelease=false
@@ -138,7 +134,6 @@ jobs:
             echo "tag=v$version"
             echo "base_tag=${image_tags%% *}"
             echo "image_tags=$image_tags"
-            echo "node_tags=$node_tags"
             echo "publish=$PUBLISH"
             echo "prerelease=$prerelease"
             echo "build_helpers=$BUILD_HELPERS"
@@ -151,6 +146,8 @@ jobs:
     runs-on: ubuntu-latest
     # Hang cap for one release build and the image push.
     timeout-minutes: 120
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
     permissions:
       contents: read
       packages: write
@@ -193,13 +190,13 @@ jobs:
       - name: Build and push the node image
         id: push
         env:
-          NODE_TAGS: ${{ needs.plan.outputs.node_tags }}
+          IMAGE_TAGS: ${{ needs.plan.outputs.image_tags }}
           # A tag push embeds the portal named by the optional ARUNA_PORTAL_TAG repository variable.
           PORTAL_TAG: ${{ github.event_name == 'push' && vars.ARUNA_PORTAL_TAG || inputs.portal_tag }}
         run: |
           set -euo pipefail
           args=(--push --digests "$RUNNER_TEMP/images.jsonl" --cache-from "type=gha,scope=compose-image")
-          for tag in $NODE_TAGS; do args+=(--tag "$tag"); done
+          for tag in $IMAGE_TAGS; do args+=(--tag "$tag"); done
           if [ -n "$PORTAL_TAG" ]; then args+=(--portal "$PORTAL_TAG"); fi
           bash scripts/build_images.sh "${args[@]}" aruna
           mkdir -p images && cp "$RUNNER_TEMP/images.jsonl" images/aruna.jsonl
@@ -420,4 +417,105 @@ jobs:
           else
             gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --title "Aruna $TAG" \
               --generate-notes --prerelease="$PRERELEASE" --target "$GITHUB_SHA"
+          fi
+
+  # Moves v3 and v3-beta only after release publication succeeds and this version is newest.
+  promote:
+    needs: [plan, node-image, release]
+    if: success() && needs.plan.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: release-floating-tags
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Sign in to the GitHub Container Registry
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Promote floating node tags when this release is newest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          NODE_DIGEST: ${{ needs.node-image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [ -n "$NODE_DIGEST" ] || { echo "missing attested node image digest" >&2; exit 1; }
+          releases_json="$(gh api --paginate "/repos/$GITHUB_REPOSITORY/releases?per_page=100" | jq -s 'add')"
+          promote_out="$(printf '%s' "$releases_json" | python3 -c '
+          import json, os, re, sys
+
+          semver = re.compile(r"^v(3)\.(\d+)\.(\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$")
+
+          def parse(tag):
+              m = semver.match(tag)
+              if not m:
+                  return None
+              major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
+              pre = m.group(4)
+              if pre is None:
+                  return (major, minor, patch, 1, ())
+              parts = tuple((0, int(p)) if p.isdigit() else (1, p) for p in pre.split("."))
+              return (major, minor, patch, 0, parts)
+
+          cand_tag = os.environ["TAG"]
+          cand = parse(cand_tag)
+          if cand is None:
+              sys.exit(f"candidate tag {cand_tag!r} is not a v3 SemVer tag")
+
+          releases = json.load(sys.stdin)
+          published = []
+          for rel in releases:
+              if rel.get("draft"):
+                  continue
+              parsed = parse(rel.get("tag_name", ""))
+              if parsed is not None:
+                  published.append((parsed, rel["tag_name"]))
+
+          if all(t != cand_tag for _, t in published):
+              sys.exit(f"release {cand_tag} is not visible as a published release")
+
+          stable = [p for p, _ in published if p[3] == 1]
+          out = []
+          if stable:
+              if cand[3] == 1 and cand >= max(stable):
+                  out.append("v3")
+          elif cand >= max(p for p, _ in published):
+              out.append("v3")
+
+          betas = [p for p, _ in published if p[3] == 0 and p[4] and p[4][0] == (1, "beta")]
+          if cand[3] == 0 and cand[4] and cand[4][0] == (1, "beta") and cand >= max(betas):
+              out.append("v3-beta")
+
+          for tag in out:
+              print(tag)
+          ')"
+          promote_tags=()
+          if [ -n "$promote_out" ]; then
+            mapfile -t promote_tags <<<"$promote_out"
+          fi
+          if [ "${#promote_tags[@]}" -eq 0 ]; then
+            echo "$TAG is not the newest eligible release; floating tags stay unchanged"
+            exit 0
+          fi
+          meta="$(mktemp)"
+          trap 'rm -f "$meta"' EXIT
+          args=(buildx imagetools create --prefer-index=false --metadata-file "$meta")
+          for tag in "${promote_tags[@]}"; do
+            args+=(-t "ghcr.io/arunaengine/aruna:$tag")
+          done
+          args+=("ghcr.io/arunaengine/aruna@${NODE_DIGEST}")
+          docker "${args[@]}"
+          pushed="$(jq -r '."containerimage.digest" // empty' "$meta")"
+          if [ "$pushed" != "$NODE_DIGEST" ]; then
+            echo "promoted digest $pushed does not match attested digest $NODE_DIGEST" >&2
+            exit 1
           fi
