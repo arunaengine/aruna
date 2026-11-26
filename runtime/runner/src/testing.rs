@@ -187,6 +187,38 @@ pub async fn read_value(storage: &StorageHandle, keyspace: &str, key: Vec<u8>) -
     value
 }
 
+/// All stored rows under `prefix` in `keyspace`; panics on any answer but an iter result.
+pub async fn scan_prefix(
+    storage: &StorageHandle,
+    keyspace: &str,
+    prefix: &[u8],
+) -> Vec<(ByteView, ByteView)> {
+    let mut rows = Vec::new();
+    let mut after = None;
+    loop {
+        let Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) = storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: keyspace.to_string(),
+                prefix: (!prefix.is_empty()).then(|| prefix.to_vec().into()),
+                start: after.map(aruna_core::effects::IterStart::After),
+                limit: 256,
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("unexpected storage iter event")
+        };
+        rows.extend(values);
+        let Some(next) = next_start_after else {
+            return rows;
+        };
+        after = Some(next);
+    }
+}
+
 /// A task handler that sends each fired timer key to `seen`.
 pub struct RecordingTaskHandler {
     pub seen: tokio::sync::mpsc::Sender<TaskKey>,

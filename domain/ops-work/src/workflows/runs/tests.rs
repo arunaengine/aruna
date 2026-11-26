@@ -2524,6 +2524,52 @@ async fn delivers_empty_dir() {
         }
         other => panic!("expected parent listing with empty dir, got {other:?}"),
     }
+
+#[tokio::test]
+async fn run_area_untracked() {
+    // Internal `.uwe/runs/...` scratch writes skip journaling while delivered outputs journal.
+    let runs = runs().await;
+    let dir = tempfile::tempdir().unwrap();
+    let context = aruna_runner::testing::with_blob(&runs.fixture.context, dir.path()).await;
+    let record = runs.started().await;
+    let staging = resolve(&record, "aruna-staging://step/tmp.bin").unwrap();
+    assert!(staging.owned && super::data::is_run_area(&staging.key));
+    let op = super::data::WriteObjectOperation::new(
+        (record.clone(), runs.fixture.node),
+        NodeRouting::default(),
+        staging,
+        super::data::WriteBody::Bytes(b"scratch".to_vec()),
+    );
+    let ack = drive(op, &context).await.unwrap();
+    assert!(matches!(ack, HostRpcResult::UploadAck { .. }), "{ack:?}");
+
+    let delivered = super::data::Target {
+        bucket: "results".to_string(),
+        key: "out/final.bin".to_string(),
+        version: None,
+        owned: false,
+        node: None,
+    };
+    let op = super::data::WriteObjectOperation::new(
+        (record.clone(), runs.fixture.node),
+        NodeRouting::default(),
+        delivered,
+        super::data::WriteBody::Bytes(b"final".to_vec()),
+    )
+    .delivery("final.bin");
+    let res = drive(op, &context).await.unwrap();
+    assert!(matches!(res, HostRpcResult::Delivered { .. }), "{res:?}");
+
+    let rows = aruna_runner::testing::scan_prefix(
+        &context.storage_handle,
+        aruna_core::keyspaces::EVENT_JOURNAL_KEYSPACE,
+        &[aruna_core::plugin_runs::JOURNAL_ROW],
+    )
+    .await;
+    assert_eq!(rows.len(), 1);
+    let event = aruna_core::plugin_runs::SourceEvent::from_bytes(&rows[0].1).unwrap();
+    assert_eq!(event.actor, Some(record.created_by));
+    assert!(event.path.ends_with("/results/out/final.bin"));
 }
 
 // Local empty-file reads of a standalone precaptured link check the link pin and keep its version.

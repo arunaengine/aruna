@@ -332,6 +332,7 @@ impl CompleteUploadOperation {
             (self.input.realm_id, group_id, self.input.node_id),
             (&self.input.bucket, &self.input.key),
             version_id,
+            Some(self.input.created_by),
             self.now_ms,
         );
         let mut rows = vec![(

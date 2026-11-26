@@ -3113,3 +3113,42 @@ async fn concurrent_puts_commit() {
         assert_eq!(conflicts, 0, "{round} uploads conflicted");
     }
 }
+
+#[tokio::test]
+async fn journal_carries_actor() {
+    // A normal upload journals `data_uploaded` with its actor; `without_journal` skips it.
+    let dir = tempdir().unwrap();
+    let context = fjall_context(dir.path()).await;
+    let realm_id = RealmId::from_bytes([1u8; 32]);
+    let group_id = Ulid::generate();
+    let node_id = context.net_handle.as_ref().unwrap().node_id();
+    let mut normal = put_config(realm_id, group_id, node_id);
+    let actor = normal.user_id;
+    normal.quota_ceiling = None;
+    normal.request.key = "normal.txt".to_string();
+    normal.request.content_length = Some(5);
+    normal.request.body = Some(BackendStream::once(Bytes::from_static(b"hello")));
+    drive(PutObjectOperation::new(normal), &context)
+        .await
+        .unwrap();
+
+    let mut scratch = put_config(realm_id, group_id, node_id);
+    scratch.quota_ceiling = None;
+    scratch.request.key = ".uwe/runs/r1/staging/a.txt".to_string();
+    scratch.request.content_length = Some(5);
+    scratch.request.body = Some(BackendStream::once(Bytes::from_static(b"hello")));
+    drive(PutObjectOperation::new(scratch).without_journal(), &context)
+        .await
+        .unwrap();
+
+    let rows = aruna_runner::testing::scan_prefix(
+        &context.storage_handle,
+        aruna_core::keyspaces::EVENT_JOURNAL_KEYSPACE,
+        &[aruna_core::plugin_runs::JOURNAL_ROW],
+    )
+    .await;
+    assert_eq!(rows.len(), 1);
+    let event = aruna_core::plugin_runs::SourceEvent::from_bytes(&rows[0].1).unwrap();
+    assert_eq!(event.actor, Some(actor));
+    assert!(event.path.ends_with("/mybucket/normal.txt"));
+}

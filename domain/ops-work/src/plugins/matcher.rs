@@ -37,14 +37,14 @@ pub struct Target {
 
 impl Target {
     /// Whether the install's trigger of the event's kind covers the event's path, and the
-    /// event is not a dataset write of the install itself.
+    /// event is not a dataset or object write of the install itself.
     pub fn matches(&self, event: &SourceEvent) -> bool {
-        let dataset = matches!(
+        let own = matches!(
             event.kind,
-            SourceKind::DatasetCreated | SourceKind::DatasetUpdated
+            SourceKind::DatasetCreated | SourceKind::DatasetUpdated | SourceKind::DataUploaded
         );
         self.group_id == event.group_id
-            && !(dataset && event.actor == Some(self.account))
+            && !(own && event.actor == Some(self.account))
             && (self.coverage.get(&event_trigger(event.kind)))
                 .is_some_and(|patterns| patterns.iter().any(|pattern| covers(pattern, &event.path)))
     }

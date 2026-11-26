@@ -333,6 +333,7 @@ impl SourceEvent {
         (realm_id, group_id, node): (RealmId, GroupId, NodeId),
         (bucket, key): (&str, &str),
         version_id: Ulid,
+        actor: Option<UserId>,
         now_ms: u64,
     ) -> Self {
         let path = object_permission_path(realm_id, group_id, node, bucket, key);
@@ -345,7 +346,7 @@ impl SourceEvent {
             source: format!("data_uploaded/{node}/{bucket}/{version_id}/{key}"),
             anchor_ms: now_ms,
             journaled_ms: now_ms,
-            actor: None,
+            actor,
         }
     }
 
@@ -733,10 +734,12 @@ mod tests {
         let node = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
         let scope = (realm_id, Ulid::from_parts(1, 1), node);
         let version = Ulid::from_parts(3, 3);
-        let first = SourceEvent::data_uploaded(scope, ("b", "x/one"), version, 7);
-        let second = SourceEvent::data_uploaded(scope, ("b", "x/two"), version, 9);
+        let actor = UserId::local(Ulid::from_parts(4, 4), realm_id);
+        let first = SourceEvent::data_uploaded(scope, ("b", "x/one"), version, Some(actor), 7);
+        let second = SourceEvent::data_uploaded(scope, ("b", "x/two"), version, None, 9);
         assert_ne!(first.source, second.source);
         assert_eq!((first.anchor_ms, second.anchor_ms), (7, 9));
+        assert_eq!((first.actor, second.actor), (Some(actor), None));
         assert!(first.path.ends_with("/b/x/one") && first.resource == first.path);
     }
 

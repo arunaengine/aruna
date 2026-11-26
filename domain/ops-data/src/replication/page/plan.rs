@@ -400,6 +400,7 @@ pub(super) fn page_rows(
             (realm_id, guards.group_id, local),
             (&page.bucket, key),
             manifest.version_id,
+            Some(manifest.created_by),
             now_ms,
         );
         rows.writes.extend(journal_entries(&uploaded)?);

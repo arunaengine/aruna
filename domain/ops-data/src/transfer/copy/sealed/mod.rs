@@ -587,6 +587,7 @@ impl SealedCopyOperation {
             (input.realm_id, input.group_id, input.node_id),
             (&input.bucket, &input.dest_key),
             self.version_id,
+            Some(input.user_id),
             self.now_ms,
         );
         let effect = write_version_effect(&self.dest_version(), &version)?;

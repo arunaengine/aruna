@@ -417,3 +417,28 @@ fn journal_reads_pages() {
     let _ = idle.first();
     assert_eq!(idle.next(page_result(Vec::new(), None)), Ok(Next::Done(0)));
 }
+
+#[test]
+fn own_upload_skipped() {
+    // An upload by the subscriber's own account never triggers its own data_uploaded match.
+    let realm_id = RealmId::from_bytes([1u8; 32]);
+    let group_id = Ulid::from_parts(1, 1);
+    let account = UserId::local(Ulid::from_parts(2, 2), realm_id);
+    let other = UserId::local(Ulid::from_parts(3, 3), realm_id);
+    let node = iroh::SecretKey::from_bytes(&[4u8; 32]).public();
+    let target = Target {
+        install_id: Ulid::from_parts(2, 2),
+        group_id,
+        revision: 1,
+        coverage: BTreeMap::from([(TriggerKind::DataUploaded, BTreeSet::from(["/**".into()]))]),
+        account,
+    };
+    let scope = (realm_id, group_id, node);
+    let ver = Ulid::from_parts(5, 5);
+    let own = SourceEvent::data_uploaded(scope, ("b", "k"), ver, Some(account), 1);
+    let foreign = SourceEvent::data_uploaded(scope, ("b", "k"), ver, Some(other), 1);
+    let unknown = SourceEvent::data_uploaded(scope, ("b", "k"), ver, None, 1);
+    assert!(!target.matches(&own));
+    assert!(target.matches(&foreign));
+    assert!(target.matches(&unknown));
+}

@@ -464,6 +464,7 @@ impl WriteReferenceOperation {
             (write.realm_id, write.group_id, write.node_id),
             (&write.bucket, &write.key),
             version_id,
+            Some(write.user_id),
             now_ms,
         );
         let effect = write_version_effect(&version_key, &version)?;

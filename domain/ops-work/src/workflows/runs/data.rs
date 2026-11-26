@@ -57,6 +57,13 @@ use crate::workflows::CatalogError;
 pub const STAGING_SCHEME: &str = "aruna-staging://";
 /// The folder below the output prefix that holds the task files of every run.
 pub const AREA_FOLDER: &str = ".uwe/runs";
+
+/// Whether `key` sits inside any run's internal `.uwe/runs/` area.
+pub fn is_run_area(key: &str) -> bool {
+    let prefix = format!("{AREA_FOLDER}/");
+    let nested = format!("/{AREA_FOLDER}/");
+    key.starts_with(&prefix) || key.contains(&nested)
+}
 /// Keys one listing page of a data call reads.
 const LIST_KEYS: usize = 1000;
 
@@ -1170,6 +1177,9 @@ impl WriteObjectOperation {
             run_id: self.run.run_id,
             started_by: Some(self.run.created_by),
         }));
+        if self.target.owned || is_run_area(&self.target.key) {
+            put = put.without_journal();
+        }
         if let Some(gate) = gate {
             put = put.with_gate(gate);
         }
