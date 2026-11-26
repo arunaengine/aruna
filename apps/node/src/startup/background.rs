@@ -290,7 +290,8 @@ pub(crate) async fn start(
                 crate::applets::spawn_upkeep(driver_ctx.clone(), &shutdown)
             }
             StartupPhase::RunPlugins => {
-                spawn_worker(driver_ctx.clone(), realm_id, node_id, &shutdown)
+                spawn_worker(driver_ctx.clone(), realm_id, node_id, &shutdown);
+                crate::automations::spawn_worker(driver_ctx.clone(), realm_id, node_id, &shutdown);
             }
         }
     }

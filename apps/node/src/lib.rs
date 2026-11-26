@@ -8,6 +8,7 @@
 
 pub mod applets;
 pub mod application;
+pub mod automations;
 pub mod backup;
 pub mod bootstrap;
 pub mod compute_setup;

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use aruna_clock::unix_timestamp_millis;
 use aruna_ops_work::applets::upkeep::UpkeepOperation;
+use aruna_ops_work::automations::upkeep::AutoUpkeepOperation;
 use aruna_ops_work::workflows::runs::prune::PruneRunsOperation;
 use aruna_runner::driver::{DriverContext, drive};
 use aruna_scheduler::shutdown::Shutdown;
@@ -38,6 +39,15 @@ pub fn spawn_upkeep(context: Arc<DriverContext>, shutdown: &Shutdown) {
             match drive(PruneRunsOperation::new(now_ms), context.as_ref()).await {
                 Ok(report) => debug!(?report, "Pruned expired workflow runs and cache"),
                 Err(error) => warn!(%error, "Workflow run retention prune failed"),
+            }
+            match drive(
+                AutoUpkeepOperation::new((node_id, realm_id), now_ms),
+                context.as_ref(),
+            )
+            .await
+            {
+                Ok(report) => debug!(?report, "Pruned automation records and kept events"),
+                Err(error) => warn!(%error, "Automation upkeep failed"),
             }
         }
     });
