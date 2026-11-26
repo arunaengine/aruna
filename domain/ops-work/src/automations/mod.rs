@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-
 pub mod change;
 pub mod check;
 pub mod control;
@@ -22,9 +21,12 @@ pub mod notify_stage;
 pub mod reads;
 pub mod run_stage;
 pub mod runner;
+#[cfg(test)]
+mod runner_tests;
 pub mod start;
 pub mod upkeep;
 
+use aruna_core::automation::firing::Firing;
 use aruna_core::automation::keys::{active_prefix, firing_key, record_key, record_prefix};
 use aruna_core::automation::record::{Automation, Lifecycle};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
