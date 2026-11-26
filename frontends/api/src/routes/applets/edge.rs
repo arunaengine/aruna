@@ -130,7 +130,9 @@ pub struct HostDecision {
 **Behavior**
 - A custom domain answers only while its DNS checks pass, so the edge can also back an operator
   proxy's on-demand TLS check with this route.
-- `frame_ancestors` stays empty unless embedding is on and the applet is live and not private.
+- `frame_ancestors` stays empty unless the applet is live and not private; then it holds the
+  configured `portal_origin` on the applet's own host plus approved embedding origins when
+  embedding is on.
 - The edge caches the answer for at most `max_age_s` seconds."#,
     params(("host" = String, Path, description = "The requested host name")),
     responses(
@@ -157,26 +159,50 @@ pub async fn host_decision(
         Serving::Live { version } | Serving::Preview { version } => Some(version),
         _ => None,
     };
-    let live = matches!(serving, Serving::Live { .. });
-    let framed = live && applet.access != Access::Private && applet.embedding.enabled;
+    let custom_domain = row.kind == HostKind::Custom;
     let guests = applet.guests.as_ref();
+    let origins = frame_ancestors(&applet, &settings, serving, custom_domain);
     Ok(Json(HostDecision {
         applet_id: applet.applet_id.to_string(),
         group_id: applet.group_id.to_string(),
         host_node: applet.host_node.to_string(),
-        custom_domain: row.kind == HostKind::Custom,
+        custom_domain,
         serving: serving.into(),
         version,
         access: applet.access.into(),
-        frame_ancestors: match framed && settings.embedding {
-            true => applet.embedding.origins.clone(),
-            false => Vec::new(),
-        },
+        frame_ancestors: origins,
         guests: guests.is_some() && settings.guests,
         guests_in_frames: guests.is_some_and(|policy| policy.in_frames),
         portal_origin: settings.portal_origin,
         max_age_s: MAX_AGE_SECONDS,
     }))
+}
+
+/// Exact origins that may frame this host: approved embedding origins when enabled, plus this
+/// node's portal origin for live non-private applets on their own applet host.
+fn frame_ancestors(
+    applet: &Applet,
+    settings: &HostingSettings,
+    serving: Serving,
+    custom_domain: bool,
+) -> Vec<String> {
+    if !matches!(serving, Serving::Live { .. }) || applet.access == Access::Private {
+        return Vec::new();
+    }
+    let mut origins = match applet.embedding.enabled && settings.embedding {
+        true => applet.embedding.origins.clone(),
+        false => Vec::new(),
+    };
+    if custom_domain {
+        if let Some(portal) = settings.portal_origin.as_ref() {
+            origins.retain(|origin| origin != portal);
+        }
+    } else if let Some(portal) = settings.portal_origin.as_ref()
+        && !origins.contains(portal)
+    {
+        origins.push(portal.clone());
+    }
+    origins
 }
 
 #[derive(Clone, Debug, Deserialize, IntoParams)]
@@ -354,4 +380,98 @@ pub(super) async fn serve_pinned(
         headers.insert(header::CONTENT_LENGTH, size.into());
     }
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::applet::record::{Embedding, Grants, Lifecycle};
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
+
+    fn sample(access: Access) -> Applet {
+        let realm = RealmId([1; 32]);
+        let node = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        Applet {
+            applet_id: Ulid::nil(),
+            group_id: Ulid::nil(),
+            name: "Bakta".into(),
+            slug: "bakta".into(),
+            host: "bakta.apps.example.net".into(),
+            repository: None,
+            host_node: node,
+            lifecycle: Lifecycle::Live,
+            access,
+            live: Some(1),
+            versions: Vec::new(),
+            drafts: Vec::new(),
+            grants: Grants::default(),
+            embedding: Embedding::default(),
+            guests: None,
+            domains: Vec::new(),
+            pending: None,
+            account: None,
+            role_id: None,
+            visitor_salt: [0; 32],
+            created_by: UserId::nil(realm),
+            created_at_ms: 0,
+            revision: 1,
+        }
+    }
+
+    fn settings(portal: Option<&str>, embedding: bool) -> HostingSettings {
+        HostingSettings {
+            applet_domain: "apps.example.net".into(),
+            edge_key_sha256: [1; 32],
+            custom_domains: true,
+            guests: false,
+            embedding,
+            max_origins: 8,
+            portal_origin: portal.map(str::to_string),
+            protected_hosts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn portal_frames_live() {
+        let portal = "https://portal.example.org";
+        let live = Serving::Live { version: 1 };
+        let with_portal = settings(Some(portal), false);
+        for access in [Access::Public, Access::GroupMembers] {
+            let applet = sample(access);
+            assert_eq!(
+                frame_ancestors(&applet, &with_portal, live, false),
+                vec![portal]
+            );
+            assert!(frame_ancestors(&applet, &with_portal, live, true).is_empty());
+        }
+        let private = sample(Access::Private);
+        assert!(frame_ancestors(&private, &with_portal, live, false).is_empty());
+        let public = sample(Access::Public);
+        for blocked in [
+            Serving::Preview { version: 1 },
+            Serving::Paused,
+            Serving::FeaturePaused,
+            Serving::Gone,
+        ] {
+            assert!(frame_ancestors(&public, &with_portal, blocked, false).is_empty());
+        }
+        let none = settings(None, false);
+        assert!(frame_ancestors(&public, &none, live, false).is_empty());
+
+        let mut embedded = sample(Access::Public);
+        embedded.embedding = Embedding {
+            enabled: true,
+            origins: vec!["https://lab.example.org".into(), portal.into()],
+        };
+        let both = settings(Some(portal), true);
+        assert_eq!(
+            frame_ancestors(&embedded, &both, live, false),
+            vec!["https://lab.example.org", portal]
+        );
+        assert_eq!(
+            frame_ancestors(&embedded, &both, live, true),
+            vec!["https://lab.example.org"]
+        );
+    }
 }
