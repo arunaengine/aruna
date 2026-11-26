@@ -1,33 +1,40 @@
-//! Intent-first `copy` stage executor with pinned source version and digest verification.
+//! Intent-first `copy` stage executor with bucket auth, quota, distribution hint and recovery.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::automation::firing::{CopiedFile, Firing};
 use aruna_core::automation::glob::{expand_copy, format_date, glob_match};
-use aruna_core::automation::record::{Automation, StageKind};
+use aruna_core::automation::keys::copy_plan_key;
+use aruna_core::automation::record::{Automation, Spec, StageKind};
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
-use aruna_core::keyspaces::AUTOMATION_INTENTS_KEYSPACE;
+use aruna_core::keyspaces::{AUTOMATION_INTENTS_KEYSPACE, AUTOMATION_RUNS_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::permission_path::permission_pattern_matches;
 use aruna_core::plugin_runs::CallIntent;
-use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::blob::object_permission_path;
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
+use aruna_core::structs::storage::distribution::hint::mint_version;
 use aruna_core::structs::storage::routing::NodeRouting;
+use aruna_core::types::GroupId;
 use aruna_ops_data::s3::object::get::GetObjectError;
 use aruna_ops_data::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
+use aruna_ops_data::s3::object::put::PutObjectError;
 use aruna_ops_data::transfer::copy::{
     CopyObjectError, CopyObjectInput, CopyObjectOperation, CopyReferences, CopyResultData,
     CopySourceConditions,
 };
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use byteview::ByteView;
 use ulid::Ulid;
 
 use super::limits::CountUsageOperation;
-use super::{AutoError, automation_auth};
+use super::{AutoError, allowed, authorize_path, automation_auth_for};
 use crate::plugins::intents::{Begun, begin_in, row_key_in, settled_row_in, unknown_row_in};
 use crate::plugins::rows::{StoreError, delete_call};
 
@@ -53,6 +60,14 @@ pub(crate) fn call_intent(ordinal: u32, parts: &[&[u8]]) -> CallIntent {
     }
 }
 
+/// Source length matching `CopyJobOperation`: local blob size or reference observation size.
+pub(super) fn source_length(head: &HeadObjectResult) -> Option<u64> {
+    head.location
+        .as_ref()
+        .map(|l| l.blob_size)
+        .or_else(|| head.source_metadata.as_ref().map(|m| m.content_length))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StageOutcome {
     Progress(CopiedFile),
@@ -60,7 +75,7 @@ pub enum StageOutcome {
     Dataset(Ulid),
     Notified(u32),
     Failed(String),
-    NeedsAttention(String),
+    NeedsAttention(String, Option<CopiedFile>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -116,22 +131,35 @@ fn collect_sources(firing: &Firing, from: &str, filter: Option<&str>) -> Vec<Cop
     items
 }
 
+pub(super) fn source_count(firing: &Firing, from: &str, filter: Option<&str>) -> usize {
+    collect_sources(firing, from, filter).len()
+}
+
 #[derive(Debug, PartialEq)]
 enum CopyStep {
     Begin,
+    ReadPlan(String),
+    SourceBucket,
+    DestBucket,
     Head,
+    AuthSource(String, u64, String),
+    AuthDest(String, u64),
+    Config(String, u64),
     Count(String, u64),
-    Copy(String, u64),
+    WritePlan(Box<CopiedFile>),
+    Copy(Box<CopiedFile>),
     Settle(Box<CopiedFile>),
+    CleanPlan(Box<CopiedFile>),
     Drop(String),
-    MarkUnknown(String),
+    MarkUnknown(String, Box<CopiedFile>),
 }
 
-/// Copies the next uncommitted file of a `copy` stage with intent-first durability and pinned
-/// source version/digest checks, returning after each file so cancellation stops cleanly.
+/// Copies the next uncommitted file of a `copy` stage with intent-first durability, bucket owner
+/// authorization, group quota enforcement, distribution-hinted versions and recovery plan rows.
 #[derive(Debug, PartialEq)]
 pub struct CopyStageOp {
     auto: Automation,
+    spec: Spec,
     firing_id: Ulid,
     stage_id: Ulid,
     dest_bucket: String,
@@ -139,6 +167,9 @@ pub struct CopyStageOp {
     allow_downgrade: bool,
     local: (NodeId, RealmId),
     auth: Option<AuthContext>,
+    src_group: Option<GroupId>,
+    dest_info: Option<BucketInfo>,
+    quota_ceiling: Option<u64>,
     item: Option<CopyItem>,
     intent: Option<CallIntent>,
     ids: IdMint,
@@ -154,7 +185,7 @@ impl CopyStageOp {
         local: (NodeId, RealmId),
     ) -> Result<Self, AutoError> {
         let (stage_name, from_stage, file, dest_bucket, dest_template, allow_downgrade) =
-            match auto.spec.stages.get(stage_idx) {
+            match firing.spec.stages.get(stage_idx) {
                 Some(stage) => match &stage.kind {
                     StageKind::Copy {
                         from_stage,
@@ -181,6 +212,7 @@ impl CopyStageOp {
         let stage_id = stage_intent_id(firing.firing_id, &stage_name);
         Ok(Self {
             auto,
+            spec: firing.spec,
             firing_id: firing.firing_id,
             stage_id,
             dest_bucket,
@@ -188,6 +220,9 @@ impl CopyStageOp {
             allow_downgrade,
             local,
             auth: None,
+            src_group: None,
+            dest_info: None,
+            quota_ceiling: None,
             item,
             intent: None,
             ids: IdMint::default(),
@@ -197,9 +232,16 @@ impl CopyStageOp {
     }
 
     fn drop_intent(&mut self, intent: &CallIntent, msg: String) -> Next<StageOutcome> {
-        let key = row_key_in(AUTOMATION_INTENTS_KEYSPACE, self.stage_id, intent);
+        let (space, key) = row_key_in(AUTOMATION_INTENTS_KEYSPACE, self.stage_id, intent);
+        let drops = vec![
+            (space.to_string(), key.into()),
+            (
+                AUTOMATION_RUNS_KEYSPACE.to_string(),
+                copy_plan_key(self.stage_id, intent.ordinal),
+            ),
+        ];
         self.step = CopyStep::Drop(msg);
-        Next::Call(delete_call(vec![key]))
+        Next::Call(IoCall::Delete(drops))
     }
 }
 
@@ -219,7 +261,7 @@ impl Operation for CopyStageOp {
         let Some(item) = &self.item else {
             return Ok(Next::Done(StageOutcome::CopiedAll));
         };
-        let auth = automation_auth(&self.auto, self.local.1)
+        let auth = automation_auth_for(&self.auto, &self.spec, self.local.1)
             .ok_or_else(|| AutoError::Conflict("automation has no active account".into()))?;
         self.auth = Some(auth);
         let intent = call_intent(
@@ -246,13 +288,9 @@ impl Operation for CopyStageOp {
                 .map_err(|e| AutoError::Storage(e.detail()))?
             {
                 Begun::Fresh => {
-                    let head = HeadObjectOperation::new(HeadObjectInput {
-                        bucket: item.src_bucket,
-                        key: item.src_key,
-                        version_id: Some(item.src_ver),
-                    });
-                    self.step = CopyStep::Head;
-                    Ok(Next::Call(IoCall::child(head)))
+                    let read = GetBucketOperation::new(item.src_bucket);
+                    self.step = CopyStep::SourceBucket;
+                    Ok(Next::Call(IoCall::child(read)))
                 }
                 Begun::Settled(reply) => {
                     let copied: CopiedFile = serde_json::from_str(&reply)
@@ -261,8 +299,43 @@ impl Operation for CopyStageOp {
                 }
                 Begun::Changed => Ok(Next::Done(StageOutcome::NeedsAttention(
                     "copy arguments changed across attempts".into(),
+                    None,
                 ))),
-                Begun::Unknown(reason) => Ok(Next::Done(StageOutcome::NeedsAttention(reason))),
+                Begun::Unknown(reason) => {
+                    self.step = CopyStep::ReadPlan(reason);
+                    Ok(Next::Call(IoCall::Read(vec![(
+                        AUTOMATION_RUNS_KEYSPACE.to_string(),
+                        copy_plan_key(self.stage_id, item.ordinal),
+                    )])))
+                }
+            },
+            CopyStep::ReadPlan(reason) => {
+                let planned = result
+                    .value()?
+                    .and_then(|bytes| postcard::from_bytes::<CopiedFile>(&bytes).ok());
+                Ok(Next::Done(StageOutcome::NeedsAttention(reason, planned)))
+            }
+            CopyStep::SourceBucket => match result.child::<BucketInfo, GetBucketError>()? {
+                Ok(info) => {
+                    self.src_group = Some(info.group_id);
+                    let read = GetBucketOperation::new(self.dest_bucket.clone());
+                    self.step = CopyStep::DestBucket;
+                    Ok(Next::Call(IoCall::child(read)))
+                }
+                Err(err) => Ok(self.drop_intent(&intent, format!("source bucket failed: {err}"))),
+            },
+            CopyStep::DestBucket => match result.child::<BucketInfo, GetBucketError>()? {
+                Ok(info) => {
+                    self.dest_info = Some(info);
+                    let head = HeadObjectOperation::new(HeadObjectInput {
+                        bucket: item.src_bucket,
+                        key: item.src_key,
+                        version_id: Some(item.src_ver),
+                    });
+                    self.step = CopyStep::Head;
+                    Ok(Next::Call(IoCall::child(head)))
+                }
+                Err(err) => Ok(self.drop_intent(&intent, format!("dest bucket failed: {err}"))),
             },
             CopyStep::Head => {
                 let head = match result.child::<HeadObjectResult, HeadObjectError>()? {
@@ -282,7 +355,7 @@ impl Operation for CopyStageOp {
                         return Ok(self.drop_intent(&intent, "source digest mismatch".into()));
                     }
                 }
-                let bytes = head.location.as_ref().map_or(0, |l| l.blob_size);
+                let bytes = source_length(&head).unwrap_or(0);
                 let run_str = self.firing_id.to_string();
                 let date = format_date(self.now_ms);
                 let dest_key =
@@ -290,30 +363,71 @@ impl Operation for CopyStageOp {
                         Ok(key) => key,
                         Err(err) => return Ok(self.drop_intent(&intent, err)),
                     };
-                let path = object_permission_path(
+                let src_group = self.src_group.ok_or(IoError::Unfinished)?;
+                let dest_group = self.dest_info.as_ref().ok_or(IoError::Unfinished)?.group_id;
+                let src_path = object_permission_path(
                     self.local.1,
-                    self.auto.group_id,
+                    src_group,
+                    self.local.0,
+                    &item.src_bucket,
+                    &item.src_key,
+                );
+                let dest_path = object_permission_path(
+                    self.local.1,
+                    dest_group,
                     self.local.0,
                     &self.dest_bucket,
                     &dest_key,
                 );
                 if !self
-                    .auto
                     .spec
                     .scope
                     .write
                     .iter()
-                    .any(|p| permission_pattern_matches(p, &path))
+                    .any(|p| permission_pattern_matches(p, &dest_path))
                 {
                     return Ok(self.drop_intent(
                         &intent,
-                        format!("copy target `{path}` outside scope.write"),
+                        format!("copy target `{dest_path}` outside scope.write"),
                     ));
                 }
+                let auth = self.auth.as_ref().ok_or(IoError::Unfinished)?;
+                let call = authorize_path(auth, &src_path, Permission::READ);
+                self.step = CopyStep::AuthSource(dest_key, bytes, dest_path);
+                Ok(Next::Call(call))
+            }
+            CopyStep::AuthSource(dest_key, bytes, dest_path) => {
+                if !allowed(result)? {
+                    return Ok(self.drop_intent(&intent, "copy source read denied".into()));
+                }
+                let auth = self.auth.as_ref().ok_or(IoError::Unfinished)?;
+                let call = authorize_path(auth, &dest_path, Permission::WRITE);
+                self.step = CopyStep::AuthDest(dest_key, bytes);
+                Ok(Next::Call(call))
+            }
+            CopyStep::AuthDest(dest_key, bytes) => {
+                if !allowed(result)? {
+                    return Ok(self.drop_intent(&intent, "copy target write denied".into()));
+                }
+                let cfg = GetConfigOperation::new(self.local.1);
+                self.step = CopyStep::Config(dest_key, bytes);
+                Ok(Next::Call(IoCall::child(cfg)))
+            }
+            CopyStep::Config(dest_key, bytes) => {
+                let cfg = match result.child::<RealmConfigDocument, GetConfigError>()? {
+                    Ok(cfg) => cfg,
+                    Err(err) => {
+                        return Ok(
+                            self.drop_intent(&intent, format!("realm config unavailable: {err}"))
+                        );
+                    }
+                };
+                let dest_group = self.dest_info.as_ref().ok_or(IoError::Unfinished)?.group_id;
+                self.quota_ceiling = cfg.quota.effective_group_ceiling(&dest_group);
                 let count = CountUsageOperation::copy_bytes(
                     self.auto.automation_id,
                     bytes,
-                    &self.auto.spec.scope.limits,
+                    &self.spec.scope.limits,
                 );
                 self.step = CopyStep::Count(dest_key, bytes);
                 Ok(Next::Call(IoCall::retry(
@@ -325,22 +439,47 @@ impl Operation for CopyStageOp {
                 if let Err(err) = result.child::<(), AutoError>()? {
                     return Ok(self.drop_intent(&intent, err.to_string()));
                 }
+                let dest_info = self.dest_info.as_ref().ok_or(IoError::Unfinished)?;
+                let hint = dest_info.distribution.as_ref().map(|d| d.hint());
+                let dest_ver = mint_version(self.ids.mint(self.now_ms), hint);
+                let planned = CopiedFile {
+                    source_key: item.src_key,
+                    source_version: item.src_ver,
+                    dest_bucket: self.dest_bucket.clone(),
+                    dest_key,
+                    dest_version: dest_ver,
+                    bytes,
+                };
+                let encoded = postcard::to_allocvec(&planned)
+                    .map_err(|err| AutoError::Storage(err.to_string()))?;
+                let plan_row = (
+                    AUTOMATION_RUNS_KEYSPACE.to_string(),
+                    copy_plan_key(self.stage_id, item.ordinal),
+                    ByteView::from(encoded),
+                );
+                self.step = CopyStep::WritePlan(Box::new(planned));
+                Ok(Next::Call(IoCall::Write(vec![plan_row])))
+            }
+            CopyStep::WritePlan(planned) => {
+                result.done()?;
                 let auth = self.auth.clone().ok_or(IoError::Unfinished)?;
-                let dest_ver = self.ids.mint(self.now_ms);
-                let allow_down = self.allow_downgrade && self.auto.spec.scope.allow_downgrade;
+                let src_group = self.src_group.ok_or(IoError::Unfinished)?;
+                let dest_group = self.dest_info.as_ref().ok_or(IoError::Unfinished)?.group_id;
+                let allow_down = self.allow_downgrade && self.spec.scope.allow_downgrade;
+                let dest_ver = planned.dest_version;
                 let input = CopyObjectInput {
                     source_bucket: item.src_bucket,
                     source_key: item.src_key,
                     source_version_id: Some(item.src_ver),
-                    source_group_id: self.auto.group_id,
+                    source_group_id: src_group,
                     source_auth_context: auth.clone(),
                     dest_bucket: self.dest_bucket.clone(),
-                    dest_key: dest_key.clone(),
+                    dest_key: planned.dest_key.clone(),
                     user_id: auth.user_id,
-                    group_id: self.auto.group_id,
+                    group_id: dest_group,
                     realm_id: self.local.1,
                     node_id: self.local.0,
-                    quota_ceiling: None,
+                    quota_ceiling: self.quota_ceiling,
                     conditions: CopySourceConditions::default(),
                     metadata: None,
                     restrictions: auth.path_restrictions,
@@ -350,56 +489,61 @@ impl Operation for CopyStageOp {
                 let op = CopyObjectOperation::new(input, NodeRouting::default())
                     .at_version(dest_ver)
                     .allow_downgrade(allow_down);
-                self.step = CopyStep::Copy(dest_key, bytes);
+                self.step = CopyStep::Copy(planned);
                 Ok(Next::Call(IoCall::child(op)))
             }
-            CopyStep::Copy(dest_key, bytes) => {
-                match result.child::<CopyResultData, CopyObjectError>()? {
-                    Ok(res) => {
-                        let copied = CopiedFile {
-                            source_key: item.src_key,
-                            source_version: item.src_ver,
-                            dest_bucket: self.dest_bucket.clone(),
-                            dest_key,
-                            dest_version: res.version_id,
-                            bytes: res.size.max(bytes),
-                        };
-                        let reply = serde_json::to_string(&copied)
-                            .map_err(|e| AutoError::Storage(e.to_string()))?;
-                        let row = settled_row_in(
-                            AUTOMATION_INTENTS_KEYSPACE,
-                            self.stage_id,
-                            &intent,
-                            reply,
-                        )
-                        .map_err(|e| AutoError::Storage(e.detail()))?;
-                        self.step = CopyStep::Settle(Box::new(copied));
-                        Ok(Next::Call(IoCall::Write(vec![row])))
-                    }
-                    Err(
-                        err @ (CopyObjectError::EncryptionDowngrade
-                        | CopyObjectError::PreconditionFailed
-                        | CopyObjectError::Get(
-                            GetObjectError::DeleteMarker
-                            | GetObjectError::NoSuchKey
-                            | GetObjectError::NoSuchVersion,
-                        )),
-                    ) => Ok(self.drop_intent(&intent, err.to_string())),
-                    Err(err) => {
-                        let msg = err.to_string();
-                        let row = unknown_row_in(
-                            AUTOMATION_INTENTS_KEYSPACE,
-                            self.stage_id,
-                            &intent,
-                            &msg,
-                        )
-                        .map_err(|e| AutoError::Storage(e.detail()))?;
-                        self.step = CopyStep::MarkUnknown(msg);
-                        Ok(Next::Call(IoCall::Write(vec![row])))
-                    }
+            CopyStep::Copy(planned) => match result.child::<CopyResultData, CopyObjectError>()? {
+                Ok(res) => {
+                    let copied = CopiedFile {
+                        source_key: planned.source_key,
+                        source_version: planned.source_version,
+                        dest_bucket: planned.dest_bucket,
+                        dest_key: planned.dest_key,
+                        dest_version: res.version_id,
+                        bytes: res.size.max(planned.bytes),
+                    };
+                    let reply = serde_json::to_string(&copied)
+                        .map_err(|e| AutoError::Storage(e.to_string()))?;
+                    let row =
+                        settled_row_in(AUTOMATION_INTENTS_KEYSPACE, self.stage_id, &intent, reply)
+                            .map_err(|e| AutoError::Storage(e.detail()))?;
+                    self.step = CopyStep::Settle(Box::new(copied));
+                    Ok(Next::Call(IoCall::Write(vec![row])))
                 }
-            }
+                Err(
+                    err @ (CopyObjectError::EncryptionDowngrade
+                    | CopyObjectError::PreconditionFailed
+                    | CopyObjectError::Put(
+                        PutObjectError::QuotaExceeded { .. }
+                        | PutObjectError::Distribution(_)
+                        | PutObjectError::PolicyError(_)
+                        | PutObjectError::PolicyGate(_),
+                    )
+                    | CopyObjectError::Get(
+                        GetObjectError::DeleteMarker
+                        | GetObjectError::NoSuchKey
+                        | GetObjectError::NoSuchVersion,
+                    )),
+                ) => Ok(self.drop_intent(&intent, err.to_string())),
+                Err(err) => {
+                    let msg = err.to_string();
+                    let row =
+                        unknown_row_in(AUTOMATION_INTENTS_KEYSPACE, self.stage_id, &intent, &msg)
+                            .map_err(|e| AutoError::Storage(e.detail()))?;
+                    self.step = CopyStep::MarkUnknown(msg, planned);
+                    Ok(Next::Call(IoCall::Write(vec![row])))
+                }
+            },
             CopyStep::Settle(copied) => {
+                result.done()?;
+                let key = (
+                    AUTOMATION_RUNS_KEYSPACE,
+                    copy_plan_key(self.stage_id, item.ordinal).to_vec(),
+                );
+                self.step = CopyStep::CleanPlan(copied);
+                Ok(Next::Call(delete_call(vec![key])))
+            }
+            CopyStep::CleanPlan(copied) => {
                 result.done()?;
                 Ok(Next::Done(StageOutcome::Progress(*copied)))
             }
@@ -407,9 +551,12 @@ impl Operation for CopyStageOp {
                 result.done()?;
                 Ok(Next::Done(StageOutcome::Failed(msg)))
             }
-            CopyStep::MarkUnknown(msg) => {
+            CopyStep::MarkUnknown(msg, planned) => {
                 result.done()?;
-                Ok(Next::Done(StageOutcome::NeedsAttention(msg)))
+                Ok(Next::Done(StageOutcome::NeedsAttention(
+                    msg,
+                    Some(*planned),
+                )))
             }
         }
     }
