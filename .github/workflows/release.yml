@@ -1,0 +1,366 @@
+# Release workflow: pushes the node and companion images to GHCR and publishes the CLI binaries.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+name: Release
+
+on:
+  push:
+    tags: ["v3.*"]
+  workflow_dispatch:
+    inputs:
+      portal_tag:
+        description: Portal release of arunaengine/website to embed, such as v0.6.22-portal.1; empty for a headless image.
+        required: false
+        default: ""
+        type: string
+      build_helpers:
+        description: Build and push the companion images as well.
+        required: false
+        default: true
+        type: boolean
+      publish_release:
+        description: Tag the images v<version> and create or update the GitHub release.
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # Decides the tags once, so every job below names its images the same way.
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      base_tag: ${{ steps.plan.outputs.base_tag }}
+      image_tags: ${{ steps.plan.outputs.image_tags }}
+      node_tags: ${{ steps.plan.outputs.node_tags }}
+      publish: ${{ steps.plan.outputs.publish }}
+      prerelease: ${{ steps.plan.outputs.prerelease }}
+      build_helpers: ${{ steps.plan.outputs.build_helpers }}
+      companions: ${{ steps.plan.outputs.companions }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Check that the tag names the workspace version
+        if: github.event_name == 'push'
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          test "$GITHUB_REF_NAME" = "v$version" || {
+            echo "tag $GITHUB_REF_NAME does not match version $version in Cargo.toml" >&2
+            exit 1
+          }
+
+      - name: Decide tags and images
+        id: plan
+        env:
+          PUBLISH: ${{ github.event_name == 'push' || inputs.publish_release }}
+          BUILD_HELPERS: ${{ github.event_name == 'push' || inputs.build_helpers }}
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          sha_tag="sha-${GITHUB_SHA::7}"
+          # A test run keeps the release tags free; only a release moves v3 and v3-beta.
+          if [ "$PUBLISH" = "true" ]; then
+            image_tags="v$version $sha_tag"
+            node_tags="$image_tags v3"
+            case "$version" in *-beta.*) node_tags="$node_tags v3-beta" ;; esac
+          else
+            image_tags="$sha_tag"
+            node_tags="$sha_tag"
+          fi
+          companions="$(bash scripts/build_images.sh --list | { grep -vx aruna || true; } | jq -R . | jq -sc .)"
+          prerelease=false
+          case "$version" in *-*) prerelease=true ;; esac
+          {
+            echo "tag=v$version"
+            echo "base_tag=${image_tags%% *}"
+            echo "image_tags=$image_tags"
+            echo "node_tags=$node_tags"
+            echo "publish=$PUBLISH"
+            echo "prerelease=$prerelease"
+            echo "build_helpers=$BUILD_HELPERS"
+            echo "companions=$companions"
+          } | tee -a "$GITHUB_OUTPUT"
+
+  # Builds the binaries on the runner once; the Dockerfile copies them from .prebuilt/.
+  node-image:
+    needs: plan
+    runs-on: ubuntu-latest
+    # Hang cap for one release build and the image push.
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Free disk space
+        uses: ./.github/actions/free-disk
+
+      - name: Set up Rust
+        uses: ./.github/actions/rust-setup
+        with:
+          shared-key: release-image
+
+      - name: Build the node binaries
+        run: |
+          cargo build --release --locked -p aruna -p aruna-doctor
+          mkdir -p .prebuilt
+          cp target/release/aruna target/release/aruna-doctor .prebuilt/
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # The gha cache backend reads the Actions runtime token, which run steps lack by default.
+      - name: Expose the Actions runtime
+        uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
+
+      - name: Sign in to the GitHub Container Registry
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      # Reads the image layers the CI compose job caches on main; a release never writes them.
+      - name: Build and push the node image
+        id: push
+        env:
+          NODE_TAGS: ${{ needs.plan.outputs.node_tags }}
+          # A tag push embeds the portal named by the optional ARUNA_PORTAL_TAG repository variable.
+          PORTAL_TAG: ${{ github.event_name == 'push' && vars.ARUNA_PORTAL_TAG || inputs.portal_tag }}
+        run: |
+          set -euo pipefail
+          args=(--push --digests "$RUNNER_TEMP/images.jsonl" --cache-from "type=gha,scope=compose-image")
+          for tag in $NODE_TAGS; do args+=(--tag "$tag"); done
+          if [ -n "$PORTAL_TAG" ]; then args+=(--portal "$PORTAL_TAG"); fi
+          bash scripts/build_images.sh "${args[@]}" aruna
+          mkdir -p images && cp "$RUNNER_TEMP/images.jsonl" images/aruna.jsonl
+          echo "digest=$(jq -r .digest images/aruna.jsonl)" >>"$GITHUB_OUTPUT"
+
+      - name: Attest the node image
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/arunaengine/aruna
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Upload the image digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: images-aruna
+          path: images/aruna.jsonl
+          if-no-files-found: error
+          retention-days: 7
+
+  # The list comes from the Dockerfiles on this ref, so new companions join without edits here.
+  companion-images:
+    needs: plan
+    if: needs.plan.outputs.build_helpers == 'true' && needs.plan.outputs.companions != '[]'
+    name: image ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    # Hang cap for one image build and push.
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(needs.plan.outputs.companions) }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Sign in to the GitHub Container Registry
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Build and push the image
+        id: push
+        env:
+          IMAGE: ${{ matrix.image }}
+          IMAGE_TAGS: ${{ needs.plan.outputs.image_tags }}
+        run: |
+          set -euo pipefail
+          args=(--push --digests "$RUNNER_TEMP/images.jsonl")
+          for tag in $IMAGE_TAGS; do args+=(--tag "$tag"); done
+          bash scripts/build_images.sh "${args[@]}" "$IMAGE"
+          mkdir -p images && cp "$RUNNER_TEMP/images.jsonl" "images/$IMAGE.jsonl"
+          echo "digest=$(jq -r .digest "images/$IMAGE.jsonl")" >>"$GITHUB_OUTPUT"
+
+      - name: Attest the image
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/arunaengine/${{ matrix.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Upload the image digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: images-${{ matrix.image }}
+          path: images/${{ matrix.image }}.jsonl
+          if-no-files-found: error
+          retention-days: 7
+
+  cli:
+    needs: plan
+    name: cli ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    # Hang cap for one CLI release build.
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The oldest supported runner sets the glibc floor of the Linux binary.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    env:
+      # Windows runners have no NASM; aws-lc-sys then uses its prebuilt NASM objects.
+      AWS_LC_SYS_PREBUILT_NASM: 1
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      # Real-time scanning of every build file slows Windows compiles.
+      - name: Exclude workspace from Windows Defender
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE", "$env:USERPROFILE\.cargo" -ErrorAction SilentlyContinue
+
+      - name: Set up Rust
+        uses: ./.github/actions/rust-setup
+        with:
+          shared-key: release-cli
+
+      - name: Build the CLI
+        shell: bash
+        run: |
+          cargo build --release --locked -p aruna-cli
+          rustc -vV | grep -qx "host: ${{ matrix.target }}"
+
+      - name: Package the CLI
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          TAG: ${{ needs.plan.outputs.base_tag }}
+        run: |
+          set -euo pipefail
+          package="aruna-cli-${TAG}-${TARGET}"
+          mkdir -p "dist/$package"
+          cp LICENSE-MIT LICENSE-APACHE "dist/$package/"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp target/release/aruna-cli.exe "dist/$package/"
+            (cd dist && 7z a -tzip "$package.zip" "$package" >/dev/null)
+          else
+            cp target/release/aruna-cli "dist/$package/"
+            tar -czf "dist/$package.tar.gz" -C dist "$package"
+          fi
+          rm -rf "dist/$package"
+
+      - name: Attest the CLI archive
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/aruna-cli-*
+
+      - name: Upload the CLI archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cli-${{ matrix.target }}
+          path: dist/aruna-cli-*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: [plan, node-image, companion-images, cli]
+    if: >-
+      !cancelled() && needs.plan.outputs.publish == 'true'
+      && needs.node-image.result == 'success' && needs.cli.result == 'success'
+      && contains(fromJSON('["success", "skipped"]'), needs.companion-images.result)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download the image digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: images-*
+          path: images
+          merge-multiple: true
+
+      - name: Download the CLI archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: cli-*
+          path: dist
+          merge-multiple: true
+
+      - name: Write the image list and checksums
+        env:
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          cat images/*.jsonl | jq -s --arg release "$TAG" --arg commit "$GITHUB_SHA" \
+            '{release: $release, commit: $commit, images: sort_by(.name)}' >dist/release-images.json
+          jq . dist/release-images.json
+          (cd dist && sha256sum -- * >SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - name: Create or update the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          PRERELEASE: ${{ needs.plan.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+            gh release edit "$TAG" --prerelease="$PRERELEASE" --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --title "Aruna $TAG" \
+              --generate-notes --prerelease="$PRERELEASE" --target "$GITHUB_SHA"
+          fi
