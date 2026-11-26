@@ -90,22 +90,58 @@ fetch_portal() {
   rm -rf "$work"
 }
 
-image_exists() {
-  docker buildx imagetools inspect "$1" >/dev/null 2>&1
+# Returns 0 when present, 1 on confirmed missing manifest, and 2 on any lookup error.
+check_remote() {
+  local ref="$1" err
+  if err="$(docker buildx imagetools inspect "$ref" 2>&1 >/dev/null)"; then
+    return 0
+  fi
+  case "$err" in
+    *"$ref: not found"* | *"manifest unknown"* | *"MANIFEST_UNKNOWN"* | *"NAME_UNKNOWN"*)
+      return 1
+      ;;
+    *)
+      printf '%s\n' "$err" >&2
+      return 2
+      ;;
+  esac
+}
+
+has_tag() {
+  local needle="$1" item
+  shift
+  for item in "$@"; do
+    [[ "$item" == "$needle" ]] && return 0
+  done
+  return 1
 }
 
 build_image() {
   local name="$1" dockerfile="$2" context="$3" fixed="${4:-}"
-  local repo="$PREFIX/$name" meta digest tag
-  local tags=("${TAGS[@]}")
+  local repo="$PREFIX/$name" meta digest tag rc
+  local tags=() kept=()
+  for tag in "${TAGS[@]}"; do
+    has_tag "$tag" "${tags[@]}" || tags+=("$tag")
+  done
   if [[ "$name" == "aruna" && -n "$PORTAL_TAG" ]]; then
-    tags+=("${TAGS[0]}-portal.$PORTAL_TAG")
+    tag="${TAGS[0]}-portal.$PORTAL_TAG"
+    has_tag "$tag" "${tags[@]}" || tags+=("$tag")
   fi
   if [[ -n "$fixed" && ("$PUSH" == "0" || "$FIXED_TAGS" == "1") ]]; then
-    if [[ "$PUSH" == "1" ]] && image_exists "$repo:$fixed"; then
+    has_tag "$fixed" "${tags[@]}" || tags+=("$fixed")
+  fi
+  if [[ "$PUSH" == "1" && -n "$fixed" ]] && has_tag "$fixed" "${tags[@]}"; then
+    rc=0
+    check_remote "$repo:$fixed" || rc=$?
+    if [[ $rc -eq 0 ]]; then
       log "$repo:$fixed exists and stays unchanged"
-    else
-      tags+=("$fixed")
+      for tag in "${tags[@]}"; do
+        [[ "$tag" == "$fixed" ]] || kept+=("$tag")
+      done
+      tags=("${kept[@]}")
+      [[ ${#tags[@]} -gt 0 ]] || die "$repo:$fixed already exists and no other tags remain"
+    elif [[ $rc -ne 1 ]]; then
+      die "cannot check whether $repo:$fixed exists"
     fi
   fi
 

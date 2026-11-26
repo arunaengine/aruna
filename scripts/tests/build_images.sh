@@ -125,6 +125,78 @@ else
   pass "local load includes fixed session tag"
 fi
 
+# Case 4: transient registry lookup failure aborts instead of overwriting fixed tag.
+reset_logs
+out="$(PATH="$FAKE_BIN:$PATH" DOCKER_LOG="$DOCKER_LOG" STUB_INSPECT=error \
+  bash "$SCRIPT" --push --fixed-tags --tag v3.0.0-alpha.210 aruna-session-python 2>&1)"
+rc=$?
+if [[ $rc -eq 0 ]]; then
+  fail "lookup error aborts fixed tag push" "exited 0 unexpectedly"
+elif grep -q '^buildx build ' "$DOCKER_LOG"; then
+  fail "lookup error skips docker build" "$(cat "$DOCKER_LOG")"
+else
+  pass "lookup error aborts fixed tag push"
+fi
+
+# Case 5: explicit --tag matching an existing fixed tag is stripped before push.
+reset_logs
+out="$(PATH="$FAKE_BIN:$PATH" DOCKER_LOG="$DOCKER_LOG" STUB_INSPECT=exists \
+  bash "$SCRIPT" --push --tag 0.2.0 --tag v3.0.0-alpha.210 \
+  --digests "$DIGESTS" aruna-session-python 2>&1)"
+rc=$?
+if [[ $rc -ne 0 ]]; then
+  fail "explicit fixed tag strips existing tag cleanly" "$out"
+elif grep -q 'buildx build .*aruna-session-python:0.2.0' "$DOCKER_LOG" \
+  || grep -q '"0.2.0"' "$DIGESTS"; then
+  fail "explicit existing fixed tag is removed" "$(cat "$DOCKER_LOG")"
+elif ! grep -q 'buildx build .*aruna-session-python:v3.0.0-alpha.210' "$DOCKER_LOG"; then
+  fail "remaining tag still pushed" "$(cat "$DOCKER_LOG")"
+else
+  pass "explicit existing fixed tag is removed"
+fi
+
+# Case 6: explicit existing fixed tag alone fails instead of pushing empty tags.
+reset_logs
+out="$(PATH="$FAKE_BIN:$PATH" DOCKER_LOG="$DOCKER_LOG" STUB_INSPECT=exists \
+  bash "$SCRIPT" --push --tag 0.2.0 aruna-session-python 2>&1)"
+rc=$?
+if [[ $rc -eq 0 ]]; then
+  fail "existing fixed tag alone fails" "exited 0 unexpectedly"
+elif grep -q '^buildx build ' "$DOCKER_LOG"; then
+  fail "existing fixed tag alone skips docker build" "$(cat "$DOCKER_LOG")"
+else
+  pass "existing fixed tag alone fails"
+fi
+
+# Case 7: OCI manifest unknown response confirms absence and allows fixed tag creation.
+reset_logs
+out="$(PATH="$FAKE_BIN:$PATH" DOCKER_LOG="$DOCKER_LOG" STUB_INSPECT=manifest_unknown \
+  bash "$SCRIPT" --push --fixed-tags --tag v3.0.0-alpha.210 \
+  --digests "$DIGESTS" aruna-session-python 2>&1)"
+rc=$?
+if [[ $rc -ne 0 ]]; then
+  fail "manifest unknown allows fixed tag creation" "$out"
+elif ! grep -q 'buildx build .*aruna-session-python:0.2.0' "$DOCKER_LOG"; then
+  fail "manifest unknown includes 0.2.0" "$(cat "$DOCKER_LOG")"
+else
+  pass "manifest unknown allows fixed tag creation"
+fi
+
+# Case 8: existing fixed tag with --fixed-tags preserves remote tag.
+reset_logs
+out="$(PATH="$FAKE_BIN:$PATH" DOCKER_LOG="$DOCKER_LOG" STUB_INSPECT=exists \
+  bash "$SCRIPT" --push --fixed-tags --tag v3.0.0-alpha.210 \
+  --digests "$DIGESTS" aruna-session-python 2>&1)"
+rc=$?
+if [[ $rc -ne 0 ]]; then
+  fail "existing fixed tag with --fixed-tags succeeds" "$out"
+elif grep -q 'buildx build .*aruna-session-python:0.2.0' "$DOCKER_LOG" \
+  || grep -q '"0.2.0"' "$DIGESTS"; then
+  fail "existing fixed tag with --fixed-tags stays unchanged" "$(cat "$DOCKER_LOG")"
+else
+  pass "existing fixed tag with --fixed-tags stays unchanged"
+fi
+
 if ((FAILED > 0)); then
   printf '%d test(s) failed\n' "$FAILED" >&2
   exit 1
