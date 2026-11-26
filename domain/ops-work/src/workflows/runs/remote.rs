@@ -997,4 +997,474 @@ mod tests {
         assert_eq!(op2.target.key, "dir/real.txt");
         assert_eq!(op2.target.version, Some(target_ver));
     }
+
+    fn base_run() -> WorkflowRunRecord {
+        WorkflowRunRecord {
+            run_id: Ulid::from_parts(1, 1),
+            lineage: Ulid::from_parts(1, 1),
+            group_id: aruna_core::types::GroupId::from_bytes([1; 16]),
+            workflow_id: Ulid::from_parts(1, 2),
+            workflow_name: "demo".into(),
+            version: 1,
+            realm_id: REALM,
+            node_id: node(1),
+            local_only: false,
+            last_event_seq: 0,
+            state: RunState::Running,
+            created_by: user(),
+            created_at_ms: 1,
+            started_at_ms: None,
+            finished_at_ms: None,
+            error: None,
+            values_json: "{}".into(),
+            inputs_json: None,
+            output: None,
+            provenance_crate: false,
+            provenance_status: None,
+            provenance_document_id: None,
+            outputs: Vec::new(),
+            origin: None,
+            parent_job_id: None,
+            claim_token_digest: None,
+            attempts: 1,
+            steps: Vec::new(),
+            resumes_run_id: None,
+            repeats_run_id: None,
+            cache_scope: CacheScope::Group,
+            placement_site: None,
+            protected: false,
+            secrets: Default::default(),
+            path_restrictions: None,
+            captured_remote: Vec::new(),
+            directory_pins: Vec::new(),
+            directory_roots: Vec::new(),
+            used_tools: Vec::new(),
+        }
+    }
+
+    fn ok_meta() -> IoResult {
+        IoResult::Child(aruna_core::calls::ChildOutcome::new(Ok::<
+            BaoReadOutput,
+            BaoReadError,
+        >(
+            BaoReadOutput::Metadata {
+                size: 4,
+                blake3: [7; 32],
+                etag: None,
+                hashes: Default::default(),
+            },
+        )))
+    }
+
+    fn refused_meta(reason: aruna_core::replication_protocol::BaoReadRefusal) -> IoResult {
+        IoResult::Child(aruna_core::calls::ChildOutcome::new(Err::<
+            BaoReadOutput,
+            BaoReadError,
+        >(
+            BaoReadError::Refused(reason),
+        )))
+    }
+
+    // Listing and stat authorize the original remote link pin at its holder before the target.
+    #[test]
+    fn checks_link_pin() {
+        use aruna_core::calls::ChildOutcome;
+        use aruna_core::replication_protocol::BaoReadRefusal;
+        use aruna_core::structs::execution::workflow_run::DirectoryPin;
+        use aruna_core::structs::storage::blob::BucketInfo;
+        use aruna_core::structs::storage::multipart::MultipartChecksumType;
+
+        let link_ver = Ulid::from_parts(2, 1);
+        let real_ver = Ulid::from_parts(3, 1);
+        let make_run = |target_node: NodeId| {
+            let sel = InputSelection {
+                source: InputSource::S3 {
+                    bucket: "other".into(),
+                    key: "real.txt".into(),
+                    version_id: Some(real_ver.to_string()),
+                },
+                source_node_id: Some(target_node),
+                dest_key: "data/folder/alias.link".into(),
+                mode: InputMode::Snapshot,
+                container_path: None,
+                name: None,
+                description: None,
+            };
+            let mut cap = captured_input(&sel, target_node);
+            cap.version_id = real_ver;
+            let mut run = base_run();
+            run.directory_pins.push(DirectoryPin {
+                bucket: "data".into(),
+                key: "folder/alias.link".into(),
+                version_id: link_ver,
+                source_node_id: Some(node(2)),
+            });
+            run.captured_remote.push(PrecapturedInput {
+                pin_node_id: node(2),
+                pin_bucket: "data".into(),
+                pin_key: "folder/alias.link".into(),
+                pin_version_id: link_ver,
+                resolved: sel,
+                captured: cap,
+            });
+            run
+        };
+        let dir_target = Target {
+            bucket: "data".into(),
+            key: "folder/".into(),
+            version: None,
+            owned: false,
+            node: Some(node(2)),
+        };
+
+        // Revoked READ on the link omits it from List and makes folder Stat return None in 1 step.
+        let run = make_run(node(3));
+        let mut list = RemoteReadOperation::new(
+            run.clone(),
+            dir_target.clone(),
+            node(2),
+            DataCall::List {
+                address: "s3://data/folder/".into(),
+            },
+        );
+        let first = list.first().unwrap();
+        assert!(format!("{first:?}").contains("folder/alias.link"));
+        assert!(matches!(
+            list.next(refused_meta(BaoReadRefusal::ReadDenied)).unwrap(),
+            Next::Done(HostRpcResult::Failed(ContractError::Denied { .. }))
+        ));
+
+        let mut stat = RemoteReadOperation::new(
+            run.clone(),
+            dir_target.clone(),
+            node(2),
+            DataCall::Stat {
+                address: "s3://data/folder/".into(),
+            },
+        );
+        let first = stat.first().unwrap();
+        assert!(format!("{first:?}").contains("folder/alias.link"));
+        assert_eq!(
+            stat.next(refused_meta(BaoReadRefusal::ReadDenied)).unwrap(),
+            Next::Done(HostRpcResult::StorageStat { entry: None })
+        );
+
+        // Allowed pin followed by denied target still omits the link.
+        let mut list = RemoteReadOperation::new(
+            run.clone(),
+            dir_target.clone(),
+            node(2),
+            DataCall::List {
+                address: "s3://data/folder/".into(),
+            },
+        );
+        assert!(matches!(
+            list.first().unwrap(),
+            Next::Call(IoCall::Child(_))
+        ));
+        let second = list.next(ok_meta()).unwrap();
+        assert!(format!("{second:?}").contains("real.txt"));
+        assert!(matches!(
+            list.next(refused_meta(BaoReadRefusal::ReadDenied)).unwrap(),
+            Next::Done(HostRpcResult::Failed(ContractError::Denied { .. }))
+        ));
+
+        // Allowed pin and allowed target expose the original link name.
+        let mut list = RemoteReadOperation::new(
+            run,
+            dir_target.clone(),
+            node(2),
+            DataCall::List {
+                address: "s3://data/folder/".into(),
+            },
+        );
+        assert!(matches!(
+            list.first().unwrap(),
+            Next::Call(IoCall::Child(_))
+        ));
+        assert!(matches!(
+            list.next(ok_meta()).unwrap(),
+            Next::Call(IoCall::Child(_))
+        ));
+        assert_eq!(
+            list.next(ok_meta()).unwrap(),
+            Next::Done(HostRpcResult::StorageList {
+                entries: vec![ListEntry {
+                    name: "alias.link".into(),
+                    directory: false,
+                }],
+            })
+        );
+
+        // A remote link resolving to a local target checks the remote pin then authorizes locally.
+        let local_run = make_run(node(1));
+        let mut list = RemoteReadOperation::new(
+            local_run,
+            dir_target,
+            node(2),
+            DataCall::List {
+                address: "s3://data/folder/".into(),
+            },
+        );
+        let first = list.first().unwrap();
+        assert!(format!("{first:?}").contains("folder/alias.link"));
+        let second = list.next(ok_meta()).unwrap();
+        assert!(format!("{second:?}").contains("ObjectAccessOperation"));
+        let info = BucketInfo {
+            group_id: aruna_core::types::GroupId::from_bytes([1; 16]),
+            created_at: std::time::UNIX_EPOCH,
+            created_by: user(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Default::default(),
+            distribution: None,
+        };
+        let third = list
+            .next(IoResult::Child(ChildOutcome::new(Ok::<_, CatalogError>(
+                info,
+            ))))
+            .unwrap();
+        assert!(matches!(third, Next::Call(IoCall::Read(_))));
+        let fourth = list.next(IoResult::Values(vec![None])).unwrap();
+        assert!(format!("{fourth:?}").contains("HeadObjectOperation"));
+        let head = HeadObjectResult {
+            location: None,
+            metadata: Default::default(),
+            source_metadata: None,
+            last_refresh: None,
+            version_created_at: None,
+            version_id: Some(real_ver),
+            resolved_version_id: Some(real_ver),
+            checksum_type: MultipartChecksumType::FullObject,
+            composite_hashes: Default::default(),
+            part_count: None,
+            source_policies: Vec::new(),
+            source_binding: None,
+        };
+        assert_eq!(
+            list.next(IoResult::Child(ChildOutcome::new(
+                Ok::<_, HeadObjectError>(head)
+            )))
+            .unwrap(),
+            Next::Done(HostRpcResult::StorageList {
+                entries: vec![ListEntry {
+                    name: "alias.link".into(),
+                    directory: false,
+                }],
+            })
+        );
+    }
+
+    // Non-permission holder refusals fail remote directory listings instead of dropping files.
+    #[test]
+    fn propagates_backend_failure() {
+        use aruna_core::structs::execution::workflow_run::DirectoryPin;
+
+        let mut run = base_run();
+        run.directory_pins.push(DirectoryPin {
+            bucket: "data".into(),
+            key: "folder/a.txt".into(),
+            version_id: Ulid::from_parts(2, 1),
+            source_node_id: Some(node(2)),
+        });
+        run.directory_pins.push(DirectoryPin {
+            bucket: "data".into(),
+            key: "folder/b.txt".into(),
+            version_id: Ulid::from_parts(2, 2),
+            source_node_id: Some(node(2)),
+        });
+        let dir_target = Target {
+            bucket: "data".into(),
+            key: "folder/".into(),
+            version: None,
+            owned: false,
+            node: Some(node(2)),
+        };
+
+        let mut list = RemoteReadOperation::new(
+            run.clone(),
+            dir_target.clone(),
+            node(2),
+            DataCall::List {
+                address: "s3://data/folder/".into(),
+            },
+        );
+        assert!(matches!(
+            list.first().unwrap(),
+            Next::Call(IoCall::Child(_))
+        ));
+        assert!(matches!(
+            list.next(refused_meta(BaoReadRefusal::BackendFailure))
+                .unwrap(),
+            Next::Done(HostRpcResult::Failed(ContractError::Internal { .. }))
+        ));
+
+        let mut locked = RemoteReadOperation::new(
+            run.clone(),
+            dir_target.clone(),
+            node(2),
+            DataCall::List {
+                address: "s3://data/folder/".into(),
+            },
+        );
+        assert!(matches!(
+            locked.first().unwrap(),
+            Next::Call(IoCall::Child(_))
+        ));
+        assert!(matches!(
+            locked
+                .next(refused_meta(BaoReadRefusal::BucketLocked(
+                    Ulid::from_parts(9, 1)
+                )))
+                .unwrap(),
+            Next::Done(HostRpcResult::Failed(ContractError::Denied { .. }))
+        ));
+
+        let mut stat = RemoteReadOperation::new(
+            run,
+            dir_target,
+            node(2),
+            DataCall::Stat {
+                address: "s3://data/folder/".into(),
+            },
+        );
+        assert!(matches!(
+            stat.first().unwrap(),
+            Next::Call(IoCall::Child(_))
+        ));
+        assert!(matches!(
+            stat.next(refused_meta(BaoReadRefusal::BackendFailure))
+                .unwrap(),
+            Next::Done(HostRpcResult::Failed(ContractError::Internal { .. }))
+        ));
+
+        assert!(matches!(
+            read_answer(refused_meta(BaoReadRefusal::BackendFailure)).unwrap(),
+            Err(ContractError::Internal { .. })
+        ));
+        assert!(matches!(
+            read_answer(refused_meta(BaoReadRefusal::NotFound)).unwrap(),
+            Err(ContractError::NotFound { .. })
+        ));
+        assert!(matches!(
+            read_answer(refused_meta(BaoReadRefusal::InvalidTarget)).unwrap(),
+            Err(ContractError::Invalid { .. })
+        ));
+        assert!(matches!(
+            read_answer(refused_meta(BaoReadRefusal::ReadDenied)).unwrap(),
+            Err(ContractError::Denied { .. })
+        ));
+    }
+
+    // Stat on a precaptured remote directory marker routes through folder auth and reports a dir.
+    #[test]
+    fn stats_captured_marker() {
+        use aruna_core::structs::execution::workflow_run::DirectoryRoot;
+
+        let marker_ver = Ulid::from_parts(6, 1);
+        let sel = InputSelection {
+            source: InputSource::S3 {
+                bucket: "data".into(),
+                key: "empty_dir/".into(),
+                version_id: Some(marker_ver.to_string()),
+            },
+            source_node_id: Some(node(2)),
+            dest_key: "data/empty_dir/".into(),
+            mode: InputMode::Snapshot,
+            container_path: None,
+            name: None,
+            description: None,
+        };
+        let mut cap = captured_input(&sel, node(2));
+        cap.version_id = marker_ver;
+        let mut run = base_run();
+        run.directory_roots.push(DirectoryRoot {
+            bucket: "data".into(),
+            prefix: "empty_dir/".into(),
+            version_id: Some(marker_ver),
+            source_node_id: Some(node(2)),
+        });
+        run.captured_remote.push(PrecapturedInput {
+            pin_node_id: node(2),
+            pin_bucket: "data".into(),
+            pin_key: "empty_dir/".into(),
+            pin_version_id: marker_ver,
+            resolved: sel,
+            captured: cap,
+        });
+
+        for key in ["empty_dir/", "empty_dir"] {
+            let dir_target = Target {
+                bucket: "data".into(),
+                key: key.into(),
+                version: None,
+                owned: false,
+                node: Some(node(2)),
+            };
+            let mut stat = RemoteReadOperation::new(
+                run.clone(),
+                dir_target.clone(),
+                node(2),
+                DataCall::Stat {
+                    address: format!("s3://data/{key}"),
+                },
+            );
+            assert!(matches!(
+                stat.first().unwrap(),
+                Next::Call(IoCall::Child(_))
+            ));
+            match stat.next(ok_meta()).unwrap() {
+                Next::Done(HostRpcResult::StorageStat { entry: Some(entry) }) => {
+                    assert!(entry.directory, "{key}: {entry:?}");
+                }
+                other => panic!("{key}: expected folder stat, got {other:?}"),
+            }
+
+            let mut denied = RemoteReadOperation::new(
+                run.clone(),
+                dir_target,
+                node(2),
+                DataCall::Stat {
+                    address: format!("s3://data/{key}"),
+                },
+            );
+            assert!(matches!(
+                denied.first().unwrap(),
+                Next::Call(IoCall::Child(_))
+            ));
+            assert_eq!(
+                denied
+                    .next(refused_meta(BaoReadRefusal::ReadDenied))
+                    .unwrap(),
+                Next::Done(HostRpcResult::StorageStat { entry: None })
+            );
+        }
+
+        let mut list = RemoteReadOperation::new(
+            run,
+            Target {
+                bucket: "data".into(),
+                key: "empty_dir/".into(),
+                version: None,
+                owned: false,
+                node: Some(node(2)),
+            },
+            node(2),
+            DataCall::List {
+                address: "s3://data/empty_dir/".into(),
+            },
+        );
+        assert!(matches!(
+            list.first().unwrap(),
+            Next::Call(IoCall::Child(_))
+        ));
+        assert_eq!(
+            list.next(ok_meta()).unwrap(),
+            Next::Done(HostRpcResult::StorageList {
+                entries: Vec::new(),
+            })
+        );
+    }
 }
