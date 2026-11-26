@@ -693,6 +693,7 @@ pub(super) fn sample_run() -> WorkflowRunRecord {
         secrets: BTreeMap::new(),
         path_restrictions: None,
         captured_remote: Vec::new(),
+        directory_pins: Vec::new(),
         used_tools: Vec::new(),
     }
 }
@@ -1631,4 +1632,172 @@ async fn reuses_deleted_idempotency() {
     let second = runs.start(&runs.fixture.alice, req2).await.unwrap();
     assert!(second.created);
     assert_ne!(second.record.run_id, first.record.run_id);
+}
+
+// Local directory-valued parameters capture versioned entries at admission so cross-node resume
+// can list the remote folder and resolve exact versions for child reads and task staging.
+#[tokio::test]
+async fn resumes_directory_values() {
+    use super::control::{Follow, FollowRunOperation};
+    use super::data::DataCall;
+    use super::remote::{RemoteReadOperation, resolve_precaptured};
+    use aruna_core::keyspaces::WORKFLOW_RUN_KEYSPACE;
+
+    let runs = runs().await;
+    let ver_a = Ulid::from_bytes([61; 16]);
+    let ver_b = Ulid::from_bytes([62; 16]);
+    seed_object(&runs, "results", "folder/a.txt", ver_a).await;
+    seed_object(&runs, "results", "folder/sub/b.txt", ver_b).await;
+
+    let req = runs.request(None, json!({ "dir": "s3://results/folder/" }));
+    let admitted = runs.start(&runs.fixture.alice, req).await.unwrap().record;
+    assert_eq!(
+        admitted.directory_pins.len(),
+        2,
+        "{:?}",
+        admitted.directory_pins
+    );
+    assert!(
+        admitted
+            .directory_pins
+            .iter()
+            .any(|p| p.key == "folder/a.txt" && p.version_id == ver_a)
+    );
+    assert!(
+        admitted
+            .directory_pins
+            .iter()
+            .any(|p| p.key == "folder/sub/b.txt" && p.version_id == ver_b)
+    );
+
+    // Replicate as an active run on another realm server and resume it here.
+    let origin = aruna_ops_identity::testing::node(9);
+    let realm_id = runs.fixture.alice.realm_id;
+    let mut cfg = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+    cfg.ensure_node(runs.fixture.node, RealmNodeKind::Server);
+    cfg.ensure_node(origin, RealmNodeKind::Server);
+    cfg.seed_default_placement();
+    cfg.seed_job_control(runs.fixture.node, 0);
+    let actor = Actor {
+        node_id: runs.fixture.node,
+        user_id: runs.fixture.alice.user_id,
+        realm_id,
+    };
+    write(
+        &runs.fixture.context,
+        REALM_CONFIG_KEYSPACE,
+        realm_id.as_bytes().to_vec(),
+        cfg.to_bytes(&actor).unwrap(),
+    )
+    .await;
+    let mut copy = admitted.clone();
+    copy.run_id = Ulid::from_bytes([63; 16]);
+    copy.lineage = copy.run_id;
+    copy.node_id = origin;
+    copy.state = RunState::Running;
+    write(
+        &runs.fixture.context,
+        WORKFLOW_RUN_KEYSPACE,
+        super::run_key(copy.run_id).to_vec(),
+        copy.to_bytes().unwrap(),
+    )
+    .await;
+    let resumed = drive(
+        FollowRunOperation::new(
+            &runs.fixture.alice,
+            runs.serving(),
+            copy.run_id,
+            Follow::Resume,
+        ),
+        &runs.fixture.context,
+    )
+    .await
+    .unwrap();
+    let resumed_values: Value = serde_json::from_str(&resumed.values_json).unwrap();
+    assert_eq!(
+        resumed_values["dir"],
+        format!("s3://results/folder/?node={origin}")
+    );
+    assert_eq!(resumed.directory_pins.len(), 2);
+    assert!(
+        resumed
+            .directory_pins
+            .iter()
+            .all(|p| p.source_node_id == Some(origin))
+    );
+
+    // RemoteReadOperation serves stat and list for the captured remote folder.
+    let dir_target = resolve(&resumed, &format!("s3://results/folder/?node={origin}")).unwrap();
+    let mut stat_op = RemoteReadOperation::new(
+        resumed.clone(),
+        dir_target.clone(),
+        origin,
+        DataCall::Stat {
+            address: format!("s3://results/folder/?node={origin}"),
+        },
+    );
+    match stat_op.first().unwrap() {
+        Next::Done(HostRpcResult::StorageStat { entry: Some(entry) }) => {
+            assert!(entry.directory);
+        }
+        other => panic!("expected directory stat, got {other:?}"),
+    }
+    let mut list_op = RemoteReadOperation::new(
+        resumed.clone(),
+        dir_target,
+        origin,
+        DataCall::List {
+            address: format!("s3://results/folder/?node={origin}"),
+        },
+    );
+    match list_op.first().unwrap() {
+        Next::Done(HostRpcResult::StorageList { entries }) => {
+            assert_eq!(entries.len(), 2, "{entries:?}");
+            assert!(entries.iter().any(|e| e.name == "a.txt" && !e.directory));
+            assert!(entries.iter().any(|e| e.name == "sub" && e.directory));
+        }
+        other => panic!("expected directory listing, got {other:?}"),
+    }
+
+    // Unversioned child reads and task DirectInputs resolve to the captured exact version.
+    let child_addr = format!("s3://results/folder/a.txt?node={origin}");
+    let child = resolve_precaptured(
+        &resumed,
+        resolve(&resumed, &child_addr).unwrap(),
+        runs.fixture.node,
+    );
+    assert_eq!(child.version, Some(ver_a));
+    assert_eq!(child.node, Some(origin));
+
+    let mut task = start_task();
+    task.direct_inputs.push(DirectInput {
+        path: "a.txt".into(),
+        address: child_addr,
+        digest: "sha256:00".into(),
+        size: 4,
+        executable: false,
+        aruna_id: None,
+        endpoints: Vec::new(),
+    });
+    let spec = task_spec(&resumed, &task, "k").unwrap();
+    assert!(spec.inputs.iter().any(|i| matches!(
+        &i.source,
+        InputSource::S3 { bucket, key, version_id }
+            if bucket == "results" && key == "folder/a.txt" && version_id.as_deref() == Some(&ver_a.to_string())
+    )));
+
+    // An uncaptured remote directory prefix is still refused.
+    let other_target = resolve(&resumed, &format!("s3://results/other/?node={origin}")).unwrap();
+    let mut refused = RemoteReadOperation::new(
+        resumed,
+        other_target,
+        origin,
+        DataCall::List {
+            address: format!("s3://results/other/?node={origin}"),
+        },
+    );
+    assert!(matches!(
+        refused.first().unwrap(),
+        Next::Done(HostRpcResult::Failed(_))
+    ));
 }
