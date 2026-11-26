@@ -351,6 +351,7 @@ fn plan_outputs(
     let mut dirs: Vec<OutputDir> = Vec::new();
     for (item, location) in raw {
         let default_rel = relative_target(&item.source, root, canonical_root)?;
+        check_path(&default_rel)?;
         let target_path = item.target_path.unwrap_or(default_rel);
         let remote_hint = location
             .as_deref()
@@ -374,14 +375,18 @@ fn plan_outputs(
             let target_base = Path::new(&item.source);
             for (local, rel) in entries {
                 check_path(&rel)?;
+                let parent_dir = rel
+                    .rsplit_once('/')
+                    .map(|(parent, _)| parent.to_owned())
+                    .or_else(|| Some(target_path.clone()));
                 let mut raw_targets = vec![ReceiptKey {
-                    scope: item.parent_dir.clone(),
+                    scope: parent_dir.clone(),
                     basename: None,
                     path: local.to_string_lossy().into_owned(),
                 }];
                 if let Ok(inner) = local.strip_prefix(&source) {
                     let joined = ReceiptKey {
-                        scope: item.parent_dir.clone(),
+                        scope: parent_dir.clone(),
                         basename: None,
                         path: target_base.join(inner).to_string_lossy().into_owned(),
                     };
@@ -389,10 +394,6 @@ fn plan_outputs(
                         raw_targets.push(joined);
                     }
                 }
-                let parent_dir = rel
-                    .rsplit_once('/')
-                    .map(|(parent, _)| parent.to_owned())
-                    .or_else(|| Some(target_path.clone()));
                 add_pending(
                     &mut by_target,
                     PendingFile {
@@ -410,11 +411,15 @@ fn plan_outputs(
                     .strip_prefix(&source)
                     .map(|inner| target_base.join(inner).to_string_lossy().into_owned())
                     .unwrap_or_else(|_| sub_canon.to_string_lossy().into_owned());
+                let sub_parent = sub_rel
+                    .rsplit_once('/')
+                    .map(|(parent, _)| parent.to_owned())
+                    .or_else(|| Some(target_path.clone()));
                 let leaf_empty = is_empty_dir(&sub_canon);
                 dirs.push(OutputDir {
                     raw_target: raw_sub,
                     canonical: sub_canon,
-                    parent_scope: item.parent_dir.clone(),
+                    parent_scope: sub_parent,
                     basename: None,
                     target_path: sub_rel,
                     leaf_empty,
@@ -507,6 +512,24 @@ fn record_sample(
             None => break,
         }
     }
+}
+
+/// Registers one delivered directory receipt and its listing scope for descendant lookups.
+fn register_dir(dir: OutputDir, prefix: String, receipts: &mut Receipts) {
+    let raw_key = ReceiptKey {
+        scope: dir.parent_scope.clone(),
+        basename: dir.basename.clone(),
+        path: dir.raw_target,
+    };
+    let canon_key = ReceiptKey {
+        scope: dir.parent_scope,
+        basename: dir.basename,
+        path: dir.canonical.to_string_lossy().into_owned(),
+    };
+    receipts.insert(raw_key.clone(), prefix.clone());
+    receipts.insert_scope(raw_key, dir.target_path.clone());
+    receipts.insert(canon_key.clone(), prefix);
+    receipts.insert_scope(canon_key, dir.target_path);
 }
 
 /// Populates missing-directory receipts only from children actually delivered beneath each prefix.
@@ -630,22 +653,7 @@ async fn deliver_outputs(
                 })
                 .unwrap_or_else(|| format!("{}/", dir.target_path.trim_end_matches('/')))
         };
-        receipts.insert(
-            ReceiptKey {
-                scope: dir.parent_scope.clone(),
-                basename: dir.basename.clone(),
-                path: dir.raw_target,
-            },
-            prefix.clone(),
-        );
-        receipts.insert(
-            ReceiptKey {
-                scope: dir.parent_scope,
-                basename: dir.basename,
-                path: dir.canonical.to_string_lossy().into_owned(),
-            },
-            prefix,
-        );
+        register_dir(dir, prefix, &mut receipts);
     }
     finish_missing(plan.missing_dirs, &dir_sample, output_base, &mut receipts);
     if let Some(value) = outputs {
@@ -825,7 +833,8 @@ fn collect_output_paths(
             let candidate = Path::new(&path);
             if candidate.is_absolute()
                 && !served(&path)
-                && relative_target(&path, root, canonical_root).is_ok()
+                && let Ok(rel) = relative_target(&path, root, canonical_root)
+                && check_path(&rel).is_ok()
                 && candidate.exists()
             {
                 let target_path = parent_dir.and_then(|parent| {
@@ -1511,6 +1520,137 @@ mod tests {
         assert_eq!(
             prefix_for("aruna://results/run/", "bundle/nested"),
             "aruna://results/run/bundle/nested/"
+        );
+    }
+
+    #[test]
+    fn rejects_escaped_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("outputs");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        std::fs::write(dir.path().join("secrets.json"), b"secret").unwrap();
+        let root = dir.path();
+        let canon = std::fs::canonicalize(root).unwrap();
+        let escaped = format!("{}/../secrets.json", out_dir.display());
+        let outputs = json!({
+            "missing_parent": {
+                "class": "Directory",
+                "location": format!("file://{}", out_dir.join("absent").display()),
+                "listing": [{
+                    "class": "File",
+                    "path": escaped,
+                    "basename": "leak.json",
+                }],
+            }
+        });
+        let err = plan_outputs(root, &canon, &[], Some(&outputs))
+            .err()
+            .expect("escaped source must fail");
+        assert!(matches!(err, ContractError::Invalid { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn separates_reused_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("outputs");
+        let shared = out_dir.join("shared");
+        let nested = shared.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let f_path = shared.join("f.txt");
+        let g_path = nested.join("g.txt");
+        std::fs::write(&f_path, b"f").unwrap();
+        std::fs::write(&g_path, b"g").unwrap();
+        let root = dir.path();
+        let canon = std::fs::canonicalize(root).unwrap();
+        let absent = out_dir.join("absent");
+        let listing = |name: &str| {
+            json!({
+                "class": "Directory",
+                "location": format!("file://{}", shared.display()),
+                "basename": name,
+                "listing": [
+                    {"class": "File", "location": format!("file://{}", f_path.display())},
+                    {
+                        "class": "Directory",
+                        "location": format!("file://{}", nested.display()),
+                        "listing": [
+                            {"class": "File", "location": format!("file://{}", g_path.display())},
+                        ],
+                    },
+                ],
+            })
+        };
+        let outputs = json!({
+            "missing_parent": {
+                "class": "Directory",
+                "location": format!("file://{}", absent.display()),
+                "listing": [listing("left"), listing("right")],
+            }
+        });
+        let plan = plan_outputs(root, &canon, &[], Some(&outputs)).unwrap();
+        let targets: Vec<&str> = plan.files.keys().map(String::as_str).collect();
+        assert_eq!(
+            targets,
+            vec![
+                "absent/left/f.txt",
+                "absent/left/nested/g.txt",
+                "absent/right/f.txt",
+                "absent/right/nested/g.txt",
+            ]
+        );
+        let mut receipts = Receipts::default();
+        let mut dir_sample = HashMap::new();
+        for (i, item) in plan.files.into_values().enumerate() {
+            let loc = format!("aruna://results/run/{}?version=v{i}", item.target_path);
+            record_sample(
+                &mut dir_sample,
+                item.parent_dir.as_deref(),
+                &item.target_path,
+                &loc,
+            );
+            for key in item.raw_targets {
+                receipts.insert(key, loc.clone());
+            }
+        }
+        for d in plan.dirs {
+            let (rel, loc) = dir_sample.get(&d.target_path).expect("sample");
+            let prefix = output_prefix(loc, rel, &d.target_path).expect("prefix");
+            register_dir(d, prefix, &mut receipts);
+        }
+        finish_missing(plan.missing_dirs, &dir_sample, None, &mut receipts);
+        let mut rewritten = outputs;
+        rewrite_locations(&mut rewritten, &receipts, None);
+        assert_eq!(
+            rewritten["missing_parent"]["location"],
+            "aruna://results/run/absent/"
+        );
+        let left = &rewritten["missing_parent"]["listing"][0];
+        let right = &rewritten["missing_parent"]["listing"][1];
+        assert_eq!(left["location"], "aruna://results/run/absent/left/");
+        assert_eq!(
+            left["listing"][0]["location"],
+            "aruna://results/run/absent/left/f.txt?version=v0"
+        );
+        assert_eq!(
+            left["listing"][1]["location"],
+            "aruna://results/run/absent/left/nested/"
+        );
+        assert_eq!(
+            left["listing"][1]["listing"][0]["location"],
+            "aruna://results/run/absent/left/nested/g.txt?version=v1"
+        );
+        assert_eq!(right["location"], "aruna://results/run/absent/right/");
+        assert_eq!(
+            right["listing"][0]["location"],
+            "aruna://results/run/absent/right/f.txt?version=v2"
+        );
+        assert_eq!(
+            right["listing"][1]["location"],
+            "aruna://results/run/absent/right/nested/"
+        );
+        assert_eq!(
+            right["listing"][1]["listing"][0]["location"],
+            "aruna://results/run/absent/right/nested/g.txt?version=v3"
         );
     }
 }
