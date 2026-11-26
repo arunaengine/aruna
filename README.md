@@ -74,17 +74,24 @@ without giving it to a central service.
 
 ### Run with Docker: single node
 
-You need Docker. The node image is published on the GitHub Container Registry for linux/amd64. It contains `aruna`,
-`aruna-doctor` and the web portal:
+You need Docker. The node image is published on the GitHub Container Registry for linux/amd64. It contains `aruna`
+and `aruna-doctor`, and includes the embedded web portal in `/run/portal` when built with a portal release:
 
 ```bash
 IMAGE=ghcr.io/arunaengine/aruna:v3
 docker pull "$IMAGE"
 ```
 
-The tag `v3` follows the newest v3 release. For persistent pre-production or production
-deployments, pin one release tag such as `v3.0.0-alpha.208` and follow the
-[production deployment guide](docs/deployment.md).
+The tag `v3` follows the newest v3 release and is headless when that release was built without a
+portal tag. For persistent pre-production or production deployments, pin a version tag such as
+`v3.0.0-alpha.210` (or the portal-qualified tag `v3.0.0-alpha.210-portal.<portal-tag>` / pinned
+digest from the release's `release-images.json` when serving the embedded portal) and follow the
+[production deployment guide](docs/deployment.md):
+
+```bash
+curl -fsSL https://github.com/arunaengine/aruna/releases/download/v3.0.0-alpha.210/release-images.json \
+  | jq -r '.images[] | select(.name == "aruna") | (.tags[] | select(contains("-portal."))), .reference'
+```
 
 To build the image from a checkout of this repository instead, run `docker build -t aruna:local .`
 and set `IMAGE=aruna:local`. A first build takes 10 to 30 minutes. A built image has no web portal
