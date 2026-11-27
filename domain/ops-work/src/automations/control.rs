@@ -29,12 +29,76 @@ use crate::plugins::rows::{Rows, StoreError, decode, encode, row, scan_rows};
 use crate::workflows::CatalogError;
 use crate::workflows::runs::cancel::{CancelRunOperation, CancelledRun};
 
-/// Result of cancelling a firing, including local job and coordinator run IDs to signal.
+/// One cancelled child workflow run whose local runtime signals must be forwarded before
+/// persisting `cancel_sent = true`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CancelAck {
+    pub automation_id: Ulid,
+    pub firing_id: Ulid,
+    pub stage_idx: usize,
+    pub run_id: Ulid,
+}
+
+/// Result of cancelling a firing, including local job/run IDs to signal before committing acks.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CancelledFiring {
     pub firing: Firing,
     pub running_jobs: Vec<JobId>,
     pub woken_runs: Vec<Ulid>,
+    pub pending_acks: Vec<CancelAck>,
+}
+
+/// Persists `cancel_sent = true` for cancelled child runs after the caller has delivered their
+/// local `JobsRuntime::request_cancel` and coordinator wake signals.
+#[derive(Debug, PartialEq)]
+pub struct AckCancelsOperation {
+    acks: Vec<CancelAck>,
+    last: Option<Firing>,
+}
+
+impl AckCancelsOperation {
+    pub fn new(mut acks: Vec<CancelAck>) -> Self {
+        acks.reverse();
+        Self { acks, last: None }
+    }
+
+    fn next_ack(&mut self) -> Result<Next<Option<Firing>>, AutoError> {
+        let Some(ack) = self.acks.pop() else {
+            return Ok(Next::Done(self.last.take()));
+        };
+        let tx = FiringTxOp::new(
+            ack.automation_id,
+            ack.firing_id,
+            FiringDelta::CancelReply {
+                idx: ack.stage_idx,
+                run_id: ack.run_id,
+                error: None,
+            },
+        );
+        Ok(Next::Call(IoCall::retry(tx, &ack.firing_id.to_bytes())))
+    }
+}
+
+impl Operation for AckCancelsOperation {
+    type Output = Option<Firing>;
+    type Error = AutoError;
+
+    fn first(&mut self) -> Result<Next<Option<Firing>>, AutoError> {
+        self.next_ack()
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Option<Firing>>, AutoError> {
+        match result.child::<FiringTxResult, AutoError>()? {
+            Ok(tx) => self.last = Some(tx.firing),
+            Err(AutoError::NotFound) => {}
+            Err(err) => return Err(err),
+        }
+        self.next_ack()
+    }
+
+    fn expected_error(error: &AutoError) -> bool {
+        !matches!(error, AutoError::Storage(_))
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -47,7 +111,7 @@ enum CancelStep {
 }
 
 /// Moves a firing into `Cancelling`, persists it atomically, and propagates cancellation to every
-/// active child `WorkflowRunRecord`, returning local running job IDs and run IDs to signal.
+/// active child `WorkflowRunRecord`, returning local running job IDs, run IDs and deferred acks.
 #[derive(Debug, PartialEq)]
 pub struct CancelFiringOperation {
     auth: AuthContext,
@@ -58,6 +122,7 @@ pub struct CancelFiringOperation {
     child_runs: Vec<(usize, Ulid)>,
     running_jobs: Vec<JobId>,
     woken_runs: Vec<Ulid>,
+    pending_acks: Vec<CancelAck>,
     step: CancelStep,
 }
 
@@ -72,6 +137,7 @@ impl CancelFiringOperation {
             child_runs: Vec::new(),
             running_jobs: Vec::new(),
             woken_runs: Vec::new(),
+            pending_acks: Vec::new(),
             step: CancelStep::Load,
         }
     }
@@ -82,6 +148,7 @@ impl CancelFiringOperation {
                 firing: self.firing.take().ok_or(IoError::Unfinished)?,
                 running_jobs: std::mem::take(&mut self.running_jobs),
                 woken_runs: std::mem::take(&mut self.woken_runs),
+                pending_acks: std::mem::take(&mut self.pending_acks),
             }));
         };
         let auto = self.auto.as_ref().ok_or(IoError::Unfinished)?;
@@ -130,16 +197,30 @@ impl Operation for CancelFiringOperation {
                 self.next_child()
             }
             CancelStep::ChildRun(idx, run_id) => {
+                let auto_id = self.auto.as_ref().ok_or(IoError::Unfinished)?.automation_id;
                 let err = match result.child::<CancelledRun, CatalogError>()? {
                     Ok(cancelled) => {
                         self.running_jobs.extend(cancelled.running);
                         self.woken_runs.push(cancelled.record.run_id);
-                        None
+                        self.pending_acks.push(CancelAck {
+                            automation_id: auto_id,
+                            firing_id: self.firing_id,
+                            stage_idx: idx,
+                            run_id,
+                        });
+                        return self.next_child();
                     }
-                    Err(CatalogError::NotFound) => None,
+                    Err(CatalogError::NotFound) => {
+                        self.pending_acks.push(CancelAck {
+                            automation_id: auto_id,
+                            firing_id: self.firing_id,
+                            stage_idx: idx,
+                            run_id,
+                        });
+                        return self.next_child();
+                    }
                     Err(e) => Some(format!("child cancel pending: {e}")),
                 };
-                let auto_id = self.auto.as_ref().ok_or(IoError::Unfinished)?.automation_id;
                 let tx = FiringTxOp::new(
                     auto_id,
                     self.firing_id,

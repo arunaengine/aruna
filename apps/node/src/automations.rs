@@ -9,6 +9,7 @@ use std::time::Duration;
 use aruna_core::id::NodeId;
 use aruna_core::structs::identity::features::Feature;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_ops_work::automations::control::AckCancelsOperation;
 use aruna_ops_work::automations::matcher::MatchEventsOperation;
 use aruna_ops_work::automations::runner::StepFiringsOperation;
 use aruna_runner::driver::{DriverContext, drive};
@@ -54,6 +55,15 @@ pub fn spawn_worker(
                         for run_id in &report.wake_runs {
                             registry.wake_run(run_id.to_string());
                         }
+                    }
+                    if !report.cancel_acks.is_empty()
+                        && let Err(error) = drive(
+                            AckCancelsOperation::new(report.cancel_acks.clone()),
+                            context.as_ref(),
+                        )
+                        .await
+                    {
+                        warn!(%error, "Automation cancel acknowledgement failed");
                     }
                     if report.advanced > 0 || report.finished > 0 {
                         busy = true;
