@@ -120,6 +120,7 @@ pub(crate) struct RunTrack {
     pub active_runs: BTreeMap<Ulid, usize>,
     pub capped: BTreeSet<Ulid>,
     pub cancel_tried: BTreeSet<Ulid>,
+    pub deferred: BTreeSet<(Ulid, usize)>,
 }
 
 impl RunTrack {
@@ -286,9 +287,12 @@ fn pending_cancel(firing: &Firing, tried: &BTreeSet<Ulid>) -> Option<(usize, Uli
     })
 }
 
-pub(crate) fn first_stranded_claim(firing: &Firing) -> Option<ClaimRecovery> {
+pub(crate) fn first_stranded_claim(
+    firing: &Firing,
+    deferred: &BTreeSet<(Ulid, usize)>,
+) -> Option<ClaimRecovery> {
     firing.stages.iter().enumerate().find_map(|(idx, stage)| {
-        if !stage.state.is_in_flight() {
+        if !stage.state.is_in_flight() || deferred.contains(&(firing.firing_id, idx)) {
             return None;
         }
         match &firing.spec.stages[idx].kind {
@@ -494,7 +498,10 @@ pub(crate) fn resolve_reconciled_run(
                 false,
             ))
         }
-        ReconciledRun::Deferred => Ok(ReconcileAction::Defer),
+        ReconciledRun::Deferred => {
+            track.deferred.insert((firing.firing_id, idx));
+            Ok(ReconcileAction::Defer)
+        }
     }
 }
 

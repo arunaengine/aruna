@@ -126,7 +126,7 @@ impl StepFiringsOperation {
     fn continue_after_load(&mut self) -> Result<Next<StepReport>, AutoError> {
         let auto = self.auto.as_ref().ok_or(IoError::Unfinished)?;
         let firing = self.firing.as_ref().ok_or(IoError::Unfinished)?;
-        if let Some(mut claim) = first_stranded_claim(firing) {
+        if let Some(mut claim) = first_stranded_claim(firing, &self.track.deferred) {
             if let Some(call) = claim_recovery_call(&mut claim, auto, firing) {
                 self.phase = StepPhase::RecoverClaim(claim);
                 return Ok(Next::Call(call));
@@ -216,7 +216,7 @@ impl Operation for StepFiringsOperation {
                     ReconcileAction::Commit(delta, terminal) => {
                         self.tx_step(delta, StepPhase::CommitRecovery(terminal))
                     }
-                    ReconcileAction::Defer => self.next_firing(),
+                    ReconcileAction::Defer => self.continue_after_load(),
                 }
             }
             StepPhase::CommitRecovery(terminal) => {

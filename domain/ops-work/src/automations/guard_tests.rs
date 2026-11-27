@@ -9,13 +9,14 @@ use aruna_core::automation::firing::{Firing, FiringState, StageState, TriggerPay
 use aruna_core::automation::keys::active_key;
 use aruna_core::automation::record::{Spec, Stage, StageKind, Trigger, When};
 use aruna_core::automation::scope::{Audience, Scope};
-use aruna_core::calls::{ChildOutcome, IoResult};
+use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
+use aruna_core::job_request::SubmitJobError;
 use aruna_core::keyspaces::{
     APPLETS_KEYSPACE, AUTOMATION_INTENTS_KEYSPACE, AUTOMATION_RUNS_KEYSPACE, REALM_CONFIG_KEYSPACE,
     RUN_IDEMPOTENCY_KEYSPACE, WORKFLOW_RUN_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::identity::RETENTION_MS;
+use aruna_core::structs::execution::job::identity::{JobId, RETENTION_MS};
 use aruna_core::structs::execution::job::input::JobPayload;
 use aruna_core::structs::execution::job::local::{WorkspaceMode, user_dedup_key};
 use aruna_core::structs::execution::workflow_run::{
@@ -37,9 +38,11 @@ use super::run_stage::{StartStageRun, parse_inputs, render_json, run_idempotency
 use super::runner::StepFiringsOperation;
 use super::start::new_firing_rows;
 use crate::applets::AppletError;
+use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::submit::SubmitJobSpec;
-use crate::jobs::submit::local::SubmitLocalOperation;
+use crate::jobs::submit::local::{DedupJobOperation, SubmitLocalOperation};
 use crate::plugins::intents::{IntentRecord, IntentState, intent_key, settled_row_in};
+use crate::workflows::runs::admit::{ReconcileRunOperation, ReconciledRun};
 
 #[tokio::test]
 async fn runner_guards_recovery() {
@@ -1118,6 +1121,106 @@ async fn recovery_edge_cases() {
     live_f.state = FiringState::Cancelling;
     live_f.stages[0].state = StageState::Cancelling;
     live_f.stages[0].receipt.workflow_run_id = Some(live_id);
+
+    // 4. Transient storage failure in DedupJobOperation preserves Storage so reconcile defers.
+    let mut dedup_op = DedupJobOperation::new(acct, b"dedup");
+    assert!(matches!(dedup_op.first(), Ok(Next::Call(IoCall::Child(_)))));
+    let dedup_err = dedup_op
+        .next(IoResult::Child(ChildOutcome::new(Err::<
+            Option<(JobId, [u8; 32])>,
+            _,
+        >(
+            JobMutationError::Storage("timeout".into()),
+        ))))
+        .unwrap_err();
+    let mut rec_op = ReconcileRunOperation::new(defer_id, (env.node, env.realm), false, None);
+    assert!(matches!(rec_op.first(), Ok(Next::Call(IoCall::Read(_)))));
+    let step_dedup = rec_op.next(IoResult::Values(vec![Some(
+        defer_rec.to_bytes().unwrap().into(),
+    )]));
+    assert!(matches!(step_dedup, Ok(Next::Call(IoCall::Child(_)))));
+    let rec_out = rec_op.next(IoResult::Child(ChildOutcome::new(Err::<
+        Option<(JobId, [u8; 32])>,
+        SubmitJobError,
+    >(dedup_err))));
+    assert_eq!(rec_out, Ok(Next::Done(ReconciledRun::Deferred)));
+
+    // 5. A deferred stranded run does not block sibling runs or downstream stages in the same tick.
+    let par_spec = Spec {
+        triggers: vec![Trigger::Manual { form_json: None }],
+        stages: vec![
+            Stage {
+                name: "run_a".into(),
+                ..spec.stages[0].clone()
+            },
+            Stage {
+                name: "run_b".into(),
+                ..spec.stages[0].clone()
+            },
+            Stage {
+                name: "done".into(),
+                needs: Some(vec!["run_b".into()]),
+                when: When::Passed,
+                kind: StageKind::Notify {
+                    audience: Audience::GroupAdmins,
+                    message: "b finished".into(),
+                },
+            },
+        ],
+        scope: Scope {
+            workflows: vec![(wf_id, 1)],
+            audiences: vec![Audience::GroupAdmins],
+            ..Scope::default()
+        },
+    };
+    let par_auto = env.create_active(par_spec.clone()).await;
+    let par_acct = par_auto.account.unwrap();
+    let par_def_id = Ulid::from_bytes([150; 16]);
+    let mut par_def_rec = env.sample_run(par_def_id, wf_id, RunState::Queued, None);
+    par_def_rec.created_by = par_acct;
+    par_def_rec.attempts = 0;
+    env.write_row(
+        WORKFLOW_RUN_KEYSPACE,
+        run_key(par_def_id),
+        par_def_rec.to_bytes().unwrap(),
+    )
+    .await;
+    let par_done_id = Ulid::from_bytes([151; 16]);
+    let par_done_rec = env.sample_run(par_done_id, wf_id, RunState::Succeeded, None);
+    env.write_row(
+        WORKFLOW_RUN_KEYSPACE,
+        run_key(par_done_id),
+        par_done_rec.to_bytes().unwrap(),
+    )
+    .await;
+    let mut par_f = Firing::new(
+        Ulid::from_bytes([152; 16]),
+        par_auto.automation_id,
+        par_auto.group_id,
+        par_auto.revision,
+        &par_spec,
+        TriggerPayload::Manual {
+            values_json: "{}".into(),
+            actor: env.owner.user_id,
+        },
+        15,
+    );
+    par_f.stages[0].state = StageState::Running;
+    par_f.stages[1].state = StageState::Running;
+    par_f.stages[1].receipt.workflow_run_id = Some(par_done_id);
+    let par_idem = run_idempotency_key(par_f.firing_id, "run_a", par_f.attempt);
+    env.write_row(
+        RUN_IDEMPOTENCY_KEYSPACE,
+        run_key_row(par_auto.group_id, par_acct, &par_idem),
+        RunKeyRecord {
+            run_id: par_def_id,
+            request_digest: [0; 32],
+        }
+        .to_bytes()
+        .unwrap(),
+    )
+    .await;
+
     for (ks, k, v) in new_firing_rows(&gone_run)
         .unwrap()
         .into_iter()
@@ -1125,6 +1228,7 @@ async fn recovery_edge_cases() {
         .chain(new_firing_rows(&direct_f).unwrap())
         .chain(new_firing_rows(&defer_f).unwrap())
         .chain(new_firing_rows(&live_f).unwrap())
+        .chain(new_firing_rows(&par_f).unwrap())
     {
         env.write_row(&ks, k, v).await;
     }
@@ -1178,4 +1282,16 @@ async fn recovery_edge_cases() {
     .unwrap();
     assert_eq!(def_after.stages[0].state, StageState::Running);
     assert_eq!(def_after.stages[0].receipt.workflow_run_id, None);
+    let (par_after, _) = drive(
+        GetFiringOperation::new(&env.owner, par_f.firing_id, env.node),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(par_after.state, FiringState::Running);
+    assert_eq!(par_after.stages[0].state, StageState::Running);
+    assert_eq!(par_after.stages[0].receipt.workflow_run_id, None);
+    assert_eq!(par_after.stages[1].state, StageState::Succeeded);
+    assert_eq!(par_after.stages[2].state, StageState::Succeeded);
+    assert!(par_after.stages[2].receipt.notified.unwrap_or(0) >= 1);
 }
