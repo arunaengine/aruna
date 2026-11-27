@@ -213,6 +213,29 @@ impl MatchEventsOperation {
         Ok(Next::Call(IoCall::Write(rows)))
     }
 
+    fn pause_chain_depth(
+        &mut self,
+        idx: usize,
+        event: SourceEvent,
+    ) -> Result<Next<MatchReport>, AutoError> {
+        let auto = &self.autos[idx];
+        if auto.lifecycle == Lifecycle::Active {
+            let actor = auto.approved_by.unwrap_or(auto.created_by);
+            let pause = WriteAutoOperation::node(
+                auto.automation_id,
+                AutoChange::Pause(PauseReason::ChainDepth),
+                actor,
+                self.realm_id,
+            );
+            self.step = MatchStep::PauseChain(idx, Box::new(event));
+            return Ok(Next::Call(IoCall::retry(
+                pause,
+                &auto.automation_id.to_bytes(),
+            )));
+        }
+        self.write_kept(idx, event, "chain_depth")
+    }
+
     fn decide(
         &mut self,
         idx: usize,
@@ -403,21 +426,7 @@ impl Operation for MatchEventsOperation {
                             .map_or(0, |o| o.depth)
                             .saturating_add(1);
                         if depth >= auto.spec.scope.limits.max_chain_depth {
-                            if auto.lifecycle == Lifecycle::Active {
-                                let actor = auto.approved_by.unwrap_or(auto.created_by);
-                                let pause = WriteAutoOperation::node(
-                                    auto.automation_id,
-                                    AutoChange::Pause(PauseReason::ChainDepth),
-                                    actor,
-                                    self.realm_id,
-                                );
-                                self.step = MatchStep::PauseChain(idx, event);
-                                return Ok(Next::Call(IoCall::retry(
-                                    pause,
-                                    &auto.automation_id.to_bytes(),
-                                )));
-                            }
-                            return self.write_kept(idx, *event, "chain_depth");
+                            return self.pause_chain_depth(idx, *event);
                         }
                         let outside_input =
                             rec.automation.as_ref().is_some_and(|o| o.outside_input)
@@ -448,6 +457,7 @@ impl Operation for MatchEventsOperation {
                     self.report.fired += 1;
                     self.next_match()
                 }
+                Ok(AdmitOutcome::ChainDepth) => self.pause_chain_depth(idx, *event),
                 Ok(
                     AdmitOutcome::AlreadySeen | AdmitOutcome::Existing(_) | AdmitOutcome::Unmatched,
                 ) => self.next_match(),
@@ -472,5 +482,70 @@ impl Operation for MatchEventsOperation {
                 self.next_row()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::structs::storage::blob::group_permission_path;
+    use aruna_core::user::id::UserId;
+
+    #[test]
+    fn admit_depth_pauses() {
+        let realm = RealmId([9; 32]);
+        let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let group = Ulid::from_bytes([11; 16]);
+        let owner = UserId::local(Ulid::from_bytes([1; 16]), realm);
+        let auto_id = Ulid::from_bytes([22; 16]);
+        let auto = Automation {
+            automation_id: auto_id,
+            group_id: group,
+            name: "chain".into(),
+            description: String::new(),
+            host_node: node,
+            lifecycle: Lifecycle::Active,
+            pause_reason: None,
+            spec: aruna_core::automation::record::Spec::default(),
+            pending: None,
+            account: None,
+            role_id: None,
+            approved_by: Some(owner),
+            approved_at_ms: Some(1),
+            created_by: owner,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            revision: 1,
+        };
+        let path = group_permission_path(realm, group, node);
+        let event = SourceEvent::run_finished(
+            (group, path),
+            (Ulid::from_bytes([60; 16]), Ulid::from_bytes([61; 16])),
+            "succeeded",
+            owner,
+            10,
+        );
+        let mut op = MatchEventsOperation::new(realm);
+        op.autos.push(auto.clone());
+        op.step = MatchStep::Admit(0, Box::new(event));
+        let next = op
+            .next(IoResult::Child(ChildOutcome::new(Ok::<_, AutoError>(
+                AdmitOutcome::ChainDepth,
+            ))))
+            .unwrap();
+        assert!(matches!(next, Next::Call(IoCall::Child(_))));
+        assert!(matches!(op.step, MatchStep::PauseChain(0, _)));
+        let mut paused = auto;
+        paused.lifecycle = Lifecycle::Paused;
+        paused.pause_reason = Some(PauseReason::ChainDepth);
+        let write = op
+            .next(IoResult::Child(ChildOutcome::new(Ok::<_, AutoError>(
+                paused,
+            ))))
+            .unwrap();
+        assert_eq!(op.report.paused, 1);
+        assert_eq!(op.report.kept, 1);
+        assert!(matches!(write, Next::Call(IoCall::Write(rows)) if rows.len() == 2));
     }
 }

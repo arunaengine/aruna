@@ -106,7 +106,7 @@ impl Operation for StartManualOperation {
                 AdmitOutcome::Created(firing) | AdmitOutcome::Existing(firing) => {
                     Ok(Next::Done(firing))
                 }
-                AdmitOutcome::AlreadySeen | AdmitOutcome::Unmatched => {
+                AdmitOutcome::AlreadySeen | AdmitOutcome::Unmatched | AdmitOutcome::ChainDepth => {
                     Err(IoError::Unfinished.into())
                 }
             },
@@ -346,7 +346,9 @@ impl Operation for StartEventsOperation {
                     AdmitOutcome::Created(firing) | AdmitOutcome::Existing(firing) => {
                         self.started.push(firing);
                     }
-                    AdmitOutcome::AlreadySeen | AdmitOutcome::Unmatched => {}
+                    AdmitOutcome::AlreadySeen
+                    | AdmitOutcome::Unmatched
+                    | AdmitOutcome::ChainDepth => {}
                 }
                 self.next_item()
             }

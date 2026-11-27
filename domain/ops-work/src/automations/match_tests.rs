@@ -364,6 +364,77 @@ async fn out_of_order() {
     .unwrap();
     assert_eq!(stale, super::admit::AdmitOutcome::Unmatched);
 
+    // Lowering max_chain_depth in a newer revision returns ChainDepth (not Unmatched) and pauses.
+    let mut lowered_spec = edited.spec.clone();
+    lowered_spec.scope.limits.max_chain_depth = 1;
+    let lowered = drive(
+        ChangeAutoOperation::new(
+            &env.owner,
+            (auto.automation_id, Some(edited.revision)),
+            AutoChange::Update {
+                name: None,
+                description: None,
+                spec: Some(lowered_spec),
+            },
+            env.node,
+        ),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    assert!(lowered.revision > edited.revision);
+    let depth_hit = drive(
+        super::admit::AdmitFiringOp::journal(
+            auto.automation_id,
+            Ulid::from_bytes([85; 16]),
+            "run_finished/depth-hit".into(),
+            edited.revision,
+            Some(env.owner.user_id),
+            TriggerPayload::RunFinished {
+                workflow_id: wf_id,
+                run_id: Ulid::from_bytes([84; 16]),
+                status: aruna_core::automation::record::RunStatus::Succeeded,
+                outputs: Vec::new(),
+                applet_id: Some(applet_id),
+                outside_input: false,
+                depth: 1,
+            },
+        ),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(depth_hit, super::admit::AdmitOutcome::ChainDepth);
+    // Restore higher chain depth for the direct applet run_finished check below.
+    let mut restored_spec = lowered.spec.clone();
+    restored_spec.scope.limits.max_chain_depth = 3;
+    let staged_up = drive(
+        ChangeAutoOperation::new(
+            &env.owner,
+            (auto.automation_id, Some(lowered.revision)),
+            AutoChange::Update {
+                name: None,
+                description: None,
+                spec: Some(restored_spec),
+            },
+            env.node,
+        ),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    drive(
+        ChangeAutoOperation::new(
+            &env.owner,
+            (auto.automation_id, Some(staged_up.revision)),
+            AutoChange::Approve,
+            env.node,
+        ),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+
     // Direct applet workflow run matches applet-filtered run_finished and propagates outside_input.
     let direct_id = Ulid::from_bytes([88; 16]);
     let mut direct_run = env.sample_run(direct_id, wf_id, RunState::Succeeded, None);

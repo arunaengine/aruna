@@ -77,21 +77,40 @@ pub(crate) enum AdmitOutcome {
     Existing(Firing),
     AlreadySeen,
     Unmatched,
+    ChainDepth,
 }
 
-fn matches_payload(auto: &Automation, payload: &TriggerPayload, actor: Option<UserId>) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PayloadMatch {
+    Matched,
+    Unmatched,
+    ChainDepth,
+}
+
+fn match_payload(
+    auto: &Automation,
+    payload: &TriggerPayload,
+    actor: Option<UserId>,
+) -> PayloadMatch {
     if auto.account.is_some() && actor == auto.account {
-        return false;
+        return PayloadMatch::Unmatched;
     }
     match payload {
-        TriggerPayload::Manual { .. } => auto
-            .spec
-            .triggers
-            .iter()
-            .any(|t| matches!(t, Trigger::Manual { .. })),
+        TriggerPayload::Manual { .. } => {
+            if auto
+                .spec
+                .triggers
+                .iter()
+                .any(|t| matches!(t, Trigger::Manual { .. }))
+            {
+                PayloadMatch::Matched
+            } else {
+                PayloadMatch::Unmatched
+            }
+        }
         TriggerPayload::DataUploaded { bucket, key, .. } => {
             let file = key.rsplit('/').next().unwrap_or(key);
-            auto.spec.triggers.iter().any(|trigger| match trigger {
+            let hit = auto.spec.triggers.iter().any(|trigger| match trigger {
                 Trigger::DataUploaded {
                     bucket: tb,
                     prefix,
@@ -102,13 +121,22 @@ fn matches_payload(auto: &Automation, payload: &TriggerPayload, actor: Option<Us
                         && pattern.as_deref().is_none_or(|p| glob_match(p, file))
                 }
                 _ => false,
-            })
+            });
+            match hit {
+                true => PayloadMatch::Matched,
+                false => PayloadMatch::Unmatched,
+            }
         }
-        TriggerPayload::AppletSubmission { applet_id, .. } => auto
-            .spec
-            .triggers
-            .iter()
-            .any(|t| matches!(t, Trigger::AppletSubmission { applet_id: a } if a == applet_id)),
+        TriggerPayload::AppletSubmission { applet_id, .. } => {
+            let hit =
+                auto.spec.triggers.iter().any(
+                    |t| matches!(t, Trigger::AppletSubmission { applet_id: a } if a == applet_id),
+                );
+            match hit {
+                true => PayloadMatch::Matched,
+                false => PayloadMatch::Unmatched,
+            }
+        }
         TriggerPayload::RunFinished {
             workflow_id,
             status,
@@ -116,19 +144,25 @@ fn matches_payload(auto: &Automation, payload: &TriggerPayload, actor: Option<Us
             depth,
             ..
         } => {
-            *depth < auto.spec.scope.limits.max_chain_depth
-                && auto.spec.triggers.iter().any(|t| match t {
-                    Trigger::RunFinished {
-                        workflow_id: w,
-                        status: want_status,
-                        applet_id: want_applet,
-                    } => {
-                        w == workflow_id
-                            && want_status.is_none_or(|s| s == *status)
-                            && want_applet.is_none_or(|a| Some(a) == *applet_id)
-                    }
-                    _ => false,
-                })
+            let hit = auto.spec.triggers.iter().any(|t| match t {
+                Trigger::RunFinished {
+                    workflow_id: w,
+                    status: want_status,
+                    applet_id: want_applet,
+                } => {
+                    w == workflow_id
+                        && want_status.is_none_or(|s| s == *status)
+                        && want_applet.is_none_or(|a| Some(a) == *applet_id)
+                }
+                _ => false,
+            });
+            if !hit {
+                PayloadMatch::Unmatched
+            } else if *depth >= auto.spec.scope.limits.max_chain_depth {
+                PayloadMatch::ChainDepth
+            } else {
+                PayloadMatch::Matched
+            }
         }
     }
 }
@@ -313,10 +347,16 @@ impl Operation for AdmitFiringOp {
                         if values.get(3).and_then(Option::as_ref).is_some() {
                             return Ok(Next::Done(AdmitOutcome::AlreadySeen));
                         }
-                        if auto.revision != *matched_revision
-                            && !matches_payload(&auto, &self.payload, *actor)
-                        {
-                            return Ok(Next::Done(AdmitOutcome::Unmatched));
+                        if auto.revision != *matched_revision {
+                            match match_payload(&auto, &self.payload, *actor) {
+                                PayloadMatch::Matched => {}
+                                PayloadMatch::Unmatched => {
+                                    return Ok(Next::Done(AdmitOutcome::Unmatched));
+                                }
+                                PayloadMatch::ChainDepth => {
+                                    return Ok(Next::Done(AdmitOutcome::ChainDepth));
+                                }
+                            }
                         }
                     }
                     AdmitSource::Replay { .. } => {
