@@ -443,7 +443,8 @@ impl RemoteReadOperation {
             _ => None,
         };
         let reported_version = pin.version;
-        let link_pin = (dir_target.is_none() && is_alias).then_some(pin);
+        // Keep `link_pin` whenever `is_alias` is true; folder Stat returns early if checks exist.
+        let link_pin = is_alias.then_some(pin);
         let node = target.node.unwrap_or(node);
         Self {
             run,
@@ -1702,6 +1703,55 @@ mod tests {
                 }],
             })
         );
+
+        // Trailing-slash standalone link without directory entries still runs LinkAccess on Stat.
+        let slash_sel = InputSelection {
+            source: InputSource::S3 {
+                bucket: "other".into(),
+                key: "slash_real.txt".into(),
+                version_id: Some(real_ver.to_string()),
+            },
+            source_node_id: Some(node(2)),
+            dest_key: "data/slash_link/".into(),
+            mode: InputMode::Snapshot,
+            container_path: None,
+            name: None,
+            description: None,
+        };
+        let mut slash_cap = captured_input(&slash_sel, node(2));
+        slash_cap.version_id = real_ver;
+        let mut slash_run = base_run();
+        slash_run.captured_remote.push(PrecapturedInput {
+            pin_node_id: node(2),
+            pin_bucket: "data".into(),
+            pin_key: "slash_link/".into(),
+            pin_version_id: link_ver,
+            resolved: slash_sel,
+            captured: slash_cap,
+        });
+        let mut slash_denied = RemoteReadOperation::new(
+            slash_run,
+            Target {
+                bucket: "data".into(),
+                key: "slash_link/".into(),
+                version: None,
+                owned: false,
+                node: Some(node(2)),
+            },
+            node(2),
+            DataCall::Stat {
+                address: "s3://data/slash_link/".into(),
+            },
+        );
+        let first = slash_denied.first().unwrap();
+        assert!(format!("{first:?}").contains("LinkAccess"));
+        assert!(format!("{first:?}").contains("slash_link/"));
+        assert!(matches!(
+            slash_denied
+                .next(refused_meta(BaoReadRefusal::ReadDenied))
+                .unwrap(),
+            Next::Done(HostRpcResult::Failed(ContractError::Denied { .. }))
+        ));
     }
 
     // Non-permission holder refusals fail remote directory listings instead of dropping files.
