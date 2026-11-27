@@ -43,6 +43,7 @@ pub(crate) fn metadata_test() -> MetadataTest {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         },
         _storage_dir: storage_dir,
         _metadata_dir: metadata_dir,

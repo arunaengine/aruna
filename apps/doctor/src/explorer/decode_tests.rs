@@ -1084,6 +1084,7 @@ fn decodes_blob_keyspaces() {
             Ulid::from_bytes([4_u8; 16]),
             7,
         )
+        .with_life(Some(Ulid::from_bytes([8_u8; 16])))
         .to_bytes()
         .unwrap();
     let location = BackendLocation {
@@ -1132,9 +1133,31 @@ fn decodes_blob_keyspaces() {
         DecodedValue::CurrentVersionPointer { data } => {
             assert_eq!(data.version_id, Ulid::from_bytes([4_u8; 16]));
             assert_eq!(data.generation, 7);
+            assert_eq!(data.life_id, Some(Ulid::from_bytes([8_u8; 16])));
         }
         other => panic!("expected current version pointer, got {other:?}"),
     }
+    // The watch key of an unpublished name shares the keyspace and decodes as its own kind.
+    let watch = aruna_core::structs::storage::vfs::VfsWatchKey::new("bucket", "new.txt");
+    let token = Ulid::from_bytes([7_u8; 16]);
+    let decoded_watch = decode_entry(
+        BLOB_HEAD_KEYSPACE,
+        &watch.to_bytes().unwrap(),
+        &token.to_bytes(),
+    );
+    assert_eq!(
+        decoded_watch.key,
+        DecodedField::WatchKey {
+            bucket: "bucket".to_string(),
+            key: "new.txt".to_string(),
+        }
+    );
+    assert_eq!(
+        decoded_watch.value,
+        DecodedValue::WatchToken {
+            token: token.to_string()
+        }
+    );
 
     let location_key =
         BlobLocationKey::new([9_u8; 32], EncodingClass::Raw, location.backend.clone());

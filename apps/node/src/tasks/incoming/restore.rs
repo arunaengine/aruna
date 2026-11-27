@@ -214,7 +214,30 @@ pub async fn install_task_queues(
     jobs_runtime: Arc<JobsRuntime>,
     rocrate_limits: RoCrateLimits,
 ) -> TaskQueues {
-    install_task_handler(context, task_handle, jobs_runtime, rocrate_limits, true).await
+    let retention = (TOMBSTONE_RETENTION_MS, STAGE_RETENTION_MS);
+    install_with_retention(
+        context,
+        task_handle,
+        jobs_runtime,
+        rocrate_limits,
+        retention,
+    )
+    .await
+}
+
+/// [`install_task_queues`] with the file server tombstone and retained checkpoint retention, in
+/// milliseconds, that the node settings configure.
+pub async fn install_with_retention(
+    context: Arc<DriverContext>,
+    task_handle: TaskHandle,
+    jobs_runtime: Arc<JobsRuntime>,
+    rocrate_limits: RoCrateLimits,
+    retention: (u64, u64),
+) -> TaskQueues {
+    let handler = OperationsTaskHandler::new(context.clone(), jobs_runtime)
+        .with_rocrate_limits(rocrate_limits)
+        .with_vfs_retention(retention.0, retention.1);
+    install_task_handler(context, task_handle, handler, true).await
 }
 
 /// Test convenience: installs the inbound handler, then restores and starts
@@ -236,15 +259,10 @@ pub async fn start_task_queues(
 async fn install_task_handler(
     context: Arc<DriverContext>,
     task_handle: TaskHandle,
-    jobs_runtime: Arc<JobsRuntime>,
-    rocrate_limits: RoCrateLimits,
+    handler: OperationsTaskHandler,
     refresh_holders: bool,
 ) -> TaskQueues {
-    let handler_context = context.clone();
-    let handler = Arc::new(
-        OperationsTaskHandler::new(handler_context, jobs_runtime.clone())
-            .with_rocrate_limits(rocrate_limits),
-    );
+    let handler = Arc::new(handler);
     task_handle.set_inbound_handler(handler.clone()).await;
     // Prime the origin-side watch interest cache from any digests already in
     // local storage so matching works before the first reconcile.
@@ -401,6 +419,12 @@ impl TaskQueues {
         handler
             .reschedule_timer(TaskKey::DrainCaptures, Duration::ZERO)
             .await;
+        // The file server sweep re-arms itself while handles, cookies or receipts remain.
+        if context.vfs_handle.is_some() {
+            handler
+                .reschedule_timer(TaskKey::SweepNfsTombstones, Duration::ZERO)
+                .await;
+        }
         if context.blob_handle.is_some() {
             let arm = ArmSweepOperation::new(TaskKey::SweepHiddenBlobs);
             if let Err(error) = drive(arm, &context).await {
@@ -574,6 +598,7 @@ mod stop_tests {
             task_handle: Some(task_handle.clone()),
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         });
         let queues = install_task_queues(
             context,

@@ -1,0 +1,17 @@
+# Manifest of aruna-admission, the shared rate limiter and live request admission crate.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+[package]
+name = "aruna-admission"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aruna-core = { workspace = true }
+governor = { workspace = true }
+tokio = { workspace = true }
+ulid = { workspace = true }

@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use aruna_core::effects::{IterEnd, IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::StorageEvent;
-use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, USAGE_PREIMAGE_KEYSPACE};
+use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, NODE_STATS_KEYSPACE, USAGE_PREIMAGE_KEYSPACE};
 use aruna_core::structs::storage::usage::{
     USAGE_COMPLETE_KEY, USAGE_SHADOW_PREFIX, dirty_share_key, usage_shadow_key,
 };
@@ -26,6 +26,7 @@ use super::handle::{
     CleanupEntry, CleanupKind, MAX_CLEANUP_ATTEMPTS, StorageHandle, cleanup_effect, effect_txn_id,
     finish_cleanup, observe_cleanup, storage_effect_mutates,
 };
+use super::heads::{HeadObservers, HeadRows};
 use super::hot_cache::{CacheWriter, HotCache};
 use super::metrics::StorageMetrics;
 use super::preimage::{is_source, kept_cursor, kept_row, kept_value, merge_kept, tagged};
@@ -97,6 +98,7 @@ impl MemoryStore {
             cache: CacheWriter::new(handle.cache.clone()),
             cleanup: handle.transaction_cleanup.clone(),
             metrics: handle.metrics.clone(),
+            heads: handle.heads.clone(),
         }))
     }
 
@@ -154,6 +156,7 @@ struct State {
     cache: CacheWriter,
     cleanup: Arc<Mutex<BTreeMap<Ulid, CleanupEntry>>>,
     metrics: Arc<StorageMetrics>,
+    heads: HeadObservers,
 }
 
 impl State {
@@ -410,7 +413,10 @@ impl State {
             None => {
                 let mut changes = std::mem::take(changes);
                 self.keep_preimages(&mut changes, noted);
+                let heads = HeadRows::of(entries.iter().map(|(space, key)| (space.as_str(), key)));
+                self.drop_watches(&mut changes, &heads, self.rows.sequence);
                 self.commit_rows(changes);
+                self.heads.notify(&heads);
             }
         }
         Ok(entries)
@@ -564,6 +570,15 @@ impl State {
             .iter()
             .map(|(key_space, key)| (key_space.as_str(), key));
         self.keep_preimages(&mut txn.changes, rows);
+        let changed = txn.changes.get(BLOB_HEAD_KEYSPACE).into_iter();
+        let changed = changed.flat_map(|rows| rows.keys());
+        let heads = HeadRows::of(changed.map(|key| (BLOB_HEAD_KEYSPACE, key)));
+        let read = self.drop_watches(&mut txn.changes, &heads, txn.snapshot);
+        let point = |key: ByteView| (Included(key.clone()), Included(key));
+        let read = read
+            .into_iter()
+            .map(|key| (BLOB_HEAD_KEYSPACE.to_string(), point(key)));
+        txn.reads.extend(read);
         if let Err(error) = self.stage_usage(txn_id, &mut txn.changes) {
             // Unlike an unknown commit, a confirmed rollback lets the caller undo work.
             let error = StorageError::RolledBack(Box::new(error));
@@ -580,6 +595,9 @@ impl State {
         self.cache.finish(&cached);
         if config_txn && !conflict {
             self.note_config();
+        }
+        if !conflict {
+            self.heads.notify(&heads);
         }
         if conflict {
             let error = StorageError::TransactionConflict;
@@ -604,6 +622,28 @@ impl State {
             rows.insert(key, Some(ByteView::from(value)));
         }
         Ok(())
+    }
+
+    /// Deletes in `changes` each watch key of `heads` present at `snapshot` and keeps its
+    /// preimage. Answers the watch keys read, which a transaction adds to its reads.
+    fn drop_watches(
+        &self,
+        changes: &mut Changes,
+        heads: &HeadRows,
+        snapshot: u64,
+    ) -> Vec<ByteView> {
+        let keys = heads.watch_keys();
+        let present: Vec<ByteView> = (keys.iter())
+            .filter(|key| self.rows.get(BLOB_HEAD_KEYSPACE, key, snapshot).is_some())
+            .cloned()
+            .collect();
+        if !present.is_empty() {
+            let kept = present.iter().map(|key| (BLOB_HEAD_KEYSPACE, key));
+            self.keep_preimages(changes, kept);
+            let rows = changes.entry(BLOB_HEAD_KEYSPACE.to_string()).or_default();
+            rows.extend(present.into_iter().map(|key| (key, None)));
+        }
+        keys
     }
 
     /// Stages the value each source row had at the last commit, unless a value is kept already.

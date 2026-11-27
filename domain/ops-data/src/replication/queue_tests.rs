@@ -676,6 +676,7 @@ async fn repair_live(storage: &StorageHandle) {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     process_live_obligations(&context)
         .await
@@ -693,6 +694,7 @@ async fn queue_persists_first() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     let result = drive(QueueBlobOperation::new(on_demand_input(), None), &context)
@@ -717,6 +719,7 @@ async fn duplicate_requests_coalesce() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     drive(QueueBlobOperation::new(on_demand_input(), None), &context)
@@ -745,6 +748,7 @@ async fn enqueue_renews_id() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     let queue = || drive(QueueBlobOperation::new(on_demand_input(), None), &context);
     queue().await.expect("first queue succeeds");
@@ -768,6 +772,7 @@ async fn retire_keeps_replaced() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     let retired = BlobJobRecord::new(on_demand_input(), None, 7, Ulid::generate());
     let replaced = BlobJobRecord::new(on_demand_input(), None, 7, Ulid::generate());
@@ -1064,6 +1069,7 @@ async fn retry_preserves_fields() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     let relationship_id = Ulid::from(77u128);
     let mut relationship = relationship(77, 2, None, true);
@@ -1136,6 +1142,7 @@ async fn missing_relationship_skips() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     drive(
         QueueBlobOperation::new_relationship(on_demand_input(), None, Ulid::from(78u128)),
@@ -1165,6 +1172,7 @@ async fn refused_member_retries() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     let mut job = BlobJobRecord::new(on_demand_input(), None, 0, Ulid::generate()).with_member(
         MemberTarget {
@@ -1210,6 +1218,7 @@ async fn denied_job_fails() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     drive(
         QueueBlobOperation::new_relationship(on_demand_input(), None, relationship.id),
@@ -1301,6 +1310,7 @@ async fn success_updates_status() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     drive(
         QueueBlobOperation::new_relationship(
@@ -1376,6 +1386,7 @@ async fn revalidation_keeps_group() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     let relationship = relationship(83, 2, None, true);
@@ -1411,6 +1422,7 @@ async fn deleted_status_skips() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     let stored = store_relationship(&context, relationship(84, 2, None, true))
@@ -1484,6 +1496,7 @@ async fn duplicate_preserves_retry() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     drive(QueueBlobOperation::new(on_demand_input(), None), &context)
@@ -1883,6 +1896,7 @@ async fn relationship_prefix_filters() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     let result = drive(
@@ -1934,6 +1948,7 @@ async fn relationship_delete_filters() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     let result = drive(
@@ -1983,6 +1998,7 @@ async fn advance_filters_targets() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     let advance = reference_advance();
 
@@ -2064,6 +2080,7 @@ async fn live_queue_retry() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     let result = drive(
@@ -2172,6 +2189,7 @@ async fn future_job_pending() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     let result = process_blob_batch(&context)
@@ -2203,6 +2221,7 @@ async fn past_due_settles() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     for _ in 0..2 {
@@ -2426,6 +2445,7 @@ async fn deletes_corrupt_job() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     let result = process_blob_batch(&context)
@@ -2449,6 +2469,7 @@ async fn corrupt_precedes_valid() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     write_corrupt_job(&storage, "000-corrupt-blob-job").await;
     drive(QueueBlobOperation::new(on_demand_input(), None), &context)
@@ -2478,6 +2499,7 @@ async fn deletes_corrupt_obligation() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     let result = process_blob_batch(&context)
@@ -2511,6 +2533,7 @@ async fn deletes_corrupt_obligations() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     let first = process_blob_batch(&context)
@@ -2859,6 +2882,7 @@ async fn denied_standalone_drops() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     drive(QueueBlobOperation::new(on_demand_input(), None), &context)
         .await
@@ -2902,6 +2926,7 @@ async fn failed_drain_retains() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     drive(QueueBlobOperation::new(on_demand_input(), None), &context)
         .await
@@ -2936,6 +2961,7 @@ async fn empty_drain_deletes() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     drive(
         QueueBlobOperation::new(

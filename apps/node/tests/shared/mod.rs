@@ -48,6 +48,7 @@ use aruna_core::structs::storage::node_info::NodeUrls;
 use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::user::id::UserId;
 use aruna_ops_data::s3::access::get::GetAccessOperation;
+use aruna_ops_data::vfs::recovery::ColdStartOperation;
 use aruna_ops_identity::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
 use aruna_ops_identity::placement::policy::reconcile::{SubjectSyncOperation, SubjectTrigger};
 use aruna_ops_identity::placement::policy::subject::SubjectScanMode;
@@ -65,6 +66,7 @@ use aruna_runner::driver::{DriverContext, drive};
 use aruna_scheduler::TaskHandle;
 use aruna_storage::storage::handle::StorageHandle;
 use aruna_storage::storage::worker::FjallStorage;
+use aruna_vfs::{VfsConfig, VfsHandle};
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -179,6 +181,8 @@ pub(crate) struct SeedNode {
     pub(crate) ops_url: String,
     pub(crate) readiness: Readiness,
     pub(crate) s3: Option<S3Endpoint>,
+    /// The file server stage folder of a seed from `spawn_vfs_seed`.
+    pub(crate) vfs_stage: Option<PathBuf>,
     server_task: JoinHandle<()>,
     s3_task: Option<S3ServerHandle>,
     ops_task: JoinHandle<()>,
@@ -691,7 +695,14 @@ pub(crate) async fn spawn_compute_seed(compute: Arc<ExecutorRegistry>) -> TestRe
 /// A full seed in `root` with fixed keys; `reopen` starts it again on the state a process left.
 #[allow(dead_code)]
 pub(crate) async fn spawn_fixed_seed(root: &Path, reopen: bool) -> TestResult<SeedNode> {
-    spawn_seed_at(NodeServiceMode::Full, None, Some((root, reopen)), None).await
+    spawn_seed_at(
+        NodeServiceMode::Full,
+        None,
+        Some((root, reopen)),
+        None,
+        false,
+    )
+    .await
 }
 
 /// Its node id starts with three zero bytes, so a random joiner sorts above it.
@@ -707,7 +718,13 @@ const LOW_SEED_KEY: [u8; 32] = {
 /// A full seed whose node id sorts below a joiner's, so it keeps the database requests.
 #[allow(dead_code)]
 pub(crate) async fn spawn_low_seed() -> TestResult<SeedNode> {
-    spawn_seed_at(NodeServiceMode::Full, None, None, Some(LOW_SEED_KEY)).await
+    spawn_seed_at(NodeServiceMode::Full, None, None, Some(LOW_SEED_KEY), false).await
+}
+
+/// A full seed with file server state: a stage folder, its head observer and a cold start.
+#[allow(dead_code)]
+pub(crate) async fn spawn_vfs_seed() -> TestResult<SeedNode> {
+    spawn_seed_at(NodeServiceMode::Full, None, None, None, true).await
 }
 
 pub(crate) async fn create_onboarding_secret(
@@ -827,7 +844,7 @@ async fn spawn_seed_mode(
     mode: NodeServiceMode,
     compute: Option<Arc<ExecutorRegistry>>,
 ) -> TestResult<SeedNode> {
-    spawn_seed_at(mode, compute, None, None).await
+    spawn_seed_at(mode, compute, None, None, false).await
 }
 
 async fn spawn_seed_at(
@@ -835,6 +852,7 @@ async fn spawn_seed_at(
     compute: Option<Arc<ExecutorRegistry>>,
     fixed: Option<(&Path, bool)>,
     net_key: Option<[u8; 32]>,
+    vfs: bool,
 ) -> TestResult<SeedNode> {
     let temp_dir = fixed.is_none().then(tempfile::tempdir).transpose()?;
     let root = match (fixed, temp_dir.as_ref()) {
@@ -877,12 +895,14 @@ async fn spawn_seed_at(
         Some(_) => NodeVaultKey::derive(&[13; 32]),
         None => NodeVaultKey::random(),
     };
+    let vfs_stage = vfs.then(|| root.join("vfs-stage"));
     let (context, incoming) = initialize_context(
         storage,
         net.clone(),
         full_storage_config.as_ref(),
         compute,
         vault,
+        vfs_stage.clone(),
     )
     .await?;
 
@@ -992,6 +1012,7 @@ async fn spawn_seed_at(
         ops_url,
         readiness,
         s3,
+        vfs_stage,
         server_task,
         s3_task,
         ops_task,
@@ -1038,6 +1059,7 @@ async fn spawn_joiner_mode(
         full_storage_config.as_ref(),
         None,
         NodeVaultKey::random(),
+        None,
     )
     .await?;
     seed.net.add_peer_addr(joiner_net.endpoint_addr()).await;
@@ -1157,8 +1179,12 @@ async fn initialize_context(
     full_storage_config: Option<&FullStorageConfig>,
     compute: Option<Arc<ExecutorRegistry>>,
     vault: NodeVaultKey,
+    vfs_stage: Option<PathBuf>,
 ) -> TestResult<(Arc<DriverContext>, Option<IncomingFixture>)> {
     storage_handle.open_vault(vault);
+    let vfs_handle = vfs_stage
+        .map(|stage_dir| open_vfs(stage_dir, &storage_handle))
+        .transpose()?;
     let task_handle = TaskHandle::new();
     let graph_handle = if let Some(config) = full_storage_config {
         config.ensure_directories()?;
@@ -1196,7 +1222,15 @@ async fn initialize_context(
         task_handle: Some(task_handle.clone()),
         compute_handle: compute,
         outbound_handle: None,
+        vfs_handle,
     });
+    // As at startup, the file servers recover their durable state before any task runs.
+    if context.vfs_handle.is_some() {
+        let report = drive(ColdStartOperation::new(), context.as_ref()).await?;
+        if !report.corrupt.is_empty() {
+            return Err(format!("corrupt file server stages: {:?}", report.corrupt).into());
+        }
+    }
     let incoming = initialize_incoming_fixture(context.clone());
     let shutdown = aruna_scheduler::shutdown::Shutdown::new();
     start_task_queues(
@@ -1207,6 +1241,19 @@ async fn initialize_context(
     )
     .await;
     Ok((context, incoming))
+}
+
+/// Opens the file server state in `stage_dir` and has storage report every head change to it.
+fn open_vfs(stage_dir: PathBuf, storage_handle: &StorageHandle) -> TestResult<VfsHandle> {
+    let vfs = VfsHandle::open(VfsConfig {
+        stage_dir,
+        node_stage_bytes: 1 << 30,
+        group_stage_bytes: 1 << 28,
+    })?;
+    if !storage_handle.install_head_observer(Arc::new(vfs.clone())) {
+        return Err(std::io::Error::other("a head change observer is already installed").into());
+    }
+    Ok(vfs)
 }
 
 async fn announce_realm_presence(

@@ -48,6 +48,7 @@ without giving it to a central service.
 
 - **Web portal**: browse files, edit datasets, manage access and follow compute runs.
 - **S3 interface**: every node speaks [S3](https://docs.aws.amazon.com/AmazonS3/latest/API/Welcome.html), so common tools and workflow systems work as they are.
+- **Native filesystem mounts**: mount buckets, folders and compute workspaces directly as network folders over SMB 3.1.1 (macOS, Windows, Linux) or NFSv4.1 over TLS.
 - **Dataset descriptions**: datasets use [RO-Crate](https://www.researchobject.org/ro-crate/). Profiles check that a description is complete.
 - **Native Git**: every dataset is also a Git repository in the [ARC](https://arc-rdm.org/) layout.
 - **History**: see every version of a dataset, compare versions and merge drafts.
@@ -294,10 +295,11 @@ stays responsible for its own data.
   `FEDERATION_REGISTRY_URL=` (empty) before the first start to opt out.
 
 The [production deployment guide](docs/deployment.md) covers release pinning, Docker Compose with
-Native HTTPS or a reverse proxy, DNS and firewall ports (REST, S3 and P2P QUIC), OIDC identity
-providers, storage backends, automated backups and upgrades. The
-[operations guide](docs/operations.md) covers day-to-day configuration, restore, encrypted buckets,
-your own storage, NFS settings, the registry and trust between nodes in detail.
+Native HTTPS or a reverse proxy, DNS and firewall ports (REST, S3, P2P QUIC and optional SMB/NFS),
+OIDC identity providers, storage backends, native SMB/NFS mounts, automated backups and upgrades.
+The [operations guide](docs/operations.md) covers day-to-day configuration, restore, encrypted
+buckets, your own storage, local/NFS imports, native SMB/NFS mounts, the registry and trust between
+nodes in detail.
 
 ## Learn more
 

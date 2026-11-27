@@ -44,6 +44,7 @@ use aruna_core::structs::storage::multipart::{
     MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary, MultipartPart,
     MultipartPartKey, MultipartUpload,
 };
+use aruna_core::structs::storage::vfs::{VfsWatchKey, decode_token};
 use aruna_ops_identity::placement::policy::cache::PolicyCacheEntry;
 use aruna_ops_work::jobs::lifecycle::witness::arm::{WitnessDeadline, WitnessExplain};
 use chrono::{DateTime, Utc};
@@ -207,9 +208,7 @@ fn decode_key(keyspace_name: &str, key: &[u8]) -> DecodedField {
             .map(|value| DecodedField::MultipartObjectKey { value })
             .unwrap_or_else(|_| raw_field(key)),
         DHT_KEYSPACE => decode_dht_key(key),
-        BLOB_HEAD_KEYSPACE => BlobHeadKey::from_bytes(key)
-            .map(|value| DecodedField::BlobHeadKey { value })
-            .unwrap_or_else(|_| raw_field(key)),
+        BLOB_HEAD_KEYSPACE => decode_head_key(key),
         PATHS_INDEX_KEYSPACE => HashIndex::from_bytes(key)
             .map(|value| DecodedField::HashIndex { value })
             .unwrap_or_else(|_| raw_field(key)),
@@ -249,6 +248,11 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
         S3_BUCKET_KEYSPACE => decode_value_with(value, BucketInfo::from_bytes, |data| {
             DecodedValue::BucketInfo { data }
         }),
+        BLOB_HEAD_KEYSPACE if VfsWatchKey::is_watch_key(key) => {
+            decode_value_with(value, decode_token, |token| DecodedValue::WatchToken {
+                token: token.to_string(),
+            })
+        }
         BLOB_HEAD_KEYSPACE => decode_value_with(value, CurrentVersionPointer::from_bytes, |data| {
             DecodedValue::CurrentVersionPointer { data }
         }),
@@ -604,6 +608,21 @@ fn decode_object_metadata(key: &[u8], value: &[u8]) -> DecodedValue {
         }
         Err(error) => raw_value(value, Some(error.to_string())),
     }
+}
+
+/// A head keyspace key: an ordinary head, or the watch key of an unpublished name.
+fn decode_head_key(key: &[u8]) -> DecodedField {
+    if VfsWatchKey::is_watch_key(key) {
+        return VfsWatchKey::from_bytes(key)
+            .map(|value| DecodedField::WatchKey {
+                bucket: value.bucket,
+                key: value.key,
+            })
+            .unwrap_or_else(|_| raw_field(key));
+    }
+    BlobHeadKey::from_bytes(key)
+        .map(|value| DecodedField::BlobHeadKey { value })
+        .unwrap_or_else(|_| raw_field(key))
 }
 
 fn decode_value_with<T, E>(

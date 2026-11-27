@@ -343,6 +343,7 @@ mod tests {
                 task_handle: None,
                 compute_handle: None,
                 outbound_handle: None,
+                vfs_handle: None,
             },
             bucket: "bucket".to_string(),
             key: "key".to_string(),

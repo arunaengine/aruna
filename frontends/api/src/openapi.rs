@@ -52,6 +52,7 @@ Native Git/LFS also accepts HTTP Basic with an Aruna bearer token as the passwor
         (name = "data/staging", description = "Staging source objects into buckets, inline or as background jobs"),
         (name = "data/storage", description = "Tenant-registered write backends on a group's own object storage"),
         (name = "data/sync", description = "S3 bucket synchronization"),
+        (name = "data/nfs", description = "NFS host enrollment, mount bindings and retained stage recovery"),
         (name = "compute/admin", description = "Realm-admin administration of compute links, quotas, pressure and drain"),
         (name = "data/connectors", description = "External source connector registration"),
         (name = "access/audit", description = "Retained administrative audit rows"),

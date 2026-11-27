@@ -322,6 +322,7 @@ async fn bad_config_degrades() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     // A failed config read must not unbind the cursor from its plan.
     let bound = ShardRestoreCursor {

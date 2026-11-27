@@ -135,6 +135,9 @@ use aruna_ops_data::s3::usage::SNAPSHOT_PUBLISH_DEBOUNCE;
 use aruna_ops_data::staging::native_source::{NativeAnswer, NativeAnswerOperation};
 use aruna_ops_data::transfer::sharding::maintain_retry;
 use aruna_ops_data::usage_publish::PublishUsageOperation;
+use aruna_ops_data::vfs::recovery::{
+    SweepTombstonesOperation, TOMBSTONE_SWEEP_AFTER, TOMBSTONE_SWEEP_RETRY,
+};
 use aruna_ops_identity::shard::incoming::{ManifestAnswer, ServeManifestOperation};
 
 /// The operation of one timer run. Its output is when the timer runs again and what it keeps;
@@ -150,6 +153,7 @@ pub enum TimerOperation {
     RealmPresence(PresenceTimerOperation),
     MigrateCompression(ProcessMigrationsOperation),
     SweepHiddenBlobs(ProcessHiddenOperation),
+    SweepNfsTombstones(SweepTombstonesOperation),
     PruneConnectorReferences(PruneReferencesOperation),
     DeliverKeyWakes(DeliverWakesOperation),
     DrainCleanupQueue(CleanupTimerOperation),
@@ -217,6 +221,11 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
         TaskKey::SweepHiddenBlobs => Some(TimerOperation::SweepHiddenBlobs(
             ProcessHiddenOperation::new(input.now_ms),
         )),
+        TaskKey::SweepNfsTombstones => {
+            let sweep = SweepTombstonesOperation::new(input.now_ms, input.memory.cursor.clone())
+                .with_retention(input.tombstone_retention_ms, input.stage_retention_ms);
+            Some(TimerOperation::SweepNfsTombstones(sweep))
+        }
         TaskKey::PruneConnectorReferences => Some(TimerOperation::PruneConnectorReferences(
             PruneReferencesOperation::new(),
         )),
@@ -403,6 +412,7 @@ macro_rules! each_timer {
             TimerOperation::RealmPresence($operation) => $body,
             TimerOperation::MigrateCompression($operation) => $body,
             TimerOperation::SweepHiddenBlobs($operation) => $body,
+            TimerOperation::SweepNfsTombstones($operation) => $body,
             TimerOperation::PruneConnectorReferences($operation) => $body,
             TimerOperation::DeliverKeyWakes($operation) => $body,
             TimerOperation::DrainCleanupQueue($operation) => $body,
@@ -643,6 +653,35 @@ impl TimerRun for ProcessHiddenOperation {
             false => HIDDEN_SWEEP_AFTER,
         };
         Ok(TimerPlan::from(Some(after)))
+    }
+}
+
+impl TimerRun for SweepTombstonesOperation {
+    /// A page that left more rows runs again at once with its cursor; a finished pass waits,
+    /// shorter after due quota retries, which go to the shell.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let outcome = result.map_err(|error| TimerFailure {
+            retry_after: TOMBSTONE_SWEEP_RETRY,
+            reason: error.to_string(),
+        })?;
+        let after = match (outcome.next.is_some(), outcome.due.is_empty()) {
+            (true, _) => Duration::ZERO,
+            (false, false) => TOMBSTONE_SWEEP_RETRY,
+            (false, true) => TOMBSTONE_SWEEP_AFTER,
+        };
+        let handoff = match outcome.due.is_empty() {
+            true => TimerHandoff::Nothing,
+            false => TimerHandoff::RetryVfsStages(outcome.due),
+        };
+        let memory = TimerMemory {
+            cursor: outcome.next,
+            ..TimerMemory::default()
+        };
+        Ok(TimerPlan {
+            after: Some(after),
+            memory,
+            handoff,
+        })
     }
 }
 
@@ -1373,6 +1412,7 @@ mod tests {
     use aruna_ops_data::s3::object::metadata::ReferenceRefreshError;
     use aruna_ops_data::s3::object::metadata_drain::ReferenceDrainResult;
     use aruna_ops_data::usage_publish::{PublishedUsage, UsagePublishError};
+    use aruna_ops_data::vfs::recovery::SweepOutcome;
     use ulid::Ulid;
 
     fn input() -> TimerInput {
@@ -1468,6 +1508,22 @@ mod tests {
         assert_eq!(clean.after, Some(HIDDEN_SWEEP_AFTER));
         let failed = ProcessHiddenOperation::rearm(Err(MigrationError::failed("boom")));
         assert_eq!(failed.unwrap_err().retry_after, HIDDEN_SWEEP_RETRY);
+    }
+
+    #[test]
+    fn sweep_hands_retries() {
+        // Due quota retries go to the shell and bring the next pass closer; none hands nothing.
+        let scope = aruna_core::structs::storage::vfs::BucketScope::new("bucket", 7);
+        let due = SweepOutcome {
+            due: vec![(scope.clone(), 3)],
+            ..SweepOutcome::default()
+        };
+        let plan = SweepTombstonesOperation::rearm(Ok(due)).unwrap();
+        assert_eq!(plan.handoff, TimerHandoff::RetryVfsStages(vec![(scope, 3)]));
+        assert_eq!(plan.after, Some(TOMBSTONE_SWEEP_RETRY));
+        let idle = SweepTombstonesOperation::rearm(Ok(SweepOutcome::default())).unwrap();
+        assert_eq!(idle.handoff, TimerHandoff::Nothing);
+        assert_eq!(idle.after, Some(TOMBSTONE_SWEEP_AFTER));
     }
 
     #[test]

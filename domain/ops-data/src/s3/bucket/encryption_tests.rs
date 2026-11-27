@@ -14,6 +14,7 @@ use aruna_core::structs::storage::encryption::public_key_of;
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::multipart::MultipartUpload;
 use aruna_core::vault_format::key_fingerprint;
+use aruna_core::vfs_effects::{VfsEffect, VfsEvent, VfsFailure};
 use std::time::SystemTime;
 use ulid::Ulid;
 
@@ -91,15 +92,48 @@ fn bucket() -> BucketInfo {
     aruna_test_harness::s3::bucket_info(Ulid::from_bytes([3; 16]), user(1))
 }
 
+fn fence_id() -> Ulid {
+    Ulid::from_bytes([6; 16])
+}
+
+fn vfs(event: VfsEvent) -> IoResult {
+    IoResult::Event(Box::new(Event::Vfs(Box::new(event))))
+}
+
+/// Starts the operation; a `vault_locked` change first reads incarnation 7 outside its
+/// transaction and holds the file server fence of that scope before the authority read.
+fn opened(operation: &mut EnableEncryptionOperation) -> Turn {
+    let turn = operation.first();
+    if operation.input.mode != EncryptionMode::VaultLocked {
+        return turn;
+    }
+    assert_eq!(operation.state, EnableState::ReadCreation);
+    let creation = Value::from(7u128.to_be_bytes().to_vec());
+    let turn = operation.next(row(Some(creation)));
+    let scope = aruna_core::structs::storage::vfs::BucketScope::new("bucket", 7);
+    let fence = Effect::Vfs(Box::new(VfsEffect::FenceVault { scope }));
+    assert_eq!(asked(&turn), &fence);
+    operation.next(vfs(VfsEvent::VaultFenced {
+        fence_id: fence_id(),
+    }))
+}
+
 /// Runs the operation up to the generated key, with no uploads and no stored settings.
 fn generated(operation: &mut EnableEncryptionOperation) -> (Turn, [u8; 32]) {
     assert_eq!(operation.transaction(), TransactionMode::Write);
-    operation.first().unwrap();
+    opened(operation).unwrap();
     let values = authority_rows(&bucket(), None, &[user(2)]);
     operation.next(keyed_rows(values)).unwrap();
     no_versions(operation).unwrap();
     operation.next(page(Vec::new(), None)).unwrap();
-    let effects = no_versions(operation);
+    let mut effects = no_versions(operation);
+    // A `vault_locked` change first finds no file server stage of the bucket.
+    if operation.input.mode == EncryptionMode::VaultLocked {
+        assert_eq!(operation.state, EnableState::ReadIncarnation);
+        let creation = Value::from(7u128.to_be_bytes().to_vec());
+        operation.next(row(Some(creation))).unwrap();
+        effects = no_versions(operation);
+    }
     assert_eq!(
         asked(&effects),
         &Effect::blob(BlobEffect::GenerateBucketKey)
@@ -217,7 +251,8 @@ fn locked_needs_recovery() {
         copies: sealed(&effects),
     }));
     assert_eq!(effects, Err(EnableError::RecoveryUnmet));
-    assert!(operation.abort().is_empty());
+    // A refusal before the commit opens the file server fence again.
+    assert_eq!(operation.abort(), vec![release_call(fence_id(), false)]);
     assert!(operation.private_key.is_none());
 
     let lookups = BTreeMap::from([
@@ -235,6 +270,115 @@ fn locked_needs_recovery() {
     // A vault-locked bucket keeps no node copy.
     let record = BucketKeyRecord::from_bytes(&writes[1].2).unwrap();
     assert_eq!(record.vault_entry, None);
+}
+
+#[test]
+fn locked_refuses_stages() {
+    use aruna_core::keyspaces::{BUCKET_CREATION_KEYSPACE, NFS_STATE_KEYSPACE};
+    use aruna_core::structs::storage::vfs::{BucketScope, STAGE_TAG, VfsKey};
+    // Any live or retained stage of this bucket incarnation refuses `vault_locked`.
+    let lookups = || BTreeMap::from([(user(1), keys(user(1), true))]);
+    let staged = |rows: Vec<(Key, Value)>| {
+        let input = input(EncryptionMode::VaultLocked, lookups());
+        let mut operation = EnableEncryptionOperation::new(input);
+        opened(&mut operation).unwrap();
+        let values = authority_rows(&bucket(), None, &[user(2)]);
+        operation.next(keyed_rows(values)).unwrap();
+        no_versions(&mut operation).unwrap();
+        operation.next(page(Vec::new(), None)).unwrap();
+        let turn = no_versions(&mut operation);
+        let Ok(Next::Call(IoCall::Read(reads))) = &turn else {
+            panic!("expected the creation read, got {turn:?}");
+        };
+        assert_eq!(reads[0].0, BUCKET_CREATION_KEYSPACE);
+        let creation = Value::from(7u128.to_be_bytes().to_vec());
+        let turn = operation.next(row(Some(creation)));
+        let Ok(Next::Call(IoCall::Page { space, prefix, .. })) = &turn else {
+            panic!("expected the stage page, got {turn:?}");
+        };
+        assert_eq!(space, NFS_STATE_KEYSPACE);
+        let scope = BucketScope::new("bucket", 7);
+        let expected = VfsKey::scope_prefix(STAGE_TAG, &scope).unwrap();
+        assert_eq!(prefix.as_ref(), expected.as_slice());
+        operation.next(page(rows, None))
+    };
+    let scope = BucketScope::new("bucket", 7);
+    for key in [
+        VfsKey::LiveStage(scope.clone(), 4),
+        VfsKey::RetainedStage(scope, Ulid::from_bytes([9; 16])),
+    ] {
+        let row = (Key::from(key.to_bytes().unwrap()), Value::from(Vec::new()));
+        assert_eq!(staged(vec![row]).err(), Some(EnableError::PlainStages));
+    }
+    let free = staged(Vec::new());
+    assert_eq!(asked(&free), &Effect::blob(BlobEffect::GenerateBucketKey));
+}
+
+#[test]
+fn locked_fence_releases() {
+    // A confirmed commit opens the fence after the commit, with the transition wake.
+    let lookups = BTreeMap::from([(user(1), keys(user(1), true))]);
+    let mut operation = EnableEncryptionOperation::new(input(EncryptionMode::VaultLocked, lookups));
+    let (effects, _) = generated(&mut operation);
+    let effects = operation.next(blob(BlobEvent::CopiesSealed {
+        copies: sealed(&effects),
+    }));
+    assert!(matches!(effects, Ok(Next::Call(IoCall::Write(_)))));
+    let Ok(Next::Then { calls, .. }) = operation.next(IoResult::Done) else {
+        panic!("expected the outcome with its calls after the commit");
+    };
+    assert_eq!(calls.last(), Some(&release_call(fence_id(), false)));
+    // An unknown commit outcome keeps the fence closed; a refused commit opens it.
+    assert_eq!(operation.abort(), vec![release_call(fence_id(), true)]);
+
+    let lookups = BTreeMap::from([(user(1), keys(user(1), true))]);
+    let mut operation = EnableEncryptionOperation::new(input(EncryptionMode::VaultLocked, lookups));
+    let (effects, _) = generated(&mut operation);
+    let copies = sealed(&effects);
+    operation
+        .next(blob(BlobEvent::CopiesSealed { copies }))
+        .unwrap();
+    operation.next(IoResult::Done).unwrap();
+    operation.rolled_back();
+    assert_eq!(operation.abort(), vec![release_call(fence_id(), false)]);
+}
+
+#[test]
+fn locked_fence_refused() {
+    // Open plaintext work refuses the change before its transaction; a node without file
+    // servers needs no fence.
+    let lookups = || BTreeMap::from([(user(1), keys(user(1), true))]);
+    let mut operation =
+        EnableEncryptionOperation::new(input(EncryptionMode::VaultLocked, lookups()));
+    operation.first().unwrap();
+    operation.next(row(None)).unwrap();
+    let refused = VfsEvent::Failed(VfsFailure::VaultFenced("bucket".to_string()));
+    assert_eq!(operation.next(vfs(refused)), Err(EnableError::PlainStages));
+    assert!(operation.abort().is_empty());
+
+    let mut operation =
+        EnableEncryptionOperation::new(input(EncryptionMode::VaultLocked, lookups()));
+    operation.first().unwrap();
+    operation.next(row(None)).unwrap();
+    let turn = operation.next(vfs(VfsEvent::Failed(VfsFailure::Unconfigured)));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
+    assert_eq!(operation.state, EnableState::ReadBucket);
+}
+
+#[test]
+fn locked_fence_incarnation() {
+    // A bucket recreated after the fence is another incarnation; the change is refused.
+    let lookups = BTreeMap::from([(user(1), keys(user(1), true))]);
+    let mut operation = EnableEncryptionOperation::new(input(EncryptionMode::VaultLocked, lookups));
+    opened(&mut operation).unwrap();
+    let values = authority_rows(&bucket(), None, &[user(2)]);
+    operation.next(keyed_rows(values)).unwrap();
+    no_versions(&mut operation).unwrap();
+    operation.next(page(Vec::new(), None)).unwrap();
+    no_versions(&mut operation).unwrap();
+    let creation = Value::from(8u128.to_be_bytes().to_vec());
+    let turn = operation.next(row(Some(creation)));
+    assert_eq!(turn, Err(EnableError::PlainStages));
 }
 
 /// Starts the operation and answers the bucket read with `settings` and the link scan with no

@@ -12,4 +12,5 @@ pub mod install_access;
 pub mod permission_rules;
 pub mod request_authorization;
 pub mod revoke_token;
+pub mod scope;
 pub mod token_subject;

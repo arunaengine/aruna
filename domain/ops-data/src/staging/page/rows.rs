@@ -468,13 +468,9 @@ pub fn page_rows(
             }
             EntryPlan::Register => {
                 let epoch = guards.epochs.get(index).copied().unwrap_or_default();
-                let (rows, change, root) = register_rows(
-                    input,
-                    guards,
-                    (entry, epoch),
-                    head.as_ref(),
-                    mint.mint(now_ms),
-                )?;
+                let ids = (mint.mint(now_ms), mint.mint(now_ms));
+                let (rows, change, root) =
+                    register_rows(input, guards, (entry, epoch), head.as_ref(), ids)?;
                 writes.extend(rows);
                 roots.extend(root);
                 inventory.extend(change);
@@ -536,7 +532,7 @@ fn register_rows(
     guards: &PageGuards,
     (entry, epoch): (&PageEntry, OriginalEpoch),
     head: Option<&CurrentVersionPointer>,
-    fresh: Ulid,
+    (fresh, life_id): (Ulid, Ulid),
 ) -> Result<EntryRows, PageImportError> {
     let connector = &input.connector;
     let mut binding = build_source_binding(
@@ -562,7 +558,7 @@ fn register_rows(
     .with_metadata(entry.metadata.clone().into_iter().collect())
     .with_policies(guards.policies.clone())?;
     let version_key = VersionKey::new(&input.bucket, &entry.target_key, version_id);
-    let pointer = CurrentVersionPointer::next_for(head, version_id)?;
+    let pointer = CurrentVersionPointer::next_live_inherit(head, version_id, life_id)?;
     let pointer = stamp_head(pointer, guards.binding.as_ref(), epoch);
     let version = stamp_version(version, guards.binding.as_ref(), pointer.generation, epoch);
     let added = AddedVersion {

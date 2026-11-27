@@ -226,6 +226,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         (temp_dir, context)
     }

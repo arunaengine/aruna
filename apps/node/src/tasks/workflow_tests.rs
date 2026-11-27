@@ -1085,6 +1085,7 @@ async fn net_context(storage: StorageHandle) -> (Arc<DriverContext>, aruna_p2p::
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     (context, net)
 }
@@ -1834,6 +1835,7 @@ fn defaults_task_walltime() {
             vault_env: BTreeMap::new(),
             staging: StagingMode::Files,
             workspace: None,
+            nfs_mounts: Default::default(),
         },
         NOBODY,
     );
@@ -1862,6 +1864,7 @@ fn carries_backend_identity() {
             vault_env: BTreeMap::new(),
             staging: StagingMode::Files,
             workspace: None,
+            nfs_mounts: Default::default(),
         },
         run_as,
     );
@@ -1886,6 +1889,7 @@ fn carries_network_access() {
             vault_env: BTreeMap::new(),
             staging: StagingMode::Files,
             workspace: None,
+            nfs_mounts: Default::default(),
         },
         NOBODY,
     );
@@ -1972,6 +1976,7 @@ fn compute_context(storage: StorageHandle) -> Arc<DriverContext> {
         task_handle: Some(TaskHandle::new()),
         compute_handle: Some(Arc::new(registry)),
         outbound_handle: None,
+        vfs_handle: None,
     })
 }
 

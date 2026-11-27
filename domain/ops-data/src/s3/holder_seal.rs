@@ -231,6 +231,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         let (realm_id, node_id) = (RealmId::from_bytes([1; 32]), net.node_id());
         let creator = UserId::new(Ulid::from_bytes([5; 16]), realm_id);

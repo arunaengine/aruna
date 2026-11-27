@@ -1343,6 +1343,7 @@ mod tests {
                 task_handle: None,
                 compute_handle: None,
                 outbound_handle: None,
+                vfs_handle: None,
             }),
             auth: AuthContext {
                 user_id,

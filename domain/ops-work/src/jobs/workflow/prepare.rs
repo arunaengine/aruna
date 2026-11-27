@@ -11,19 +11,22 @@ use aruna_core::compute::effect::{BackendFacts, ComputeAnswer, ComputeEffect, Wo
 use aruna_core::compute::quota::JobReservationRecord;
 use aruna_core::compute::runtimes::SESSION_SOCKET_PATH;
 use aruna_core::compute::{
-    AttemptRef, ExecutorKind, NetworkAccess, ResourceRequest, S3Mount, Secret, SecurityContext,
-    StagingMode, TaskInput, TaskSpec, UserSpec, WorkspaceBinding,
+    AttemptRef, ExecutorKind, NetworkAccess, NfsBindings, NfsShareConfig, ResourceRequest, S3Mount,
+    Secret, SecurityContext, StagingMode, TaskInput, TaskSpec, UserSpec, WorkspaceBinding,
 };
 use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::operation::Operation;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::structs::execution::job::family::JobFamilyId;
+use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::execution::job::input::{
     ExecutionSpec, PLUGIN_REPORT_TAG, WORKFLOW_RUN_TAG, WORKFLOW_SECRETS_TAG,
     parse_workflow_secrets, tagged,
 };
 use aruna_core::structs::execution::job::local::{JobError, JobRecord, WorkspaceMode};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::storage::vfs::{BucketScope, NfsMountBinding, NfsMountTarget};
+use aruna_core::vfs_effects::VfsProtocol;
 
 use super::DEFAULT_WALLTIME;
 use super::compute::{compute_answer, compute_call};
@@ -39,7 +42,10 @@ use crate::jobs::lifecycle::held::HeldReservations;
 use crate::jobs::lifecycle::screen::{AdmitTask, ScreenError, ScreenTask};
 use crate::jobs::route::JobRouteError;
 use aruna_core::job_request::session_of;
+use aruna_ops_data::vfs::admin::MountInput;
+use aruna_ops_data::vfs::{BucketScopeOperation, CreateMountOperation, VfsAccessContext, VfsError};
 use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use ulid::Ulid;
 
 pub const NETWORK_TAG_KEY: &str = "aruna-engine.org/network";
 /// Set to `files` so a run never mounts its inputs, and so never gets an input credential.
@@ -56,6 +62,8 @@ pub struct PreparedTask {
     /// Set for a session or a batch run inside its bucket: the bucket and endpoint its
     /// credential reaches.
     pub workspace: Option<WorkspaceBinding>,
+    /// The attempt's own bindings on its backend's NFS worker-pool host.
+    pub nfs_mounts: NfsBindings,
 }
 
 /// The bucket a run works inside, empty when it owns none.
@@ -73,6 +81,32 @@ fn insert_mount_secrets(
     secrets.insert("secret_access_key".to_string(), Secret::new(secret));
 }
 
+/// A binding the host or storage may still take later retries; a refused one fails the job.
+fn share_error(error: VfsError) -> JobError {
+    let message = format!("the attempt's NFS binding failed: {error}");
+    match error {
+        VfsError::Conflict | VfsError::Unavailable(_) | VfsError::Storage(_) | VfsError::Vfs(_) => {
+            JobError::retryable(message)
+        }
+        _ => JobError::permanent(message),
+    }
+}
+
+/// The binding id of one attempt's share on `host_id`, the same for every preparation of
+/// that attempt, so a retried volume names the binding the first preparation created.
+fn binding_id(host_id: Ulid, job_id: JobId, attempt: u32, session: bool) -> Ulid {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"aruna-worker-nfs-mount-v1");
+    hasher.update(&host_id.to_bytes());
+    hasher.update(&job_id.to_bytes());
+    hasher.update(&attempt.to_be_bytes());
+    let role: &[u8] = if session { b"session" } else { b"input" };
+    hasher.update(role);
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    Ulid::from_bytes(id)
+}
+
 #[derive(Debug, PartialEq)]
 enum PrepareStep {
     Access,
@@ -87,6 +121,9 @@ enum PrepareStep {
     InputCredential,
     SessionCredential { view: bool },
     VaultSecrets,
+    InputShare,
+    SessionScope,
+    SessionShare,
 }
 
 type PrepareNext = Result<Next<PreparedTask>, JobError>;
@@ -99,11 +136,17 @@ pub struct PrepareAttemptOperation {
     run: RunIdentity,
     spec: Arc<ExecutionSpec>,
     record: Arc<JobRecord>,
+    /// The attempt number its task spec carries, which names its NFS bindings.
+    attempt: u32,
     bucket: String,
     encryption_key: Option<CredentialEncryptionKey>,
     /// A first preparation also authorizes the bucket of an `Existing`-mode run.
     check_workspace: bool,
     facts: Option<BackendFacts>,
+    /// The NFS host of the selected backend and the user its workers run as.
+    nfs: Option<(NfsShareConfig, UserSpec)>,
+    /// The minted key the attempt's NFS bindings are admitted under.
+    share_key: String,
     address: WorkspaceAddress,
     entries: Vec<ViewEntry>,
     prepared: Option<PreparedTask>,
@@ -119,20 +162,30 @@ impl PrepareAttemptOperation {
         encryption_key: Option<CredentialEncryptionKey>,
         check_workspace: bool,
     ) -> Self {
+        let attempt = record.attempts;
         Self {
             run,
             spec,
             record,
+            attempt,
             bucket: bucket.to_string(),
             encryption_key,
             check_workspace,
             facts: None,
+            nfs: None,
+            share_key: String::new(),
             address: WorkspaceAddress::default(),
             entries: Vec::new(),
             prepared: None,
             now_ms: 0,
             step: PrepareStep::Access,
         }
+    }
+
+    /// Prepares the attempt `attempt` instead of the record's current attempt count.
+    pub fn with_attempt(mut self, attempt: u32) -> Self {
+        self.attempt = attempt;
+        self
     }
 
     fn call(&mut self, step: PrepareStep, call: IoCall) -> PrepareNext {
@@ -240,6 +293,7 @@ impl PrepareAttemptOperation {
                 false => StagingMode::S3Mount,
             },
             workspace: None,
+            nfs_mounts: NfsBindings::default(),
         });
         if empty {
             return self.after_mounts();
@@ -306,6 +360,7 @@ impl PrepareAttemptOperation {
     }
 
     fn session_minted(&mut self, credential: WorkspaceCredential, view: bool) -> PrepareNext {
+        self.share_key = credential.access_key.clone();
         let endpoint = self.endpoint().unwrap_or_default();
         let region = self.address.region.clone();
         let bucket_name = self.bucket.clone();
@@ -329,7 +384,88 @@ impl PrepareAttemptOperation {
             bucket_name,
             region,
         });
+        self.bind_shares()
+    }
+
+    /// Binds the attempt's own exports on its backend's NFS worker-pool host, the input view
+    /// first. Each binding names the attempt's key, so its terminal cleanup removes it.
+    fn bind_shares(&mut self) -> PrepareNext {
+        let (Some((share, _)), Some(prepared)) = (self.nfs, self.prepared.as_ref()) else {
+            return self.finish();
+        };
+        let bound = &prepared.nfs_mounts;
+        if share.inputs && !prepared.mounts.is_empty() && bound.input.is_none() {
+            let job_id = self.run.job_id;
+            let create = self.share_mount(NfsMountTarget::JobInputView { job_id })?;
+            return self.call(PrepareStep::InputShare, IoCall::child(create));
+        }
+        let mounted = session_of(&self.spec).is_some_and(|session| session.mount.is_some());
+        if share.sessions && mounted && bound.session.is_none() {
+            let scope = BucketScopeOperation::new(self.bucket.clone());
+            return self.call(PrepareStep::SessionScope, IoCall::child(scope));
+        }
         self.finish()
+    }
+
+    /// A worker-pool binding of `target` under the attempt's key, shown as the run's user: the
+    /// job input view read-only, the session's folder writable by that user alone.
+    fn share_mount(&self, target: NfsMountTarget) -> Result<CreateMountOperation, JobError> {
+        let (share, run_as) = self.nfs.ok_or(JobError::retryable(
+            "the attempt preparation lost its NFS host",
+        ))?;
+        let job_id = match &target {
+            NfsMountTarget::JobInputView { job_id } => Some(*job_id),
+            NfsMountTarget::Bucket { .. } | NfsMountTarget::Folder { .. } => None,
+        };
+        let read_only = job_id.is_some();
+        let (bucket, prefix) = match read_only {
+            true => (String::new(), None),
+            false => (self.bucket.clone(), self.session_prefix()),
+        };
+        let context = VfsAccessContext {
+            realm_id: self.run.realm_id,
+            node_id: self.run.node_id,
+            access_key: self.share_key.clone(),
+            protocol: VfsProtocol::Nfs,
+            target,
+            read_only,
+            now_ms: self.now_ms,
+        };
+        let input = MountInput {
+            context,
+            caller: self.run.user_id,
+            host_id: share.host_id,
+            group_id: self.run.group_id,
+            bucket,
+            prefix,
+            job_id,
+            read_only,
+            allowed_networks: Vec::new(),
+            display_uid: run_as.uid,
+            display_gid: run_as.gid,
+            mode: if read_only { 0o555 } else { 0o700 },
+        };
+        let mount_id = binding_id(share.host_id, self.run.job_id, self.attempt, !read_only);
+        let create = CreateMountOperation::new(input).for_worker_pool();
+        Ok(create.with_mount_id(mount_id))
+    }
+
+    /// The session's folder in its bucket, `None` when it mounts the whole bucket.
+    fn session_prefix(&self) -> Option<String> {
+        let mount = session_of(&self.spec).and_then(|session| session.mount)?;
+        (!mount.prefix.trim_matches('/').is_empty()).then_some(mount.prefix)
+    }
+
+    fn share_bound(&mut self, binding: NfsMountBinding, session: bool) -> PrepareNext {
+        let prepared = self.prepared.as_mut().ok_or(JobError::retryable(
+            "the attempt preparation lost its inputs",
+        ))?;
+        let mount_id = Some(binding.mount_id.to_string());
+        match session {
+            true => prepared.nfs_mounts.session = mount_id,
+            false => prepared.nfs_mounts.input = mount_id,
+        }
+        self.bind_shares()
     }
 
     fn finish(&mut self) -> PrepareNext {
@@ -420,6 +556,8 @@ impl Operation for PrepareAttemptOperation {
                     return self.read_endpoint(None);
                 };
                 let name = facts.name.clone();
+                // The selected backend runs the attempt, so its NFS host serves the bindings.
+                self.nfs = facts.nfs_share.map(|share| (share, facts.run_as));
                 // Mounts and sessions follow a backend the run is pinned to.
                 if self.spec.backend.is_some() || self.spec.executor_constraint.is_some() {
                     self.facts = Some(facts);
@@ -444,11 +582,12 @@ impl Operation for PrepareAttemptOperation {
             }
             PrepareStep::InputCredential => {
                 let credential = result.child::<WorkspaceCredential, JobError>()??;
+                self.share_key = credential.access_key.clone();
                 if let Some(prepared) = self.prepared.as_mut() {
                     let (access_key, secret) = (credential.access_key, credential.secret);
                     insert_mount_secrets(&mut prepared.secrets, access_key, secret);
                 }
-                self.finish()
+                self.bind_shares()
             }
             PrepareStep::SessionCredential { view } => {
                 let credential = result.child::<WorkspaceCredential, JobError>()??;
@@ -461,6 +600,23 @@ impl Operation for PrepareAttemptOperation {
                 })?;
                 prepared.vault_env = released;
                 Ok(Next::Done(prepared))
+            }
+            PrepareStep::InputShare => {
+                let binding = result.child::<NfsMountBinding, VfsError>()?;
+                self.share_bound(binding.map_err(share_error)?, false)
+            }
+            PrepareStep::SessionScope => {
+                let scope = result
+                    .child::<BucketScope, VfsError>()?
+                    .map_err(share_error)?;
+                let target = NfsMountTarget::for_bucket(&scope.bucket, scope.incarnation)
+                    .map_err(|error| JobError::permanent(error.to_string()))?;
+                let create = self.share_mount(target)?;
+                self.call(PrepareStep::SessionShare, IoCall::child(create))
+            }
+            PrepareStep::SessionShare => {
+                let binding = result.child::<NfsMountBinding, VfsError>()?;
+                self.share_bound(binding.map_err(share_error)?, true)
             }
         }
     }
@@ -480,6 +636,7 @@ pub fn build_task_spec(
         vault_env,
         staging,
         workspace,
+        nfs_mounts,
     } = prepared;
     let resources = ResourceRequest {
         cpu_cores: spec.resources.cpu_cores,
@@ -528,6 +685,7 @@ pub fn build_task_spec(
         log_limits: Default::default(),
         session: session.is_some(),
         session_mount: session.and_then(|session| session.mount),
+        nfs_mounts,
         inputs,
         s3_mounts: mounts,
         staging_mode: staging,

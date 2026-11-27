@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::egress::EgressGuard;
+use crate::folder_sync::FolderSync;
 use crate::local_fs::LocalFsBuilder;
 use crate::walk::{Child, Step, Walk, walk_after, walk_page};
 use aruna_core::errors::{BlobError, StagingSourceError};
@@ -73,9 +74,10 @@ pub(crate) fn init_operator(
             build_service::<services::S3>(s3_operator_config(config), context)
                 .map_err(blob_creation_error)
         }
-        Backend::FileSystem => {
-            build_service::<services::Fs>(config, None).map_err(blob_creation_error)
-        }
+        // The service syncs written files but not their folders; the layer adds that.
+        Backend::FileSystem => build_service::<services::Fs>(config, None)
+            .map(|operator| operator.layer(FolderSync))
+            .map_err(blob_creation_error),
         Backend::Group(kind) => {
             build_group_service(kind, config, guard).map_err(blob_creation_error)
         }

@@ -613,6 +613,9 @@ pub const SHARE_EVENT_KEYSPACE: &str = "share_events";
 pub const SHARE_USE_KEYSPACE: &str = "share_uses";
 /// Upload names claimed by running share uploads, by bucket and key, with the claim's end.
 pub const SHARE_NAME_KEYSPACE: &str = "share_upload_names";
+/// Node-local state of the embedded file servers: boot and id counters, hosts, mounts, handles,
+/// cookies, stages and transaction receipts. Never replicated; S3 requests never write it.
+pub const NFS_STATE_KEYSPACE: &str = "nfs_state";
 
 /// Workflows of the registry by workflow id, with their group, visibility and version count.
 pub const WORKFLOW_KEYSPACE: &str = "workflows";
@@ -968,6 +971,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     RUN_IDEMPOTENCY_KEYSPACE,
     WORKFLOW_CACHE_KEYSPACE,
     WORKFLOW_CRATE_KEYSPACE,
+    NFS_STATE_KEYSPACE,
 ];
 
 /// Smallest key strictly greater than every key starting with `prefix`,

@@ -82,6 +82,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(storage::bucket::metadata::router())
         .merge(storage::releases::router())
         .merge(storage::moves::router())
+        .merge(storage::nfs::router())
         .merge(storage::rename::router())
         .merge(storage::checks::router())
         .merge(storage::encryption::router())
@@ -382,6 +383,21 @@ pub(crate) mod tests {
         ("GET", "/data/buckets/{bucket}/abe/grants"),
         ("POST", "/data/buckets/{bucket}/abe/epoch"),
         ("POST", "/data/buckets/{bucket}/abe/rekey"),
+        ("POST", "/data/nfs/hosts"),
+        ("GET", "/data/nfs/hosts"),
+        ("GET", "/data/nfs/hosts/{host_id}"),
+        ("PUT", "/data/nfs/hosts/{host_id}"),
+        ("DELETE", "/data/nfs/hosts/{host_id}"),
+        ("POST", "/data/nfs/mounts"),
+        ("GET", "/data/nfs/mounts"),
+        ("GET", "/data/nfs/mounts/{mount_id}"),
+        ("DELETE", "/data/nfs/mounts/{mount_id}"),
+        ("GET", "/data/buckets/{bucket}/nfs/stages"),
+        (
+            "POST",
+            "/data/buckets/{bucket}/nfs/stages/{stage_id}/publish",
+        ),
+        ("DELETE", "/data/buckets/{bucket}/nfs/stages/{stage_id}"),
         ("GET", "/data/blobs/envelope"),
         ("GET", "/data/blobs/content"),
         ("GET", "/data/blobs/locations"),

@@ -40,6 +40,7 @@ fn facts(
         local_site: caps.local_site,
         worker_location: caps.worker_site.map(|site| site.location),
         run_as: backend.run_identity(),
+        nfs_share: caps.nfs_share,
     }
 }
 

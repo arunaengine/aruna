@@ -119,7 +119,8 @@ impl RecoverSubmitOperation {
             &scope.bucket,
             scope.wiring.encryption_key.clone(),
             false,
-        );
+        )
+        .with_attempt(scope.fence.attempt.attempt);
         self.call(RecoverStep::Prepare, IoCall::child(prepare))
     }
 

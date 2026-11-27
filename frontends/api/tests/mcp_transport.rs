@@ -122,6 +122,7 @@ async fn setup_fixture() -> Fixture {
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let realm_key = SigningKey::from_bytes(&[31u8; 32]);
     let realm_id = RealmId::from_bytes(realm_key.verifying_key().to_bytes());

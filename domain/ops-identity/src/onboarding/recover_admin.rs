@@ -307,6 +307,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
 
         let old_id = Ulid::generate();

@@ -49,6 +49,7 @@ async fn user_node() -> (tempfile::TempDir, Arc<ServerState>, AuthContext) {
                 task_handle: Some(TaskHandle::new()),
                 compute_handle: None,
                 outbound_handle: None,
+                vfs_handle: None,
             }),
             realm_id,
             node_id,

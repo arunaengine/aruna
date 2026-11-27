@@ -176,6 +176,7 @@ impl FjallStorage {
         self.txn_rows.remove(&txn_id);
         self.usage_views.remove(&txn_id);
         self.config_txns.remove(&txn_id);
+        self.txn_heads.remove(&txn_id);
         self.cache.take(txn_id);
         // A read still running in the transaction drops the last handle, which rolls it back.
         match self.txns.remove(&txn_id) {
@@ -194,6 +195,7 @@ impl FjallStorage {
         }
 
         let config_txn = self.config_txns.remove(&txn_id);
+        let heads = self.txn_heads.remove(&txn_id).unwrap_or_default();
         let cached = self.cache.take(txn_id);
         self.usage_views.remove(&txn_id);
         let rows = self.txn_rows.remove(&txn_id).unwrap_or_default();
@@ -212,7 +214,8 @@ impl FjallStorage {
                     };
                 };
                 let rows = rows.iter().map(|(space, key)| (space.as_str(), key));
-                let staged = self.keep_preimages(&mut txn, rows);
+                let staged = (self.keep_preimages(&mut txn, rows))
+                    .and_then(|()| self.drop_watches(&mut txn, &heads));
                 if let Err(error) = staged.and_then(|()| self.stage_usage(txn_id, &mut txn)) {
                     self.take_txn_deletes(txn_id, false);
                     txn.rollback();
@@ -227,6 +230,9 @@ impl FjallStorage {
                 // An unknown outcome may still have committed.
                 if config_txn && !matches!(committed, Ok(Err(_))) {
                     self.note_config_change();
+                }
+                if !matches!(committed, Ok(Err(_))) {
+                    self.heads.notify(&heads);
                 }
                 match committed {
                     Ok(Ok(())) => {

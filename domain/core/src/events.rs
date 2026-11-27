@@ -70,6 +70,8 @@ pub enum Event {
     Git(Box<crate::git::GitAnswer>),
     /// Answers `Effect::Workflow`; never persisted.
     Workflow(Box<crate::workflow::WorkflowAnswer>),
+    /// Answers `Effect::Vfs`; never persisted.
+    Vfs(Box<crate::vfs_effects::VfsEvent>),
 }
 
 impl Event {
@@ -1248,6 +1250,7 @@ impl Event {
             Event::Job(_) => "Event::Job",
             Event::Git(_) => "Event::Git",
             Event::Workflow(_) => "Event::Workflow",
+            Event::Vfs(_) => "Event::Vfs",
             Event::Plugin(_) => "Event::Plugin",
             Event::Index(event) => variant_label!(
                 event,

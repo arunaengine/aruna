@@ -364,10 +364,13 @@ fn fence_refuses_replay() {
     let mut child = parent.publish_child();
     let version_id = child.version_id.unwrap();
 
-    // Both transactions find the receipt free, so both record their version id.
-    let turn = child.write_cleanup_row();
+    // Both transactions find the receipt free before the head moves, then record their id.
+    let turn = child.object_lookup_read(None);
     assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
+    assert_eq!(child.state, PutObjectState::RowGuards);
     let turn = child.next(values(vec![None]));
+    assert_eq!(written(&turn)[0].0, BLOB_HEAD_KEYSPACE);
+    let turn = child.write_cleanup_row();
     assert_eq!(written(&turn)[0].2.as_ref(), version_id.to_bytes());
     // The reconcile row follows in the same transaction.
     let turn = child.next(IoResult::Done);
@@ -375,7 +378,7 @@ fn fence_refuses_replay() {
 
     // The rerun reads the guard again and finds the other pull's receipt.
     let mut rerun = parent.publish_child();
-    rerun.write_cleanup_row().unwrap();
+    rerun.object_lookup_read(None).unwrap();
     let winner: Value = Ulid::generate().to_bytes().to_vec().into();
     let turn = rerun.next(values(vec![Some(winner)]));
     assert_eq!(turn.err(), Some(PutObjectError::FenceTaken));
@@ -385,6 +388,290 @@ fn fence_refuses_replay() {
         .next(published(Err(PutObjectError::FenceTaken)))
         .unwrap_err();
     assert_rolls_back(&parent.abort(), &location);
+}
+
+#[test]
+fn fence_rows_follow() {
+    // Fence rows and deletes run after the version rows, in the same transaction.
+    let space = "nfs_state".to_string();
+    let (marker, watch): (Key, Key) = (b"m".to_vec().into(), b"w".to_vec().into());
+    let fence = RowFence::new(Vec::new(), Vec::new())
+        .with_writes(vec![(
+            space.clone(),
+            marker.clone(),
+            Value::from(Vec::new()),
+        )])
+        .with_deletes(vec![(space.clone(), watch.clone())]);
+    let operation = PutObjectOperation::new(config()).with_row_fence(fence);
+    let mut child = publisher(operation, hashed(test_location(UserId::default())));
+    let turn = child.object_lookup_read(None);
+    assert_eq!(written(&turn).last().unwrap().0, BLOB_HEAD_KEYSPACE);
+    let turn = child.write_cleanup_row();
+    assert_eq!(written(&turn)[0].1, marker);
+    let Ok(Next::Call(IoCall::Delete(deletes))) = child.next(IoResult::Done) else {
+        panic!("the fence deletes follow its writes");
+    };
+    assert_eq!(deletes, [(space, watch)]);
+    let turn = child.next(IoResult::Done);
+    assert_eq!(written(&turn)[0].0, BLOB_CLEANUP_KEYSPACE);
+}
+
+#[test]
+fn life_fences_write() {
+    // The life the caller saw must still be the head's; `None` expects no live object.
+    let life = Ulid::from_bytes([3; 16]);
+    let head = CurrentVersionPointer::new(Ulid::from_bytes([2; 16])).with_life(Some(life));
+    let marker = CurrentVersionPointer::new(Ulid::from_bytes([4; 16]));
+    let lookup = |expected: Option<Ulid>, head: Option<&CurrentVersionPointer>| {
+        let operation = PutObjectOperation::new(config()).with_expected_life(expected);
+        let mut child = publisher(operation, hashed(test_location(UserId::default())));
+        let row = head.map(|head| Value::from(head.to_bytes().unwrap()));
+        child.object_lookup_read(row).err()
+    };
+    assert_eq!(lookup(Some(life), Some(&head)), None);
+    assert_eq!(lookup(None, None), None);
+    assert_eq!(lookup(None, Some(&marker)), None);
+    let changed = Some(PutObjectError::HeadChanged);
+    assert_eq!(lookup(Some(life), Some(&marker)), changed);
+    assert_eq!(lookup(Some(life), None), changed);
+    assert_eq!(lookup(None, Some(&head)), changed);
+    let other = head.clone().with_life(Some(Ulid::from_bytes([5; 16])));
+    assert_eq!(lookup(Some(life), Some(&other)), changed);
+}
+
+/// A fixed id for the joint publish tests.
+fn fixed(seed: u8) -> Ulid {
+    Ulid::from_parts(1_000 + u64::from(seed), u128::from(seed))
+}
+
+fn pointer_row(version: u8, life: Option<u8>) -> Value {
+    let pointer = CurrentVersionPointer::new(fixed(version)).with_life(life.map(fixed));
+    pointer.to_bytes().unwrap().into()
+}
+
+#[test]
+fn life_names_head() {
+    // A given life starts a new object and replaces another life; a live head of it continues.
+    let head = |existing: Option<Value>| {
+        let operation = PutObjectOperation::new(config()).with_life(fixed(9));
+        let mut child = publisher(operation, hashed(test_location(UserId::default())));
+        child.output = child.written_location.clone();
+        child.new_blob = true;
+        let turn = child.object_lookup_read(existing.clone());
+        let turn = match existing {
+            Some(_) => child.liveness_read(None),
+            None => turn,
+        };
+        let (_, _, row) = written(&turn).last().unwrap().clone();
+        CurrentVersionPointer::from_bytes(row.as_ref())
+            .unwrap()
+            .life_id
+    };
+    assert_eq!(head(None), Some(fixed(9)));
+    assert_eq!(head(Some(pointer_row(2, None))), Some(fixed(9)));
+    assert_eq!(head(Some(pointer_row(2, Some(3)))), Some(fixed(9)));
+}
+
+fn source_delete() -> SourceDelete {
+    SourceDelete {
+        key: "old.txt".to_string(),
+        expected_life: Some(fixed(3)),
+        expected_version: Some(fixed(2)),
+        deleted_by: UserId::default(),
+        marker_version: fixed(8),
+    }
+}
+
+fn source_version() -> Value {
+    let version = BlobVersion::materialized(
+        [7u8; 32],
+        BackendRef::node_default(),
+        StoredFormat::default().encoding(),
+        std::time::SystemTime::UNIX_EPOCH,
+        UserId::default(),
+        None,
+    );
+    version.to_bytes().unwrap().into()
+}
+
+/// The version transaction of a put that also deletes `source`, read up to its source head.
+fn joint(source: SourceDelete) -> (PutObjectOperation, Turn) {
+    let operation = PutObjectOperation::new(config()).with_source_delete(source);
+    let mut child = publisher(operation, hashed(test_location(UserId::default())));
+    child.output = child.written_location.clone();
+    child.new_blob = true;
+    let turn = child.object_lookup_read(None);
+    (child, turn)
+}
+
+#[test]
+fn source_delete_joins() {
+    // The destination version and the source's delete marker commit in one transaction.
+    let (mut child, turn) = joint(source_delete());
+    assert_eq!(
+        read_spaces(&turn),
+        [
+            PURGE_FENCE_KEYSPACE,
+            BLOB_HEAD_KEYSPACE,
+            aruna_core::keyspaces::BUCKET_CREATION_KEYSPACE
+        ]
+    );
+    let turn = child.next(values(vec![None, Some(pointer_row(2, Some(3))), None]));
+    assert_eq!(read_spaces(&turn), [BLOB_VERSIONS_KEYSPACE]);
+    let turn = child.next(values(vec![Some(source_version())]));
+    assert_eq!(written(&turn).last().unwrap().0, BLOB_HEAD_KEYSPACE);
+    // After the destination's rows, the source's marker rows follow in the same transaction.
+    let turn = child.write_cleanup_row();
+    let rows = written(&turn).to_vec();
+    let spaces: Vec<_> = rows.iter().map(|(space, ..)| space.as_str()).collect();
+    assert_eq!(
+        spaces[..2],
+        [BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE],
+        "marker head and version"
+    );
+    assert!(spaces.contains(&DELETE_TRAIL_KEYSPACE));
+    let head = CurrentVersionPointer::from_bytes(rows[0].2.as_ref()).unwrap();
+    assert_eq!((head.version_id, head.life_id), (fixed(8), None));
+    let marker = BlobVersion::from_bytes(rows[1].2.as_ref()).unwrap();
+    assert!(marker.is_deleted());
+    // The source's counters change in the transaction, then the cleanup row commits.
+    let turn = child.next(IoResult::Done);
+    assert!(matches!(turn, Ok(Next::Call(IoCall::AddUsage { .. }))));
+    child.next(IoResult::Done).unwrap();
+    let turn = child.next(IoResult::Done);
+    assert_eq!(written(&turn)[0].0, BLOB_CLEANUP_KEYSPACE);
+}
+
+#[test]
+fn source_change_aborts() {
+    // Another life, another version or no live source refuses the destination too.
+    let refused = |head: Option<Value>| {
+        let (mut child, _) = joint(source_delete());
+        child.next(values(vec![None, head, None])).err()
+    };
+    let changed = Some(PutObjectError::HeadChanged);
+    assert_eq!(refused(Some(pointer_row(2, Some(4)))), changed);
+    assert_eq!(refused(Some(pointer_row(5, Some(3)))), changed);
+    assert_eq!(refused(Some(pointer_row(2, None))), changed);
+    assert_eq!(refused(None), changed);
+    // A head whose version row is a marker is no live source either.
+    let (mut child, _) = joint(source_delete());
+    child
+        .next(values(vec![None, Some(pointer_row(2, Some(3))), None]))
+        .unwrap();
+    let deleted = BlobVersion::deleted(std::time::SystemTime::UNIX_EPOCH, UserId::default());
+    let deleted = Some(Value::from(deleted.to_bytes().unwrap()));
+    assert_eq!(child.next(values(vec![deleted])).err(), changed);
+}
+
+#[test]
+fn range_guard_hosted() {
+    // A live head below a guarded range refuses the version before any row is written.
+    let range = RangeGuard {
+        key_space: BLOB_HEAD_KEYSPACE.to_string(),
+        prefix: b"mybucket/d/".to_vec().into(),
+        exclude_key: None,
+    };
+    let fence = RowFence::new(Vec::new(), Vec::new()).with_range_guards(vec![range]);
+    let operation = PutObjectOperation::new(config()).with_row_fence(fence);
+    let location = hashed(test_location(UserId::default()));
+    let mut child = publisher(operation, location.clone());
+    let turn = child.object_lookup_read(None);
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Page { .. }))));
+    let live = (Key::from(b"mybucket/d/x".to_vec()), pointer_row(2, Some(3)));
+    let page = IoResult::Page {
+        rows: vec![live],
+        next: None,
+    };
+    assert_eq!(child.next(page).err(), Some(PutObjectError::FenceTaken));
+    let operation = PutObjectOperation::new(config()).with_row_fence(
+        RowFence::new(Vec::new(), Vec::new()).with_range_guards(vec![RangeGuard {
+            key_space: BLOB_HEAD_KEYSPACE.to_string(),
+            prefix: b"mybucket/d/".to_vec().into(),
+            exclude_key: None,
+        }]),
+    );
+    let mut child = publisher(operation, location);
+    child.output = child.written_location.clone();
+    child.new_blob = true;
+    child.object_lookup_read(None).unwrap();
+    let marker = (Key::from(b"mybucket/d/y".to_vec()), pointer_row(2, None));
+    let page = IoResult::Page {
+        rows: vec![marker],
+        next: None,
+    };
+    assert_eq!(
+        written(&child.next(page)).last().unwrap().0,
+        BLOB_HEAD_KEYSPACE
+    );
+}
+
+fn parent_marker() -> ParentMarker {
+    ParentMarker {
+        key: "d/".to_string(),
+        version_id: fixed(10),
+        life_id: fixed(11),
+        owner: UserId::default(),
+    }
+}
+
+#[test]
+fn marker_written_first() {
+    // The marker's empty bytes are written before the version transaction starts.
+    let mut parent = PutObjectOperation::new(config()).with_parent_marker(parent_marker());
+    parent.written_location = Some(hashed(test_location(UserId::default())));
+    let turn = parent.start_publish();
+    let Effect::Blob(write) = asked(&turn) else {
+        panic!("the marker bytes are written first");
+    };
+    assert!(matches!(
+        write.as_ref(),
+        BlobEffect::Write { key, size: Some(0), .. } if key == "d/"
+    ));
+    let marker = hashed(test_location(UserId::default()));
+    let finished = Event::Blob(Box::new(BlobEvent::WriteFinished {
+        location: marker.clone(),
+    }));
+    let turn = parent.next(event(finished));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    // A refused publish rolls back both written blobs.
+    parent.state = PutObjectState::Error;
+    let calls = parent.abort();
+    assert!(calls.contains(&IoCall::child(RollbackWrite::new(marker))));
+}
+
+#[test]
+fn marker_joins_publish() {
+    // A missing marker commits with the version; a live one is left alone.
+    let marker = hashed(test_location(UserId::default()));
+    let child = |marker: &BackendLocation| {
+        let operation = PutObjectOperation::new(config()).with_parent_marker(parent_marker());
+        let mut child = publisher(operation, hashed(test_location(UserId::default())));
+        child.marker_location = Some(marker.clone());
+        child.marker_read = true;
+        child
+    };
+    let mut created = child(&marker);
+    let turn = created.marker_rows_read(vec![Some(pointer_row(2, None)), None]);
+    let rows = written(&turn);
+    let head = rows
+        .iter()
+        .find(|(space, key, _)| space == BLOB_HEAD_KEYSPACE && key.as_ref() == b"mybucket/d/");
+    let head = CurrentVersionPointer::from_bytes(head.unwrap().2.as_ref()).unwrap();
+    assert_eq!(
+        (head.version_id, head.life_id),
+        (fixed(10), Some(fixed(11)))
+    );
+    assert_eq!(
+        rows[0].0, BLOB_LOCATIONS_KEYSPACE,
+        "the new bytes get their row"
+    );
+    let turn = created.next(IoResult::Done);
+    assert!(matches!(turn, Ok(Next::Call(IoCall::AddUsage { .. }))));
+    let mut kept = child(&marker);
+    let turn = kept.marker_rows_read(vec![Some(pointer_row(2, Some(4))), None]);
+    assert_eq!(written(&turn)[0].0, BLOB_CLEANUP_KEYSPACE);
+    assert!(kept.marker_skipped);
 }
 
 #[test]
@@ -556,6 +843,7 @@ pub async fn test_put_object() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     // Jesus, Take the Wheel!
     let result = drive(put_operation, &context).await.unwrap();
@@ -812,6 +1100,7 @@ pub async fn deduplicates_blob() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     let data = b"hello, world!";
@@ -996,6 +1285,7 @@ async fn setup_two_backends(temp_root: &str) -> (DriverContext, String, String) 
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         },
         hot_root,
         cold_root,
@@ -1277,6 +1567,7 @@ pub async fn overwrite_retains_index() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     let realm_id = RealmId::from_bytes([1u8; 32]);
@@ -1462,6 +1753,7 @@ async fn mismatch_cleans_blob() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     let data = b"hello, world!";
@@ -2002,6 +2294,20 @@ mod sealed {
         assert_eq!((plan.epoch, &plan.parameters), (1, &parameters));
         let seal = SealPlan::capture(&settings(), &record()).unwrap();
         assert_eq!(resolved.encryption, seal);
+    }
+
+    #[test]
+    fn preassigned_keeps_envelope() {
+        // A file server's own version id still gets the envelope; other preassigned ids skip it.
+        let reached = |preserve: bool| {
+            let mut op = operation().with_preserve_envelope(preserve);
+            op.config.preassigned_version_id = Some(Ulid::from_bytes([7; 16]));
+            op.seal_settings = Some(settings());
+            let turn = op.seal_key_read(Some(record().to_bytes().unwrap().into()));
+            (op.state, turn.is_ok())
+        };
+        assert_eq!(reached(true), (PutObjectState::ReadAbe, true));
+        assert_ne!(reached(false).0, PutObjectState::ReadAbe);
     }
 
     #[test]
@@ -2768,6 +3074,7 @@ async fn fjall_context(root: &Path) -> DriverContext {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     }
 }
 

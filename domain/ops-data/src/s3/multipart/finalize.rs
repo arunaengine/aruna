@@ -240,7 +240,8 @@ impl CompleteUploadOperation {
         existing: Option<&CurrentVersionPointer>,
         version_id: Ulid,
     ) -> Turn {
-        let pointer = CurrentVersionPointer::next_for(existing, version_id)?;
+        let life_id = self.ids.mint(self.now_ms);
+        let pointer = CurrentVersionPointer::next_live_inherit(existing, version_id, life_id)?;
         let pointer = stamp_head(pointer, self.binding.as_ref(), self.version_epoch);
         let alias_context = self.alias_context()?;
         let row = (

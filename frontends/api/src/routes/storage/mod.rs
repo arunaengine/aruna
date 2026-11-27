@@ -1,5 +1,5 @@
 //! Groups the storage routes: blobs, bucket usage, compression, connectors, backends, imports,
-//! routing and deletion.
+//! routing, deletion and NFS administration.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -17,6 +17,7 @@ pub mod encryption;
 pub mod group_backends;
 pub mod imports;
 pub mod moves;
+pub mod nfs;
 pub mod objects;
 pub mod organize;
 pub mod origin;

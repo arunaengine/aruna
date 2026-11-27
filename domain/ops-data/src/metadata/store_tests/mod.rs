@@ -38,6 +38,7 @@ fn graph_context(storage: StorageHandle, graph: GraphHandle) -> DriverContext {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     }
 }
 

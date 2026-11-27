@@ -16,6 +16,7 @@ use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::execution::job::local::JobRecord;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::routing::NodeRouting;
+use aruna_core::structs::storage::vfs::BucketScope;
 use aruna_core::task::TaskKey;
 use aruna_ops_identity::sync::outbox::batches::OutboxLimits;
 use aruna_ops_identity::sync::outbox::cleanup::Publication;
@@ -24,6 +25,7 @@ use thiserror::Error;
 
 use crate::replication::catch_up::CatchUpCursors;
 use crate::transfer::sharding::MaintainCursors;
+use crate::vfs::{STAGE_RETENTION_MS, TOMBSTONE_RETENTION_MS};
 
 /// What a timer keeps on this node between its runs, in memory only: its attempts since the last
 /// clean run and where its work goes on. The shell stores it per key and hands it back unread, so
@@ -59,6 +61,8 @@ pub enum TimerHandoff {
         claimed: Vec<JobRecord>,
         lost_attempts: Vec<JobRecord>,
     },
+    /// The file server sweep found these writerless checkpoints due for a quota retry.
+    RetryVfsStages(Vec<(BucketScope, u64)>),
 }
 
 /// Retry steps after which a timer's retry ladder stops doubling.
@@ -141,6 +145,10 @@ pub struct TimerInput {
     pub jobs_started: bool,
     pub in_process_slots: usize,
     pub external_slots: usize,
+    /// How long file server handle tombstones and cookie positions stay readable.
+    pub tombstone_retention_ms: u64,
+    /// How long a retained file server checkpoint stays recoverable.
+    pub stage_retention_ms: u64,
 }
 
 /// Which costly inputs a timer reads; the shell builds only these, since most runs never look
@@ -209,6 +217,8 @@ impl TimerInput {
             jobs_started: false,
             in_process_slots: 0,
             external_slots: 0,
+            tombstone_retention_ms: TOMBSTONE_RETENTION_MS,
+            stage_retention_ms: STAGE_RETENTION_MS,
         }
     }
 }

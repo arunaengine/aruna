@@ -24,6 +24,7 @@ use aruna_core::structs::storage::blob::{
     VersionKey, object_permission_path,
 };
 use aruna_core::structs::storage::replication::W3idIdentifier;
+use aruna_core::structs::storage::vfs::VfsWatchKey;
 use aruna_core::types::{GroupId, Key, Value};
 
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
@@ -648,7 +649,8 @@ impl ScanBatchOperation {
     /// through their range indexes, so the scan skips them.
     fn learn_buckets(&mut self, values: Vec<(Key, Value)>) -> BatchTurn {
         let mut names = Vec::new();
-        for (key, _) in &values {
+        // An unprefixed scan also meets the watch keys of unpublished names.
+        for (key, _) in values.iter().filter(|(key, _)| !is_watch_key(key)) {
             let head = BlobHeadKey::from_bytes(key.as_ref())?;
             if !self.distributed.contains_key(&head.bucket) && !names.contains(&head.bucket) {
                 names.push(head.bucket);
@@ -670,7 +672,7 @@ impl ScanBatchOperation {
     fn take_heads(&mut self, values: Vec<(Key, Value)>) -> BatchTurn {
         let input = &self.input;
         let mut heads = Vec::new();
-        for (key, value) in values {
+        for (key, value) in values.into_iter().filter(|(key, _)| !is_watch_key(key)) {
             let head = BlobHeadKey::from_bytes(key.as_ref())?;
             if self.distributed.get(&head.bucket) == Some(&true) {
                 // "{bucket}0" is the first head key after every key of the bucket.
@@ -703,6 +705,11 @@ impl ScanBatchOperation {
             })),
         }
     }
+}
+
+/// Whether a head keyspace key is the watch key of an unpublished name rather than a head.
+fn is_watch_key(key: &Key) -> bool {
+    VfsWatchKey::is_watch_key(key)
 }
 
 impl Operation for ScanBatchOperation {
@@ -955,6 +962,7 @@ mod tests {
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDocument};
     use aruna_core::structs::storage::blob::{BackendRef, BlobLocationKey};
+    use aruna_core::structs::storage::vfs::encode_token;
     use aruna_core::user::id::UserId;
     use aruna_storage::storage;
     use byteview::ByteView;
@@ -1012,6 +1020,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         let realm_id = RealmId::from_bytes([3u8; 32]);
         let node_id = iroh::SecretKey::from_bytes(&[4u8; 32]).public();
@@ -1320,6 +1329,35 @@ mod tests {
 
         assert_eq!(page.hits.len(), 1);
         assert_eq!(page.hits[0].hit.key, "state-live");
+    }
+
+    #[tokio::test]
+    async fn watch_keys_skipped() {
+        let fixture = setup().await;
+        seed_materialized(&fixture, "visible", "watch-live", UNIX_EPOCH, 9).await;
+        // An unpublished name's watch key sorts before every head of a realm-wide scan.
+        let watch = VfsWatchKey::new("visible", "watch-new");
+        let token = encode_token(Ulid::from_bytes([3u8; 16])).to_vec();
+        write_value(
+            &fixture.context,
+            BLOB_HEAD_KEYSPACE,
+            watch.to_bytes().unwrap(),
+            token,
+        )
+        .await;
+        let owner = AuthContext {
+            user_id: fixture.owner,
+            realm_id: fixture.realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+
+        let page = search_local_objects(&fixture.context, input(&fixture, owner, "watch-", 10))
+            .await
+            .unwrap();
+
+        assert_eq!(page.hits.len(), 1);
+        assert_eq!(page.hits[0].hit.key, "watch-live");
     }
 
     #[tokio::test]

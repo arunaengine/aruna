@@ -186,13 +186,18 @@ fn fence_refuses_marker() {
             vec![(space.clone(), receipt.clone())],
         );
         operation.version_id = Some(marker);
-        operation.write_delete_audit().unwrap();
+        operation.state = DeleteObjectState::ReadCurrentLookup;
+        operation.pending_version_id = Some(marker);
+        // The guard is read before the marker moves the head.
+        let turn = operation.next(read(None));
+        assert_eq!(operation.state, DeleteObjectState::RowGuards);
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
         operation
     };
     let mut free = fenced();
-    let turn = free.next(IoResult::Done);
-    assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
-    let written = call(free.next(read(None)));
+    assert_eq!(self::space(&free.next(read(None))), BLOB_HEAD_KEYSPACE);
+    free.write_delete_audit().unwrap();
+    let written = call(free.next(IoResult::Done));
     let IoCall::Write(writes) = &written else {
         panic!("expected the receipt write, got {written:?}")
     };
@@ -200,7 +205,6 @@ fn fence_refuses_marker() {
     assert!(matches!(free.next(IoResult::Done), Ok(Next::Then { .. })));
 
     let mut taken = fenced();
-    taken.next(IoResult::Done).unwrap();
     let winner: aruna_core::types::Value = Ulid::generate().to_bytes().to_vec().into();
     assert_eq!(
         taken.next(read(Some(winner))).err(),
@@ -554,10 +558,13 @@ fn rewrites_current_pointer() {
         panic!("expected only the head row, got {rows:?}");
     };
     assert_eq!(key_space, BLOB_HEAD_KEYSPACE);
+    let head = CurrentVersionPointer::from_bytes(value.as_ref()).unwrap();
     assert_eq!(
-        CurrentVersionPointer::from_bytes(value.as_ref()).unwrap(),
+        head,
         CurrentVersionPointer::new_with_generation(fallback_version_id, 21)
     );
+    // The surviving version is a marker, so the head carries no live object identity.
+    assert_eq!(head.life_id, None);
 }
 
 #[test]
@@ -661,6 +668,7 @@ async fn missing_version_rejected() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     let result = drive(
@@ -715,6 +723,7 @@ async fn creates_tombstone() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     let user_id =
@@ -869,6 +878,7 @@ async fn deletes_version() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     let user_id =
@@ -1263,6 +1273,7 @@ async fn pending_archive_shared() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     // Two versions of one key share the archive, as a same-bucket copy does.
     let (first, second) = (Ulid::generate(), Ulid::generate());
@@ -1344,6 +1355,7 @@ async fn malformed_owner_aborts() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     let version_id = Ulid::generate();
     let location = seed_pending(&storage_handle, &[version_id]).await;
@@ -1393,6 +1405,7 @@ async fn removes_envelope_rows() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     let version_id = Ulid::generate();
     let location = seed_pending(&storage_handle, &[version_id]).await;
@@ -1458,6 +1471,7 @@ async fn removes_pending_copy() {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         let version_id = Ulid::generate();
         let location = seed_pending(&storage_handle, &[version_id]).await;
@@ -1675,6 +1689,73 @@ fn marker_needs_head() {
     assert!(marked(head).is_ok());
 }
 
+#[test]
+fn marker_needs_life() {
+    // A deferred removal fences the life it saw: a marker and a recreation both refuse it.
+    let life = Ulid::from_parts(7, 7);
+    let marked = |expected: Option<Ulid>, current: Option<Ulid>| {
+        let mut operation = audit_op(None).with_expected_life(expected);
+        operation.state = DeleteObjectState::ReadCurrentLookup;
+        operation.pending_version_id = Some(Ulid::generate());
+        let pointer = CurrentVersionPointer::new(Ulid::from_parts(5, 5)).with_life(current);
+        operation.next(read(Some(pointer.to_bytes().unwrap().into())))
+    };
+    assert!(marked(Some(life), Some(life)).is_ok());
+    assert!(marked(None, None).is_ok());
+    let changed = Some(DeleteObjectError::VersionChanged);
+    assert_eq!(marked(Some(life), None).err(), changed);
+    assert_eq!(
+        marked(Some(life), Some(Ulid::from_parts(8, 8))).err(),
+        changed
+    );
+    assert_eq!(marked(None, Some(life)).err(), changed);
+}
+
+#[test]
+fn fence_rows_commit() {
+    // The fence's rows and deletes follow the audit rows in the delete transaction.
+    let nfs = "nfs_state".to_string();
+    let (marker_row, watch): (Key, Key) = (b"m".to_vec().into(), b"w".to_vec().into());
+    let fence = RowFence::new(vec![(nfs.clone(), watch.clone(), None)], Vec::new())
+        .with_writes(vec![(
+            nfs.clone(),
+            marker_row.clone(),
+            Value::from(Vec::new()),
+        )])
+        .with_deletes(vec![(nfs.clone(), watch.clone())]);
+    let mut operation = audit_op(None).with_row_fence(fence);
+    let marker = Ulid::generate();
+    operation.version_id = Some(marker);
+    operation.state = DeleteObjectState::ReadCurrentLookup;
+    operation.pending_version_id = Some(marker);
+    assert_eq!(space(&operation.next(read(None))), nfs);
+    let taken: Value = b"token".to_vec().into();
+    let mut refused = audit_op(None).with_row_fence(RowFence::new(
+        vec![(nfs.clone(), watch.clone(), None)],
+        Vec::new(),
+    ));
+    refused.state = DeleteObjectState::ReadCurrentLookup;
+    refused.pending_version_id = Some(marker);
+    refused.next(read(None)).unwrap();
+    let turn = refused.next(read(Some(taken)));
+    assert_eq!(turn.err(), Some(DeleteObjectError::FenceTaken));
+
+    assert_eq!(space(&operation.next(read(None))), BLOB_HEAD_KEYSPACE);
+    operation.write_delete_audit().unwrap();
+    let IoCall::Write(writes) = call(operation.next(IoResult::Done)) else {
+        panic!("the fence rows are written after the audit");
+    };
+    assert_eq!(writes[0].1, marker_row);
+    let IoCall::Delete(deletes) = call(operation.next(IoResult::Done)) else {
+        panic!("the fence deletes follow its writes");
+    };
+    assert_eq!(deletes, [(nfs, watch)]);
+    assert!(matches!(
+        operation.next(IoResult::Done),
+        Ok(Next::Then { .. })
+    ));
+}
+
 /// Puts, an overwrite, a delete marker and a version delete in two buckets keep each bucket row
 /// exact and the group row their sum, and a rebuild finds the same rows.
 #[tokio::test]
@@ -1717,6 +1798,7 @@ async fn bucket_rows_sum() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     let realm_id = RealmId::from_bytes([1u8; 32]);
     let user_id = aruna_core::user::id::UserId::local(Ulid::generate(), realm_id);

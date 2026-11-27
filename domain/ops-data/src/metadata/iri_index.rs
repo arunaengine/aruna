@@ -1133,6 +1133,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         let (found, matches) = lookup_iri_references(&context, "p", OBJECT, 8)
             .await

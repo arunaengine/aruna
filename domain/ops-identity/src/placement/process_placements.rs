@@ -1044,6 +1044,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         });
         let local = net.node_id();
         let topic = shard_topic_id(

@@ -359,3 +359,101 @@ async fn skips_fifo() {
         ErrorKind::NotFound
     );
 }
+
+/// A writable core that serves `folder` below `root`, built without the operator around it.
+fn writable_core(root: &Path, folder: &[&str]) -> Core {
+    Core {
+        root: root.to_path_buf(),
+        base: folder.iter().map(|name| name.to_string()).collect(),
+        writable: true,
+        filter: None,
+    }
+}
+
+#[test]
+fn keeps_folder_chain() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("served")).unwrap();
+    let core = writable_core(root.path(), &["served"]);
+
+    // Publish syncs the parent and every folder above it, down from the served one.
+    let mut spool = Spool::open(&core, "a/b/blob").unwrap();
+    assert_eq!(spool.above.len(), 2);
+    spool.file.write_all(b"nested").unwrap();
+    spool.size = 6;
+    assert_eq!(spool.publish(false).unwrap(), 6);
+    let written = root.path().join("served/a/b/blob");
+    assert_eq!(std::fs::read(written).unwrap(), b"nested");
+    let spool = Spool::open(&core, "top").unwrap();
+    assert!(spool.above.is_empty());
+    assert_eq!(spool.publish(true).unwrap(), 0);
+    assert_eq!(std::fs::read(root.path().join("served/top")).unwrap(), b"");
+}
+
+#[tokio::test]
+async fn publishes_nested_writes() {
+    let root = tempfile::tempdir().unwrap();
+    put(root.path(), "old/kept", "kept");
+    let op = writable(root.path());
+
+    op.write_with("x/y/z/blob", "created")
+        .if_not_exists(true)
+        .await
+        .unwrap();
+    assert_eq!(op.read("x/y/z/blob").await.unwrap().to_vec(), b"created");
+    let mut writer = op.writer("old/blob").await.unwrap();
+    writer.write("first ").await.unwrap();
+    writer.write("second").await.unwrap();
+    writer.close().await.unwrap();
+    assert_eq!(op.read("old/blob").await.unwrap().to_vec(), b"first second");
+    op.write("old/kept", "replaced").await.unwrap();
+    assert_eq!(op.read("old/kept").await.unwrap().to_vec(), b"replaced");
+    // No folder keeps a temporary file of the writes.
+    for folder in ["x/y/z", "old"] {
+        let names = std::fs::read_dir(root.path().join(folder)).unwrap();
+        let temps = names
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().starts_with(TEMP_PREFIX))
+            .count();
+        assert_eq!(temps, 0, "{folder}");
+    }
+}
+
+#[tokio::test]
+async fn blocked_parent_fails() {
+    let root = tempfile::tempdir().unwrap();
+    put(root.path(), "taken", "file");
+    let op = writable(root.path());
+
+    let error = op.write("taken/blob", "data").await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::NotFound);
+    assert!(op.create_dir("taken/sub/").await.is_err());
+    assert_eq!(std::fs::read(root.path().join("taken")).unwrap(), b"file");
+}
+
+#[tokio::test]
+async fn failed_close_ends() {
+    let root = tempfile::tempdir().unwrap();
+    put(root.path(), "target/inner", "busy");
+    let mut writer = FileWriter {
+        core: Arc::new(writable_core(root.path(), &[])),
+        path: "target".to_string(),
+        if_not_exists: false,
+        state: WriteState::Unopened,
+    };
+
+    oio::Write::write(&mut writer, Buffer::from("data"))
+        .await
+        .unwrap();
+    // The rename fails while a full folder holds the name, after the spool is used up.
+    assert!(oio::Write::close(&mut writer).await.is_err());
+    std::fs::remove_dir_all(root.path().join("target")).unwrap();
+    // A retried close must not publish a new, empty spool over the now free name.
+    let error = oio::Write::close(&mut writer).await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Unexpected);
+    let error = oio::Write::write(&mut writer, Buffer::from("more"))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Unexpected);
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+}

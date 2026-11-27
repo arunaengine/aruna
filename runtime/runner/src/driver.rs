@@ -27,6 +27,7 @@ use aruna_p2p::NetHandle;
 use aruna_rdf_graph::GraphHandle;
 use aruna_scheduler::TaskHandle;
 use aruna_storage::storage;
+use aruna_vfs::VfsHold;
 use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
 use futures_util::stream::FuturesUnordered;
@@ -103,6 +104,8 @@ pub struct DriverContext {
     pub compute_handle: Option<std::sync::Arc<ExecutorRegistry>>,
     /// HTTP and mail clients; `None` where outbound calls answer as unavailable.
     pub outbound_handle: Option<aruna_egress::OutboundHandle>,
+    /// Embedded SMB and NFS server state; `None` on nodes that serve no file shares.
+    pub vfs_handle: Option<aruna_vfs::VfsHandle>,
 }
 
 impl DriverContext {
@@ -116,6 +119,7 @@ impl DriverContext {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         }
     }
 
@@ -321,6 +325,7 @@ impl std::fmt::Debug for DriverContext {
             .field("task_handle", &self.task_handle.is_some())
             .field("compute_handle", &self.compute_handle.is_some())
             .field("outbound_handle", &self.outbound_handle.is_some())
+            .field("vfs_handle", &self.vfs_handle.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -599,12 +604,52 @@ fn extend_unblocked(queue: &mut VecDeque<Effect>, effects: Effects, tracker: &Tr
     }));
 }
 
+/// File server permits and guards a run holds; dropping the run, also by cancelling its
+/// future, gives back every one it did not release itself.
+struct VfsHolds {
+    handle: Option<aruna_vfs::VfsHandle>,
+    held: Vec<VfsHold>,
+}
+
+impl VfsHolds {
+    fn observe(&mut self, released: Option<VfsHold>, event: &Event) {
+        if let Some(released) = released {
+            self.held.retain(|hold| *hold != released);
+        }
+        if let Event::Vfs(answer) = event
+            && let Some(granted) = VfsHold::granted(answer)
+        {
+            self.held.push(granted);
+        }
+    }
+}
+
+impl Drop for VfsHolds {
+    fn drop(&mut self) {
+        let Some(handle) = self.handle.as_ref() else {
+            return;
+        };
+        for hold in self.held.drain(..) {
+            handle.release_hold(&hold);
+        }
+    }
+}
+
+/// The hold an effect gives back, read before dispatch consumes it.
+fn vfs_release(effect: &Effect) -> Option<VfsHold> {
+    match effect {
+        Effect::Vfs(call) => VfsHold::released(call),
+        _ => None,
+    }
+}
+
 /// State the effect loop carries between dispatches: the tracker owns every
 /// started transaction, `committed` stops a deadline's abort, and `expired`
 /// plus `cleanup_deadline` bound cleanup. `holds` pin backend reservations.
 struct RunState {
     tracker: TransactionTracker,
     holds: Vec<GroupHold>,
+    vfs: VfsHolds,
     committed: bool,
     expired: bool,
     cleanup_deadline: Option<tokio::time::Instant>,
@@ -615,6 +660,10 @@ impl RunState {
         Self {
             tracker: TransactionTracker::new(context.storage_handle.clone()),
             holds: Vec::new(),
+            vfs: VfsHolds {
+                handle: context.vfs_handle.clone(),
+                held: Vec::new(),
+            },
             committed: false,
             expired: false,
             cleanup_deadline: None,
@@ -804,7 +853,8 @@ fn hang_limit(effect: &Effect, limits: HangLimits) -> Option<Duration> {
         | Effect::Delay(_)
         | Effect::Job(_)
         | Effect::Git(_)
-        | Effect::Workflow(_) => None,
+        | Effect::Workflow(_)
+        | Effect::Vfs(_) => None,
     }
 }
 
@@ -1071,6 +1121,7 @@ async fn drive_effects(
     while !executable.is_complete() || !queue.is_empty() {
         while let Some(effect) = queue.pop_front() {
             let transaction = transaction_effect(&effect);
+            let released = vfs_release(&effect);
             if let Some(TransactionEffect::Abort(txn_id)) = transaction
                 && state.tracker.blocked_abort(txn_id)
             {
@@ -1163,6 +1214,7 @@ async fn drive_effects(
                 }
             };
             state.record_outcome(transaction, &event);
+            state.vfs.observe(released, &event);
             if !executable.is_complete() {
                 extend_unblocked(&mut queue, executable.step(event), &state.tracker);
             }

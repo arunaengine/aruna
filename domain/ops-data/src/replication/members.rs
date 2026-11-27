@@ -512,6 +512,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         let (snapshot, _) = replicated(true, 1);
         let set_id = snapshot.set_id();
@@ -589,6 +590,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         let (snapshot, _) = replicated(true, 1);
         let realm_id = snapshot.statements[0].statement.realm_id;

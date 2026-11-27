@@ -63,6 +63,7 @@ async fn build_state(realm_id: RealmId, node_id: NodeId) -> (TempDir, Arc<Server
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let state = ServerState::new(
         ctx,
@@ -105,6 +106,7 @@ async fn build_network_state(
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let state = ServerState::new(
         ctx,

@@ -1457,6 +1457,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         });
         let target = DocumentTarget::RealmConfig { realm_id: realm() };
         let bytes = config

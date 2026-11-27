@@ -5,7 +5,7 @@
 use super::scope::resolve_scope;
 use super::server::S3OpLabel;
 use super::service::forward::forwarded_digest;
-use super::util::{anonymous_read_allowed, operation_permission, public_read_allowed};
+use super::util::{anonymous_read_allowed, operation_permission};
 use crate::object_key::ObjectKey;
 use crate::rate_limit::{LocalKey, LocalLease, LocalPermit};
 use crate::s3::service::view::InputView;
@@ -17,9 +17,9 @@ use aruna_core::id::NodeId;
 use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 use aruna_core::structs::identity::auth::{AuthContext, Permission, SessionKind, SessionRef};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::identity::s3_session::{S3Session, SESSION_ACCESS_PREFIX};
+use aruna_core::structs::identity::s3_session::S3Session;
 use aruna_core::structs::storage::blob::{
-    BucketInfo, UserAccess, bucket_permission_path, group_permission_path, object_permission_path,
+    BucketInfo, UserAccess, bucket_permission_path, object_permission_path,
 };
 use aruna_core::structs::storage::distribution::delegation::{
     COPY_READ_HEADER, DELEGATION_HEADER, Payload, SignedDelegation,
@@ -30,29 +30,28 @@ use aruna_core::user::id::UserId;
 use aruna_ops_data::distribution::accept_delegation::DelegateError;
 use aruna_ops_data::distribution::delegate::accept_delegation;
 use aruna_ops_data::distribution::routing::{delegated_range, delegated_read};
+use aruna_ops_data::s3::access::admit::{
+    AdmissionFailure, AdmitOwnerConfig, AdmitOwnerError, AdmitOwnerOperation, PathError,
+    PathRequest, build_authorization_path, check_credential_usable,
+};
 use aruna_ops_data::s3::access::get::{GetAccessError, GetAccessOperation};
-use aruna_ops_data::s3::access::revoke::{RevokeUserError, RevokeUserOperation};
 use aruna_ops_data::s3::bucket::write_guard::BucketGuardOperation;
 use aruna_ops_data::s3::session::S3SessionError;
 use aruna_ops_data::s3::session::get::GetS3Operation;
 use aruna_ops_data::s3::session::touch::{TouchS3Config, TouchS3Operation};
 use aruna_ops_data::staging::offered_directory::OfferedDirectoryError;
-use aruna_ops_identity::auth::bearer_token::AccountDeactivatedOperation;
-use aruna_ops_identity::auth::bearer_token::UserCutoffOperation;
 use aruna_ops_identity::auth::enforcement::EnforcePolicyOperation;
 use aruna_ops_identity::auth::error::AuthorizeError;
 use aruna_ops_identity::auth::request_authorization::AuthorizeOperation;
-use aruna_ops_identity::document_repository::GetConfigOperation;
 use aruna_ops_work::jobs::workflow::input_view::view_job;
 use aruna_runner::driver::{DriverContext, drive, drive_retry};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use http::{HeaderMap, Uri};
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::auth::{S3Auth, SecretKey};
-use s3s::{S3ErrorCode, S3Result, s3_error};
+use s3s::{S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fmt::Display;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tracing::debug;
@@ -78,20 +77,7 @@ pub enum Access {
     Write,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum Action {
-    Read,
-    Write,
-}
-
-impl Display for Action {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Action::Read => write!(f, "read"),
-            Action::Write => write!(f, "write"),
-        }
-    }
-}
+pub use aruna_ops_data::s3::access::admit::Action;
 
 /// Marks a request that arrived with a delegation; it is never forwarded again, and its body
 /// is checked against the binding the issuer signed.
@@ -244,14 +230,9 @@ impl S3Access for AuthProvider {
         cx.extensions_mut().insert(lease);
 
         // Decryption proves this node issued the credential; it must still belong to the realm.
-        if !self.issuer_in_realm(&user_access.issued_by).await? {
-            return Err(s3_error!(
-                InvalidAccessKeyId,
-                "Credential issuer not in realm"
-            ));
-        }
         let credential = session_token_hash.is_none();
-        self.admit_owner(&access_key_id, &user_access.user_identity, credential)
+        let (user_id, issued_by) = (user_access.user_identity, user_access.issued_by);
+        self.admit_owner(&access_key_id, &user_id, issued_by, credential)
             .await?;
 
         // A run's own credential reads its input view; each read is authorized at its source.
@@ -272,9 +253,7 @@ impl S3Access for AuthProvider {
         };
 
         let mut user_access = user_access;
-        let (path, auth_context) = self
-            .build_authorization_path(cx, &mut user_access, &action)
-            .await?;
+        let (path, auth_context) = self.authorization_path(cx, &mut user_access).await?;
 
         // An offered directory is an observation of the owner's own files: it is
         // served read-only, so no write may claim to change it.
@@ -933,12 +912,10 @@ impl AuthProvider {
         user_access: &UserAccess,
         now: SystemTime,
     ) -> S3Result<LocalPermit> {
-        if user_access.is_revoked() {
-            return Err(s3_error!(AccessDenied, "Credential has been revoked"));
-        }
-        if user_access.is_expired(now) {
-            return Err(s3_error!(AccessDenied, "Credential has expired"));
-        }
+        check_credential_usable(user_access, now).map_err(|failure| match failure {
+            AdmissionFailure::Revoked => s3_error!(AccessDenied, "Credential has been revoked"),
+            AdmissionFailure::Expired => s3_error!(AccessDenied, "Credential has expired"),
+        })?;
         // Charge the stable identity after lookup so credential rotation cannot
         // multiply the authenticated request budget.
         if self
@@ -974,61 +951,48 @@ impl AuthProvider {
         self.admit_credential_at(&session.as_user_access(), now)
     }
 
-    /// Denies a credential issued before its owner's cutoff, like a bearer token issued before it.
-    async fn check_cutoff(&self, access_key_id: &str, user_id: &UserId) -> S3Result<()> {
-        let key_id = access_key_id
-            .strip_prefix(SESSION_ACCESS_PREFIX)
-            .unwrap_or(access_key_id);
-        let issued = ulid::Ulid::from_string(key_id).map_or(0, |id| id.timestamp_ms() / 1000);
-        let cutoff = drive(
-            UserCutoffOperation::new(self.realm_id, user_id),
-            &self.driver_ctx,
-        )
-        .await
-        .map_err(|_| s3_error!(ServiceUnavailable, "Revocation state is unavailable"))?;
-        if cutoff.is_some_and(|cutoff| issued < cutoff) {
-            return Err(s3_error!(AccessDenied, "Credential has been revoked"));
-        }
-        Ok(())
-    }
-
-    /// Refuses a key whose owner is cut off or deactivated. A refused credential is deleted at
-    /// once, so it stays refused after the cutoff ages out of the realm's revocation set.
+    /// Refuses a key whose issuer left the realm, or whose owner is cut off or deactivated. A
+    /// refused stored credential is deleted at once, so it stays refused after the cutoff ages out.
     async fn admit_owner(
         &self,
         access_key_id: &str,
         user_id: &UserId,
+        issued_by: [u8; 32],
         credential: bool,
     ) -> S3Result<()> {
-        let admitted = match self.check_cutoff(access_key_id, user_id).await {
-            Ok(()) => self.check_status(user_id).await,
-            Err(error) => Err(error),
-        };
-        if let Err(error) = &admitted
-            && credential
-            && *error.code() == S3ErrorCode::AccessDenied
-        {
-            let revoke = RevokeUserOperation::new(access_key_id.to_string());
-            match drive(revoke, self.driver_ctx.as_ref()).await {
-                Ok(_) | Err(RevokeUserError::NotFound) => {}
-                Err(error) => {
-                    tracing::warn!(error = %error, "Failed to delete a refused credential")
+        let operation = AdmitOwnerOperation::new(AdmitOwnerConfig {
+            realm_id: self.realm_id,
+            access_key: access_key_id.to_string(),
+            user_id: *user_id,
+            issued_by,
+            revoke: credential,
+        });
+        drive(operation, self.driver_ctx.as_ref())
+            .await
+            .map_err(|error| match error {
+                AdmitOwnerError::IssuerUnknown => {
+                    s3_error!(InvalidAccessKeyId, "Credential issuer not in realm")
                 }
-            }
-        }
-        admitted
-    }
-
-    /// Denies every key of an account this realm's replicated record marks deactivated.
-    async fn check_status(&self, user_id: &UserId) -> S3Result<()> {
-        match drive(AccountDeactivatedOperation::new(user_id), &self.driver_ctx).await {
-            Ok(false) => Ok(()),
-            Ok(true) => Err(s3_error!(AccessDenied, "Account is deactivated")),
-            Err(_) => Err(s3_error!(
-                ServiceUnavailable,
-                "Account state is unavailable"
-            )),
-        }
+                AdmitOwnerError::Revoked => {
+                    s3_error!(AccessDenied, "Credential has been revoked")
+                }
+                AdmitOwnerError::Deactivated => s3_error!(AccessDenied, "Account is deactivated"),
+                AdmitOwnerError::RevocationUnavailable => {
+                    s3_error!(ServiceUnavailable, "Revocation state is unavailable")
+                }
+                AdmitOwnerError::AccountUnavailable => {
+                    s3_error!(ServiceUnavailable, "Account state is unavailable")
+                }
+                AdmitOwnerError::MalformedNode => {
+                    s3_error!(InternalError, "Malformed realm node id")
+                }
+                AdmitOwnerError::ConfigUnavailable => {
+                    s3_error!(InternalError, "Failed to load realm config")
+                }
+                AdmitOwnerError::Io(_) => {
+                    s3_error!(InternalError, "Failed to check credential owner")
+                }
+            })
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
@@ -1077,22 +1041,6 @@ impl AuthProvider {
         }
     }
 
-    /// Checks that the issuer proven by local decryption still belongs to this realm.
-    async fn issuer_in_realm(&self, issued_by: &[u8; 32]) -> S3Result<bool> {
-        let config = drive(
-            GetConfigOperation::new(self.realm_id),
-            self.driver_ctx.as_ref(),
-        )
-        .await
-        .map_err(|_| s3_error!(InternalError, "Failed to load realm config"))?;
-        let node_ids = config
-            .node_ids()
-            .map_err(|_| s3_error!(InternalError, "Malformed realm node id"))?;
-        Ok(node_ids
-            .iter()
-            .any(|node_id| node_id.as_bytes() == issued_by))
-    }
-
     async fn find_bucket_info(&self, bucket: &str) -> S3Result<Option<BucketInfo>> {
         let operation = GetBucketOperation::new(bucket.to_string());
         match drive(operation, self.driver_ctx.as_ref()).await {
@@ -1102,62 +1050,41 @@ impl AuthProvider {
         }
     }
 
-    async fn build_authorization_path(
+    /// The permission path and principal of a request. A caller reading another group's bucket
+    /// becomes Everyone in that group, and the found bucket goes to the handler.
+    async fn authorization_path(
         &self,
         cx: &mut S3AccessContext<'_>,
         user_access: &mut UserAccess,
-        action: &Action,
     ) -> S3Result<(String, AuthContext)> {
-        let mut auth_context = AuthContext {
-            user_id: user_access.user_identity,
-            realm_id: self.realm_id,
-            path_restrictions: user_access.path_restrictions.clone(),
-            session: None,
-        };
-        let Some(bucket) = cx.s3_path().get_bucket_name().map(str::to_owned) else {
-            return Ok((self.group_data_path(user_access.group_id), auth_context));
-        };
+        let bucket = cx.s3_path().get_bucket_name().map(str::to_owned);
         let key = cx.s3_path().get_object_key().map(str::to_owned);
-
-        let group_id = match self.find_bucket_info(&bucket).await? {
-            Some(bucket_info) => {
-                if bucket_info.group_id != user_access.group_id {
-                    if !matches!(action, Action::Read)
-                        || !public_read_allowed(cx.s3_op().name(), key.is_some())
-                    {
-                        return Err(s3_error!(
-                            AccessDenied,
-                            "Bucket belongs to a different group"
-                        ));
-                    }
-                    // Another group's bucket is read as Everyone in that group, so a part
-                    // forwarded to another node asks as Everyone too.
-                    auth_context = AuthContext::anonymous(self.realm_id);
-                    user_access.user_identity = UserId::nil(self.realm_id);
-                    user_access.group_id = bucket_info.group_id;
-                    user_access.path_restrictions = None;
-                }
-                cx.extensions_mut().insert(bucket_info.clone());
-                bucket_info.group_id
-            }
-            None if cx.s3_op().name() == "CreateBucket" && key.is_none() => user_access.group_id,
-            None => {
-                return Err(s3_error!(
-                    NoSuchBucket,
-                    "The specified bucket does not exist."
-                ));
-            }
+        let bucket_info = match &bucket {
+            Some(bucket) => self.find_bucket_info(bucket).await?,
+            None => None,
         };
-
-        Ok((
-            match key {
-                Some(key) => {
-                    object_permission_path(self.realm_id, group_id, self.node_id, &bucket, &key)
-                }
-                None => bucket_permission_path(self.realm_id, group_id, self.node_id, &bucket),
-            },
-            auth_context,
-        ))
+        let built = build_authorization_path(PathRequest {
+            realm_id: self.realm_id,
+            node_id: self.node_id,
+            access: user_access,
+            bucket: bucket.as_deref(),
+            bucket_info: bucket_info.as_ref(),
+            key: key.as_deref(),
+            operation: cx.s3_op().name(),
+        })
+        .map_err(|error| match error {
+            PathError::OtherGroup => {
+                s3_error!(AccessDenied, "Bucket belongs to a different group")
+            }
+            PathError::NoSuchBucket => {
+                s3_error!(NoSuchBucket, "The specified bucket does not exist.")
+            }
+        })?;
+        if let Some(bucket_info) = bucket_info {
+            cx.extensions_mut().insert(bucket_info);
+        }
+        *user_access = built.access;
+        Ok((built.path, built.context))
     }
 
     /// Admits a listing whose caller reaches only part of the requested path,
@@ -1198,10 +1125,6 @@ impl AuthProvider {
         }
         Ok(())
     }
-
-    fn group_data_path(&self, group_id: ulid::Ulid) -> String {
-        group_permission_path(self.realm_id, group_id, self.node_id)
-    }
 }
 
 #[cfg(test)]
@@ -1241,6 +1164,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         });
         AuthProvider {
             driver_ctx,
@@ -1276,6 +1200,36 @@ mod tests {
                 key_space: S3_SESSION_KEYSPACE.to_string(),
                 key: session.access_key.as_bytes().into(),
                 value: session.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+    }
+
+    /// Stores the realm config with the provider's node as a member, so it may issue keys.
+    async fn store_realm(
+        provider: &AuthProvider,
+        mut config: aruna_core::structs::identity::realm::RealmConfigDocument,
+    ) {
+        use aruna_core::document::DocumentTarget;
+        use aruna_core::effects::StorageEffect;
+        use aruna_core::structs::identity::auth::Actor;
+        use aruna_core::structs::identity::realm::RealmNodeKind;
+        config.ensure_node(provider.node_id, RealmNodeKind::Server);
+        let target = DocumentTarget::RealmConfig {
+            realm_id: provider.realm_id,
+        };
+        let actor = Actor {
+            node_id: provider.node_id,
+            user_id: UserId::nil(provider.realm_id),
+            realm_id: provider.realm_id,
+        };
+        provider
+            .driver_ctx
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: target.storage_keyspace().to_string(),
+                key: target.storage_key(),
+                value: config.to_bytes(&actor).unwrap().into(),
                 txn_id: None,
             })
             .await;
@@ -1335,9 +1289,8 @@ mod tests {
     async fn cutoff_denies_older() {
         // A user cutoff denies S3 keys issued before it and keeps later keys usable.
         use aruna_core::auth::{user_cutoff_expiry, user_cutoff_hash};
-        use aruna_core::document::DocumentTarget;
-        use aruna_core::effects::StorageEffect;
         use aruna_core::structs::identity::realm::{RealmConfigDocument, TokenRevocation};
+        use aruna_core::structs::identity::s3_session::SESSION_ACCESS_PREFIX;
         use ulid::Ulid;
         let provider = provider();
         let user = UserId::local(Ulid::generate(), provider.realm_id);
@@ -1347,36 +1300,25 @@ mod tests {
             token_hash: user_cutoff_hash(&user),
             expires_at: user_cutoff_expiry(cutoff),
         });
-        let target = DocumentTarget::RealmConfig {
-            realm_id: provider.realm_id,
-        };
-        provider
-            .driver_ctx
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: target.storage_keyspace().to_string(),
-                key: target.storage_key(),
-                value: config
-                    .to_bytes(&aruna_core::structs::identity::auth::Actor {
-                        node_id: provider.node_id,
-                        user_id: user,
-                        realm_id: provider.realm_id,
-                    })
-                    .unwrap()
-                    .into(),
-                txn_id: None,
-            })
-            .await;
+        store_realm(&provider, config).await;
+        let node = *provider.node_id.as_bytes();
         let older = Ulid::generate().to_string();
         let later = Ulid::from_parts((cutoff + 1) * 1000, 0).to_string();
 
         for key in [older.clone(), format!("{SESSION_ACCESS_PREFIX}{older}")] {
-            let error = provider.check_cutoff(&key, &user).await.unwrap_err();
+            let error = provider.admit_owner(&key, &user, node, false).await;
+            let error = error.unwrap_err();
             assert_eq!(error.code(), &s3s::S3ErrorCode::AccessDenied);
         }
-        provider.check_cutoff(&later, &user).await.unwrap();
+        provider
+            .admit_owner(&later, &user, node, false)
+            .await
+            .unwrap();
         let other = UserId::local(Ulid::generate(), provider.realm_id);
-        provider.check_cutoff(&older, &other).await.unwrap();
+        provider
+            .admit_owner(&older, &other, node, false)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1385,11 +1327,15 @@ mod tests {
         // owner's credential is still refused and deleted.
         use aruna_core::effects::StorageEffect;
         use aruna_core::keyspaces::USER_KEYSPACE;
+        use aruna_core::structs::identity::realm::RealmConfigDocument;
         use aruna_core::structs::identity::user::User;
         use aruna_core::user::validation::DEACTIVATED_ATTRIBUTE;
         let provider = provider();
-        let refused = issued_access(&provider, *provider.node_id.as_bytes());
-        let active = issued_access(&provider, *provider.node_id.as_bytes());
+        let config = RealmConfigDocument::new(provider.realm_id, Vec::new(), 3);
+        store_realm(&provider, config).await;
+        let node = *provider.node_id.as_bytes();
+        let refused = issued_access(&provider, node);
+        let active = issued_access(&provider, node);
         let owner = refused.user_identity;
         let user = User {
             user_id: owner,
@@ -1414,7 +1360,7 @@ mod tests {
         }
 
         let error = provider
-            .admit_owner(&refused.access_key, &owner, true)
+            .admit_owner(&refused.access_key, &owner, node, true)
             .await
             .unwrap_err();
         assert_eq!(error.code(), &s3s::S3ErrorCode::AccessDenied);
@@ -1426,7 +1372,7 @@ mod tests {
 
         let owner = active.user_identity;
         provider
-            .admit_owner(&active.access_key, &owner, true)
+            .admit_owner(&active.access_key, &owner, node, true)
             .await
             .unwrap();
         assert!(provider.query_user_access(&active.access_key).await.is_ok());

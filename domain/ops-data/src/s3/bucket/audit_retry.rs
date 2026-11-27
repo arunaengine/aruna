@@ -413,6 +413,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         let record = BucketAuditRecord {
             event_id: ulid::Ulid::from_parts(5, 1),
@@ -489,6 +490,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         });
         // The timer's run is stopped after a growing number of steps, as a crash would stop it,
         // and the last run completes.

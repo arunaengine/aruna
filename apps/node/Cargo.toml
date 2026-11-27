@@ -21,7 +21,10 @@ slurm = ["aruna-compute/slurm"]
 
 [dependencies]
 # Aruna modules
+aruna-admission = { workspace = true }
 aruna-api = { workspace = true }
+aruna-nfs = { workspace = true }
+aruna-smb = { workspace = true }
 aruna-wire = { workspace = true }
 aruna-blob = { workspace = true }
 aruna-compute = { workspace = true, default-features = false }
@@ -35,6 +38,7 @@ aruna-ops-identity = { workspace = true }
 aruna-ops-work = { workspace = true }
 aruna-runner = { workspace = true }
 aruna-storage = { workspace = true }
+aruna-vfs = { workspace = true }
 aruna-egress = { workspace = true }
 aruna-gateway = { workspace = true }
 aruna-plugin-contract = { workspace = true }

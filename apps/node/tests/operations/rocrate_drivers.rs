@@ -1422,6 +1422,7 @@ async fn build_fixture(gated: bool) -> Result<Fixture, Box<dyn std::error::Error
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     create_bucket(&context, &actor, group_id).await?;
     Ok(Fixture {

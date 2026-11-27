@@ -195,6 +195,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         // The operation's own commit is the managed effect whose refresh the actor holds.
         let task_context = context.clone();
@@ -289,6 +290,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         let realm_id = *net_handle.realm_id();
         let actor = Actor {
@@ -341,6 +343,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
 
         let event = dispatch_storage(

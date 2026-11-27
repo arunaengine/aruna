@@ -37,6 +37,7 @@ tar = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
+ulid = { workspace = true }
 nix = { workspace = true, optional = true }
 rustix = { workspace = true, optional = true }
 kube = { workspace = true, optional = true }

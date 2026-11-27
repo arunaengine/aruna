@@ -120,6 +120,7 @@ pub(crate) async fn node_state() -> Node {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let auth = |seed: u8| AuthContext {
         user_id: UserId::local(Ulid::from_bytes([seed; 16]), realm_id),

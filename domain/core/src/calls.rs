@@ -497,6 +497,7 @@ enum Family {
     Git,
     Plugin,
     Workflow,
+    Vfs,
 }
 
 impl Wait {
@@ -522,6 +523,7 @@ impl Wait {
             Self::Family(Family::Git) => "a Git store event",
             Self::Family(Family::Plugin) => "a plugin host event",
             Self::Family(Family::Workflow) => "a workflow coordinator event",
+            Self::Family(Family::Vfs) => "a file server event",
             Self::Child => "the child's event",
             Self::Group => "GroupEvent::Finished",
             Self::Window => "GroupEvent::Member or GroupEvent::Closed",
@@ -942,6 +944,7 @@ fn forbidden_effect(effect: &Effect, mode: TransactionMode) -> Option<&'static s
         Effect::Compute(_) => Some("Effect::Compute inside a transaction"),
         Effect::Git(_) => Some("Effect::Git inside a transaction"),
         Effect::Workflow(_) => Some("Effect::Workflow inside a transaction"),
+        Effect::Vfs(_) => Some("Effect::Vfs inside a transaction"),
         Effect::Plugin(_) => Some("Effect::Plugin inside a transaction"),
         Effect::StagingSource(_) if mode == TransactionMode::Write => {
             Some("Effect::StagingSource inside a write transaction")
@@ -1087,6 +1090,7 @@ fn effect_family(effect: &Effect) -> Result<Family, IoError> {
         Effect::Job(_) => Ok(Family::Job),
         Effect::Git(_) => Ok(Family::Git),
         Effect::Workflow(_) => Ok(Family::Workflow),
+        Effect::Vfs(_) => Ok(Family::Vfs),
         Effect::Plugin(_) => Ok(Family::Plugin),
         Effect::Storage(
             StorageEffect::StartTransaction { .. }
@@ -1119,6 +1123,7 @@ fn event_family(event: &Event) -> Option<Family> {
         Event::Job(_) => Some(Family::Job),
         Event::Git(_) => Some(Family::Git),
         Event::Workflow(_) => Some(Family::Workflow),
+        Event::Vfs(_) => Some(Family::Vfs),
         Event::Plugin(_) => Some(Family::Plugin),
         Event::SubOperation(_)
         | Event::Group(_)

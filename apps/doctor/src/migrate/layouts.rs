@@ -27,7 +27,8 @@ use ulid::Ulid;
 pub(super) type KeyspaceRows<'k, R = (Vec<u8>, Vec<u8>)> =
     (&'k OptimisticTxKeyspace, &'static str, Vec<R>);
 
-/// Heads and the policy records that hold one, before the original epoch.
+/// The policy records that hold a head, before the original epoch. Heads themselves have no
+/// older shape the doctor pads: their local life needs a fresh store.
 pub(super) const HEAD: Layout = &[("CurrentVersionPointer", 2)];
 /// Node info before the download slots and the storage capacity.
 pub(super) const NODE_INFO: Layout = &[("NodeUtilization", 4)];
@@ -284,6 +285,7 @@ mod tests {
     use aruna_core::structs::storage::replication_queue::{
         ReplicateScopeInput, ReplicateScopeTarget,
     };
+    use aruna_core::structs::storage::vfs::VfsWatchKey;
     use aruna_core::user::id::UserId;
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -295,8 +297,10 @@ mod tests {
         // replication job moves to its current key, and replaced queue and index rows go.
         let realm_id = RealmId([2; 32]);
         let head = CurrentVersionPointer::new(Ulid::from(1))
+            .with_life(Some(Ulid::from(2)))
             .to_bytes()
             .unwrap();
+        let watch = VfsWatchKey::new("b", "k").to_bytes().unwrap();
         let job = job(ReplicateScopeTarget::Bucket);
         let job_key = blob_job_key(&job).unwrap().to_vec();
         let job_bytes = stored(&job);
@@ -327,11 +331,11 @@ mod tests {
         .unwrap();
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("db");
-        write(
-            &path,
-            BLOB_HEAD_KEYSPACE,
-            vec![(b"head", head[..head.len() - 1].to_vec())],
-        );
+        let heads = vec![
+            (b"head".as_slice(), head.clone()),
+            (watch.as_slice(), vec![3; 16]),
+        ];
+        write(&path, BLOB_HEAD_KEYSPACE, heads);
         let old_key = &job_key[..job_key.len() - 1];
         let old_job = job_bytes[..job_bytes.len() - 1].to_vec();
         write(&path, REPLICATION_JOB_KEYSPACE, vec![(old_key, old_job)]);
@@ -364,7 +368,10 @@ mod tests {
 
         let output = migrate_output(path.to_str().unwrap()).unwrap();
 
-        assert_eq!(read(&path, BLOB_HEAD_KEYSPACE)[b"head".as_slice()], head);
+        // Heads and the watch keys of unpublished names stay exactly as stored.
+        let heads = read(&path, BLOB_HEAD_KEYSPACE);
+        assert_eq!(heads[b"head".as_slice()], head);
+        assert_eq!(heads[&watch], vec![3; 16]);
         let jobs = read(&path, REPLICATION_JOB_KEYSPACE);
         assert_eq!(jobs.keys().collect::<Vec<_>>(), vec![&job_key]);
         assert_eq!(migrated(&jobs[&job_key], &job), job);
@@ -381,7 +388,7 @@ mod tests {
         let consents = read(&path, PLAINTEXT_COPY_KEYSPACE);
         let expected = BTreeMap::from([(consent(&job_key), vec![1]), (relationship, vec![2])]);
         assert_eq!(consents, expected);
-        assert_eq!(output.relaid_rows.values().sum::<usize>(), 5);
+        assert_eq!(output.relaid_rows.values().sum::<usize>(), 4);
         assert_eq!(output.stale_rows_deleted.values().sum::<usize>(), 5);
         let again = migrate_output(path.to_str().unwrap()).unwrap();
         assert!(again.relaid_rows.is_empty() && again.stale_rows_deleted.is_empty());

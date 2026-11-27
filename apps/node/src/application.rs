@@ -10,7 +10,9 @@ use crate::shutdown::{
 use crate::startup;
 use crate::startup::background::{Background, BackgroundOutcome, start as start_background};
 use crate::startup::listeners::{ServerBindings, bind as bind_servers, device_wipe_armed};
-use crate::startup::listeners::{https_exit, portal_exit, s3_exit, session_s3_exit};
+use crate::startup::listeners::{
+    https_exit, nfs_exit, portal_exit, s3_exit, session_s3_exit, smb_exit,
+};
 use crate::startup::resources::NodeResources;
 
 /// What the node process accomplished, mapped to one exit behavior by the
@@ -69,6 +71,8 @@ pub enum Service {
     SessionS3,
     /// The native HTTPS front, redirect and certificate reload.
     Https,
+    Smb,
+    Nfs,
     Ops,
 }
 
@@ -86,7 +90,12 @@ pub enum ServiceExit {
 /// must answer `/readyz` through the drain. Changing a policy is behavior.
 pub fn supervision(service: Service) -> ServiceExit {
     match service {
-        Service::Rest | Service::S3 | Service::Portal | Service::Https => ServiceExit::StopsNode,
+        Service::Rest
+        | Service::S3
+        | Service::Portal
+        | Service::Https
+        | Service::Smb
+        | Service::Nfs => ServiceExit::StopsNode,
         Service::SessionS3 | Service::Ops => ServiceExit::ReportedOnly,
     }
 }
@@ -242,6 +251,7 @@ async fn run_node_owned(
 
     let bindings = match bind_servers(
         &resources.config,
+        &resources.vfs,
         resources.session_s3,
         resources.driver_ctx.clone(),
         resources.jobs_runtime.clone(),
@@ -312,6 +322,8 @@ async fn run_node_owned(
         s3_handle,
         portal_handle,
         session_s3_handle,
+        smb_handle,
+        nfs_handle,
         https_handle,
         realm_id: _,
         node_id: _,
@@ -323,6 +335,8 @@ async fn run_node_owned(
         s3: s3_handle,
         portal: portal_handle,
         session_s3: session_s3_handle,
+        smb: smb_handle,
+        nfs: nfs_handle,
         https: https_handle,
     };
     let failure = supervise(&mut listeners, device_wipe.as_ref(), &stop_token, failure).await;
@@ -343,6 +357,8 @@ async fn run_node_owned(
         s3: listeners.s3,
         portal: listeners.portal,
         session_s3: listeners.session_s3,
+        smb: listeners.smb,
+        nfs: listeners.nfs,
         https: listeners.https,
         monitoring: Some(resources.monitoring),
         task_handle: resources.task_handle,
@@ -383,6 +399,8 @@ struct Listeners {
     s3: Option<aruna_api::s3::server::S3ServerHandle>,
     portal: Option<tokio::task::JoinHandle<()>>,
     session_s3: Option<aruna_api::s3::server::S3ServerHandle>,
+    smb: Option<aruna_smb::SmbServerHandle>,
+    nfs: Option<aruna_nfs::NfsServerHandle>,
     https: Option<aruna_api::https::listener::HttpsHandle>,
 }
 
@@ -420,6 +438,12 @@ async fn supervise(
             }
             message = https_exit(listeners.https.as_mut()) => {
                 Some((Service::Https, message))
+            }
+            message = smb_exit(listeners.smb.as_mut()) => {
+                Some((Service::Smb, message))
+            }
+            message = nfs_exit(listeners.nfs.as_mut()) => {
+                Some((Service::Nfs, message))
             }
             _ = device_wipe_armed(device_wipe) => None,
             _ = stop.cancelled() => None,
@@ -499,6 +523,18 @@ fn observed_listener_exit(bindings: &ServerBindings) -> Option<(Service, Service
     {
         Some((Service::Portal, supervision(Service::Portal)))
     } else if bindings
+        .smb_handle
+        .as_ref()
+        .is_some_and(aruna_smb::SmbServerHandle::is_finished)
+    {
+        Some((Service::Smb, supervision(Service::Smb)))
+    } else if bindings
+        .nfs_handle
+        .as_ref()
+        .is_some_and(aruna_nfs::NfsServerHandle::is_finished)
+    {
+        Some((Service::Nfs, supervision(Service::Nfs)))
+    } else if bindings
         .session_s3_handle
         .as_ref()
         .is_some_and(aruna_api::s3::server::S3ServerHandle::is_finished)
@@ -550,13 +586,16 @@ async fn release_unready(
         session_s3: _,
         monitoring,
         ops_handle,
+        vfs: _,
     } = resources;
-    let (rest, s3, portal, session_s3, https) = match bindings {
+    let (rest, s3, portal, session_s3, smb, nfs, https) = match bindings {
         Some(ServerBindings {
             rest_handle,
             s3_handle,
             portal_handle,
             session_s3_handle,
+            smb_handle,
+            nfs_handle,
             https_handle,
             ..
         }) => (
@@ -564,9 +603,11 @@ async fn release_unready(
             s3_handle,
             portal_handle,
             session_s3_handle,
+            smb_handle,
+            nfs_handle,
             https_handle,
         ),
-        None => (None, None, None, None, None),
+        None => (None, None, None, None, None, None, None),
     };
     NodeShutdown {
         shutdown,
@@ -575,6 +616,8 @@ async fn release_unready(
         s3,
         portal,
         session_s3,
+        smb,
+        nfs,
         https,
         monitoring: Some(monitoring),
         task_handle,
@@ -605,6 +648,8 @@ mod pure_tests {
             s3: None,
             portal: None,
             session_s3: None,
+            smb: None,
+            nfs: None,
             https: None,
         };
         let stop = tokio_util::sync::CancellationToken::new();
@@ -629,6 +674,8 @@ mod pure_tests {
         assert_eq!(supervision(Service::S3), ServiceExit::StopsNode);
         assert_eq!(supervision(Service::Portal), ServiceExit::StopsNode);
         assert_eq!(supervision(Service::Https), ServiceExit::StopsNode);
+        assert_eq!(supervision(Service::Smb), ServiceExit::StopsNode);
+        assert_eq!(supervision(Service::Nfs), ServiceExit::StopsNode);
         assert_eq!(supervision(Service::SessionS3), ServiceExit::ReportedOnly);
         assert_eq!(supervision(Service::Ops), ServiceExit::ReportedOnly);
     }
@@ -637,7 +684,13 @@ mod pure_tests {
     // observed message, `ReportedOnly` decisions keep the node serving.
     #[test]
     fn exit_follows_policy() {
-        for service in [Service::Rest, Service::S3, Service::Portal] {
+        for service in [
+            Service::Rest,
+            Service::S3,
+            Service::Portal,
+            Service::Smb,
+            Service::Nfs,
+        ] {
             assert_eq!(
                 exit_effect(service, "observed exit"),
                 Some("observed exit"),
@@ -1259,6 +1312,8 @@ mod tests {
             s3: None,
             portal: None,
             session_s3: None,
+            smb: None,
+            nfs: None,
             https: None,
             monitoring: None,
             task_handle: aruna_scheduler::TaskHandle::new(),

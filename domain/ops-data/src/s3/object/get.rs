@@ -1871,7 +1871,9 @@ impl AdvanceReference {
         .with_advance_count(successor_count)
         .with_policies(current.placement_policies.clone())?;
         let successor_key = VersionKey::new(&self.input.bucket, &self.input.key, new_version_id);
-        let next_pointer = CurrentVersionPointer::next_for(Some(&pointer), new_version_id)?;
+        let life_id = self.ids.mint(self.now_ms);
+        let next_pointer =
+            CurrentVersionPointer::next_live_inherit(Some(&pointer), new_version_id, life_id)?;
         let reference_advance = ReferenceAdvance {
             generation: next_pointer.generation,
             predecessor: pointer.version_id,

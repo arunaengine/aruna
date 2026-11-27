@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{RELATIONSHIP_OUT_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::plugin_runs::{SourceEvent, journal_entries};
@@ -36,6 +37,7 @@ enum Phase {
 pub struct StoreStatusOperation {
     relationship: SyncRelationship,
     now_ms: u64,
+    ids: IdMint,
     phase: Phase,
 }
 
@@ -44,6 +46,7 @@ impl StoreStatusOperation {
         Self {
             relationship,
             now_ms: 0,
+            ids: IdMint::default(),
             phase: Phase::Outgoing,
         }
     }
@@ -111,7 +114,8 @@ impl StoreStatusOperation {
     ) -> Result<Next<bool>, SyncMirrorError> {
         if let Some(value) = value {
             let info = BucketInfo::from_bytes(&value)?;
-            let event = failure_event(&self.relationship, &info, self.now_ms);
+            let transition = self.ids.mint(self.now_ms);
+            let event = failure_event(&self.relationship, &info, transition, self.now_ms);
             writes.extend(journal_entries(&event)?);
         }
         Ok(self.write(writes))
@@ -153,6 +157,10 @@ impl Operation for StoreStatusOperation {
     fn stamp(&mut self, now_ms: u64) {
         self.now_ms = now_ms;
     }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 }
 
 fn outgoing_key(relationship: &SyncRelationship) -> Result<Key, SyncMirrorError> {
@@ -164,9 +172,14 @@ fn outgoing_key(relationship: &SyncRelationship) -> Result<Key, SyncMirrorError>
     )))
 }
 
-/// The plugin event of a relationship that stops as failed at `now_ms`. The transition id is
-/// derived from the time and the relationship, since one relationship fails once at a time.
-fn failure_event(relationship: &SyncRelationship, info: &BucketInfo, now_ms: u64) -> SourceEvent {
+/// The plugin event of a relationship that stops as failed at `now_ms`. Each run mints its
+/// own `transition` id from its run seed so two failures in the same millisecond stay distinct.
+fn failure_event(
+    relationship: &SyncRelationship,
+    info: &BucketInfo,
+    transition: Ulid,
+    now_ms: u64,
+) -> SourceEvent {
     let source = &relationship.source;
     let bucket = source.bucket().unwrap_or_default();
     let prefix = source.key_prefix().unwrap_or_default();
@@ -177,7 +190,6 @@ fn failure_event(relationship: &SyncRelationship, info: &BucketInfo, now_ms: u64
         bucket,
         prefix,
     );
-    let transition = Ulid::from_parts(now_ms, relationship.id.random());
     SourceEvent::sync_failure(
         (info.group_id, path),
         (relationship.id, relationship.created_by),
@@ -295,5 +307,51 @@ mod tests {
             reading(relationship()).next(IoResult::Done),
             Err(SyncMirrorError::Io(IoError::Unexpected { .. }))
         ));
+    }
+
+    #[test]
+    fn same_ms_distinct() {
+        use aruna_core::id_mint::run_entropy;
+        use aruna_core::keyspaces::EVENT_JOURNAL_KEYSPACE;
+        use aruna_core::structs::storage::format::Compression;
+
+        let base = relationship();
+        let bucket = BucketInfo {
+            group_id: Ulid::from_bytes([6; 16]),
+            created_at: base.created_at,
+            created_by: base.created_by,
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Off,
+            distribution: None,
+        };
+        let bucket_bytes = bucket.to_bytes().unwrap();
+        let failed_source = |slot: u32| -> String {
+            let mut failed = relationship();
+            failed.state = SyncState::Failed {
+                reason: "access_denied".to_string(),
+            };
+            let mut operation = StoreStatusOperation::new(failed);
+            operation.stamp(NOW);
+            operation.seed(run_entropy(1, slot));
+            operation.first().unwrap();
+            operation
+                .next(values(Some(relationship().to_bytes().unwrap())))
+                .unwrap();
+            operation.next(values(None)).unwrap();
+            let Ok(Next::Call(IoCall::Write(writes))) =
+                operation.next(values(Some(bucket_bytes.clone())))
+            else {
+                panic!("expected journal writes");
+            };
+            let (_, _, raw) = writes
+                .into_iter()
+                .find(|(space, ..)| space == EVENT_JOURNAL_KEYSPACE)
+                .expect("journal entry");
+            SourceEvent::from_bytes(&raw).unwrap().source
+        };
+        assert_ne!(failed_source(1), failed_source(2));
     }
 }

@@ -52,6 +52,7 @@ pub(super) async fn build(
                         cache: kubernetes.kubedal_cache.clone(),
                     })
                 }),
+            share_mount: kubernetes.share_mount.clone().map(Box::new),
             policy_manifests: kubernetes.policy_manifests.clone(),
             service_account: kubernetes.service_account.clone(),
             execution_location: kubernetes.execution_location.clone(),

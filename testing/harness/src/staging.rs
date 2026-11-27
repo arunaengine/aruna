@@ -100,6 +100,7 @@ pub async fn setup_driver_context() -> StagingTestContext {
             task_handle: None,
             compute_handle: None,
             outbound_handle: Some(aruna_egress::OutboundHandle::new(http, policy)),
+            vfs_handle: None,
         },
     }
 }

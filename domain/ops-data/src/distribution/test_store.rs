@@ -262,6 +262,7 @@ pub fn context(handle: &StorageHandle) -> aruna_runner::driver::DriverContext {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     }
 }
 

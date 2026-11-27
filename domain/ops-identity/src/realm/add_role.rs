@@ -814,6 +814,7 @@ pub mod test {
             task_handle: Some(task_handle),
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
             blob_handle: None,
         };
 

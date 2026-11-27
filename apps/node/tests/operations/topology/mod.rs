@@ -1048,6 +1048,7 @@ pub async fn spawn_node(realm_id: RealmId, kind: RealmNodeKind) -> TestResult<Te
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
 
     let incoming = initialize_incoming_fixture(context.clone());
@@ -1593,6 +1594,7 @@ pub async fn spawn_node_with(
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
 
     let shutdown = Shutdown::new();
@@ -1988,6 +1990,7 @@ pub async fn spawn_replica_with(
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let jobs_runtime = JobsRuntime::new();
     let shutdown = Shutdown::new();

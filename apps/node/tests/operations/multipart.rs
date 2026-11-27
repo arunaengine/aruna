@@ -95,6 +95,7 @@ async fn setup_context() -> TestContext {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         },
     }
 }
@@ -1832,6 +1833,7 @@ async fn setup_s3_context() -> (TestContext, HashMap<String, String>) {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         },
     };
     (context, config)

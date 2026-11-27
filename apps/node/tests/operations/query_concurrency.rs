@@ -139,6 +139,7 @@ async fn open_harness(
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         },
         storage,
         group_id,

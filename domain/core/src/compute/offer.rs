@@ -36,6 +36,16 @@ pub struct BackendCaps {
     pub suitability: Option<WorkloadSuitability>,
     /// Groups allowed to run here; empty allows every group.
     pub groups: Vec<GroupId>,
+    /// Enrolled NFS worker-pool host that serves this backend's per-attempt mounts.
+    pub nfs_share: Option<NfsShareConfig>,
+}
+
+/// Enrolled NFS worker-pool host whose per-attempt bindings serve a backend's mounts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NfsShareConfig {
+    pub host_id: ulid::Ulid,
+    pub inputs: bool,
+    pub sessions: bool,
 }
 
 impl BackendCaps {

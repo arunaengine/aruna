@@ -642,6 +642,7 @@ pub(crate) mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         let mut writes = [&base, &late, &latest]
             .into_iter()

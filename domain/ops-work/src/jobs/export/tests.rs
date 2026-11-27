@@ -547,6 +547,7 @@ async fn selection_skips_discovery() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     let user = UserId::local(Ulid::from_bytes([150; 16]), RealmId::from_bytes([151; 32]));
     let ctx = job_context(

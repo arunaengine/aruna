@@ -331,6 +331,7 @@ async fn build_node(
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     Ok(Node {
         _root: root,

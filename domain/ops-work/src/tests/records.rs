@@ -454,6 +454,7 @@ pub async fn context(config: &RealmConfigDocument, publisher: NodeId) -> (TempDi
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         },
     )
 }

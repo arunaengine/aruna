@@ -1,0 +1,44 @@
+# Manifest of aruna-nfs, the embedded NFSv4.1 over RPC-over-TLS frontend.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+[package]
+name = "aruna-nfs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aruna-admission = { workspace = true }
+aruna-clock = { workspace = true }
+aruna-core = { workspace = true }
+aruna-ops-data = { workspace = true }
+aruna-ops-identity = { workspace = true }
+aruna-ops-work = { workspace = true }
+aruna-runner = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+hmac = { workspace = true }
+ipnet = { workspace = true }
+parking_lot = { workspace = true }
+rustls = { workspace = true }
+rustls-webpki = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+ulid = { workspace = true }
+
+[dev-dependencies]
+aruna-core = { workspace = true, features = ["test-hooks"] }
+aruna-runner = { workspace = true, features = ["test-hooks"] }
+aruna-storage = { workspace = true, features = ["test-hooks"] }
+rcgen = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

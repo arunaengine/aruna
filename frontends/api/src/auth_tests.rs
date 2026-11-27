@@ -85,6 +85,7 @@ async fn canonical_blob_path() {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         }),
         realm_id,
         node_id,
@@ -344,6 +345,7 @@ async fn valid_token_required() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
         blob_handle: None,
     });
     let realm_signing_key = generate_signing_key();
@@ -996,6 +998,7 @@ pub async fn test_token_capabilities() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
         blob_handle: None,
     });
 
@@ -1185,6 +1188,7 @@ pub async fn unknown_user_rejected() {
         task_handle: Some(task_handle),
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
         blob_handle: None,
     });
 
@@ -1290,6 +1294,7 @@ pub async fn test_token_validation() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
         blob_handle: None,
     });
 
@@ -1593,6 +1598,7 @@ async fn untrusted_issuers_rejected() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
         blob_handle: None,
     });
 
@@ -1648,6 +1654,7 @@ async fn delegated_token_accepted() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
         blob_handle: None,
     });
 

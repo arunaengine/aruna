@@ -43,13 +43,14 @@ They start an operation in the same way as an HTTP request does.
 | Layer | Crate | Owns |
 | --- | --- | --- |
 | Inputs | `frontends/api`, `frontends/wire` | REST, S3 and MCP transports: input checks, auth, error mapping, OpenAPI, wire DTOs |
+| Inputs | `frontends/smb`, `frontends/nfs`, `frontends/admission` | embedded SMB 3.1.1 and NFSv4.1 file-share servers and shared frontend IP/principal admission limits |
 | Inputs | `frontends/gateway` | the stateless applet gateway (`aruna applet-gateway`): serves applet hosts through the node's edge routes |
 | Inputs | `apps/applet-builder` | the applet builder image and its starter template; no Rust crate |
 | Inputs | `apps/node`, `runtime/config` | the node binary: settings, portal assets, wiring, startup, shutdown, trigger shells |
 | Inputs | `apps/doctor`, `apps/cli`, `apps/registry` | operator tool on a stopped node; user client; standalone identifier registry |
 | Operations | `domain/ops-identity`, `domain/ops-data`, `domain/ops-work` | pure sans-IO use-case state machines in three layer crates (`aruna-ops-identity` -> `aruna-ops-data` -> `aruna-ops-work`, which also holds the trigger tables) |
 | Drivers | `runtime/runner` (`aruna-runner`) | the drive loop, effect routing to the backends and the job runtime |
-| Backends | `runtime/storage`, `runtime/p2p`, `runtime/blob`, `runtime/rdf-graph`, `runtime/scheduler`, `runtime/compute`, `runtime/egress`, `runtime/wasm-host` | Fjall, Iroh and document sync, blob backends, RDF/RO-Crate graph store, timers, executors, egress HTTP/SMTP, the WASM host |
+| Backends | `runtime/storage`, `runtime/p2p`, `runtime/blob`, `runtime/rdf-graph`, `runtime/scheduler`, `runtime/compute`, `runtime/egress`, `runtime/wasm-host`, `runtime/vfs` | Fjall, Iroh and document sync, blob backends, RDF/RO-Crate graph store, timers, executors, egress HTTP/SMTP, the WASM host, local VFS staging/locking/fencing |
 | Foundations | `domain/core`, `domain/kpabe`, `domain/plugin-contract` | domain types, record formats, keyspaces, effects, events, the `Operation` trait, pure helpers, plugin manifests/recipes |
 | Foundations | `runtime/clock` | host clocks and the OS random source for the runner, backends and inputs; never core or operations |
 | Tests | `testing/harness` (`aruna-test-harness`) | test helpers that drive operations through the drivers; only dev-dependencies use it |
@@ -103,7 +104,7 @@ group and lower groups, and never forms a cycle inside its group:
    secrets, abe, placement, shard, sync, owner index, document repository,
    endpoint screening, forward, vaults, tasks.
 2. Data (`domain/ops-data`): s3, blob, staging, connectors, replication, distribution, metadata,
-   git, shares.
+   git, shares, vfs.
 3. Work and integrations (`domain/ops-work`): jobs, plugins, assistant, notifications, federation,
    harvest, node.
 
@@ -222,7 +223,7 @@ crates remain forbidden even as dev-dependencies. The current state:
    and task resources. On failure it tears down only what it acquired.
 2. `startup::realm::prepare` replays metadata and prepares the realm mode
    (initialize, join or provision).
-3. `startup::listeners::bind` binds REST, S3, portal and session S3.
+3. `startup::listeners::bind` binds REST, S3, portal, session S3 and optional SMB/NFS listeners.
 4. `startup::background::start` announces readiness and runs the startup phases
    in `STARTUP_PHASES` order.
 5. `application::run_node` supervises ingress exits and the termination signal,

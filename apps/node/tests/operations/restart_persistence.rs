@@ -198,6 +198,7 @@ fn build_context(
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         }),
         actor,
         config,

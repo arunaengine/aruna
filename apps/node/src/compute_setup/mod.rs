@@ -130,6 +130,8 @@ pub(super) struct KubernetesSettings {
     pub(super) kubedal_driver: Option<String>,
     /// KubeDAL worker cache for cached run inputs, set by its scope.
     pub(super) kubedal_cache: Option<aruna_compute::executor::config::KubedalCache>,
+    /// The node's SMB or NFS share for run inputs or session data; `None` keeps S3 and KubeDAL.
+    pub(super) share_mount: Option<aruna_compute::executor::config::ShareMount>,
     /// The node's S3 endpoint as task pods reach it, used for their S3 env instead of the
     /// public one.
     pub(super) session_endpoint: Option<String>,

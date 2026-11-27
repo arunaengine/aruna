@@ -13,6 +13,7 @@ pub mod blob;
 mod codec;
 pub mod egress;
 pub mod error;
+mod folder_sync;
 mod framing;
 mod fs_source;
 mod fs_write;

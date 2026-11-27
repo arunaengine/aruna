@@ -53,6 +53,7 @@ async fn concurrent_creates_succeed() -> Result<(), BoxError> {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
 
     let realm_id = RealmId([61u8; 32]);

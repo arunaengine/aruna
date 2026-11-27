@@ -425,8 +425,9 @@ impl WriteReferenceOperation {
         let released =
             (existing.as_ref()).and_then(|version| version.offered_size(&write.bucket, &write.key));
         let was_live = existing.is_some_and(|version| !version.is_deleted());
-        let version_id = self.version_id;
-        let next_pointer = CurrentVersionPointer::next_for(self.pointer.as_ref(), version_id)?;
+        let (version_id, life_id) = (self.version_id, self.ids.mint(self.now_ms));
+        let pointer = self.pointer.as_ref();
+        let next_pointer = CurrentVersionPointer::next_live_inherit(pointer, version_id, life_id)?;
         let next_pointer = stamp_head(next_pointer, self.binding.as_ref(), self.epoch);
         let generation = next_pointer.generation;
         let alias = HeadAliasContext::new(
@@ -745,6 +746,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         (tempdir, context)
     }

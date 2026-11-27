@@ -219,6 +219,7 @@ pub(super) fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Plugin(_) => "plugin",
         Effect::Delay(_) => "delay",
         Effect::Job(_) => "job",
+        Effect::Vfs(_) => "vfs",
     }
 }
 

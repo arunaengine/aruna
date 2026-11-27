@@ -529,6 +529,8 @@ class EffectsTest(unittest.TestCase):
         )
         files = {
             "frontends/api/src/routes.rs": text,
+            "frontends/smb/src/session.rs": "fn run() { let _ = VfsEffect::WriteVerifier; }\n",
+            "frontends/nfs/src/rpc.rs": "fn run() { let _ = StorageEffect::SyncAll; }\n",
             "frontends/api/src/routes_tests.rs": "fn fixture() { BlobEffect::Write; }\n",
             "frontends/api/tests/flow.rs": "fn flow() { NetEffect::Send; }\n",
             "apps/node/src/serve.rs": "fn serve() { StorageEffect::Read; }\n",
@@ -536,7 +538,14 @@ class EffectsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             write_tree(root, files)
             sources = [check_layers.load_source(root, rel) for rel in sorted(files)]
-        self.assertEqual(check_layers.raw_effects(sources), ["frontends/api/src/routes.rs:2"])
+        self.assertEqual(
+            check_layers.raw_effects(sources),
+            [
+                "frontends/api/src/routes.rs:2",
+                "frontends/nfs/src/rpc.rs:1",
+                "frontends/smb/src/session.rs:1",
+            ],
+        )
         errors, output = run_report(pure_tree({"frontends/api/src/routes.rs": text}), zero_baseline())
         self.assertEqual(errors, 1, output)
         self.assertIn("error: api_raw_effects rose above its baseline", output)

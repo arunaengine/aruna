@@ -36,6 +36,7 @@ use crate::structs::synced_folder::WriteGuard;
 use crate::task::TaskEffect;
 use crate::types::{Key, KeySpace, TxnId, Value};
 use crate::user::id::UserId;
+pub use crate::vfs_effects::{VfsEffect, VfsEvent, VfsFailure};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
@@ -76,6 +77,8 @@ pub enum Effect {
     Git(Box<crate::git::GitCall>),
     /// One call to a workflow coordinator of this node; never persisted.
     Workflow(Box<crate::workflow::WorkflowEffect>),
+    /// One call to the file server adapter of this node; never persisted.
+    Vfs(Box<VfsEffect>),
 }
 
 impl Effect {

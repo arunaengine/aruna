@@ -34,7 +34,7 @@ GROUPS = (
         "data",
         frozenset(
             "s3 blob staging replication distribution transfer metadata git shares connectors device "
-            "holder_choice usage_publish".split()
+            "holder_choice usage_publish vfs".split()
         ),
     ),
     (
@@ -51,6 +51,7 @@ CRATE_TARGETS = {
     "aruna-api": (
         "aruna-core",
         "aruna-clock",
+        "aruna-admission",
         "aruna-ops-identity",
         "aruna-ops-data",
         "aruna-ops-work",
@@ -58,6 +59,25 @@ CRATE_TARGETS = {
         "aruna-wire",
         "aruna-test-harness",
         "aruna-workflow-contract",
+    ),
+    "aruna-admission": ("aruna-core",),
+    "aruna-smb": (
+        "aruna-core",
+        "aruna-clock",
+        "aruna-admission",
+        "aruna-ops-identity",
+        "aruna-ops-data",
+        "aruna-ops-work",
+        "aruna-runner",
+    ),
+    "aruna-nfs": (
+        "aruna-core",
+        "aruna-clock",
+        "aruna-admission",
+        "aruna-ops-identity",
+        "aruna-ops-data",
+        "aruna-ops-work",
+        "aruna-runner",
     ),
     "aruna-doctor": (
         "aruna-core",
@@ -98,8 +118,10 @@ CRATE_TARGETS = {
         "aruna-wasm-host",
         "aruna-rdf-graph",
         "aruna-egress",
+        "aruna-vfs",
     ),
     "aruna-storage": ("aruna-core", "aruna-clock"),
+    "aruna-vfs": ("aruna-core",),
     "aruna-p2p": ("aruna-core", "aruna-clock"),
     "aruna-blob": ("aruna-core", "aruna-clock", "aruna-kpabe", "aruna-p2p"),
     "aruna-scheduler": ("aruna-core",),
@@ -145,11 +167,12 @@ CRATE_TARGETS = {
 # for the explicit dev-only storage test fixture allowance below (production edges stay forbidden).
 BACKENDS = frozenset(
     "aruna-storage aruna-p2p aruna-blob aruna-scheduler aruna-compute aruna-wasm-host aruna-rdf-graph aruna-egress "
-    "aruna-workflow".split()
+    "aruna-workflow aruna-vfs".split()
 )
 BACKEND_DEV_TARGETS = {
     "aruna-p2p": ("aruna-storage",),
     "aruna-blob": ("aruna-storage",),
+    "aruna-vfs": ("aruna-storage",),
 }
 # Layers are the first directory of a workspace member. Domain crates reach only domain
 # crates; the operations crates reach only lower ones, in tests as well.
@@ -160,9 +183,9 @@ RUNTIME_FOUNDATIONS = frozenset(
 )
 RUNTIME_EXTRAS = {"aruna-config": ("aruna-wire",)}
 FRONTEND_RUNTIME = frozenset({"aruna-clock", "aruna-runner"})
-API_SRC = "frontends/api/src/"
-RAW_EFFECT = re.compile(r"(?<![\w#])(?:r#)?(?:Storage|Net|Blob)Effect::")
-EFFECT_NAMES = frozenset({"StorageEffect", "NetEffect", "BlobEffect"})
+API_SRC = ("frontends/api/src/", "frontends/admission/src/", "frontends/smb/src/", "frontends/nfs/src/")
+RAW_EFFECT = re.compile(r"(?<![\w#])(?:r#)?(?:Storage|Net|Blob|Vfs)Effect::")
+EFFECT_NAMES = frozenset({"StorageEffect", "NetEffect", "BlobEffect", "VfsEffect"})
 EFFECT_USE = re.compile(r"(?<![\w#.:])\buse\s+([\w:#*{},\s]+?);|[{}]")
 TRIGGER_MATCHES = (
     ("apps/node/src/tasks/incoming/mod.rs", "TaskKey::"),

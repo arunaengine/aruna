@@ -319,8 +319,9 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "aruna"
-version = "3.0.0-alpha.211"
+version = "3.0.0-alpha.212"
 dependencies = [
+ "aruna-admission",
  "aruna-api",
  "aruna-blob",
  "aruna-cli",
@@ -331,6 +332,7 @@ dependencies = [
  "aruna-egress",
  "aruna-gateway",
  "aruna-kpabe",
+ "aruna-nfs",
  "aruna-ops-data",
  "aruna-ops-identity",
  "aruna-ops-work",
@@ -339,8 +341,10 @@ dependencies = [
  "aruna-rdf-graph",
  "aruna-runner",
  "aruna-scheduler",
+ "aruna-smb",
  "aruna-storage",
  "aruna-test-harness",
+ "aruna-vfs",
  "aruna-wasm-host",
  "aruna-wire",
  "aruna-workflow",
@@ -399,10 +403,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "aruna-admission"
+version = "3.0.0-alpha.212"
+dependencies = [
+ "aruna-core",
+ "governor",
+ "tokio",
+ "ulid 3.0.0",
+]
+
+[[package]]
 name = "aruna-api"
-version = "3.0.0-alpha.211"
+version = "3.0.0-alpha.212"
 dependencies = [
  "ahash",
+ "aruna-admission",
  "aruna-blob",
  "aruna-clock",
  "aruna-compute",
@@ -478,7 +493,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-blob"
-version = "3.0.0-alpha.211"
+version = "3.0.0-alpha.212"
 dependencies = [
  "aruna-clock",
  "aruna-core",
@@ -531,7 +546,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-cli"
-version = "3.0.0-alpha.211"
+version = "3.0.0-alpha.212"
 dependencies = [
  "apple-native-keyring-store",
  "aruna-plugin-contract",
@@ -562,7 +577,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-clock"
-version = "3.0.0-alpha.211"
+version = "3.0.0-alpha.212"
 dependencies = [
  "aruna-core",
  "nix",
@@ -572,7 +587,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-compute"
-version = "3.0.0-alpha.211"
+version = "3.0.0-alpha.212"
 dependencies = [
  "aruna-clock",
  "aruna-core",
@@ -599,11 +614,12 @@ dependencies = [
  "tokio-util",
  "tower",
  "tracing",
+ "ulid 3.0.0",
 ]
 
 [[package]]
 name = "aruna-compute-helper"
-version = "3.0.0-alpha.211"
+version = "3.0.0-alpha.212"
 dependencies = [
  "rustix",
  "serde_json",
@@ -613,7 +629,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-config"
-version = "3.0.0-alpha.211"
+version = "3.0.0-alpha.212"
 dependencies = [
  "aruna-clock",
  "aruna-core",
@@ -647,7 +663,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-core"
-version = "3.0.0-alpha.211"
+version = "3.0.0-alpha.212"
 dependencies = [
  "aes-gcm 0.11.1",
  "argon2",
@@ -706,7 +722,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-doctor"
-version = "3.0.0-alpha.211"
+version = "3.0.0-alpha.212"
 dependencies = [
  "ahash",
  "aruna",
@@ -757,7 +773,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-egress"
-version = "3.0.0-alpha.211"
+version = "3.0.0-alpha.212"
 dependencies = [
  "aruna-core",
  "async-trait",
@@ -777,7 +793,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-gateway"
-version = "3.0.0-alpha.211"
+version = "3.0.0-alpha.212"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -798,7 +814,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-kpabe"
-version = "3.0.0-alpha.211"
+version = "3.0.0-alpha.212"
 dependencies = [
  "aes-gcm 0.11.1",
  "bls12_381_plus",
@@ -814,7 +830,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-kpabe-wasm"
-version = "3.0.0-alpha.211"
+version = "3.0.0-alpha.212"
 dependencies = [
  "aruna-kpabe",
  "blake3",
@@ -827,8 +843,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "aruna-nfs"
+version = "3.0.0-alpha.212"
+dependencies = [
+ "aruna-admission",
+ "aruna-clock",
+ "aruna-core",
+ "aruna-ops-data",
+ "aruna-ops-identity",
+ "aruna-ops-work",
+ "aruna-runner",
+ "aruna-storage",
+ "blake3",
+ "bytes",
+ "futures-util",
+ "hmac 0.13.0",
+ "ipnet",
+ "parking_lot 0.13.0",
+ "rcgen",
+ "rustls",
+ "rustls-webpki",
+ "sha2 0.11.2",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "tracing",
+ "ulid 3.0.0",
+]
+
+[[package]]
 name = "aruna-ops-data"
-version = "3.0.0-alpha.211"
+version = "3.0.0-alpha.212"
 dependencies = [
  "aruna-blob",
  "aruna-core",
@@ -876,7 +924,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-ops-identity"
-version = "3.0.0-alpha.211"
+version = "3.0.0-alpha.212"
 dependencies = [
  "aruna-core",
  "aruna-p2p",
@@ -910,7 +958,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-ops-work"
-version = "3.0.0-alpha.211"
+version = "3.0.0-alpha.212"
 dependencies = [
  "aruna-blob",
  "aruna-compute",
@@ -969,7 +1017,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-p2p"
-version = "3.0.0-alpha.211"
+version = "3.0.0-alpha.212"
 dependencies = [
  "aruna-clock",
  "aruna-core",
@@ -999,7 +1047,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-plugin"
-version = "3.0.0-alpha.211"
+version = "3.0.0-alpha.212"
 dependencies = [
  "aruna-plugin-contract",
  "serde",
@@ -1009,7 +1057,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-plugin-contract"
-version = "3.0.0-alpha.211"
+version = "3.0.0-alpha.212"
 dependencies = [
  "hex",
  "regex",
@@ -1025,7 +1073,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-plugin-fixture"
-version = "3.0.0-alpha.211"
+version = "3.0.0-alpha.212"
 dependencies = [
  "aruna-plugin",
  "serde_json",
@@ -1034,7 +1082,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-rdf-graph"
-version = "3.0.0-alpha.211"
+version = "3.0.0-alpha.212"
 dependencies = [
  "aruna-core",
  "chrono",
@@ -1057,7 +1105,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-registry"
-version = "3.0.0-alpha.211"
+version = "3.0.0-alpha.212"
 dependencies = [
  "aruna-blob",
  "aruna-clock",
@@ -1088,7 +1136,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-runner"
-version = "3.0.0-alpha.211"
+version = "3.0.0-alpha.212"
 dependencies = [
  "aruna-blob",
  "aruna-clock",
@@ -1099,6 +1147,7 @@ dependencies = [
  "aruna-rdf-graph",
  "aruna-scheduler",
  "aruna-storage",
+ "aruna-vfs",
  "aruna-wasm-host",
  "async-trait",
  "bytes",
@@ -1123,7 +1172,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-scheduler"
-version = "3.0.0-alpha.211"
+version = "3.0.0-alpha.212"
 dependencies = [
  "aruna-core",
  "async-trait",
@@ -1136,8 +1185,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "aruna-smb"
+version = "3.0.0-alpha.212"
+dependencies = [
+ "aes 0.9.4",
+ "aes-gcm 0.11.1",
+ "aruna-admission",
+ "aruna-clock",
+ "aruna-core",
+ "aruna-ops-data",
+ "aruna-ops-identity",
+ "aruna-ops-work",
+ "aruna-runner",
+ "aruna-storage",
+ "bytes",
+ "cmac",
+ "futures-util",
+ "getrandom 0.4.3",
+ "hmac 0.13.0",
+ "md-5",
+ "md4",
+ "parking_lot 0.13.0",
+ "rc4",
+ "sha2 0.11.2",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "ulid 3.0.0",
+ "zeroize",
+]
+
+[[package]]
 name = "aruna-storage"
-version = "3.0.0-alpha.211"
+version = "3.0.0-alpha.212"
 dependencies = [
  "aruna-clock",
  "aruna-core",
@@ -1161,7 +1244,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-test-harness"
-version = "3.0.0-alpha.211"
+version = "3.0.0-alpha.212"
 dependencies = [
  "aruna-blob",
  "aruna-core",
@@ -1192,8 +1275,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "aruna-vfs"
+version = "3.0.0-alpha.212"
+dependencies = [
+ "aruna-core",
+ "parking_lot 0.13.0",
+ "rustix",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "ulid 3.0.0",
+]
+
+[[package]]
 name = "aruna-wasm-host"
-version = "3.0.0-alpha.211"
+version = "3.0.0-alpha.212"
 dependencies = [
  "aruna-plugin-contract",
  "async-trait",
@@ -1223,7 +1320,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-wire"
-version = "3.0.0-alpha.211"
+version = "3.0.0-alpha.212"
 dependencies = [
  "aruna-core",
  "serde",
@@ -1232,7 +1329,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-workflow"
-version = "3.0.0-alpha.211"
+version = "3.0.0-alpha.212"
 dependencies = [
  "aruna-compute",
  "aruna-core",
@@ -1248,7 +1345,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-workflow-contract"
-version = "3.0.0-alpha.211"
+version = "3.0.0-alpha.212"
 dependencies = [
  "serde",
  "serde_json",
@@ -2505,6 +2602,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e0921b3876b3a1df8a1c9f912e7f94342458022c2e84288015893d83c4d62a79"
 
 [[package]]
+name = "cmac"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac78aa94ce13e432b332a4d1bf2eff167d3a2520188ee05b337180a42fd2e62e"
+dependencies = [
+ "cipher 0.5.2",
+ "dbl",
+ "digest 0.11.3",
+]
+
+[[package]]
 name = "cmake"
 version = "0.1.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3317,6 +3425,15 @@ name = "datasketches"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "11c0bd7d22989969a619bae09147b992a6aa7f31dd4f9d9af6345f533744781f"
+
+[[package]]
+name = "dbl"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0d7a944e61df464668c5f51f56cc667396a8821434273112948ea0b66e405d7"
+dependencies = [
+ "hybrid-array",
+]
 
 [[package]]
 name = "dbus"
@@ -5997,6 +6114,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "md4"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd76fb0fd6b2e4be62a73f8e0858ca97f81babcb1af322dcaca196f735f17f80"
+dependencies = [
+ "digest 0.11.3",
+]
+
+[[package]]
 name = "md5"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8363,6 +8489,15 @@ checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
+]
+
+[[package]]
+name = "rc4"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "840038b674daa9f7a7957440d937951d15c0143c056e631e529141fd780e0c92"
+dependencies = [
+ "cipher 0.5.2",
 ]
 
 [[package]]

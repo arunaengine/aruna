@@ -21,6 +21,9 @@ use crate::executor::config::{KubedalCache, KubernetesConfig};
 use crate::executor::staging::StageLayout;
 use crate::executor::{digest_pinned, enforced_limit};
 
+#[path = "csi.rs"]
+pub mod csi;
+
 pub const WORKSPACE_PATH: &str = "/workspace";
 pub const MARKER_PATH: &str = "/aruna-marker/marker";
 pub const SENTINEL_PATH: &str = "/workspace/.aruna-stage";
@@ -58,6 +61,8 @@ pub fn job_manifest(
     let mut mounts = Vec::new();
     let mut init = Vec::new();
     let mut env_from = Vec::new();
+    // A worker's NFS identity covers every pod on it, so the pod must prove its isolation.
+    let mut nfs = false;
     if needs_workspace(spec) {
         volumes.extend([
             json!({"name":"workspace","persistentVolumeClaim":{"claimName":workspace_name(&name)}}),
@@ -101,7 +106,22 @@ pub fn job_manifest(
         }));
     }
     if spec.staging_mode == StagingMode::S3Mount {
-        let buckets = mount_buckets(layout);
+        let mut buckets = mount_buckets(layout);
+        let share = csi::input_source(config, spec, &spec.attempt.job_id, &buckets)?;
+        if let Some(source) = share.filter(|_| !layout.mounts.is_empty()) {
+            let volume = csi::share_input_name(&name);
+            nfs |= matches!(source, csi::ShareSource::Nfs { .. });
+            volumes.push(json!({"name":volume,"persistentVolumeClaim":{"claimName":volume}}));
+            for input in &layout.mounts {
+                mounts.push(json!({
+                    "name":volume,
+                    "mountPath":input.path,
+                    "subPath":input.key,
+                    "readOnly":true
+                }));
+            }
+            buckets.clear();
+        }
         for (index, bucket) in buckets.iter().enumerate() {
             let inputs = layout.mounts.iter().filter(|input| &input.bucket == bucket);
             let (cached, streamed): (Vec<_>, Vec<_>) =
@@ -172,10 +192,25 @@ pub fn job_manifest(
     // The data mount nests inside the scratch directory, so it comes after it.
     if let Some(mount) = session_mount(spec, config) {
         let path = normalize_container_path(&mount.path).map_err(BackendError::InvalidSpec)?;
-        let volume = data_name(&name);
+        let bucket = spec
+            .workspace
+            .as_ref()
+            .map(|workspace| &workspace.bucket_name);
+        let share = bucket
+            .map(|bucket| csi::session_source(config, spec, bucket, mount))
+            .transpose()?
+            .flatten();
+        let volume = match share {
+            Some(_) => csi::share_data_name(&name),
+            None => data_name(&name),
+        };
         // KubeDAL writes through the session's own DataNode, so the credential stays on this realm.
-        volumes.push(match &config.kubedal {
-            Some(kubedal) => {
+        volumes.push(match (&share, &config.kubedal) {
+            (Some(source), _) => {
+                nfs |= matches!(source, csi::ShareSource::Nfs { .. });
+                json!({"name":volume,"persistentVolumeClaim":{"claimName":volume}})
+            }
+            (None, Some(kubedal)) => {
                 let mut attributes = json!({"dataNode":volume,"mount":"fuse-read-write"});
                 if !mount.prefix.is_empty() {
                     attributes["path"] = json!(mount.prefix);
@@ -186,7 +221,7 @@ pub fn job_manifest(
                     "volumeAttributes":attributes
                 }})
             }
-            None => json!({"name":volume,"persistentVolumeClaim":{"claimName":volume}}),
+            (None, None) => json!({"name":volume,"persistentVolumeClaim":{"claimName":volume}}),
         });
         mounts.push(json!({
             "name":volume,
@@ -244,7 +279,7 @@ pub fn job_manifest(
         "volumeMounts":mounts
     });
     let deadline = deadline_secs(spec);
-    serde_json::from_value(json!({
+    let job: Job = serde_json::from_value(json!({
         "apiVersion":"batch/v1",
         "kind":"Job",
         "metadata":{
@@ -276,7 +311,16 @@ pub fn job_manifest(
             }
         }
     }))
-    .map_err(manifest_error)
+    .map_err(manifest_error)?;
+    if nfs {
+        let pod = job
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.template.spec.as_ref());
+        let pod = pod.ok_or_else(|| BackendError::Api("task Job has no pod".to_string()))?;
+        csi::check_isolation(pod)?;
+    }
+    Ok(job)
 }
 
 pub fn pvc_manifest(
@@ -762,7 +806,7 @@ pub fn session_mount<'a>(
     spec: &'a TaskSpec,
     config: &KubernetesConfig,
 ) -> Option<&'a SessionMount> {
-    if !spec.session || spec.workspace.is_none() || !config.mounts_inputs() {
+    if !spec.session || spec.workspace.is_none() || !config.mounts_sessions() {
         return None;
     }
     spec.session_mount.as_ref()

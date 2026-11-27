@@ -1068,6 +1068,7 @@ pub(super) mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         let (jobs, _) = drive(ListJobsOperation::new(user(), None, 10, |_| true), &context)
             .await

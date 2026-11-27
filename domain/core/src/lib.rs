@@ -11,6 +11,7 @@ mod realm;
 mod storage;
 mod sync;
 mod vault;
+pub mod vfs_effects;
 mod workload;
 
 pub mod applet;

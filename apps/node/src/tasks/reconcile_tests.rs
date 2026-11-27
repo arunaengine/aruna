@@ -46,6 +46,7 @@ async fn missing_backend_spares() {
         task_handle: Some(TaskHandle::new()),
         compute_handle: Some(Arc::new(ExecutorRegistry::new())),
         outbound_handle: None,
+        vfs_handle: None,
     });
     let job_id = job_id();
     let token = Ulid::generate();

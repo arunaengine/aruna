@@ -706,6 +706,7 @@ mod tests {
             task_handle: Some(task),
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         });
 
         assert!(drive(start_sync_run(), &context).await.unwrap());
@@ -737,6 +738,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         });
         let now = aruna_core::time::unix_timestamp_millis();
         let note = |note| aruna_runner::driver::drive(NoteSyncOperation::new(note, now), &context);
@@ -775,6 +777,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         });
         let document_id = Ulid::generate();
         let retryable = draft(PublishState::Failed {

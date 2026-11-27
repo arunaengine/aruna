@@ -749,6 +749,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         let node = |seed| iroh::SecretKey::from_bytes(&[seed; 32]).public();
         let (local, source) = (node(1), node(2));
@@ -843,6 +844,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         let realm_id = RealmId([1; 32]);
         let owner = UserId::local(Ulid::from_bytes([2; 16]), realm_id);

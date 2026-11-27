@@ -106,6 +106,7 @@ impl DockerTestExt for DockerBackend {
             log_limits: spec.log_limits,
             session: spec.session,
             session_mount: spec.session_mount.clone(),
+            nfs_mounts: spec.nfs_mounts.clone(),
         };
         aruna_compute::executor::ExecutorBackend::submit(
             self,

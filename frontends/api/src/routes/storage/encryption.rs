@@ -969,6 +969,7 @@ fn change_refusal(error: ChangeError) -> ServerError {
             "the key holders do not meet the recovery rule",
         ),
         ChangeError::TransitionRunning => transition_running(),
+        ChangeError::PlainStages => plain_stages(),
         other => ServerError::InternalError(other.into()),
     }
 }
@@ -1054,8 +1055,18 @@ pub(crate) fn enable_refusal(error: EnableError) -> ServerError {
             "mapped_bucket",
             aruna_ops_data::s3::imports::MAPPED_REASON,
         ),
+        EnableError::PlainStages => plain_stages(),
         other => ServerError::InternalError(other.into()),
     }
+}
+
+/// Plaintext file server stages on this node block the change until they are published.
+fn plain_stages() -> ServerError {
+    refused(
+        StatusCode::CONFLICT,
+        "plain_stages_present",
+        "the bucket still has plaintext file server stages",
+    )
 }
 
 #[cfg(test)]
@@ -1311,6 +1322,7 @@ mod tests {
         assert_eq!(code(ChangeError::OpenUploads), "open_uploads");
         assert_eq!(code(ChangeError::RecoveryUnmet), "recovery_unmet");
         assert_eq!(code(ChangeError::Unchanged), "unchanged");
+        assert_eq!(code(ChangeError::PlainStages), "plain_stages_present");
         let stale = BucketKeyError::StaleGeneration {
             requested: 1,
             current: 2,
@@ -1348,6 +1360,14 @@ mod tests {
             .response_body()
             .code;
         assert_eq!(code.as_deref(), Some("transition_running"));
+    }
+
+    #[test]
+    fn plain_stages_conflict() {
+        let refusal = enable_refusal(EnableError::PlainStages);
+        assert_eq!(refusal.status_code(), StatusCode::CONFLICT);
+        let body = refusal.response_body();
+        assert_eq!(body.code.as_deref(), Some("plain_stages_present"));
     }
 
     #[test]

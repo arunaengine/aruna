@@ -7,7 +7,8 @@ use crate::distribution::inventory::{AddedVersion, stamp_head, stamp_version, ve
 use crate::s3::purge_fence::{
     PurgeFenceError, check_fence_row, check_published, fence_key, publication_rows,
 };
-use crate::s3::row_fence::{FenceError, RowFence};
+use crate::s3::row_fence::FenceError;
+pub use crate::s3::row_fence::{RangeGuard, RowFence};
 use crate::s3::usage::{
     QuotaGate, QuotaGateError, RowChange, StoredDelta, UsageCounterUpdate, UsageUpdateError,
     schedule_snapshot_publish,
@@ -125,10 +126,24 @@ pub enum PutObjectState {
     WriteReplicationObligation,
     EnforceQuota,
     UpdateUsage,
-    /// Checks the caller's guard rows and writes its receipts in the version transaction.
+    /// Reads the caller's guard rows in the version transaction before any target row moves.
+    RowGuards,
+    /// Writes the caller's receipts and rows, then deletes its rows, after the version rows.
     RowFence,
     /// The write failed; only the cleanup in `abort` remains.
     Error,
+    /// Reads the purge fence, the head and the bucket incarnation of a source the write deletes.
+    ReadSourceHead,
+    ReadSourceVersion,
+    /// Writes the source's delete marker, head, obligation and delete trail.
+    WriteSource,
+    SourceUsage,
+    /// Writes the empty bytes of a parent directory marker before the version transaction.
+    WriteMarkerBlob,
+    /// Reads the marker's head and the location of its bytes in the version transaction.
+    ReadMarkerRows,
+    WriteMarkerRows,
+    MarkerUsage,
     ReadAbe,
     FenceAbe,
     WriteEnvelope,
@@ -233,6 +248,28 @@ pub enum PutObjectError {
     FenceTaken,
     #[error("usage counters are being rebuilt; retry later")]
     UsageRebuilding,
+}
+
+/// A source key the version transaction deletes with a delete marker, as a rename does: the
+/// head must still hold the given life and version, and the marker commits with the version.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SourceDelete {
+    pub key: String,
+    pub expected_life: Option<Ulid>,
+    pub expected_version: Option<Ulid>,
+    pub deleted_by: UserId,
+    /// The id of the delete marker, given by the caller so a rerun writes the same one.
+    pub marker_version: Ulid,
+}
+
+/// The empty directory marker `key` (ending in `/`) the version transaction creates when the
+/// key has no live head, so a directory whose last child moves away stays visible.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ParentMarker {
+    pub key: String,
+    pub version_id: Ulid,
+    pub life_id: Ulid,
+    pub owner: UserId,
 }
 
 /// A refused call fails as its storage error; a lost conflict as the transaction conflict.
@@ -377,6 +414,10 @@ pub struct PutObjectOperation {
     plain: Option<plain::PlainWrite>,
     /// The head the caller saw, `None` for no head; another head refuses the write.
     expected_head: Option<Option<Ulid>>,
+    /// The head's life the caller saw, `None` for no live object; another life refuses the write.
+    expected_life: Option<Option<Ulid>>,
+    /// Seals a preassigned version's bytes with an envelope like an ordinary upload.
+    preserve_envelope: bool,
     import_rows: Option<plain::ImportRows>,
     /// Whether the import rule exists, read in the current version transaction.
     rule_exists: Option<bool>,
@@ -407,6 +448,27 @@ pub struct PutObjectOperation {
     /// The head this write installs and the epoch of its version, for the inventory.
     head_pointer: Option<CurrentVersionPointer>,
     version_epoch: OriginalEpoch,
+    /// The life a new or replaced live head takes instead of a minted one.
+    life: Option<Ulid>,
+    source_delete: Option<SourceDelete>,
+    /// The source head, its offered bytes and its bucket incarnation, read in the transaction.
+    source_head: Option<CurrentVersionPointer>,
+    source_released: u64,
+    source_incarnation: u128,
+    source_written: bool,
+    source_usage: Option<UsageCounterUpdate>,
+    parent_marker: Option<ParentMarker>,
+    /// The empty bytes written for the parent marker before the version transaction.
+    marker_location: Option<BackendLocation>,
+    /// The stored copy the marker publishes, and whether this transaction adds its row.
+    marker_output: Option<BackendLocation>,
+    marker_new: bool,
+    marker_read: bool,
+    /// The marker key already had a live head, so the written bytes are dropped.
+    marker_skipped: bool,
+    marker_usage: Option<UsageCounterUpdate>,
+    /// The marker bytes after a publish whose commit outcome is unknown.
+    marker_reconcile: Option<BackendLocation>,
 }
 
 impl PutObjectOperation {
@@ -455,6 +517,8 @@ impl PutObjectOperation {
             envelope_bytes: 0,
             plain: None,
             expected_head: None,
+            expected_life: None,
+            preserve_envelope: false,
             import_rows: None,
             rule_exists: None,
             keep_head: false,
@@ -473,7 +537,41 @@ impl PutObjectOperation {
             authority: None,
             head_pointer: None,
             version_epoch: OriginalEpoch::default(),
+            life: None,
+            source_delete: None,
+            source_head: None,
+            source_released: 0,
+            source_incarnation: 0,
+            source_written: false,
+            source_usage: None,
+            parent_marker: None,
+            marker_location: None,
+            marker_output: None,
+            marker_new: false,
+            marker_read: false,
+            marker_skipped: false,
+            marker_usage: None,
+            marker_reconcile: None,
         }
+    }
+
+    /// The life the published head takes when it starts a new live object or replaces another
+    /// one, instead of a minted life; a live head of the same life continues it.
+    pub fn with_life(mut self, life_id: Ulid) -> Self {
+        self.life = Some(life_id);
+        self
+    }
+
+    /// Deletes `source` with a delete marker in the same transaction as the version.
+    pub fn with_source_delete(mut self, source: SourceDelete) -> Self {
+        self.source_delete = Some(source);
+        self
+    }
+
+    /// Creates the parent directory marker in the same transaction when it has no live head.
+    pub fn with_parent_marker(mut self, marker: ParentMarker) -> Self {
+        self.parent_marker = Some(marker);
+        self
     }
 
     /// Mints no object key or envelope for this copied version.
@@ -509,6 +607,20 @@ impl PutObjectOperation {
     /// Refuses the write with `HeadChanged` unless the key's head is still `head`.
     pub fn with_expected_head(mut self, head: Option<Ulid>) -> Self {
         self.expected_head = Some(head);
+        self
+    }
+
+    /// Refuses the write with `HeadChanged` unless the head's life is still `life_id`; `None`
+    /// expects an absent head or a delete marker.
+    pub fn with_expected_life(mut self, life_id: Option<Ulid>) -> Self {
+        self.expected_life = Some(life_id);
+        self
+    }
+
+    /// A file server write that supplies its version id still gets the bucket's envelope, as
+    /// an ordinary upload does; other preassigned versions skip it.
+    pub fn with_preserve_envelope(mut self, preserve: bool) -> Self {
+        self.preserve_envelope = preserve;
         self
     }
 
@@ -573,11 +685,16 @@ impl PutObjectOperation {
     /// Refuses the write with `FenceTaken` unless the version transaction still reads each
     /// guard as given; each receipt key then records the version id in that transaction.
     pub fn with_fence(
-        mut self,
+        self,
         guards: Vec<(String, Key, Option<Value>)>,
         receipts: Vec<(String, Key)>,
     ) -> Self {
-        self.row_fence = Some(RowFence::new(guards, receipts));
+        self.with_row_fence(RowFence::new(guards, receipts))
+    }
+
+    /// The full fence: its guards are read before the version rows, its rows written after.
+    pub fn with_row_fence(mut self, fence: RowFence) -> Self {
+        self.row_fence = Some(fence);
         self
     }
 
@@ -786,7 +903,7 @@ impl PutObjectOperation {
             || self.adopt.is_some()
             || !self.envelope_enabled
             || self.origin != CopyOrigin::Write
-            || self.config.preassigned_version_id.is_some()
+            || (self.config.preassigned_version_id.is_some() && !self.preserve_envelope)
         {
             self.write_blob()
         } else {
@@ -950,6 +1067,7 @@ impl PutObjectOperation {
         child.envelope = self.envelope.clone();
         child.plain = self.plain.clone();
         child.expected_head = self.expected_head;
+        child.expected_life = self.expected_life;
         child.import_rows = self.import_rows.clone();
         child.keep_head = self.keep_head;
         child.written_intent = self.written_intent.clone();
@@ -960,10 +1078,17 @@ impl PutObjectOperation {
         child.binding = self.binding.clone();
         child.authority = self.authority.clone();
         child.version_epoch = self.version_epoch;
+        child.life = self.life;
+        child.source_delete = self.source_delete.clone();
+        child.parent_marker = self.parent_marker.clone();
+        child.marker_location = self.marker_location.clone();
         child
     }
 
     fn start_publish(&mut self) -> Turn {
+        if self.parent_marker.is_some() && self.marker_location.is_none() {
+            return self.write_marker_blob();
+        }
         let child = self.publish_child();
         self.call(PutObjectState::Publish, IoCall::child(child))
     }
@@ -1001,6 +1126,7 @@ impl PutObjectOperation {
     /// reconciliation queue rather than being deleted: the committed blob location row is
     /// what decides their fate.
     fn keep_written_blob(&mut self, error: &StorageError) {
+        self.marker_reconcile = self.marker_location.take();
         let Some(location) = self.written_location.take() else {
             return;
         };
@@ -1181,7 +1307,22 @@ impl Operation for PutObjectOperation {
             }
             PutObjectState::EnforceQuota => self.handle_enforce_quota(result),
             PutObjectState::UpdateUsage => self.handle_usage_update(result),
+            PutObjectState::RowGuards => self.guards_answered(result),
             PutObjectState::RowFence => self.fence_answered(result),
+            PutObjectState::ReadSourceHead => self.source_head_read(result.values()?),
+            PutObjectState::ReadSourceVersion => self.source_version_read(result.value()?),
+            PutObjectState::WriteSource => {
+                result.done()?;
+                self.start_source_usage()
+            }
+            PutObjectState::SourceUsage => self.source_usage_step(result),
+            PutObjectState::WriteMarkerBlob => self.marker_written(result.event()?),
+            PutObjectState::ReadMarkerRows => self.marker_rows_read(result.values()?),
+            PutObjectState::WriteMarkerRows => {
+                result.done()?;
+                self.start_marker_usage()
+            }
+            PutObjectState::MarkerUsage => self.marker_usage_step(result),
             PutObjectState::Error => Err(PutObjectError::InvalidOperationState),
         }
     }
@@ -1201,6 +1342,9 @@ impl Operation for PutObjectOperation {
             return Vec::new();
         }
         // The publish was cut off: its commit may have applied.
+        if self.state == PutObjectState::Publish {
+            self.marker_reconcile = self.marker_location.take();
+        }
         if self.state == PutObjectState::Publish
             && !self.adopted
             && let Some(location) = self.written_location.take()
@@ -1208,6 +1352,15 @@ impl Operation for PutObjectOperation {
             self.reconcile_location = Some(location);
         }
         let mut calls = Vec::new();
+        if let Some(location) = self.marker_reconcile.take() {
+            let (id, fresh) = (location.ulid, self.ids.mint(self.now_ms));
+            let work = self.reconcile_work(location);
+            calls.extend(work.ok().and_then(|work| Self::cleanup_row(&work, fresh)));
+            calls.push(Effect::blob(BlobEffect::ReleaseReservation { id }).into());
+        }
+        if let Some(location) = self.marker_location.take() {
+            calls.push(IoCall::child(RollbackWrite::new(location)));
+        }
         if let Some(location) = self.reconcile_location.take() {
             let work = self.reconcile_work(location);
             let fresh = self.ids.mint(self.now_ms);

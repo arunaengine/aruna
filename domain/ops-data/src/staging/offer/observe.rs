@@ -90,15 +90,21 @@ struct VersionChange {
 }
 
 impl VersionChange {
-    /// The head transition to `version_id`, then `write`, then `usage`.
+    /// The head transition to `version_id`, then `write`, then `usage`. A live observation
+    /// passes a fresh `life_id` it uses when the head has no life yet; a marker passes none.
     fn new(
         scope: &ObservationScope,
         key: &str,
-        (pointer, version_id): (Option<&CurrentVersionPointer>, Ulid),
+        (pointer, version_id, life_id): (Option<&CurrentVersionPointer>, Ulid, Option<Ulid>),
         write: Effect,
         (usage, generation): (UsageCounterUpdate, Ulid),
     ) -> Result<Self, OfferError> {
-        let next = CurrentVersionPointer::next_for(pointer, version_id)?;
+        let next = match life_id {
+            Some(life_id) => {
+                CurrentVersionPointer::next_live_inherit(pointer, version_id, life_id)?
+            }
+            None => CurrentVersionPointer::next_deleted(pointer, version_id)?,
+        };
         let alias = HeadAliasContext::new(
             scope.realm_id,
             scope.group_id,
@@ -260,8 +266,8 @@ impl ObserveFileOperation {
         let usage = UsageCounterUpdate::for_group(scope.group_id, delta)
             .in_bucket(&scope.bucket, RowChange::AddedVersion);
         let usage = (usage, self.mint.mint(self.now_ms));
-        let mut change =
-            VersionChange::new(scope, &self.path, (pointer, version_id), write, usage)?;
+        let head = (pointer, version_id, Some(self.mint.mint(self.now_ms)));
+        let mut change = VersionChange::new(scope, &self.path, head, write, usage)?;
         let call = change.next_call().ok_or(IoError::Unfinished)?;
         self.version_id = Some(version_id);
         self.change = Some(change);
@@ -353,7 +359,8 @@ impl TombstoneOperation {
             .in_bucket(&scope.bucket, RowChange::AddedMarker);
         let pointer = self.rows.pointer.as_ref();
         let usage = (usage, self.mint.mint(self.now_ms));
-        let mut change = VersionChange::new(scope, &self.key, (pointer, version_id), write, usage)?;
+        let head = (pointer, version_id, None);
+        let mut change = VersionChange::new(scope, &self.key, head, write, usage)?;
         let call = change.next_call().ok_or(IoError::Unfinished)?;
         self.change = Some(change);
         Ok(Next::Call(call))

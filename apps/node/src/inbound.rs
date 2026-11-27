@@ -847,6 +847,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         let documents = vec![evicted(1), evicted(2)];
         let (failed, receivers) = aruna_storage::storage::handle::StorageHandle::new();
@@ -935,6 +936,7 @@ mod tests {
                 task_handle: None,
                 compute_handle: None,
                 outbound_handle: None,
+                vfs_handle: None,
             }),
             RoCrateLimits::default(),
             JobsRuntime::new(),
@@ -997,6 +999,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         });
         (net, context)
     }
@@ -1140,6 +1143,7 @@ mod tests {
                     task_handle: None,
                     compute_handle: None,
                     outbound_handle: None,
+                    vfs_handle: None,
                 }),
                 RoCrateLimits::default(),
                 JobsRuntime::new(),

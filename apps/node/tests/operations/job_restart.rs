@@ -106,6 +106,7 @@ async fn restart_recovers_jobs() -> Result<(), Box<dyn std::error::Error>> {
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     });
     let recovered = recover_stale_jobs(&runtime, &context).await?;
     assert_eq!(recovered, 2, "both in-flight jobs are re-queued at startup");

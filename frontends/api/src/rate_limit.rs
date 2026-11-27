@@ -5,6 +5,8 @@
 use crate::error::ErrorResponse;
 use crate::forwarded::client_ip;
 use crate::server::state::ServerState;
+use aruna_admission::RateLimits;
+pub(crate) use aruna_admission::{LocalKey, LocalLease, LocalPermit};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::user::id::UserId;
 use axum::body::Body;
@@ -12,143 +14,8 @@ use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::Response;
-use governor::clock::{Clock, DefaultClock};
-use governor::state::keyed::DefaultKeyedStateStore;
-use governor::{Quota, RateLimiter};
-use std::collections::HashMap;
 use std::net::IpAddr;
-use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-
-const IP_REQUESTS_MINUTE: u32 = 24_000;
-const IP_BURST: u32 = 4_000;
-const PRINCIPAL_REQUESTS_MINUTE: u32 = 12_000;
-const PRINCIPAL_BURST: u32 = 2_000;
-/// Every N checks the keyed stores drop entries that are fully replenished.
-const MAINTENANCE_INTERVAL: u64 = 4_096;
-const LOCAL_PERMITS: usize = 16;
-const LOCAL_TABLE_LIMIT: usize = 4_096;
-const LOCAL_LEASE_LIMIT: usize = 2;
-/// Share link opens per address and per link: each may test a password.
-const SHARE_OPENS_MINUTE: u32 = 30;
-const SHARE_OPENS_BURST: u32 = 10;
-/// Account merges and sign-in attaches per account: each checks a token of another account.
-const ACCOUNT_LINKS_MINUTE: u32 = 6;
-const ACCOUNT_LINKS_BURST: u32 = 5;
-
-type Keyed<K> = RateLimiter<K, DefaultKeyedStateStore<K>, DefaultClock>;
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum LocalKey {
-    User(UserId),
-    Ip(IpAddr),
-}
-
-#[derive(Default)]
-struct LocalTable {
-    entries: HashMap<LocalKey, Arc<Semaphore>>,
-}
-
-impl LocalTable {
-    fn try_acquire(&mut self, key: LocalKey, table: &Arc<Mutex<Self>>) -> Option<LocalPermit> {
-        let semaphore = match self.entries.get(&key) {
-            Some(semaphore) => Arc::clone(semaphore),
-            None => {
-                if self.entries.len() >= LOCAL_TABLE_LIMIT {
-                    return None;
-                }
-                let semaphore = Arc::new(Semaphore::new(LOCAL_PERMITS));
-                self.entries.insert(key, Arc::clone(&semaphore));
-                semaphore
-            }
-        };
-        let permit = semaphore.clone().try_acquire_owned().ok()?;
-        Some(LocalPermit {
-            permit: Some(permit),
-            table: Arc::downgrade(table),
-            key,
-            semaphore,
-        })
-    }
-}
-
-pub(crate) struct LocalPermit {
-    permit: Option<OwnedSemaphorePermit>,
-    table: Weak<Mutex<LocalTable>>,
-    key: LocalKey,
-    semaphore: Arc<Semaphore>,
-}
-
-impl LocalPermit {
-    #[cfg(test)]
-    pub(crate) fn test_permit(semaphore: Arc<Semaphore>) -> Self {
-        let permit = semaphore
-            .clone()
-            .try_acquire_owned()
-            .expect("test semaphore has a free permit");
-        Self {
-            permit: Some(permit),
-            table: Weak::new(),
-            key: LocalKey::Ip(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
-            semaphore,
-        }
-    }
-}
-
-impl Drop for LocalPermit {
-    fn drop(&mut self) {
-        let Some(permit) = self.permit.take() else {
-            return;
-        };
-        drop(permit);
-        let Some(table) = self.table.upgrade() else {
-            return;
-        };
-        let mut table = table
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.semaphore.available_permits() == LOCAL_PERMITS
-            && table
-                .entries
-                .get(&self.key)
-                .is_some_and(|entry| Arc::ptr_eq(entry, &self.semaphore))
-        {
-            table.entries.remove(&self.key);
-        }
-    }
-}
-
-/// A request extension that keeps local admission permits alive through the
-/// response body. The server may clone this slot before handing the request to
-/// s3s and move its clone into the response wrapper.
-#[derive(Clone, Default)]
-pub(crate) struct LocalLease(Arc<Mutex<Vec<LocalPermit>>>);
-
-impl LocalLease {
-    pub(crate) fn hold(&self, permit: LocalPermit) -> bool {
-        let mut slot = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if slot.len() >= LOCAL_LEASE_LIMIT {
-            return false;
-        }
-        slot.push(permit);
-        true
-    }
-
-    pub(crate) fn replace(&self, permit: LocalPermit) {
-        let mut slot = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous = std::mem::replace(&mut *slot, vec![permit]);
-        drop(slot);
-        drop(previous);
-    }
-}
+use std::sync::Arc;
 
 impl std::fmt::Debug for ApiRateLimits {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -156,53 +23,40 @@ impl std::fmt::Debug for ApiRateLimits {
     }
 }
 
+/// The HTTP and S3 view of the node's shared limits; other frontends hold the same `Arc`.
 pub struct ApiRateLimits {
-    per_ip: Keyed<IpAddr>,
-    per_principal: Keyed<String>,
-    share_opens: Keyed<String>,
-    account_links: Keyed<String>,
-    clock: DefaultClock,
-    checks: AtomicU64,
-    local: Arc<Mutex<LocalTable>>,
+    shared: Arc<RateLimits>,
 }
 
 impl Default for ApiRateLimits {
     fn default() -> Self {
-        Self::new(
-            IP_REQUESTS_MINUTE,
-            IP_BURST,
-            PRINCIPAL_REQUESTS_MINUTE,
-            PRINCIPAL_BURST,
-        )
+        Self::from_shared(Arc::new(RateLimits::default()))
     }
-}
-
-fn quota(per_minute: u32, burst: u32) -> Quota {
-    Quota::per_minute(NonZeroU32::new(per_minute.max(1)).expect("nonzero rate"))
-        .allow_burst(NonZeroU32::new(burst.max(1)).expect("nonzero burst"))
 }
 
 impl ApiRateLimits {
     /// Operator-configurable quotas; each value floors at one so a limiter is
     /// always valid.
     pub fn new(ip_per_minute: u32, ip_burst: u32, principal_per_minute: u32, burst: u32) -> Self {
-        Self {
-            per_ip: RateLimiter::keyed(quota(ip_per_minute, ip_burst)),
-            per_principal: RateLimiter::keyed(quota(principal_per_minute, burst)),
-            share_opens: RateLimiter::keyed(quota(SHARE_OPENS_MINUTE, SHARE_OPENS_BURST)),
-            account_links: RateLimiter::keyed(quota(ACCOUNT_LINKS_MINUTE, ACCOUNT_LINKS_BURST)),
-            clock: DefaultClock::default(),
-            checks: AtomicU64::new(0),
-            local: Arc::new(Mutex::new(LocalTable::default())),
-        }
+        Self::from_shared(Arc::new(RateLimits::new(
+            ip_per_minute,
+            ip_burst,
+            principal_per_minute,
+            burst,
+        )))
+    }
+
+    /// Wraps limits that the node shares with its filesystem frontends.
+    pub fn from_shared(shared: Arc<RateLimits>) -> Self {
+        Self { shared }
+    }
+
+    pub fn shared(&self) -> &Arc<RateLimits> {
+        &self.shared
     }
 
     pub(crate) fn try_acquire_local(&self, key: LocalKey) -> Option<LocalPermit> {
-        let local = Arc::clone(&self.local);
-        local
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .try_acquire(key, &local)
+        self.shared.try_acquire_local(key)
     }
 
     /// Tight quotas for tests that must observe a denial quickly.
@@ -211,69 +65,28 @@ impl ApiRateLimits {
         Self::new(60, burst, 60, burst)
     }
 
-    fn maybe_maintain(&self) {
-        if self
-            .checks
-            .fetch_add(1, Ordering::Relaxed)
-            .is_multiple_of(MAINTENANCE_INTERVAL)
-        {
-            self.per_ip.retain_recent();
-            self.per_principal.retain_recent();
-            self.share_opens.retain_recent();
-            self.account_links.retain_recent();
-        }
-    }
-
     /// Charges the caller's IP bucket. `Err` carries the seconds after which a
     /// retry can conform (never zero).
     pub fn check_ip(&self, ip: IpAddr) -> Result<(), u64> {
-        self.maybe_maintain();
-        let now = self.clock.now();
-        self.per_ip
-            .check_key(&ip)
-            .map_err(|not_until| retry_secs(not_until.wait_time_from(now).as_secs()))
+        self.shared.check_ip(ip)
     }
 
     /// Charges the authenticated principal's bucket, independent of the IP
     /// bucket so a request is never double-charged for its address.
     pub fn check_principal(&self, principal: UserId) -> Result<(), u64> {
-        self.maybe_maintain();
-        let now = self.clock.now();
-        let principal = principal.to_string();
-        self.per_principal
-            .check_key(&principal)
-            .map_err(|not_until| retry_secs(not_until.wait_time_from(now).as_secs()))
+        self.shared.check_principal(principal)
     }
-}
 
-impl ApiRateLimits {
     /// Charges one share link open to the client address and to the link, so neither many
     /// addresses nor many links speed up password guessing.
     pub fn check_share_open(&self, ip: IpAddr, share_id: ulid::Ulid) -> Result<(), u64> {
-        self.maybe_maintain();
-        let now = self.clock.now();
-        for key in [format!("ip:{ip}"), format!("link:{share_id}")] {
-            self.share_opens
-                .check_key(&key)
-                .map_err(|not_until| retry_secs(not_until.wait_time_from(now).as_secs()))?;
-        }
-        Ok(())
+        self.shared.check_share_open(ip, share_id)
     }
-}
 
-impl ApiRateLimits {
     /// Charges one account merge or sign-in attach to the calling account.
     pub fn check_account_link(&self, user_id: UserId) -> Result<(), u64> {
-        self.maybe_maintain();
-        let now = self.clock.now();
-        self.account_links
-            .check_key(&user_id.to_string())
-            .map_err(|not_until| retry_secs(not_until.wait_time_from(now).as_secs()))
+        self.shared.check_account_link(user_id)
     }
-}
-
-fn retry_secs(secs: u64) -> u64 {
-    secs.max(1)
 }
 
 /// REST IP limiter. Runs at the outer transport boundary, before CORS, bearer
@@ -340,142 +153,4 @@ fn too_many_requests(retry_after: u64) -> Response {
         HeaderValue::from_static("application/json; charset=utf-8"),
     );
     response
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{ApiRateLimits, LOCAL_PERMITS, LOCAL_TABLE_LIMIT, LocalKey, LocalLease};
-    use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::user::id::UserId;
-    use std::net::IpAddr;
-    use std::str::FromStr;
-    use ulid::Ulid;
-
-    #[test]
-    fn limits_by_ip() {
-        // The burst drains, the denial names a retry delay, other IPs still pass.
-        let limits = ApiRateLimits::for_test(3);
-        let ip = IpAddr::from_str("203.0.113.7").unwrap();
-        for _ in 0..3 {
-            assert!(limits.check_ip(ip).is_ok());
-        }
-        let retry_after = limits.check_ip(ip).expect_err("over budget");
-        assert!(retry_after >= 1);
-        assert!(
-            limits
-                .check_ip(IpAddr::from_str("203.0.113.8").unwrap())
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn limits_by_principal() {
-        // A principal is bounded independently of any source address.
-        let limits = ApiRateLimits::for_test(3);
-        for _ in 0..3 {
-            assert!(limits.check_principal(user(1)).is_ok());
-        }
-        assert!(limits.check_principal(user(1)).is_err());
-        assert!(limits.check_principal(user(2)).is_ok());
-    }
-
-    #[test]
-    fn buckets_stay_independent() {
-        // Draining the IP bucket must not spend the principal's, and vice versa.
-        let limits = ApiRateLimits::for_test(2);
-        let ip = IpAddr::from_str("203.0.113.10").unwrap();
-        assert!(limits.check_ip(ip).is_ok());
-        assert!(limits.check_ip(ip).is_ok());
-        assert!(limits.check_ip(ip).is_err());
-        // The principal bucket is untouched by the exhausted IP bucket.
-        assert!(limits.check_principal(user(1)).is_ok());
-        assert!(limits.check_principal(user(1)).is_ok());
-        assert!(limits.check_principal(user(1)).is_err());
-    }
-
-    fn user(number: u128) -> UserId {
-        UserId::local(Ulid::from(number), RealmId([1u8; 32]))
-    }
-
-    #[test]
-    fn limits_local_user() {
-        let limits = ApiRateLimits::default();
-        let key = LocalKey::User(user(1));
-        let mut permits = Vec::new();
-        for _ in 0..LOCAL_PERMITS {
-            permits.push(limits.try_acquire_local(key).expect("local permit"));
-        }
-        assert!(limits.try_acquire_local(key).is_none());
-        drop(permits.pop());
-        assert!(limits.try_acquire_local(key).is_some());
-    }
-
-    #[test]
-    fn permits_distinct_users() {
-        let limits = ApiRateLimits::default();
-        assert!(limits.try_acquire_local(LocalKey::User(user(1))).is_some());
-        assert!(limits.try_acquire_local(LocalKey::User(user(2))).is_some());
-    }
-
-    #[test]
-    fn reclaims_local() {
-        let limits = ApiRateLimits::default();
-        let mut permits = Vec::with_capacity(LOCAL_TABLE_LIMIT);
-        for number in 0..LOCAL_TABLE_LIMIT as u128 {
-            permits.push(
-                limits
-                    .try_acquire_local(LocalKey::User(user(number)))
-                    .expect("table entry permit"),
-            );
-        }
-        assert!(
-            limits
-                .try_acquire_local(LocalKey::User(user(LOCAL_TABLE_LIMIT as u128)))
-                .is_none()
-        );
-        drop(permits);
-        assert!(
-            limits
-                .try_acquire_local(LocalKey::User(user(LOCAL_TABLE_LIMIT as u128)))
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn clone_keeps_lease() {
-        let limits = ApiRateLimits::default();
-        let key = LocalKey::User(user(3));
-        let mut permits = Vec::new();
-        for _ in 0..LOCAL_PERMITS - 1 {
-            permits.push(limits.try_acquire_local(key).expect("local permit"));
-        }
-        let lease = LocalLease::default();
-        assert!(lease.hold(limits.try_acquire_local(key).expect("local permit")));
-        let clone = lease.clone();
-        drop(lease);
-        assert!(limits.try_acquire_local(key).is_none());
-        drop(clone);
-        assert!(limits.try_acquire_local(key).is_some());
-        drop(permits);
-    }
-
-    #[test]
-    fn replaces_lease() {
-        let limits = ApiRateLimits::default();
-        let ip = LocalKey::Ip(IpAddr::from_str("203.0.113.11").unwrap());
-        let user_key = LocalKey::User(user(4));
-        let lease = LocalLease::default();
-        assert!(lease.hold(limits.try_acquire_local(ip).expect("ip permit")));
-        lease.replace(limits.try_acquire_local(user_key).expect("user permit"));
-        assert!(limits.try_acquire_local(ip).is_some());
-
-        let mut permits = Vec::new();
-        for _ in 0..LOCAL_PERMITS - 1 {
-            permits.push(limits.try_acquire_local(user_key).expect("user permit"));
-        }
-        assert!(limits.try_acquire_local(user_key).is_none());
-        drop(lease);
-        assert!(limits.try_acquire_local(user_key).is_some());
-        drop(permits);
-    }
 }

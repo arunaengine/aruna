@@ -140,6 +140,7 @@ async fn manifest_read_authorized() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     // The submitter may read the source, except the manifest's own path.
     let mut spec = spec();

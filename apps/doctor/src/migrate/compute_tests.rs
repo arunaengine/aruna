@@ -737,6 +737,7 @@ async fn tombstones_old_families() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     let now_ms = aruna_clock::unix_timestamp_millis();
     let status =

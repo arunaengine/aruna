@@ -700,6 +700,7 @@ mod tests {
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         let realm_id = RealmId([31u8; 32]);
         let actor = Actor {

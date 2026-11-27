@@ -212,6 +212,7 @@ async fn projection_takes_fence() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     project_create_events(&context, vec![event.clone()], Some(event.node_id))
@@ -252,6 +253,7 @@ async fn fence_rejects_create() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     let error = project_create_events(&context, vec![event.clone()], Some(event.node_id))
@@ -287,6 +289,7 @@ async fn deferred_mint_retries() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     let marker_key = pending_projection_key(event.record.document_id, event.event_id);
 
@@ -346,6 +349,7 @@ async fn tombstone_blocks_projection() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     let result = transactional_projection_write(
@@ -398,6 +402,7 @@ async fn malformed_marker_deleted() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     let result = drain_projection_queue(&context)
@@ -441,6 +446,7 @@ async fn malformed_before_valid() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     let result = drain_projection_queue(&context)
@@ -476,6 +482,7 @@ async fn orphan_pending_marker() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     let result = drain_projection_queue(&context)
@@ -562,6 +569,7 @@ async fn outbox_rides_stored() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     project_create_event(&context, event.clone(), Some(event.node_id))
@@ -777,6 +785,7 @@ async fn journaled_aged(
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
     for _ in 0..2 {
         project_create_event(&context, event.clone(), Some(local))
@@ -821,6 +830,7 @@ async fn projected_audit_message() {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+            vfs_handle: None,
         };
         let other = iroh::SecretKey::from_bytes(&[42u8; 32]).public();
         project_create_event(&context, event, Some(other))
@@ -873,6 +883,7 @@ async fn holderless_projection_defers() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     project_create_event(&context, event.clone(), Some(event.node_id))
@@ -1107,6 +1118,7 @@ async fn skewed_direct_writes() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     let error = project_create_events(&context, vec![event], None)
@@ -1146,6 +1158,7 @@ async fn skewed_queue_keeps() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     let error = drain_projection_queue(&context)
@@ -1484,6 +1497,7 @@ async fn owned_recovery_waits() {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+        vfs_handle: None,
     };
 
     let result = drain_projection_queue(&context).await.expect("drain runs");

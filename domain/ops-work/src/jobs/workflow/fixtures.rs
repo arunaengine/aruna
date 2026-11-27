@@ -112,6 +112,7 @@ pub(super) fn prepared() -> PreparedTask {
         vault_env: BTreeMap::new(),
         staging: StagingMode::Files,
         workspace: None,
+        nfs_mounts: Default::default(),
     }
 }
 
@@ -139,6 +140,7 @@ pub(super) fn facts() -> BackendFacts {
         local_site: false,
         worker_location: None,
         run_as: NOBODY,
+        nfs_share: None,
     }
 }
 
