@@ -201,6 +201,16 @@ fn trim_slash(path: &str) -> &str {
     if trimmed.is_empty() { path } else { trimmed }
 }
 
+fn same_object(first: &str, second: &str) -> bool {
+    if trim_slash(first) == trim_slash(second) {
+        return true;
+    }
+    match (std::fs::canonicalize(first), std::fs::canonicalize(second)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// Exact-keyed table with an unambiguous canonical-path fallback for symlinks.
 #[derive(Default)]
 struct ReceiptTable {
@@ -942,18 +952,32 @@ fn rewrite_locations(value: &mut Value, receipts: &Receipts, scope: Option<&str>
             let is_dir = class == Some("Directory");
             let is_entry = matches!(class, Some("File" | "Directory"));
             let basename = is_entry.then(|| entry_basename(map)).flatten();
-            let entry_raw = is_entry
-                .then(|| usable_path(map, "location").or_else(|| usable_path(map, "path")))
-                .flatten();
-            let entry_uri = entry_raw
+            let loc_raw = is_entry.then(|| usable_path(map, "location")).flatten();
+            let path_raw = is_entry.then(|| usable_path(map, "path")).flatten();
+            let alias = match (loc_raw.as_deref(), path_raw.as_deref()) {
+                (Some(loc), Some(path)) => same_object(loc, path),
+                _ => false,
+            };
+            let loc_uri = loc_raw
+                .as_deref()
+                .and_then(|raw| receipts.get_raw(scope, basename.as_deref(), raw));
+            let path_uri = path_raw
                 .as_deref()
                 .and_then(|raw| receipts.get_raw(scope, basename.as_deref(), raw));
             let list_scope = match is_dir {
-                true => match entry_raw.as_deref() {
-                    Some(raw) => receipts
+                true => match (loc_raw.as_deref(), path_raw.as_deref()) {
+                    (Some(loc), Some(path)) => receipts
+                        .child_scope(scope, basename.as_deref(), loc)
+                        .or_else(|| {
+                            alias
+                                .then(|| receipts.child_scope(scope, basename.as_deref(), path))
+                                .flatten()
+                        })
+                        .or_else(|| scope.map(str::to_owned)),
+                    (Some(raw), None) | (None, Some(raw)) => receipts
                         .child_scope(scope, basename.as_deref(), raw)
                         .or_else(|| scope.map(str::to_owned)),
-                    None => match (scope, basename.as_deref()) {
+                    (None, None) => match (scope, basename.as_deref()) {
                         (Some(parent), Some(_)) if receipts.is_walked(parent) => {
                             Some(parent.to_owned())
                         }
@@ -969,12 +993,18 @@ fn rewrite_locations(value: &mut Value, receipts: &Receipts, scope: Option<&str>
                     && let Value::String(text) = item
                 {
                     let usable = !text.is_empty() && !text.starts_with("_:") && !served(text);
-                    if usable
-                        && let Some(delivered) = entry_uri
-                            .clone()
-                            .or_else(|| receipts.get(scope, basename.as_deref(), text))
-                    {
-                        *text = delivered;
+                    if usable {
+                        let delivered = match (key.as_str(), alias) {
+                            ("location" | "path", true) => {
+                                loc_uri.clone().or_else(|| path_uri.clone())
+                            }
+                            ("location", false) => loc_uri.clone(),
+                            ("path", false) => path_uri.clone(),
+                            _ => None,
+                        };
+                        if let Some(delivered) = delivered {
+                            *text = delivered;
+                        }
                     }
                     continue;
                 }
@@ -1915,8 +1945,13 @@ mod tests {
                 "listing": [
                     {
                         "class": "Directory",
-                        "location": format!("file://{}", sub_a.display()),
-                        "listing": [{"class": "File", "location": format!("file://{}", sub_a.join("item.txt").display())}],
+                        "location": format!("file://{}", shared_sub.display()),
+                        "path": sub_a.to_string_lossy(),
+                        "listing": [{
+                            "class": "File",
+                            "location": format!("file://{}", shared_sub.join("item.txt").display()),
+                            "path": sub_a.join("item.txt").to_string_lossy(),
+                        }],
                     },
                     {
                         "class": "Directory",
@@ -1979,7 +2014,15 @@ mod tests {
             "aruna://results/run/tree_link/a/"
         );
         assert_eq!(
+            out2["linked_tree"]["listing"][0]["path"],
+            "aruna://results/run/tree_link/a/"
+        );
+        assert_eq!(
             out2["linked_tree"]["listing"][0]["listing"][0]["location"],
+            "aruna://results/run/tree_link/a/item.txt?version=v1"
+        );
+        assert_eq!(
+            out2["linked_tree"]["listing"][0]["listing"][0]["path"],
             "aruna://results/run/tree_link/a/item.txt?version=v1"
         );
         assert_eq!(
