@@ -181,7 +181,7 @@ no local node. With it you can:
 
 ### Install
 
-There are no release binaries yet. Install it with Rust 1.97.1 or newer, from a checkout of this
+There are no release binaries yet. Install it with Rust 1.99.1 or newer, from a checkout of this
 repository or straight from Git:
 
 ```bash

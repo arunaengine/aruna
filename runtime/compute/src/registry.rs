@@ -12,6 +12,7 @@ use aruna_core::compute::offer::{
 };
 use aruna_core::compute::{BackendError, ExecutorCapability, ExecutorKind};
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementSubject};
+use aruna_core::workflow::WorkflowHost;
 
 use crate::executor::ExecutorBackend;
 use crate::session::SessionRegistry;
@@ -77,14 +78,53 @@ impl Registered {
 pub struct ExecutorRegistry {
     backends: BTreeMap<String, Registered>,
     sessions: Arc<SessionRegistry>,
+    /// The workflow coordinators of this node, which run on these backends or as a local binary.
+    workflow: Option<Arc<dyn WorkflowHost>>,
+    run_wakes: RunWakes,
 }
+
+/// Wakes the event streams of workflow runs on this node when a run stored new events. A wake
+/// carries the run id; a missed one only delays a stream until its next read.
+pub struct RunWakes(tokio::sync::broadcast::Sender<String>);
+
+impl Default for RunWakes {
+    fn default() -> Self {
+        Self(tokio::sync::broadcast::channel(RUN_WAKES).0)
+    }
+}
+
+/// Wakes one stream may fall behind by before it rereads from its last event.
+const RUN_WAKES: usize = 256;
 
 impl ExecutorRegistry {
     pub fn new() -> Self {
         Self {
             backends: BTreeMap::new(),
             sessions: Arc::new(SessionRegistry::new()),
+            workflow: None,
+            run_wakes: RunWakes::default(),
         }
+    }
+
+    /// Tells the event streams of run `run_id` that it stored new events.
+    pub fn wake_run(&self, run_id: String) {
+        let _ = self.run_wakes.0.send(run_id);
+    }
+
+    /// The wakes of every run on this node, from now on.
+    pub fn run_wakes(&self) -> tokio::sync::broadcast::Receiver<String> {
+        self.run_wakes.0.subscribe()
+    }
+
+    /// Attaches the workflow runtime that answers `Effect::Workflow` on this node.
+    pub fn with_workflow(mut self, workflow: Arc<dyn WorkflowHost>) -> Self {
+        self.workflow = Some(workflow);
+        self
+    }
+
+    /// The workflow runtime of this node, when one is attached.
+    pub fn workflow(&self) -> Option<&Arc<dyn WorkflowHost>> {
+        self.workflow.as_ref()
     }
 
     /// Adds `backend` under `name` without a container-facing S3 endpoint.

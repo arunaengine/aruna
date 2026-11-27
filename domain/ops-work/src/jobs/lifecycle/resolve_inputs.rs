@@ -3,14 +3,19 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::family::SubmissionId;
-use aruna_core::structs::execution::job::input::{CapturedInput, ExecutionSpec, InputSelection};
+use aruna_core::structs::execution::job::input::{
+    CapturedInput, ExecutionSpec, InputSelection, InputSource,
+};
+use aruna_core::structs::execution::workflow_run::PrecapturedInput;
+use aruna_core::structs::identity::auth::PathRestriction;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 
@@ -31,9 +36,43 @@ pub(super) struct ResolveScope {
     pub(super) submission_id: SubmissionId,
     pub(super) expires_at: u64,
     pub(super) token: Option<AuthToken>,
+    /// Sync-eligible realm servers allowed to receive credential-bearing input resolve requests.
+    pub(super) allowed_remote: Option<BTreeSet<NodeId>>,
+    /// Remote inputs already captured and granted at workflow admission.
+    pub(super) precaptured: Vec<PrecapturedInput>,
+    /// Refuse resolved inputs whose final bucket is encrypted (unprotected workflow runs).
+    pub(super) disallow_encrypted: bool,
 }
 
 impl ResolveScope {
+    pub(super) fn with_config(mut self, config: &RealmConfigDocument) -> Self {
+        let allowed = config
+            .sync_eligible_nodes()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        self.allowed_remote = Some(allowed);
+        self
+    }
+
+    pub(super) fn with_precaptured(mut self, precaptured: Vec<PrecapturedInput>) -> Self {
+        self.precaptured = precaptured;
+        self
+    }
+
+    pub(super) fn with_path_restrictions(
+        mut self,
+        restrictions: Option<Vec<PathRestriction>>,
+    ) -> Self {
+        self.caller.path_restrictions = restrictions;
+        self
+    }
+
+    pub(super) fn disallow_encrypted(mut self, disallow: bool) -> Self {
+        self.disallow_encrypted = disallow;
+        self
+    }
+
     /// The caller for captures here; the bearer lets coordinators answer release membership.
     pub(super) fn capture_caller(&self) -> CaptureCaller {
         let bearer = match &self.token {
@@ -41,10 +80,11 @@ impl ResolveScope {
             _ => None,
         };
         CaptureCaller {
-            input: self.caller,
+            input: self.caller.clone(),
             submission_id: self.submission_id,
             expires_at: self.expires_at,
             bearer,
+            disallow_encrypted: self.disallow_encrypted,
         }
     }
 }
@@ -121,7 +161,7 @@ impl ResolveInputsOperation {
         while let Some(input) = self.pending.pop_front() {
             if is_directory(&input) {
                 self.step = ResolveStep::Expand;
-                let expand = ExpandDirectoryOperation::new(self.scope.caller, input);
+                let expand = ExpandDirectoryOperation::new(self.scope.caller.clone(), input);
                 return Ok(Next::Call(IoCall::child(expand)));
             }
             self.files.push(input);
@@ -136,7 +176,7 @@ impl ResolveInputsOperation {
             return self.capture();
         };
         self.step = ResolveStep::Follow;
-        let follow = FollowLinkOperation::new(self.scope.caller, input);
+        let follow = FollowLinkOperation::new(self.scope.caller.clone(), input);
         Ok(Next::Call(IoCall::child(follow)))
     }
 
@@ -153,15 +193,53 @@ impl ResolveInputsOperation {
             let policies = OutputPoliciesOperation::new(&self.spec, self.local());
             return Ok(Next::Call(IoCall::child(policies)));
         };
+        if let Some(allowed) = &self.scope.allowed_remote
+            && !allowed.contains(&node)
+        {
+            return Err(SubmitJobError::PlacementUnavailable(format!(
+                "input node {node} is not an eligible realm server"
+            )));
+        }
         self.step = ResolveStep::Remote;
         let caller = ResolveCaller {
             created_by: self.scope.caller.created_by,
             submission_id: self.scope.submission_id,
             expires_at: self.scope.expires_at,
+            disallow_encrypted: self.scope.disallow_encrypted,
         };
         let token = self.scope.token.clone();
         let ask = RemoteInputsOperation::new(node, inputs, caller, token);
         Ok(Next::Call(IoCall::child(ask)))
+    }
+
+    fn take_precaptured(
+        &self,
+        node: NodeId,
+        input: &InputSelection,
+    ) -> Option<(InputSelection, CapturedInput)> {
+        let InputSource::S3 {
+            bucket,
+            key,
+            version_id: Some(version),
+        } = &input.source
+        else {
+            return None;
+        };
+        let entry = self.scope.precaptured.iter().find(|entry| {
+            entry.pin_node_id == node
+                && entry.pin_bucket == *bucket
+                && entry.pin_key == *key
+                && entry.pin_version_id.to_string() == *version
+        })?;
+        let mut resolved = entry.resolved.clone();
+        resolved.dest_key = input.dest_key.clone();
+        resolved.container_path = input.container_path.clone();
+        resolved.mode = input.mode;
+        resolved.name = input.name.clone();
+        resolved.description = input.description.clone();
+        let mut captured = entry.captured.clone();
+        captured.destination_key = input.dest_key.clone();
+        Some((resolved, captured))
     }
 
     /// The captures in input order, each with the first link its walk met, here or remotely.
@@ -203,7 +281,12 @@ impl Operation for ResolveInputsOperation {
             match input.source_node_id.filter(|node| *node != self.local()) {
                 Some(node) => {
                     exact_version(&input)?;
-                    self.remote.entry(node).or_default().push(input);
+                    if let Some((resolved, captured)) = self.take_precaptured(node, &input) {
+                        self.answered.push(resolved);
+                        self.captured.push(captured);
+                    } else {
+                        self.remote.entry(node).or_default().push(input);
+                    }
                 }
                 None => self.pending.push_back(input),
             }
@@ -235,7 +318,7 @@ impl Operation for ResolveInputsOperation {
             }
             ResolveStep::Capture => {
                 let captured = result.child::<Vec<CapturedInput>, SubmitJobError>()?;
-                self.captured = captured.map_err(placement_failure)?;
+                self.captured.extend(captured.map_err(placement_failure)?);
                 self.remote_next()
             }
             ResolveStep::Remote => {
@@ -287,10 +370,14 @@ mod tests {
                 created_by: user(),
                 realm_id: REALM,
                 local: node(1),
+                path_restrictions: None,
             },
             submission_id: SubmissionId([4; 32]),
             expires_at: 10,
             token: None,
+            allowed_remote: None,
+            precaptured: Vec::new(),
+            disallow_encrypted: false,
         };
         ResolveInputsOperation::new(&spec, scope)
     }
@@ -376,5 +463,65 @@ mod tests {
             resolve.next(answer),
             Err(SubmitJobError::PlacementUnavailable(_))
         ));
+    }
+
+    // Precaptured remote link pins match by the original link pin and emit the resolved target.
+    #[test]
+    fn reuses_precaptured_link() {
+        let link_ver = Ulid::from_parts(2, 1);
+        let target_ver = Ulid::from_parts(3, 1);
+        let asked = input("alias.link", Some(&link_ver.to_string()), Some(node(2)));
+        let resolved_target = input("real.dat", Some(&target_ver.to_string()), Some(node(2)));
+        let mut captured = captured_input(&resolved_target, node(2));
+        captured.version_id = target_ver;
+        captured.link = Some(arn("alias.link"));
+        let mut spec = payload();
+        spec.inputs = vec![asked];
+        let scope = ResolveScope {
+            caller: InputCaller {
+                created_by: user(),
+                realm_id: REALM,
+                local: node(1),
+                path_restrictions: None,
+            },
+            submission_id: SubmissionId([4; 32]),
+            expires_at: 10,
+            token: None,
+            allowed_remote: None,
+            precaptured: vec![PrecapturedInput {
+                pin_node_id: node(2),
+                pin_bucket: "b".to_string(),
+                pin_key: "alias.link".to_string(),
+                pin_version_id: link_ver,
+                resolved: resolved_target,
+                captured,
+            }],
+            disallow_encrypted: false,
+        };
+        let mut resolve = ResolveInputsOperation::new(&spec, scope);
+        // No remote RPC is issued: local capture is empty, then policies finish immediately.
+        calls_child(resolve.first());
+        assert_eq!(resolve.step, ResolveStep::Capture);
+        calls_child(resolve.next(child(Vec::<CapturedInput>::new())));
+        assert_eq!(resolve.step, ResolveStep::Policies);
+        let Ok(Next::Done(done)) = resolve.next(child(Vec::<PlacementPolicyRef>::new())) else {
+            panic!("precaptured link should resolve without remote call");
+        };
+        assert_eq!(done.inputs.len(), 1);
+        assert_eq!(done.inputs[0].dest_key, "alias.link");
+        assert_eq!(
+            done.inputs[0].container_path.as_deref(),
+            Some("/in/alias.link")
+        );
+        let InputSource::S3 {
+            key, version_id, ..
+        } = &done.inputs[0].source
+        else {
+            panic!("expected S3 target");
+        };
+        assert_eq!(key, "real.dat");
+        assert_eq!(version_id.as_deref(), Some(target_ver.to_string().as_str()));
+        assert_eq!(done.captured[0].version_id, target_ver);
+        assert_eq!(done.captured[0].destination_key, "alias.link");
     }
 }

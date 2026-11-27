@@ -19,10 +19,10 @@ use aruna_core::user::id::UserId;
 use aruna_ops_work::jobs::local_run::{
     BackendState, ComputeStatus, LocalExecutionError, LocalRunsOperation, status_of,
 };
-use aruna_ops_work::jobs::workflow::publish_run::{
-    PublishRunError, PublishRunInput, PublishedRun, local_run_crate, publish_run,
-};
+use aruna_ops_work::jobs::workflow::publish_run::{PublishRunError, PublishedRun};
+use aruna_ops_work::workflows::runs::publish::{self, DevicePublishInput};
 use aruna_runner::driver::{DriverContext, drive};
+use ulid::Ulid;
 
 use crate::auth::OwnerAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
@@ -256,7 +256,7 @@ for.
   another node, bucket or prefix for the same run is refused with 409.
 - A run that has not finished, whose crate is still being prepared, or with two outputs on one
   key is refused with 409."#,
-    params(("job_id" = String, Path, description = "Job id of the local run: a 26-character ULID; an unparseable id is 404")),
+    params(("job_id" = String, Path, description = "Job id or workflow run id of the local run: a 26-character ULID; an unparseable id is 404")),
     request_body(content = PublishRunRequest, example = json!({
         "node_id": "k5r2gmr7qeqfhqxhbpcpqoa2xhpqcrmr2vpxjqx3nvxfvbxvvrga",
         "bucket": "lab-data",
@@ -288,14 +288,14 @@ async fn publish_device_run(
     Path(job_id): Path<String>,
     Json(request): Json<PublishRunRequest>,
 ) -> ServerResult<Json<PublishRunResponse>> {
-    let job_id = crate::jobs::parse_job_id(&job_id).map_err(ServerError::from)?;
+    let id = Ulid::from_str(&job_id).map_err(|_| ServerError::NotFound)?;
     let node_id = NodeId::from_str(&request.node_id)
         .map_err(|_| ServerError::BadRequestReason("node_id is not a node id".to_string()))?;
     let context = state.get_ctx();
-    let publish = publish_run(
+    let publish = publish::publish_device_run(
         context.node_and_realm(),
-        PublishRunInput {
-            job_id,
+        DevicePublishInput {
+            id,
             owner: auth.user_id,
             node_id: state.get_node_id(),
             target: RemoteBinding {
@@ -325,7 +325,7 @@ for.
 - Publishing the run writes a separate crate in the realm that names the realm copies; this one
   stays on the device.
 - A run without a local crate, such as a notebook session or a run still being finished, is 404."#,
-    params(("job_id" = String, Path, description = "Job id of the local run: a 26-character ULID; an unparseable id is 404")),
+    params(("job_id" = String, Path, description = "Job id or workflow run id of the local run: a 26-character ULID; an unparseable id is 404")),
     responses(
         (status = 200, description = "The crate JSON-LD", body = Object, example = json!({
             "@context": ["https://w3id.org/ro/crate/1.2/context"],
@@ -345,10 +345,13 @@ async fn get_local_crate(
     OwnerAuth(auth): OwnerAuth,
     Path(job_id): Path<String>,
 ) -> ServerResult<Json<serde_json::Value>> {
-    let job_id = crate::jobs::parse_job_id(&job_id).map_err(ServerError::from)?;
-    let jsonld = drive(local_run_crate(job_id, auth.user_id), &state.get_ctx())
-        .await
-        .map_err(ServerError::from)?;
+    let id = Ulid::from_str(&job_id).map_err(|_| ServerError::NotFound)?;
+    let jsonld = drive(
+        publish::local_device_crate(id, auth.user_id),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(ServerError::from)?;
     Ok(Json(jsonld))
 }
 

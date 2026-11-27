@@ -34,6 +34,9 @@ pub struct NativeReferenceRequest {
     pub version_id: Ulid,
     pub head: bool,
     pub range: Option<NativeRange>,
+    /// Refuse reads from encrypted buckets or sealed blobs (for unprotected workflow runs).
+    #[serde(default)]
+    pub disallow_encrypted: bool,
 }
 
 /// On whose behalf a native read runs: a sync relationship's creator, or a caller a read grant
@@ -56,6 +59,7 @@ pub struct GrantedReadEffect {
     pub version_id: Ulid,
     pub head: bool,
     pub range: Option<NativeRange>,
+    pub disallow_encrypted: bool,
 }
 
 /// One version read from the node a delegation targets. The adapter signs the delegation with
@@ -192,6 +196,7 @@ pub fn relationship_request(
             version_id,
             head,
             range: NativeRange::checked(range)?,
+            disallow_encrypted: false,
         },
     ))
 }
@@ -209,6 +214,7 @@ mod tests {
             version_id: Ulid::from_bytes([2u8; 16]),
             head: false,
             range: Some(NativeRange { start: 3, end: 9 }),
+            disallow_encrypted: false,
         };
         let bytes = postcard::to_allocvec(&request).unwrap();
         assert_eq!(

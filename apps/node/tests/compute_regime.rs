@@ -20,3 +20,5 @@ mod plugin_tasks;
 mod run_publish;
 #[path = "operations/table_jobs.rs"]
 mod table_jobs;
+#[path = "operations/workflow_runs.rs"]
+mod workflow_runs;

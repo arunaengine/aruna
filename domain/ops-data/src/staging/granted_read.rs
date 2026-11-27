@@ -29,6 +29,7 @@ pub struct GrantedReadOperation {
     grant: SignedGrant,
     range: Option<Range<u64>>,
     head: bool,
+    disallow_encrypted: bool,
     now_ms: u64,
     mint: IdMint,
 }
@@ -50,7 +51,14 @@ impl GrantedReadOperation {
             grant: grant.clone(),
             range,
             head,
+            disallow_encrypted: false,
         }
+    }
+
+    /// Refuses reads from encrypted buckets or sealed blobs on the holder.
+    pub fn with_disallow_encrypted(mut self, disallow: bool) -> Self {
+        self.disallow_encrypted = disallow;
+        self
     }
 
     fn request(
@@ -109,6 +117,7 @@ impl Operation for GrantedReadOperation {
             version_id: arn.version,
             head: self.head,
             range,
+            disallow_encrypted: self.disallow_encrypted,
         };
         let effect = Effect::Net(NetEffect::GrantedRead(Box::new(read)));
         Ok(Next::Call(IoCall::from(effect)))

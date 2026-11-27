@@ -466,6 +466,7 @@ mod tests {
                 },
             },
             warnings: Vec::new(),
+            applets: None,
         }
     }
 

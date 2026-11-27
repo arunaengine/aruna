@@ -62,6 +62,7 @@ fn read_request(local_node: aruna_core::id::NodeId, hash: [u8; 32]) -> BaoReadRe
         destination: None,
         known_refs: Vec::new(),
         range: None,
+        disallow_encrypted: false,
     }
 }
 
@@ -253,6 +254,113 @@ fn device_serves_file() {
     let turn = operation.serve_observation(observation(5, Some("5-1")));
     assert!(matches!(&turn, Ok(Next::Call(IoCall::Child(_)))));
     assert_eq!(operation.source_fingerprint.as_deref(), Some("5-1"));
+}
+
+#[test]
+fn probes_authorized_link() {
+    use aruna_core::structs::execution::source_access::SourceMetadata;
+    use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode};
+    use aruna_core::structs::storage::link::LinkTarget;
+    use aruna_core::structs::storage::replication::VersionedObjectArn;
+
+    let realm = test_realm();
+    let local = node_from_seed(1);
+    let peer = node_from_seed(2);
+    let target = LinkTarget {
+        arn: VersionedObjectArn::new(realm, peer, "other", "real.txt", Ulid::from(9u128)).unwrap(),
+        group_id: Ulid::from(3u128),
+    };
+    let meta = SourceMetadata {
+        content_length: 12,
+        content_type: None,
+        etag: Some("v-link".to_string()),
+        last_modified: None,
+        source_version: None,
+        digests: Default::default(),
+    };
+    let version = BlobVersion::reference(
+        target.binding(),
+        meta,
+        SystemTime::UNIX_EPOCH,
+        UserId::nil(realm),
+        SystemTime::UNIX_EPOCH,
+    );
+    let value: byteview::ByteView = version.to_bytes().unwrap().into();
+
+    // Ordinary ExactVersion metadata requests must never synthesize a zero BLAKE3 for a link.
+    let mut exact_req = read_request(local, [0u8; 32]);
+    exact_req.expected_blake3 = None;
+    exact_req.metadata_only = true;
+    let mut exact =
+        IncomingBaoOperation::new(peer, local, realm, Ulid::from(7u128), exact_req.clone());
+    exact.policy_allowed = true;
+    let turn = exact.handle_exact_version(Some(value.clone()));
+    assert_eq!(refusal_from(&turn), BaoReadRefusal::NotFound);
+
+    let link_arn =
+        VersionedObjectArn::new(realm, local, "bucket", "path/file.txt", Ulid::from(4u128))
+            .unwrap();
+    let mut link_req = exact_req.clone();
+    link_req.target = BaoReadTarget::LinkAccess(link_arn);
+    link_req.disallow_encrypted = true;
+    let mut allowed =
+        IncomingBaoOperation::new(peer, local, realm, Ulid::from(8u128), link_req.clone());
+    allowed.policy_allowed = true;
+    let turn = allowed.handle_exact_version(Some(value.clone()));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
+    let accepted = allowed.next(row(None));
+    let Some(BlobEffect::SendMessage { payload, .. }) = asked(&accepted).as_blob() else {
+        panic!("expected authorized probe frame");
+    };
+    assert_eq!(
+        VersionReplicationMessage::from_bytes(payload).unwrap(),
+        VersionReplicationMessage::BaoReadAuthorized
+    );
+
+    // Client decodes BaoReadAuthorized into BaoReadOutput::Authorized only for LinkAccess.
+    let mut client = BaoReadOperation::new(local, link_req.clone());
+    let close = client.response(Ulid::from(8u128), payload).unwrap();
+    assert!(matches!(close, Next::Call(IoCall::Effect(_))));
+    assert_eq!(client.metadata, Some(BaoReadOutput::Authorized));
+    let mut exact_client = BaoReadOperation::new(local, exact_req);
+    assert!(matches!(
+        exact_client.response(Ulid::from(7u128), payload),
+        Err(BaoReadError::Unexpected { .. })
+    ));
+
+    // Encrypted bucket refuses LinkAccess when disallow_encrypted is set.
+    let mut enc =
+        IncomingBaoOperation::new(peer, local, realm, Ulid::from(11u128), link_req.clone());
+    enc.policy_allowed = true;
+    assert!(matches!(
+        enc.handle_exact_version(Some(value.clone())),
+        Ok(Next::Call(IoCall::Read(_)))
+    ));
+    let enc_row: byteview::ByteView = BucketEncryption {
+        mode: EncryptionMode::VaultLocked,
+        bucket_id: Some(Ulid::from(12u128)),
+        key_generation: 1,
+        ..Default::default()
+    }
+    .to_bytes()
+    .unwrap()
+    .into();
+    let refused = enc.next(row(Some(enc_row)));
+    assert_eq!(refusal_from(&refused), BaoReadRefusal::ReadDenied);
+
+    let mut denied =
+        IncomingBaoOperation::new(peer, local, realm, Ulid::from(9u128), link_req.clone());
+    denied.policy_allowed = false;
+    let turn = denied.handle_exact_version(Some(value.clone()));
+    assert_eq!(refusal_from(&turn), BaoReadRefusal::ReadDenied);
+
+    let mut bytes_req = link_req;
+    bytes_req.metadata_only = false;
+    let mut stream_read =
+        IncomingBaoOperation::new(peer, local, realm, Ulid::from(10u128), bytes_req);
+    stream_read.policy_allowed = true;
+    let turn = stream_read.handle_exact_version(Some(value));
+    assert_eq!(refusal_from(&turn), BaoReadRefusal::InvalidTarget);
 }
 
 #[test]
@@ -1370,6 +1478,20 @@ fn unconverted_copy_refused() {
     assert!(
         matches!((asked(&turn)).as_blob(), Some(BlobEffect::ServeSealedRead { lease, .. }) if lease.key == key)
     );
+
+    // An unprotected workflow read refuses both sealed blobs and encrypting buckets.
+    let (mut operation, sealed_loc) = sealed_serve(bucket_id);
+    operation.request.disallow_encrypted = true;
+    let turn = operation.send_accepted(sealed_loc);
+    assert_eq!(refusal_from(&turn), BaoReadRefusal::ReadDenied);
+
+    let (mut operation, location) = plain();
+    operation.request.disallow_encrypted = true;
+    operation.request.metadata_only = true;
+    let turn = operation.send_accepted(location);
+    assert!(matches!(&turn, Ok(Next::Call(IoCall::Read(_)))));
+    let turn = operation.next(settings_row());
+    assert_eq!(refusal_from(&turn), BaoReadRefusal::ReadDenied);
 }
 
 #[test]

@@ -144,6 +144,7 @@ impl GitStore {
             | GitEffect::Ancestry { document_id, .. }
             | GitEffect::SetRefs { document_id, .. }
             | GitEffect::Pack { document_id, .. }
+            | GitEffect::Commit { document_id, .. }
             | GitEffect::Export { document_id, .. }
             | GitEffect::ReadFile { document_id, .. }
             | GitEffect::Layout { document_id, .. } => *document_id,
@@ -194,6 +195,15 @@ impl GitStore {
                 snapshot,
                 message,
             } => crate::arc::edit(&repository, &head, snapshot, message)
+                .await
+                .map(GitEvent::Edited),
+            GitEffect::Commit {
+                head,
+                files,
+                message,
+                occurred_at_ms,
+                ..
+            } => crate::arc::commit_files(&repository, &head, files, (message, occurred_at_ms))
                 .await
                 .map(GitEvent::Edited),
             GitEffect::Merge {

@@ -4,17 +4,17 @@
 
 use super::paths::{
     CONFIG_COMPUTE_PATH, CONFIG_DESCRIPTION_PATH, CONFIG_DISCOVERY_PATH, CONFIG_EMAIL_PATH,
-    CONFIG_FEDERATION_PATH, CONFIG_MERGE_PATH, CONFIG_POLICIES_PATH, CONFIG_PORTAL_PATH,
-    CONFIG_QUOTA_PATH, CONFIG_REPLICAS_PATH, DISPLAY_NAME_PATH, GROUP_LOCATION_PATH,
-    GROUP_OWNER_PATH, GROUP_POLICIES_PATH, METADATA_REPLICATION_PATH, NODE_HISTORY_PREFIX,
-    PLUGIN_ENTRY_PREFIX, PLUGIN_INSTALL_PREFIX, REALM_ID_PATH, SECRET_INFO_PREFIX,
-    USER_ALIAS_PREFIX, USER_NAME_PATH, VAULT_ENTRY_PREFIX, compute_from_value, config_node_path,
-    config_oidc_path, decode_metadata_replication, decode_oidc_provider, decode_realm_discovery,
-    group_assignment_role, group_role_path, group_user_path, metadata_replication_value,
-    node_history_path, parse_config_oidc, parse_group_role, parse_realm_role, policies_from_value,
-    publisher_cutoffs_path, quota_from_value, realm_assignment_role, realm_discovery_value,
-    realm_role_path, realm_user_path, secret_info_path, user_alias_path, user_attribute_path,
-    user_subject_path,
+    CONFIG_FEATURES_PATH, CONFIG_FEDERATION_PATH, CONFIG_MERGE_PATH, CONFIG_POLICIES_PATH,
+    CONFIG_PORTAL_PATH, CONFIG_QUOTA_PATH, CONFIG_REPLICAS_PATH, DISPLAY_NAME_PATH,
+    GROUP_LOCATION_PATH, GROUP_OWNER_PATH, GROUP_POLICIES_PATH, METADATA_REPLICATION_PATH,
+    NODE_HISTORY_PREFIX, PLUGIN_ENTRY_PREFIX, PLUGIN_INSTALL_PREFIX, REALM_ID_PATH,
+    SECRET_INFO_PREFIX, USER_ALIAS_PREFIX, USER_NAME_PATH, VAULT_ENTRY_PREFIX, compute_from_value,
+    config_node_path, config_oidc_path, decode_metadata_replication, decode_oidc_provider,
+    decode_realm_discovery, group_assignment_role, group_role_path, group_user_path,
+    metadata_replication_value, node_history_path, parse_config_oidc, parse_group_role,
+    parse_realm_role, policies_from_value, publisher_cutoffs_path, quota_from_value,
+    realm_assignment_role, realm_discovery_value, realm_role_path, realm_user_path,
+    secret_info_path, user_alias_path, user_attribute_path, user_subject_path,
 };
 use super::*;
 
@@ -335,6 +335,25 @@ impl AdminDocumentState {
 
         self.user_subject_ids
             .get(CONFIG_PORTAL_PATH)
+            .and_then(|version| version.value.as_deref())
+            .and_then(|value| serde_json::from_str(value).ok())
+    }
+
+    /// The realm feature policy the events agree on, if any event set it.
+    pub fn materialized_realm_features(
+        &self,
+    ) -> Option<
+        BTreeMap<
+            crate::structs::identity::features::Feature,
+            crate::structs::identity::features::FeatureMode,
+        >,
+    > {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return None;
+        }
+
+        self.user_subject_ids
+            .get(CONFIG_FEATURES_PATH)
             .and_then(|version| version.value.as_deref())
             .and_then(|value| serde_json::from_str(value).ok())
     }

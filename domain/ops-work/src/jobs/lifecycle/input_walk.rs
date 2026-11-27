@@ -9,7 +9,7 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::input::{InputSelection, InputSource};
-use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::link::LinkTarget;
@@ -33,11 +33,12 @@ use aruna_ops_data::s3::object::list::{
 use aruna_ops_data::s3::object::read_access::{SourceObject, SourceReadError, SourceReadOperation};
 
 /// Who walks the inputs, in the realm this node serves, and where.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct InputCaller {
     pub(super) created_by: UserId,
     pub(super) realm_id: RealmId,
     pub(super) local: NodeId,
+    pub(super) path_restrictions: Option<Vec<PathRestriction>>,
 }
 
 impl InputCaller {
@@ -45,7 +46,7 @@ impl InputCaller {
         AuthContext {
             user_id: self.created_by,
             realm_id: self.realm_id,
-            path_restrictions: None,
+            path_restrictions: self.path_restrictions.clone(),
             session: None,
         }
     }
@@ -463,6 +464,7 @@ mod tests {
             created_by: user(),
             realm_id: RealmId([1u8; 32]),
             local: node(1),
+            path_restrictions: None,
         }
     }
 

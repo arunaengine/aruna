@@ -23,6 +23,7 @@ pub mod stop_record;
 mod storage_audit;
 pub mod supervise;
 pub mod task_report;
+pub mod vault_secrets;
 pub mod workspace;
 
 use std::sync::Arc;

@@ -249,6 +249,8 @@ pub struct MaterializedBlobInfo {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum BaoReadTarget {
     ExactVersion(VersionedObjectArn),
+    /// Checks READ access on an exact link version without exposing target bytes or digests.
+    LinkAccess(VersionedObjectArn),
     Blake3([u8; 32]),
     /// One version of a distributed bucket by its logical identity: the holder finds it in its
     /// own member bucket. `expected_blake3` names its content, unless an external reference's
@@ -274,6 +276,9 @@ pub struct BaoReadRequest {
     pub known_refs: Vec<PlacementPolicyRef>,
     /// Reads only these bytes; bao verifies each chunk against the object's BLAKE3 root.
     pub range: Option<std::ops::Range<u64>>,
+    /// Refuse reads whose source copy or bucket is encrypted (unprotected workflow runs).
+    #[serde(default)]
+    pub disallow_encrypted: bool,
 }
 
 impl BaoReadRequest {
@@ -499,6 +504,8 @@ pub enum VersionReplicationMessage {
         etag: Option<String>,
         hashes: BTreeMap<String, Vec<u8>>,
     },
+    /// Authorization-only probe succeeded for a `LinkAccess` target; no bytes or digest follow.
+    BaoReadAuthorized,
     BaoReadRefused(BaoReadRefusal),
     LocationSummaryRequest(LocationSummaryRequest),
     LocationSummaryResponse(LocationSummary),
@@ -873,6 +880,7 @@ mod pure_tests {
             destination: None,
             known_refs: Vec::new(),
             range: None,
+            disallow_encrypted: false,
         });
         let accepted = VersionReplicationMessage::BaoReadAccepted {
             size: 42,

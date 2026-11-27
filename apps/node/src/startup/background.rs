@@ -99,6 +99,7 @@ pub(crate) enum StartupPhase {
     RecoverChild,
     FeedIndexes,
     RepairPlugins,
+    KeepApplets,
     RunPlugins,
 }
 
@@ -120,6 +121,7 @@ pub(crate) const STARTUP_PHASES: &[StartupPhase] = &[
     StartupPhase::RecoverChild,
     StartupPhase::FeedIndexes,
     StartupPhase::RepairPlugins,
+    StartupPhase::KeepApplets,
     StartupPhase::RunPlugins,
 ];
 
@@ -284,6 +286,9 @@ pub(crate) async fn start(
             }
             StartupPhase::FeedIndexes => spawn_index_feed(driver_ctx.clone(), &shutdown),
             StartupPhase::RepairPlugins => spawn_repair(driver_ctx.clone(), &shutdown),
+            StartupPhase::KeepApplets => {
+                crate::applets::spawn_upkeep(driver_ctx.clone(), &shutdown)
+            }
             StartupPhase::RunPlugins => {
                 spawn_worker(driver_ctx.clone(), realm_id, node_id, &shutdown)
             }
@@ -559,7 +564,7 @@ mod tests {
 mod pure_tests {
     use super::*;
 
-    const ALL_PHASES: [StartupPhase; 15] = [
+    const ALL_PHASES: [StartupPhase; 16] = [
         StartupPhase::Ready,
         StartupPhase::CorePublication,
         StartupPhase::RecoverStaleJobs,
@@ -574,6 +579,7 @@ mod pure_tests {
         StartupPhase::RecoverChild,
         StartupPhase::FeedIndexes,
         StartupPhase::RepairPlugins,
+        StartupPhase::KeepApplets,
         StartupPhase::RunPlugins,
     ];
 

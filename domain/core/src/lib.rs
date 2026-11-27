@@ -13,6 +13,7 @@ mod sync;
 mod vault;
 mod workload;
 
+pub mod applet;
 pub mod calls;
 pub mod compute;
 pub mod effects;
@@ -44,6 +45,7 @@ pub mod testing;
 pub mod time;
 pub mod types;
 pub mod user;
+pub mod workflow;
 
 pub use access::{
     admin_checks, admin_documents, audit, auth, config_authority, join_request, permission_path,

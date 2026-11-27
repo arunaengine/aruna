@@ -7,6 +7,8 @@ use crate::error::{ServerError, ServerSetupError};
 use crate::https::check_host;
 use crate::https::listener::CombinedListener;
 use crate::server::state::{PortalRuntimeState, ServerState};
+use aruna_core::structs::identity::features::{Feature, FeatureMode, resolve};
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 use aruna_runner::driver::drive;
 use aruna_wire::portal::{LegalDocument, PortalLogin};
@@ -18,6 +20,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -110,25 +113,32 @@ struct PortalRuntimeConfig<'a> {
     landing: Option<bool>,
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     legal: &'a [LegalDocument],
+    /// Surfaces this node serves beyond the portal's defaults, like `workflows`.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    features: BTreeMap<String, bool>,
 }
 
 async fn portal_config(State(state): State<PortalState>) -> Response {
     if let Err(error) = portal_dir(&state.server).await {
         return error.into_response();
     }
-    let registry_url = match drive(
+    let config = match drive(
         GetConfigOperation::new(state.server.get_realm_id()),
         &state.server.get_ctx(),
     )
     .await
     {
-        // Stored settings decide, also a cleared URL; without them the node default applies.
-        Ok(config) => match config.federation {
-            Some(settings) => settings.registry_url.map(String::from),
-            None => state.registry_url.clone(),
-        },
-        Err(GetConfigError::DocumentNotFound) => state.registry_url.clone(),
+        Ok(config) => Some(config),
+        Err(GetConfigError::DocumentNotFound) => None,
         Err(error) => return ServerError::InternalError(error.into()).into_response(),
+    };
+    // Stored settings decide, also a cleared URL; without them the node default applies.
+    let registry_url = match config
+        .as_ref()
+        .and_then(|config| config.federation.as_ref())
+    {
+        Some(settings) => settings.registry_url.clone().map(String::from),
+        None => state.registry_url.clone(),
     };
     let config = Json(PortalRuntimeConfig {
         api_base_url: &state.api_base_url,
@@ -136,8 +146,45 @@ async fn portal_config(State(state): State<PortalState>) -> Response {
         login: state.login.as_ref(),
         landing: (!state.landing).then_some(false),
         legal: &state.legal,
+        features: node_features(&state.server, config.as_ref()),
     });
     ([(header::CACHE_CONTROL, NO_CACHE)], config).into_response()
+}
+
+/// Node and realm level feature flags, with the older names `compute` and `builder`. Anyone
+/// reads them, so they never show one group's state; without a realm config only the node's.
+fn node_features(
+    state: &ServerState,
+    config: Option<&RealmConfigDocument>,
+) -> BTreeMap<String, bool> {
+    let off = state.disabled_features();
+    let Some(config) = config else {
+        let workflows = !off.contains(&Feature::Workflows);
+        return (workflows
+            .then(|| ("workflows".to_string(), true))
+            .into_iter())
+        .collect();
+    };
+    let named = [
+        ("workflows", Feature::Workflows),
+        ("applets", Feature::Applets),
+        ("builder", Feature::Applets),
+        ("runs", Feature::Runs),
+        ("compute", Feature::Runs),
+    ];
+    let mut features: BTreeMap<String, bool> = (named.into_iter())
+        .map(|(name, feature)| (name.to_string(), resolve(config, &off, feature, None).on))
+        .collect();
+    // Runs off for every group also hides the job and TES surfaces.
+    let forced = matches!(
+        config.features.get(&Feature::Runs),
+        Some(FeatureMode::ForcedOff)
+    );
+    if off.contains(&Feature::Runs) || forced {
+        features.insert("jobs".to_string(), false);
+        features.insert("tes".to_string(), false);
+    }
+    features
 }
 
 async fn realm_descriptor(State(state): State<PortalState>) -> Response {
@@ -272,7 +319,8 @@ mod tests {
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
     use aruna_core::listener::MAX_BODY_SIZE;
     use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
-    use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmId};
+    use aruna_core::structs::identity::features::{Feature, FeatureMode};
+    use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmConfigDocument, RealmId};
     use aruna_core::user::id::UserId;
     use aruna_ops_identity::document_repository::GetConfigOperation;
     use aruna_ops_identity::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
@@ -552,15 +600,69 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let config: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // Realm level feature flags only; no group's state reaches this unauthenticated file.
+        let features = serde_json::json!({
+            "applets": false, "builder": false, "compute": true, "runs": true, "workflows": false
+        });
         assert_eq!(
             config,
-            serde_json::json!({ "apiBaseUrl": format!("{TEST_API_URL}/api/v1") })
+            serde_json::json!({ "apiBaseUrl": format!("{TEST_API_URL}/api/v1"), "features": features })
         );
 
         let index = router.oneshot(request(Method::GET, "/")).await.unwrap();
         assert_eq!(index.status(), StatusCode::OK);
         let body = to_bytes(index.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], b"<html>portal</html>");
+    }
+
+    struct Idle;
+
+    #[async_trait::async_trait]
+    impl aruna_core::workflow::WorkflowHost for Idle {
+        async fn serve(
+            &self,
+            effect: aruna_core::workflow::WorkflowEffect,
+        ) -> aruna_core::workflow::WorkflowAnswer {
+            effect.unavailable()
+        }
+    }
+
+    #[tokio::test]
+    async fn names_workflow_feature() {
+        let (state, _dir) = setup_state().await;
+        assert!(super::node_features(&state, None).is_empty());
+        let mut context = (*state.get_ctx()).clone();
+        let registry =
+            aruna_compute::registry::ExecutorRegistry::new().with_workflow(Arc::new(Idle));
+        context.compute_handle = Some(Arc::new(registry));
+        let state = ServerState::new(
+            Arc::new(context),
+            state.get_realm_id(),
+            state.get_node_id(),
+            NodeCapabilities::user_node(state.get_realm_id()).unwrap(),
+            false,
+            None,
+            aruna_runner::jobs::runtime::JobsRuntime::new(),
+        )
+        .await;
+        let features = super::node_features(&state, None);
+        assert_eq!(
+            serde_json::to_value(&features).unwrap(),
+            serde_json::json!({"workflows": true})
+        );
+        // With the realm config the flags are realm level, with the older names beside them.
+        let mut config = RealmConfigDocument::new(state.get_realm_id(), Vec::new(), 3);
+        config
+            .features
+            .insert(Feature::Runs, FeatureMode::ForcedOff);
+        let features = super::node_features(&state, Some(&config));
+        assert_eq!(
+            serde_json::to_value(&features).unwrap(),
+            serde_json::json!({
+                "workflows": false, "applets": false, "builder": false, "runs": false,
+                "compute": false, "jobs": false, "tes": false
+            })
+        );
     }
 
     async fn registry_url(router: Router) -> serde_json::Value {
@@ -855,6 +957,7 @@ mod tests {
                 policy.contains("script-src 'self' 'wasm-unsafe-eval'"),
                 "{path}: {policy}"
             );
+            assert!(policy.contains("frame-src blob:;"), "{path}: {policy}");
             assert!(
                 policy.contains("frame-ancestors 'none'"),
                 "{path}: {policy}"
@@ -871,6 +974,7 @@ mod tests {
             );
         }
         let response = router
+            .clone()
             .oneshot(request(Method::GET, "/federation/login"))
             .await
             .unwrap();
@@ -881,6 +985,142 @@ mod tests {
                 .unwrap(),
             "unsafe-none"
         );
+        let signin = router
+            .oneshot(request(Method::GET, "/applets/signin"))
+            .await
+            .unwrap();
+        assert_eq!(
+            signin.headers().get("cross-origin-opener-policy").unwrap(),
+            "unsafe-none"
+        );
+    }
+
+    #[tokio::test]
+    async fn portal_applet_headers() {
+        let tempdir = tempdir().unwrap();
+        let portal_dir = tempdir.path().join("portal");
+        std::fs::create_dir_all(&portal_dir).unwrap();
+        std::fs::write(portal_dir.join("index.html"), "<html>portal</html>").unwrap();
+        let (base, _state_dir) = setup_state().await;
+        let hosting = aruna_core::applet::settings::HostingSettings {
+            applet_domain: "apps.example.net".into(),
+            edge_key_sha256: [1; 32],
+            custom_domains: true,
+            guests: false,
+            embedding: false,
+            max_origins: 8,
+            portal_origin: Some("https://portal.example.org".into()),
+            protected_hosts: Vec::new(),
+        };
+        let state = Arc::new(
+            ServerState::new(
+                base.get_ctx(),
+                base.get_realm_id(),
+                base.get_node_id(),
+                NodeCapabilities::user_node(base.get_realm_id()).unwrap(),
+                false,
+                None,
+                aruna_runner::jobs::runtime::JobsRuntime::new(),
+            )
+            .await
+            .with_applets(aruna_core::applet::settings::AppletSettings {
+                hosting: Some(hosting),
+                building: None,
+            }),
+        );
+        enable_portal(&state, &portal_dir).await;
+        let make_router = || {
+            super::router(
+                state.clone(),
+                PortalConfig {
+                    api_public_url: TEST_API_URL.to_string(),
+                    csp: PortalCspConfig::new(Vec::new()),
+                    registry_url: None,
+                    login: None,
+                    landing: true,
+                    legal: Vec::new(),
+                },
+            )
+        };
+        // Without a readable realm config, applet wildcard framing fails closed.
+        let uninit = make_router()
+            .oneshot(request(Method::GET, "/"))
+            .await
+            .unwrap();
+        let uninit_csp = uninit
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            !uninit_csp.contains("apps.example.net"),
+            "missing realm config must fail closed: {uninit_csp}"
+        );
+
+        // With a clean realm config, applet wildcard framing is emitted.
+        let realm_id = state.get_realm_id();
+        let actor = aruna_core::structs::identity::auth::Actor {
+            node_id: state.get_node_id(),
+            user_id: aruna_core::user::id::UserId::nil(realm_id),
+            realm_id,
+        };
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        state
+            .get_ctx()
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                key: realm_id.as_bytes().to_vec().into(),
+                value: config.to_bytes(&actor).unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        let response = make_router()
+            .oneshot(request(Method::GET, "/"))
+            .await
+            .unwrap();
+        let policy = response
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            policy.contains("frame-src blob: https://*.apps.example.net;"),
+            "{policy}"
+        );
+
+        // With a conflicting OIDC provider on the same site, framing is omitted again.
+        config
+            .oidc_providers
+            .push(aruna_core::structs::identity::realm::OidcProviderConfig {
+                id: "idp".into(),
+                issuer: "https://auth.example.net/realms/main".into(),
+                audience: "client".into(),
+                discovery_url: "https://auth.example.net/.well-known/openid-configuration".into(),
+            });
+        state
+            .get_ctx()
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                key: realm_id.as_bytes().to_vec().into(),
+                value: config.to_bytes(&actor).unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        let blocked = make_router()
+            .oneshot(request(Method::GET, "/"))
+            .await
+            .unwrap();
+        let blocked_csp = blocked
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(!blocked_csp.contains("apps.example.net"), "{blocked_csp}");
     }
 
     #[tokio::test]

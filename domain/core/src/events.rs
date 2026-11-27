@@ -68,6 +68,8 @@ pub enum Event {
     Job(crate::jobs::JobEvent),
     /// Answers `Effect::Git`; never persisted.
     Git(Box<crate::git::GitAnswer>),
+    /// Answers `Effect::Workflow`; never persisted.
+    Workflow(Box<crate::workflow::WorkflowAnswer>),
 }
 
 impl Event {
@@ -1245,6 +1247,7 @@ impl Event {
             Event::Child(_) => "Event::Child",
             Event::Job(_) => "Event::Job",
             Event::Git(_) => "Event::Git",
+            Event::Workflow(_) => "Event::Workflow",
             Event::Plugin(_) => "Event::Plugin",
             Event::Index(event) => variant_label!(
                 event,
@@ -1272,7 +1275,8 @@ impl Event {
                     MemberAnswered,
                     ConnectionAnswered,
                     SmtpChecked,
-                    AddressChecked
+                    AddressChecked,
+                    DnsAnswered
                 }
             ),
         }

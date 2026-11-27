@@ -98,6 +98,7 @@ pub fn spawn_job(runtime: &Arc<JobsRuntime>, context: Arc<DriverContext>, record
             slot.claim_token,
             (slot.cancel, slot.progress),
             (shutdown, turns),
+            Some(runtime.clone()),
         ))
         .catch_unwind()
         .await;
@@ -327,6 +328,7 @@ pub(crate) async fn run_job(
     token: ulid::Ulid,
     (cancel, progress): (CancellationToken, Option<ProgressReporter>),
     (shutdown, range_turns): (CancellationToken, RangeTurns),
+    runtime: Option<Arc<JobsRuntime>>,
 ) {
     // External attempts drive a container through the fenced lifecycle; a lost
     // lease reconciles, and a mid-supervise shutdown hands it back for adoption.
@@ -388,7 +390,8 @@ pub(crate) async fn run_job(
         range_turns,
     };
 
-    let SuperviseResult::Outcome(outcome) = supervise(&context, job_id, token, &record, &ctx).await
+    let SuperviseResult::Outcome(outcome) =
+        supervise(&context, job_id, token, &record, &ctx, runtime).await
     else {
         return;
     };
@@ -411,6 +414,7 @@ async fn supervise(
     token: ulid::Ulid,
     record: &JobRecord,
     ctx: &JobContext,
+    runtime: Option<Arc<JobsRuntime>>,
 ) -> SuperviseResult {
     // Renew the lease and flush progress on a separate task so a non-yielding
     // payload cannot starve its renewals and be swept into a second execution.
@@ -426,7 +430,7 @@ async fn supervise(
     tokio::pin!(heartbeat);
 
     let payload = async {
-        match AssertUnwindSafe(dispatch_payload(ctx, &record.payload))
+        match AssertUnwindSafe(dispatch_payload(ctx, &record.payload, runtime))
             .catch_unwind()
             .await
         {

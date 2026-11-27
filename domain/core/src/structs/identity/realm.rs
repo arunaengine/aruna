@@ -14,6 +14,7 @@ use crate::structs::execution::job::family::SubmissionId;
 use crate::structs::execution::job::identity::JobId;
 use crate::structs::identity::auth::Actor;
 use crate::structs::identity::auth::{Permission, Role};
+use crate::structs::identity::features::{Feature, FeatureMode};
 use crate::structs::placement::binding_directory::{BindingDirectory, BindingError};
 use crate::structs::placement::handle_allocation::HandleRangeDirectory;
 use crate::structs::placement::record::{
@@ -235,6 +236,8 @@ pub struct RealmConfigDocument {
     pub plugins: Vec<crate::plugins::PublishedPlugin>,
     /// Plugin installs, sorted by install id. A conflicting install is absent.
     pub installs: Vec<crate::plugin_installs::PluginInstall>,
+    /// Realm feature policy; a missing feature uses its built-in default.
+    pub features: BTreeMap<Feature, FeatureMode>,
 }
 
 pub const MAX_PORTAL_FEATURES: usize = 64;
@@ -595,12 +598,14 @@ impl RealmConfigDocument {
         // Exclude request policies because they do not route requests; each receiver enforces its local set,
         // and nodes without a realm-config bucket may never observe them.
         canonical.request_policies.clear();
-        // Exclude federation, portal features, email, vault and secrets: they never route requests.
+        // Exclude federation, portal features, email, vault, secrets and the feature policy: they
+        // never route requests.
         canonical.federation = None;
         canonical.portal_features.clear();
         canonical.email = None;
         canonical.vault.clear();
         canonical.secrets.clear();
+        canonical.features.clear();
         let encoded = postcard::to_allocvec(&canonical)?;
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"aruna-realm-config-v1");
@@ -645,6 +650,7 @@ impl RealmConfigDocument {
             secrets: Vec::new(),
             plugins: Vec::new(),
             installs: Vec::new(),
+            features: BTreeMap::new(),
         }
     }
 

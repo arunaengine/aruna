@@ -105,6 +105,7 @@ pub fn task_spec(
             disk_bytes: None,
             max_walltime_ms: Some(recipe.time.saturating_mul(1000)),
             preemptible: false,
+            gpus: None,
         },
         executor_constraint: None,
         backend: None,

@@ -418,10 +418,23 @@ fn filters_tasks() {
         logical_state: Some("running".to_string()),
         executor_kind: Some("docker".to_string()),
         transfer_bytes: Some(4_096),
+        node_id: None,
     };
     assert!(derived.has_derived());
     assert!(derived.matches(&record));
     assert!(derived.matches_details(&record, &details));
+
+    // A workflow run's child task is left out unless the query names the run tag.
+    let mut child = record.clone();
+    if let JobPayload::Execution(spec) = &mut child.payload {
+        spec.tags
+            .insert(WORKFLOW_RUN_TAG.to_string(), "run-1".to_string());
+    }
+    let plain = TaskFilters::from_query(&ListTasksQuery::default(), None).unwrap();
+    assert!(plain.matches(&record) && !plain.matches(&child));
+    let run = Some("tag_key=aruna-engine.org%2Fworkflow-run&tag_value=run-1");
+    let run = TaskFilters::from_query(&ListTasksQuery::default(), run).unwrap();
+    assert!(run.matches(&child) && !run.matches(&record));
 
     let wrong_name = ListTasksQuery {
         name_prefix: Some("other".to_string()),
@@ -715,7 +728,9 @@ fn adds_nextflow_output() {
     task.inputs[0].path = "/work/.command.run".to_string();
     task.inputs[0].url = Some("s3://src/work/ef/.command.run".to_string());
     let output = env_glob(&task).expect("the wrapper input marks a Nextflow task");
-    let OutputDestination::S3 { key, .. } = output.destination;
+    let OutputDestination::S3 { key, .. } = output.destination else {
+        panic!("a Nextflow output names its object");
+    };
     assert_eq!(key, "work/ef");
 }
 
@@ -1031,6 +1046,7 @@ fn family_fixture() -> aruna_ops_work::jobs::lifecycle::report::FamilyReport {
         disk_bytes: 0,
         max_walltime_ms: 1_000,
         preemptible: false,
+        gpus: 0,
     };
     let mut payload = ExecutionSpec {
         group_id: Ulid::from_bytes([6u8; 16]),
@@ -1106,6 +1122,9 @@ fn family_fixture() -> aruna_ops_work::jobs::lifecycle::report::FamilyReport {
             locally_exhausted: false,
             session_runtime: None,
             awaiting_keys: Vec::new(),
+            group_id: None,
+            started_at_ms: None,
+            node_id: None,
         },
         spec,
         submission_id,
@@ -1443,6 +1462,19 @@ fn rejects_plugin_tag() {
 }
 
 #[test]
+fn rejects_workflow_tag() {
+    let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
+    task.tags.insert(
+        "aruna-engine.org/workflow-run".to_string(),
+        Ulid::nil().to_string(),
+    );
+
+    let error = map_execution_spec(&task, None, ExecutionTarget::Realm).unwrap_err();
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    assert_eq!(error.code.as_deref(), Some("reserved_tag"));
+}
+
+#[test]
 fn projects_full_command() {
     // Docker runs entrypoint + command together; the projection shows both.
     let mut spec = ExecutionSpec {
@@ -1503,7 +1535,7 @@ async fn rejects_basic() {
         (foreign_issuer, "tes-secret"),
     ] {
         write_credential(&state, &access).await;
-        let error = authenticate_tes(&state, None, &basic_headers(&access, secret))
+        let error = authenticate_tes(&state, None, &basic_headers(&access, secret), false)
             .await
             .unwrap_err();
         assert_eq!(error.status, StatusCode::UNAUTHORIZED);
@@ -1526,7 +1558,8 @@ async fn basic_foreign_owner() {
             .encrypt_secret(state.credential_encryption_key(), TES_SECRET, [3; 24])
             .unwrap();
         write_credential(&state, &access).await;
-        let result = authenticate_tes(&state, None, &basic_headers(&access, TES_SECRET)).await;
+        let result =
+            authenticate_tes(&state, None, &basic_headers(&access, TES_SECRET), false).await;
         match accepted {
             true => {
                 let caller = result.unwrap();
@@ -1534,9 +1567,10 @@ async fn basic_foreign_owner() {
                 assert_eq!(caller.auth.realm_id, state.get_realm_id());
                 // Deactivating the owner in this realm revokes the older credential.
                 deactivate(&state, owner).await;
-                let error = authenticate_tes(&state, None, &basic_headers(&access, TES_SECRET))
-                    .await
-                    .unwrap_err();
+                let error =
+                    authenticate_tes(&state, None, &basic_headers(&access, TES_SECRET), false)
+                        .await
+                        .unwrap_err();
                 assert_eq!(error.status, StatusCode::UNAUTHORIZED);
             }
             false => assert_eq!(result.unwrap_err().status, StatusCode::UNAUTHORIZED),
@@ -1551,10 +1585,108 @@ async fn rejects_restricted_basic() {
     access.path_restrictions = Some(Vec::new());
     write_credential(&state, &access).await;
 
-    let error = authenticate_tes(&state, None, &basic_headers(&access, TES_SECRET))
+    let error = authenticate_tes(&state, None, &basic_headers(&access, TES_SECRET), false)
         .await
         .unwrap_err();
     assert_eq!(error.status, StatusCode::FORBIDDEN);
+    // Task creation lets it in; `restricted_scope` bounds what it may start.
+    let caller = authenticate_tes(&state, None, &basic_headers(&access, TES_SECRET), true).await;
+    assert_eq!(caller.unwrap().auth.path_restrictions, Some(Vec::new()));
+}
+
+// A path-restricted caller starts work only inside its restrictions: every input and output an
+// object of the group on this node, and no workspace.
+#[tokio::test]
+async fn restricted_scope_bounds() {
+    use crate::jobs::JobRequestError;
+    use aruna_core::structs::identity::auth::{PathRestriction, Permission};
+    use aruna_core::structs::storage::blob::object_permission_path;
+
+    let (_dir, state) = build_state().await;
+    let (group, owner) = (
+        Ulid::from_bytes([5u8; 16]),
+        UserId::new(Ulid::from_parts(5, 5), realm()),
+    );
+    write_auth(&state, group, owner).await;
+    let context = state.get_ctx();
+    for bucket in ["src", "dest"] {
+        aruna_runner::testing::seed_bucket(&context, bucket, group, owner, Vec::new()).await;
+    }
+    let other_group = Ulid::from_bytes([6u8; 16]);
+    aruna_runner::testing::seed_bucket(&context, "foreign", other_group, owner, Vec::new()).await;
+    let (spec, _) = map_execution_spec(&sample_task(group), None, ExecutionTarget::Realm).unwrap();
+    let node = state.get_node_id();
+    let object =
+        |bucket: &str, key: &str| object_permission_path(realm(), group, node, bucket, key);
+    let restricted = |rules: Vec<(String, Permission)>| AuthContext {
+        user_id: owner,
+        realm_id: realm(),
+        path_restrictions: Some(
+            (rules.into_iter())
+                .map(|(pattern, permission)| PathRestriction {
+                    pattern,
+                    permission,
+                })
+                .collect(),
+        ),
+        session: None,
+    };
+    let inside = restricted(vec![
+        (object("src", "data.csv"), Permission::READ),
+        (format!("{}/**", object("dest", "out")), Permission::WRITE),
+    ]);
+    let scope = |auth: AuthContext, spec: ExecutionSpec, workspace: Option<&'static str>| {
+        let state = state.clone();
+        async move {
+            let extras = aruna_core::request_policy::PolicyRequestExtras::rest();
+            crate::jobs::restricted_scope(&state, &auth, &spec, workspace, extras).await
+        }
+    };
+    let allowed = scope(inside.clone(), spec.clone(), None).await;
+    assert!(allowed.is_ok(), "{allowed:?}");
+
+    let workspace = scope(inside.clone(), spec.clone(), Some("dest")).await;
+    assert!(matches!(workspace, Err(JobRequestError::Forbidden)));
+
+    let narrow_output = restricted(vec![
+        (object("src", "data.csv"), Permission::READ),
+        (object("dest", "out/other.txt"), Permission::WRITE),
+    ]);
+    let refused = scope(narrow_output, spec.clone(), None).await;
+    assert!(
+        matches!(refused, Err(JobRequestError::Forbidden)),
+        "{refused:?}"
+    );
+
+    let no_input = restricted(vec![(
+        format!("{}/**", object("dest", "out")),
+        Permission::WRITE,
+    )]);
+    let refused = scope(no_input, spec.clone(), None).await;
+    assert!(
+        matches!(refused, Err(JobRequestError::Forbidden)),
+        "{refused:?}"
+    );
+
+    let mut remote = spec.clone();
+    remote.inputs[0].source_node_id = Some(iroh::SecretKey::from_bytes(&[9u8; 32]).public());
+    let refused = scope(inside.clone(), remote, None).await;
+    assert!(
+        matches!(refused, Err(JobRequestError::Forbidden)),
+        "{refused:?}"
+    );
+
+    let mut foreign = spec;
+    foreign.inputs[0].source = InputSource::S3 {
+        bucket: "foreign".to_string(),
+        key: "data.csv".to_string(),
+        version_id: None,
+    };
+    let refused = scope(inside, foreign, None).await;
+    assert!(
+        matches!(refused, Err(JobRequestError::BadRequest)),
+        "{refused:?}"
+    );
 }
 
 #[tokio::test]
@@ -1633,7 +1765,9 @@ async fn basic_scopes_tasks() {
     let access = issued_access(&state, group);
     write_credential(&state, &access).await;
     let headers = basic_headers(&access, TES_SECRET);
-    let caller = authenticate_tes(&state, None, &headers).await.unwrap();
+    let caller = authenticate_tes(&state, None, &headers, false)
+        .await
+        .unwrap();
     assert_eq!(caller.auth.user_id, owner);
     assert_eq!(caller.credential_group, Some(group));
 

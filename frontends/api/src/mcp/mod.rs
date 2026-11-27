@@ -23,6 +23,7 @@ use rmcp::transport::streamable_http_server::tower::{
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+mod applets;
 mod compute;
 mod context;
 pub(crate) mod data;
@@ -30,6 +31,7 @@ mod forward;
 mod metadata;
 mod prompts;
 mod resources;
+mod workflows;
 
 const MCP_BODY_LIMIT: usize = 4 * 1024 * 1024;
 
@@ -64,8 +66,10 @@ impl McpServer {
     pub fn new(state: Arc<ServerState>) -> Self {
         let mut tool_router = context::toolset();
         tool_router.merge(compute::toolset());
+        tool_router.merge(applets::toolset());
         tool_router.merge(data::toolset());
         tool_router.merge(metadata::toolset());
+        tool_router.merge(workflows::toolset());
         Self { state, tool_router }
     }
 }
@@ -245,6 +249,19 @@ pub(crate) async fn authorize_self(
     .map_err(|_| crate::error::ServerError::Forbidden)
 }
 
+/// The request parts of a tool call by `auth`, as the MCP router hands them to a tool.
+#[cfg(test)]
+pub(crate) fn caller(
+    auth: &aruna_core::structs::identity::auth::AuthContext,
+) -> http::request::Parts {
+    let (mut parts, ()) = http::Request::new(()).into_parts();
+    parts.extensions.insert(Some(auth.clone()));
+    parts
+        .extensions
+        .insert(None::<crate::auth::ValidatedBearer>);
+    parts
+}
+
 fn error_result(body: crate::error::ErrorResponse) -> CallToolResult {
     let text = body.error.clone();
     let mut result = CallToolResult::error(vec![ContentBlock::text(text)]);
@@ -332,6 +349,7 @@ mod tests {
         router.merge(super::compute::toolset());
         router.merge(super::data::toolset());
         router.merge(super::metadata::toolset());
+        router.merge(super::workflows::toolset());
         router.list_all()
     }
 

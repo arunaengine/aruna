@@ -10,11 +10,13 @@ members = [
     "apps/registry",
     "apps/compute-helper",
     "frontends/api",
+    "frontends/gateway",
     "frontends/wire",
     "domain/core",
     "domain/kpabe",
     "domain/kpabe/wasm",
     "domain/plugin-contract",
+    "domain/workflow-contract",
     "domain/ops-identity",
     "domain/ops-data",
     "domain/ops-work",
@@ -29,22 +31,25 @@ members = [
     "runtime/scheduler",
     "runtime/egress",
     "runtime/wasm-host",
+    "runtime/workflow",
     "plugins/examples/elabftw",
     "plugins/examples/announcer/rust",
     "plugins/fixture",
     "plugins/sdk",
     "testing/harness",
 ]
+# The coordinator links uwe-rs and keeps its own lock file and feature set.
+exclude = ["apps/coordinator"]
 # default-members = ["aruna"]
 resolver = "3"
 
 [workspace.package]
 description = "A federated data orchestration network"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/arunaengine/aruna"
-rust-version = "1.97.1"
+rust-version = "1.99.1"
 
 [workspace.dependencies]
 argon2 = { version = "0.6.0", default-features = false, features = ["alloc", "zeroize"] }
@@ -65,6 +70,7 @@ aruna-ops-data = { path = "domain/ops-data" }
 aruna-ops-identity = { path = "domain/ops-identity" }
 aruna-runner = { path = "runtime/runner" }
 aruna-egress = { path = "runtime/egress" }
+aruna-gateway = { path = "frontends/gateway" }
 aruna-plugin = { path = "plugins/sdk" }
 aruna-plugin-contract = { path = "domain/plugin-contract" }
 aruna-wasm-host = { path = "runtime/wasm-host", default-features = false }
@@ -72,6 +78,8 @@ aruna-storage = { path = "runtime/storage" }
 aruna-scheduler = { path = "runtime/scheduler" }
 aruna-test-harness = { path = "testing/harness" }
 aruna-wire = { path = "frontends/wire" }
+aruna-workflow = { path = "runtime/workflow" }
+aruna-workflow-contract = { path = "domain/workflow-contract" }
 
 # Third-party crates
 aes-gcm = "0.11.1"

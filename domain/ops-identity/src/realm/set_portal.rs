@@ -1,4 +1,4 @@
-//! Replaces the realm default on/off state of optional portal features.
+//! Replaces the realm portal feature defaults and the realm feature policy.
 //! It writes through the shared admin document path, so concurrent changes converge.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
@@ -9,12 +9,13 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::reducer::paths::CONFIG_PORTAL_PATH;
+use aruna_core::reducer::paths::{CONFIG_FEATURES_PATH, CONFIG_PORTAL_PATH};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, stale_conflict_deletes,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::identity::features::{Feature, FeatureMode};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, validate_portal_features};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_core::types::Value;
@@ -38,8 +39,10 @@ pub struct SetPortalConfig {
     /// The caller's own token context, so a path-restricted credential stays
     /// restricted; it is never derived from `actor`.
     pub auth_context: AuthContext,
-    /// The complete feature map; it replaces the stored one.
-    pub features: BTreeMap<String, bool>,
+    /// The complete portal feature map that replaces the stored one; `None` keeps it.
+    pub features: Option<BTreeMap<String, bool>>,
+    /// The complete realm feature policy that replaces the stored one; `None` keeps it.
+    pub policy: Option<BTreeMap<Feature, FeatureMode>>,
 }
 
 /// Checks the caller's config permission, then writes the change in a write transaction that
@@ -182,11 +185,13 @@ impl PortalWrite {
         document_value: Option<Value>,
         reducer_state_value: Option<Value>,
     ) -> Result<Next<RealmConfigDocument>, SetPortalError> {
-        validate_portal_features(&self.config.features).map_err(|error| {
-            SetPortalError::InvalidFeatures {
-                reason: error.to_string(),
-            }
-        })?;
+        if let Some(features) = &self.config.features {
+            validate_portal_features(features).map_err(|error| {
+                SetPortalError::InvalidFeatures {
+                    reason: error.to_string(),
+                }
+            })?;
+        }
 
         let Some(document_value) = document_value else {
             return Err(SetPortalError::ConfigMissing);
@@ -214,13 +219,21 @@ impl PortalWrite {
         let mut reducer_state = previous_reducer_state
             .clone()
             .unwrap_or_else(|| AdminDocumentState::new(target));
-        let admin_event = reducer_state.apply_operation(
-            &self.config.actor,
-            AdminDocumentOperation::ConfigPortalSet {
-                features: self.config.features.clone(),
-            },
-            self.write.ids.mint(self.write.now_ms),
-        )?;
+        let policy = (self.config.policy.clone())
+            .or_else(|| compute_runs(&document, self.config.features.as_ref()));
+        let mut operations = Vec::new();
+        if let Some(features) = &self.config.features {
+            let features = features.clone();
+            operations.push(AdminDocumentOperation::ConfigPortalSet { features });
+        }
+        if let Some(features) = policy {
+            operations.push(AdminDocumentOperation::ConfigFeaturesSet { features });
+        }
+        let mut admin_events = Vec::new();
+        for operation in operations {
+            let id = self.write.ids.mint(self.write.now_ms);
+            admin_events.push(reducer_state.apply_operation(&self.config.actor, operation, id)?);
+        }
         // Materialized reducer state keeps local and replicated conflict outcomes equal.
         apply_reducer_portal(&mut document, &reducer_state);
 
@@ -236,16 +249,18 @@ impl PortalWrite {
             ),
             reducer_state_entry(&reducer_state)?,
         ];
-        let record = new_identified_record(
-            admin_event.event_id,
-            self.config.actor.node_id,
-            document_target,
-            Vec::new(),
-            DocumentOutboxEvent::admin(admin_event),
-            placement,
-            false,
-        );
-        writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
+        for admin_event in admin_events {
+            let record = new_identified_record(
+                admin_event.event_id,
+                self.config.actor.node_id,
+                document_target.clone(),
+                Vec::new(),
+                DocumentOutboxEvent::admin(admin_event),
+                placement,
+                false,
+            );
+            writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
+        }
         writes.extend(conflict_write_entries(&reducer_state)?);
 
         self.document = Some(document.clone());
@@ -295,7 +310,7 @@ impl Operation for PortalWrite {
     }
 }
 
-/// Overlays the reducer's materialized portal features onto the document,
+/// Overlays the reducer's materialized portal features and feature policy onto the document,
 /// mirroring the replicated materialization in `net::document_sync`.
 fn apply_reducer_portal(document: &mut RealmConfigDocument, reducer_state: &AdminDocumentState) {
     if !reducer_state.conflicts.contains_key(CONFIG_PORTAL_PATH)
@@ -303,6 +318,26 @@ fn apply_reducer_portal(document: &mut RealmConfigDocument, reducer_state: &Admi
     {
         document.portal_features = features;
     }
+    if !reducer_state.conflicts.contains_key(CONFIG_FEATURES_PATH)
+        && let Some(features) = reducer_state.materialized_realm_features()
+    {
+        document.features = features;
+    }
+}
+
+/// The policy with its `runs` default set from the older portal key `compute`, when the realm
+/// sets `runs` itself and the key changes it; without a `runs` entry `compute` already decides.
+fn compute_runs(
+    document: &RealmConfigDocument,
+    features: Option<&BTreeMap<String, bool>>,
+) -> Option<BTreeMap<Feature, FeatureMode>> {
+    let compute = *features?.get("compute")?;
+    let mut policy = document.features.clone();
+    match policy.get_mut(&Feature::Runs)? {
+        FeatureMode::Scoped { default, .. } if *default != compute => *default = compute,
+        _ => return None,
+    }
+    Some(policy)
 }
 
 #[cfg(test)]
@@ -338,7 +373,8 @@ mod tests {
                 path_restrictions: None,
                 session: None,
             },
-            features,
+            features: Some(features),
+            policy: None,
         }
     }
 
@@ -386,6 +422,49 @@ mod tests {
             .await
             .expect("config reads");
         assert_eq!(reread.portal_features, features());
+    }
+
+    #[tokio::test]
+    async fn stores_feature_policy() {
+        // A policy write keeps the portal map; a later `compute` default moves an explicit `runs`.
+        let ctx = memory_context();
+        let actor = actor(RealmId::from_bytes([1u8; 32]));
+        seed(&ctx, &actor).await;
+        drive(
+            SetPortalOperation::new(portal_config(&actor, features())),
+            &ctx,
+        )
+        .await
+        .expect("portal features store");
+
+        let runs = FeatureMode::Scoped {
+            default: true,
+            groups: BTreeMap::from([(Ulid::from_bytes([2u8; 16]), false)]),
+        };
+        let policy = BTreeMap::from([(Feature::Runs, runs)]);
+        let mut config = portal_config(&actor, BTreeMap::new());
+        (config.features, config.policy) = (None, Some(policy.clone()));
+        let stored = drive(SetPortalOperation::new(config), &ctx)
+            .await
+            .expect("feature policy stores");
+        assert_eq!(stored.features, policy);
+        assert_eq!(stored.portal_features, features());
+
+        let compute_on = BTreeMap::from([("compute".to_string(), false)]);
+        drive(
+            SetPortalOperation::new(portal_config(&actor, compute_on)),
+            &ctx,
+        )
+        .await
+        .expect("portal features store");
+        let reread = drive(GetConfigOperation::new(actor.realm_id), &ctx)
+            .await
+            .expect("config reads");
+        let expected = FeatureMode::Scoped {
+            default: false,
+            groups: BTreeMap::from([(Ulid::from_bytes([2u8; 16]), false)]),
+        };
+        assert_eq!(reread.features.get(&Feature::Runs), Some(&expected));
     }
 
     #[tokio::test]

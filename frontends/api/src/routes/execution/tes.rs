@@ -20,10 +20,11 @@ use aruna_core::structs::execution::job::family::{
 use aruna_core::structs::execution::job::identity::{JobId, JobState};
 use aruna_core::structs::execution::job::input::{
     ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, JobPayload,
-    OutputDestination, OutputSelection,
+    OutputDestination, OutputSelection, WORKFLOW_RUN_TAG,
 };
 use aruna_core::structs::execution::job::local::{JobRecord, JobResultPayload, WorkspaceMode};
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
+use aruna_core::structs::identity::features::Feature;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
@@ -47,7 +48,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::auth::require_owner;
-use crate::auth::{ValidatedBearer, require_unrestricted_auth};
+use crate::auth::{ValidatedBearer, require_realm_auth, require_unrestricted_auth};
 use crate::error::ServerError;
 use crate::forwarded::{DirectOrigin, external_base_url};
 use crate::routes::execution::jobs::ExecutionTarget;
@@ -74,7 +75,18 @@ const ID_TAG_KEY: &str = "aruna-engine.org/job-id";
 const STATE_TAG_KEY: &str = "aruna-engine.org/logical-state";
 const KIND_TAG_KEY: &str = "aruna-engine.org/executor-kind";
 const TRANSFER_TAG_KEY: &str = "aruna-engine.org/estimated-transfer-bytes";
-const DERIVED_TAG_KEYS: [&str; 4] = [ID_TAG_KEY, STATE_TAG_KEY, KIND_TAG_KEY, TRANSFER_TAG_KEY];
+/// The node that runs the task, or that holds it while no placement names one.
+const NODE_TAG_KEY: &str = "aruna-engine.org/node-id";
+/// What a `PAUSED` task waits for: `bucket_key`.
+const WAITING_TAG_KEY: &str = "aruna-engine.org/waiting-for";
+const DERIVED_TAG_KEYS: [&str; 6] = [
+    ID_TAG_KEY,
+    STATE_TAG_KEY,
+    KIND_TAG_KEY,
+    TRANSFER_TAG_KEY,
+    NODE_TAG_KEY,
+    WAITING_TAG_KEY,
+];
 
 const DEFAULT_PAGE_SIZE: usize = 256;
 const MAX_PAGE_SIZE: usize = 512;
@@ -359,6 +371,12 @@ impl TaskFilters {
         })
     }
 
+    /// Whether the query asks for the child tasks of workflow runs, which are left out unless
+    /// it names their tag.
+    fn names_run(&self) -> bool {
+        self.tags.iter().any(|(key, _)| key == WORKFLOW_RUN_TAG)
+    }
+
     fn matches(&self, record: &JobRecord) -> bool {
         self.matches_base(record)
     }
@@ -374,7 +392,8 @@ impl TaskFilters {
             return false;
         };
         let tags = project_tags(spec);
-        self.state.is_none_or(|state| tes_state(record) == state)
+        (self.names_run() || !tags.contains_key(WORKFLOW_RUN_TAG))
+            && self.state.is_none_or(|state| tes_state(record) == state)
             && self.name_prefix.as_deref().is_none_or(|prefix| {
                 spec.name
                     .as_deref()
@@ -398,7 +417,7 @@ impl TaskFilters {
             return false;
         };
         let mut tags = project_tags(spec);
-        details.stamp(&record.job_id.to_string(), &mut tags);
+        details.stamp(record, &mut tags);
         self.tags
             .iter()
             .filter(|(key, _)| DERIVED_TAG_KEYS.contains(&key.as_str()))
@@ -546,11 +565,14 @@ pub async fn service_info(
     description = r#"Accepts a task for asynchronous execution and returns the id to poll.
 
 **Authentication**: realm bearer token, or HTTP Basic with an access key and secret issued by this
-node; a path-restricted credential is refused. The caller needs WRITE on the target group. Basic
-authentication takes the group from the credential and refuses an `aruna-engine.org/group` tag
-naming a different one; a bearer token requires that tag.
+node. The caller needs WRITE on the target group. Basic authentication takes the group from the
+credential and refuses an `aruna-engine.org/group` tag naming a different one; a bearer token
+requires that tag.
 
 **Behavior**
+- A path-restricted credential must name the group's data path on this node exactly and may use
+  no workspace; every input and output must be an object of the group on this node inside its
+  restrictions (READ for inputs, WRITE for outputs).
 - 200 means the task was durably accepted and queued, never that it started or finished.
 - State runs `QUEUED`, `INITIALIZING`, `RUNNING`, then `COMPLETE`, `EXECUTOR_ERROR`,
   `SYSTEM_ERROR` or `CANCELED`; `CANCELING` shows while a cancellation is in flight and `UNKNOWN`
@@ -676,7 +698,7 @@ pub async fn create_task(
     headers: HeaderMap,
     Json(task): Json<TesTask>,
 ) -> Response {
-    let caller = match authenticate_tes(&state, auth, &headers).await {
+    let caller = match authenticate_tes(&state, auth, &headers, true).await {
         Ok(caller) => caller,
         Err(error) => return error.into_response(),
     };
@@ -699,12 +721,28 @@ pub async fn create_task(
     if let Err(error) = ensure_group_write(&state, &caller.auth, group_id).await {
         return error.into_response();
     }
+    if let Err(error) = crate::features::require(&state, Feature::Runs, Some(group_id)).await {
+        return error.into_response();
+    }
 
     let (spec, idempotency_key) = match map_execution_spec(&task, caller.credential_group, target) {
         Ok(mapped) => mapped,
         Err(error) => return error.into_response(),
     };
     let workspace_mode = target_modes(target).1;
+
+    if caller.auth.path_restrictions.is_some()
+        && let Err(error) = crate::jobs::restricted_scope(
+            &state,
+            &caller.auth,
+            &spec,
+            None,
+            aruna_core::request_policy::PolicyRequestExtras::rest(),
+        )
+        .await
+    {
+        return TesError::from_server(ServerError::from(error)).into_response();
+    }
 
     if target == ExecutionTarget::Local {
         let config = LocalExecutionConfig {
@@ -899,7 +937,7 @@ pub async fn get_task(
     Path(id): Path<String>,
     Query(query): Query<ViewQuery>,
 ) -> Response {
-    let caller = match authenticate_tes(&state, auth, &headers).await {
+    let caller = match authenticate_tes(&state, auth, &headers, false).await {
         Ok(caller) => caller,
         Err(error) => return error.into_response(),
     };
@@ -1021,6 +1059,11 @@ credential additionally sees only tasks of that credential's group.
 - `BASIC` and `FULL` also carry the derived read-only tags `aruna-engine.org/job-id`,
   `aruna-engine.org/logical-state`, `aruna-engine.org/executor-kind` and
   `aruna-engine.org/estimated-transfer-bytes` wherever this responder knows them.
+- `BASIC` and `FULL` also carry `aruna-engine.org/node-id`, the node that runs the task or holds
+  it while no placement names one, and `aruna-engine.org/waiting-for` `bucket_key` on a `PAUSED`
+  task that waits for a bucket key.
+- The child tasks of workflow runs, tagged `aruna-engine.org/workflow-run`, are left out unless
+  `tag_key` names that tag; with a `tag_value` they are the tasks of one run.
 - `tag_value` pairs by position with `tag_key`, and an empty or missing value matches any value of
   that key.
 
@@ -1069,7 +1112,7 @@ pub async fn list_tasks(
     RawQuery(raw_query): RawQuery,
     Query(query): Query<ListTasksQuery>,
 ) -> Response {
-    let caller = match authenticate_tes(&state, auth, &headers).await {
+    let caller = match authenticate_tes(&state, auth, &headers, false).await {
         Ok(caller) => caller,
         Err(error) => return error.into_response(),
     };
@@ -1183,7 +1226,7 @@ pub async fn cancel_task(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    let caller = match authenticate_tes(&state, auth, &headers).await {
+    let caller = match authenticate_tes(&state, auth, &headers, false).await {
         Ok(caller) => caller,
         Err(error) => return error.into_response(),
     };
@@ -1334,6 +1377,13 @@ fn validate_task_shape(task: &TesTask) -> Result<&TesExecutor, TesError> {
         return Err(TesError::coded(
             StatusCode::BAD_REQUEST,
             format!("tag `{key}` is reserved for plugin tasks"),
+            "reserved_tag",
+        ));
+    }
+    if let Some(key) = aruna_core::structs::execution::job::input::node_tag(&task.tags) {
+        return Err(TesError::coded(
+            StatusCode::BAD_REQUEST,
+            format!("tag `{key}` is reserved for workflow tasks"),
             "reserved_tag",
         ));
     }
@@ -1515,6 +1565,7 @@ fn map_task_resources(task: &TesTask) -> Result<ComputeResources, TesError> {
             .as_ref()
             .and_then(|resources| resources.preemptible)
             .unwrap_or(false),
+        gpus: None,
     })
 }
 
@@ -1774,6 +1825,7 @@ struct TaskDetails {
     logical_state: Option<String>,
     executor_kind: Option<String>,
     transfer_bytes: Option<u64>,
+    node_id: Option<aruna_core::id::NodeId>,
 }
 
 impl TaskDetails {
@@ -1787,11 +1839,19 @@ impl TaskDetails {
                 .and_then(|plan| plan.target.as_ref())
                 .map(|target| target.executor_kind.clone()),
             transfer_bytes: placed.map(|plan| plan.estimated_transfer_bytes),
+            node_id: placed
+                .and_then(|plan| plan.target.as_ref())
+                .map(|target| target.node_id),
         }
     }
 
-    fn stamp(&self, id: &str, tags: &mut BTreeMap<String, String>) {
-        tags.insert(ID_TAG_KEY.to_string(), id.to_string());
+    fn stamp(&self, record: &JobRecord, tags: &mut BTreeMap<String, String>) {
+        tags.insert(ID_TAG_KEY.to_string(), record.job_id.to_string());
+        let node = self.node_id.unwrap_or(record.owner_node_id);
+        tags.insert(NODE_TAG_KEY.to_string(), node.to_string());
+        if record.state == JobState::AwaitingKey {
+            tags.insert(WAITING_TAG_KEY.to_string(), "bucket_key".to_string());
+        }
         if let Some(state) = &self.logical_state {
             tags.insert(STATE_TAG_KEY.to_string(), state.clone());
         }
@@ -1892,11 +1952,14 @@ fn project_task(
         .file_outputs
         .iter()
         .map(|output| {
-            let OutputDestination::S3 { bucket, key } = &output.destination;
+            let url = match &output.destination {
+                OutputDestination::S3 { bucket, key } => format!("s3://{bucket}/{key}"),
+                OutputDestination::RunArea { prefix } => format!("run-area://{prefix}"),
+            };
             TesOutput {
                 name: output.name.clone(),
                 description: output.description.clone(),
-                url: Some(format!("s3://{bucket}/{key}")),
+                url: Some(url),
                 path: output.container_path.clone(),
                 path_prefix: output.path_prefix.clone(),
                 kind: TesFileType::File,
@@ -1919,7 +1982,7 @@ fn project_task(
     });
 
     let mut tags = project_tags(spec);
-    details.stamp(&id, &mut tags);
+    details.stamp(record, &mut tags);
 
     let mut log = build_task_log(record, base_url);
     if view == TesView::Basic {
@@ -2067,13 +2130,20 @@ struct TesCaller {
     credential_group: Option<Ulid>,
 }
 
+/// The caller of a TES route; only task creation lets a path-restricted caller in, as
+/// `restricted_scope` then bounds what it may start.
 async fn authenticate_tes(
     state: &ServerState,
     auth: Option<AuthContext>,
     headers: &HeaderMap,
+    restricted: bool,
 ) -> Result<TesCaller, TesError> {
+    let realm_auth = |auth: AuthContext| match restricted {
+        true => require_realm_auth(state, Some(auth)),
+        false => require_unrestricted_auth(state, Some(auth)),
+    };
     if let Some(auth) = auth {
-        let auth = require_unrestricted_auth(state, Some(auth)).map_err(TesError::from_server)?;
+        let auth = realm_auth(auth).map_err(TesError::from_server)?;
         return Ok(TesCaller {
             auth,
             credential_group: None,
@@ -2141,15 +2211,12 @@ async fn authenticate_tes(
     }
 
     let credential_group = access.group_id;
-    let auth = require_unrestricted_auth(
-        state,
-        Some(AuthContext {
-            user_id: access.user_identity,
-            realm_id: state.get_realm_id(),
-            path_restrictions: access.path_restrictions,
-            session: None,
-        }),
-    )
+    let auth = realm_auth(AuthContext {
+        user_id: access.user_identity,
+        realm_id: state.get_realm_id(),
+        path_restrictions: access.path_restrictions,
+        session: None,
+    })
     .map_err(TesError::from_server)?;
     Ok(TesCaller {
         auth,

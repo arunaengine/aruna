@@ -65,6 +65,11 @@ upgrades).
   Both kinds can also be mixed in one list.
 - **Compute.** `ARUNA_COMPUTE_EXECUTOR` is `none` by default. The `docker` executor needs the host's
   Docker socket and an S3 address that job containers can reach.
+- **Applets.** Off while `APPLETS_DOMAIN` is unset. Give applets a dedicated registered domain
+  separate from the portal, API, S3 and OIDC hosts (the node refuses to start if they share a
+  registered domain), set `APPLETS_EDGE_KEY_SHA256` and `APPLETS_PORTAL_ORIGIN`, and keep the
+  gateway's `/_edge/*` routes off the public ingress. See
+  [Applet hosting](deployment.md#applet-hosting).
 
 ## Native HTTPS
 

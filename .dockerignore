@@ -4,6 +4,7 @@
 
 .git
 target
+apps/coordinator/target
 **/.env
 .compose-data
 docker/

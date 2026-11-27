@@ -7,17 +7,17 @@ use crate::error::{ServerError, ServerResult};
 use crate::jobs::{JobProgressResponse, rfc3339};
 use crate::routes::info::{InfoAccess, info_access};
 use crate::server::state::ServerState;
-use aruna_core::jobs::{JobTarget, RunningJobView};
+use aruna_core::jobs::{JobKind, JobTarget, RunningJobView};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_ops_identity::auth::request_authorization::BucketAccessOperation;
 use aruna_runner::driver::drive;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -33,10 +33,29 @@ pub struct NodeJobsResponse {
     pub hidden: u32,
 }
 
-/// One running job. A visitor gets only `kind`.
+/// Narrows the running jobs to some kinds.
+#[derive(Debug, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct RunningJobsQuery {
+    /// Comma-separated job kinds, such as `workflow_run`; `session` names notebook sessions and
+    /// `execution` the runs that are not sessions.
+    pub kind: Option<String>,
+}
+
+/// The value of `kind` that names notebook sessions.
+const SESSION_KIND: &str = "session";
+
+/// One running job. A visitor gets only `kind`, `session` and `state`.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct NodeJobResponse {
+    /// Present only where the caller sees the job in detail.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
     pub kind: String,
+    /// A notebook session, whose `kind` is `execution`.
+    pub session: bool,
+    /// `running`, or `cancelling` once a cancel was asked for.
+    pub state: String,
     /// Absent when the job works on no single bucket or dataset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<JobTargetResponse>,
@@ -63,7 +82,10 @@ pub enum JobTargetResponse {
 impl From<RunningJobView> for NodeJobResponse {
     fn from(job: RunningJobView) -> Self {
         Self {
+            job_id: Some(job.job_id.to_string()),
             kind: job.kind.name().to_string(),
+            session: job.session,
+            state: state_name(&job).to_string(),
             target: job.target.map(|target| match target {
                 JobTarget::Bucket { bucket, path, .. } => {
                     JobTargetResponse::Bucket { bucket, path }
@@ -98,10 +120,15 @@ impl From<RunningJobView> for NodeJobResponse {
   works on (its key, or all of its prefix or bucket with no deny below it), or the job's group
   when the job works on no bucket, or when it created the job with an unrestricted token. Every
   other job only adds to `hidden`.
-- An anonymous caller gets one entry with only `kind` per running job and `hidden` 0.
+- An anonymous caller gets one entry with only `kind`, `session` and `state` per running job and
+  `hidden` 0.
 - `target` is a bucket with an optional key or prefix, or a dataset id. `progress` is present only
   while the job counts something; `total` is absent when the job has only a count.
-- The list is a snapshot: a job may finish right after it is listed."#,
+- The list is a snapshot: a job may finish right after it is listed.
+- `kind` keeps only the named kinds, before `hidden` is counted: `session` names notebook
+  sessions and `execution` the runs that are not sessions. An unknown kind is a 400.
+- `job_id` is present only on a row the caller sees in detail."#,
+    params(RunningJobsQuery),
     responses(
         (
             status = 200,
@@ -110,28 +137,40 @@ impl From<RunningJobView> for NodeJobResponse {
             example = json!({
                 "jobs": [
                     {
+                        "job_id": "01JJRSTVWXYZ0123456789ABCD",
                         "kind": "import_rocrate",
+                        "session": false,
+                        "state": "running",
                         "target": {"bucket": "bakrep-reference", "path": "records/part-1/"},
                         "progress": {"current": 14402, "total": 20000, "unit": "entries"},
                         "started_at": "2026-11-01T10:00:00+00:00"
                     },
                     {
+                        "job_id": "01JJRSTVWXYZ0123456789ABCE",
                         "kind": "register_identifiers",
+                        "session": false,
+                        "state": "running",
                         "target": {"dataset_id": "01JABCDEF0123456789ABCDEFG"},
                         "started_at": "2026-11-01T10:40:00+00:00"
                     }
                 ],
                 "hidden": 2
             })
-        )
+        ),
+        (status = 400, description = "An unknown job kind", body = crate::error::ErrorResponse)
     ),
     security((), ("bearer_auth" = []))
 )]
 pub async fn get_running_jobs(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Query(query): Query<RunningJobsQuery>,
 ) -> ServerResult<(StatusCode, Json<NodeJobsResponse>)> {
-    let jobs = state.jobs_runtime().running_list();
+    let kinds = kind_filter(query.kind.as_deref())?;
+    let mut jobs = state.jobs_runtime().running_list();
+    if let Some(kinds) = kinds {
+        jobs.retain(|job| kinds.contains(&kind_name(job)));
+    }
     let response = visible_jobs(&state, auth.as_ref(), jobs).await?;
     Ok((StatusCode::OK, Json(response)))
 }
@@ -169,10 +208,49 @@ pub(crate) async fn visible_jobs(
     Ok(response)
 }
 
+/// The kind a job is filtered by: `session` for a notebook session, else its job kind.
+fn kind_name(job: &RunningJobView) -> &'static str {
+    match job.session {
+        true => SESSION_KIND,
+        false => job.kind.name(),
+    }
+}
+
+fn state_name(job: &RunningJobView) -> &'static str {
+    match job.cancel_requested {
+        true => "cancelling",
+        false => "running",
+    }
+}
+
+/// The kinds `kind` names, or `None` when it names none.
+fn kind_filter(kind: Option<&str>) -> ServerResult<Option<Vec<&'static str>>> {
+    let Some(kind) = kind.filter(|kind| !kind.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let known = JobKind::ALL.map(JobKind::name);
+    let mut kinds = Vec::new();
+    for name in kind.split(',').map(str::trim) {
+        let found = (known.iter().chain([&SESSION_KIND])).find(|known| **known == name);
+        match found {
+            Some(found) => kinds.push(*found),
+            None => {
+                return Err(ServerError::BadRequestReason(format!(
+                    "{name:?} is no job kind"
+                )));
+            }
+        }
+    }
+    Ok(Some(kinds))
+}
+
 impl NodeJobResponse {
     fn kind_only(job: &RunningJobView) -> Self {
         Self {
+            job_id: None,
             kind: job.kind.name().to_string(),
+            session: job.session,
+            state: state_name(job).to_string(),
             target: None,
             progress: None,
             started_at: None,

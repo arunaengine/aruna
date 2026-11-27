@@ -6,6 +6,7 @@ use std::array::TryFromSliceError;
 
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::metadata::{MetadataValidationViolation, ProfileValidationFinding};
+use aruna_core::structs::identity::features::{Feature, Resolved, Scope};
 use aruna_ops_identity::auth::error::ArunaBearerError;
 use axum::Json;
 use axum::http::StatusCode;
@@ -100,6 +101,37 @@ pub enum ServerError {
     /// A refusal with its own status and machine-readable code, such as `bucket_locked`.
     #[error("{2}")]
     Refused(StatusCode, &'static str, String),
+    /// A feature the node, realm or group has off refused a new start or write.
+    #[error("{}", feature_message(.0, .1))]
+    FeatureOff(Feature, Resolved),
+}
+
+/// The body of a `403` refusal by a feature that is off.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FeatureRefusal {
+    /// Always `feature_disabled`.
+    pub error: String,
+    /// The feature key, such as `shares`.
+    pub feature: String,
+    /// The layer that turned it off: `node`, `realm`, `group`, `default` or `dependency`.
+    pub scope: String,
+    pub message: String,
+}
+
+fn feature_message(feature: &Feature, resolved: &Resolved) -> String {
+    let name = feature.name();
+    match (resolved.scope, resolved.dependency) {
+        (Scope::Node, _) => format!("The feature `{name}` is turned off on this node."),
+        (Scope::Realm, _) => format!("The feature `{name}` is turned off in this realm."),
+        (Scope::Group, _) => format!("The feature `{name}` is turned off for this group."),
+        (Scope::Default, _) => {
+            format!("The feature `{name}` is off until a realm admin turns it on.")
+        }
+        (Scope::Dependency, parent) => format!(
+            "The feature `{name}` needs `{}`, which is turned off.",
+            parent.map_or("another feature", Feature::name)
+        ),
+    }
 }
 
 #[derive(Debug, Error)]
@@ -378,6 +410,15 @@ impl IntoResponse for ServerError {
         if let ServerError::InternalError(source) = &self {
             tracing::error!(error = %source, "internal server error");
         }
+        if let ServerError::FeatureOff(feature, resolved) = &self {
+            let body = FeatureRefusal {
+                error: "feature_disabled".to_string(),
+                feature: feature.name().to_string(),
+                scope: resolved.scope.name().to_string(),
+                message: self.to_string(),
+            };
+            return (StatusCode::FORBIDDEN, Json(body)).into_response();
+        }
         let status = self.status_code();
         let body = self.response_body();
 
@@ -472,6 +513,7 @@ impl ServerError {
             | ServerError::ServiceUnavailableReason(_)
             | ServerError::NoManagementNode => StatusCode::SERVICE_UNAVAILABLE,
             ServerError::Refused(status, ..) => *status,
+            ServerError::FeatureOff(..) => StatusCode::FORBIDDEN,
         }
     }
 
@@ -508,6 +550,7 @@ impl ServerError {
             ServerError::NoManagementNode => "no_management_node".to_string(),
             ServerError::RelayFailed => "relay_failed".to_string(),
             ServerError::Refused(_, code, _) => (*code).to_string(),
+            ServerError::FeatureOff(..) => "feature_disabled".to_string(),
         }
     }
 

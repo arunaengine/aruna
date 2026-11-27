@@ -3,5 +3,5 @@
 # SPDX-License-Identifier: MIT or Apache-2.0
 
 [toolchain]
-channel = "1.97.1"
+channel = "1.99.1"
 profile = "minimal"

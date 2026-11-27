@@ -35,6 +35,7 @@ use aruna_core::structs::storage::distribution::snapshot::DistributionView;
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRef, ReadLease,
 };
+use aruna_core::structs::storage::link::LinkTarget;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::types::{GroupId, Key, KeySpace, Value};
 use aruna_core::user::id::UserId;
@@ -69,6 +70,8 @@ pub enum BaoReadOutput {
         etag: Option<String>,
         hashes: HashMap<String, Vec<u8>>,
     },
+    /// Authorization-only probe succeeded for a `LinkAccess` target; carries no digest or bytes.
+    Authorized,
     Stream {
         blob: BackendStream<Result<Bytes, StreamError>>,
         size: u64,
@@ -181,13 +184,21 @@ impl BaoReadOperation {
     }
 
     fn response(&mut self, stream_id: Ulid, payload: &[u8]) -> ReadStep {
+        let is_link = matches!(self.request.target, BaoReadTarget::LinkAccess(_));
         let (size, blake3, etag, hashes) = match VersionReplicationMessage::from_bytes(payload)? {
+            VersionReplicationMessage::BaoReadAuthorized
+                if is_link && self.request.metadata_only =>
+            {
+                self.metadata = Some(BaoReadOutput::Authorized);
+                self.state = BaoReadState::CloseMetadata;
+                return Ok(blob_call(BlobEffect::CloseConnection { stream_id }));
+            }
             VersionReplicationMessage::BaoReadAccepted {
                 size,
                 blake3,
                 etag,
                 hashes,
-            } => (size, blake3, etag, hashes),
+            } if !is_link => (size, blake3, etag, hashes),
             VersionReplicationMessage::BaoReadRefused(reason) => {
                 return Err(BaoReadError::Refused(reason));
             }
@@ -476,7 +487,7 @@ impl IncomingBaoOperation {
 
     fn exact_target(&self) -> Option<&VersionedObjectArn> {
         match &self.request.target {
-            BaoReadTarget::ExactVersion(target) => Some(target),
+            BaoReadTarget::ExactVersion(target) | BaoReadTarget::LinkAccess(target) => Some(target),
             BaoReadTarget::Version { .. } => self.located.as_ref(),
             BaoReadTarget::Blake3(_) => None,
         }
@@ -485,7 +496,9 @@ impl IncomingBaoOperation {
     fn hash_target(&self) -> Option<[u8; 32]> {
         match &self.request.target {
             BaoReadTarget::Blake3(hash) => Some(*hash),
-            BaoReadTarget::ExactVersion(_) | BaoReadTarget::Version { .. } => None,
+            BaoReadTarget::ExactVersion(_)
+            | BaoReadTarget::LinkAccess(_)
+            | BaoReadTarget::Version { .. } => None,
         }
     }
 
@@ -664,7 +677,10 @@ impl IncomingBaoOperation {
 
     /// A sealed copy is offered only once its bucket admits the read; a locked bucket refuses.
     fn send_accepted(&mut self, location: BackendLocation) -> ServeTurn {
-        if self.request.metadata_only {
+        if self.request.disallow_encrypted && location.format.bucket_key().is_some() {
+            return self.send_refusal(BaoReadRefusal::ReadDenied);
+        }
+        if self.request.metadata_only && !self.request.disallow_encrypted {
             return self.offer_location(location);
         }
         if let Some(key) = location.format.bucket_key() {
@@ -675,6 +691,9 @@ impl IncomingBaoOperation {
         }
         // A plain copy of an encrypting bucket, not converted yet, needs the bucket unlocked too.
         let Some(version) = self.version_key.clone() else {
+            if self.request.disallow_encrypted {
+                return self.send_refusal(BaoReadRefusal::ReadDenied);
+            }
             return self.offer_location(location);
         };
         self.location = Some(location);
@@ -692,6 +711,12 @@ impl IncomingBaoOperation {
             Ok(settings) => settings,
             Err(error) => return self.fail(error.into()),
         };
+        if self.request.disallow_encrypted && settings.is_encrypted() {
+            return self.send_refusal(BaoReadRefusal::ReadDenied);
+        }
+        if self.request.metadata_only {
+            return self.offer_admitted(location);
+        }
         let Some(key) = settings.active_key() else {
             return self.offer_admitted(location);
         };
@@ -739,12 +764,27 @@ impl IncomingBaoOperation {
         }
     }
 
-    /// Offers the admitted copy, or the observation when no location was resolved.
+    /// Offers the admitted copy, link authorization, or observation once checked.
     fn offer_admitted(&mut self, location: Option<BackendLocation>) -> ServeTurn {
+        if matches!(self.request.target, BaoReadTarget::LinkAccess(_)) {
+            return self.send_authorized();
+        }
         match location {
             Some(location) => self.offer_location(location),
             None => self.accept_observation(),
         }
+    }
+
+    fn send_authorized(&mut self) -> ServeTurn {
+        let payload = match VersionReplicationMessage::BaoReadAuthorized.to_bytes() {
+            Ok(payload) => payload,
+            Err(error) => return self.fail(error.into()),
+        };
+        self.state = IncomingBaoState::SendAccepted;
+        Ok(blob_call(BlobEffect::SendMessage {
+            stream_id: self.stream_id,
+            payload,
+        }))
     }
 
     fn offer_location(&mut self, location: BackendLocation) -> ServeTurn {
@@ -891,7 +931,7 @@ impl IncomingBaoOperation {
             .is_ok_and(|ids| ids.contains(&self.peer));
         self.peer_placement = document.placement_entry(self.peer).cloned();
         match &self.request.target {
-            BaoReadTarget::ExactVersion(target) => {
+            BaoReadTarget::ExactVersion(target) | BaoReadTarget::LinkAccess(target) => {
                 if target.realm_id != self.request.realm_id || target.node_id != self.local_node {
                     self.send_refusal(BaoReadRefusal::InvalidTarget)
                 } else {
@@ -964,6 +1004,9 @@ impl IncomingBaoOperation {
             Err(_) => return self.send_refusal(BaoReadRefusal::BackendFailure),
         };
         self.version_refs = version.placement_policies.clone();
+        if matches!(self.request.target, BaoReadTarget::LinkAccess(_)) {
+            return self.probe_link(&version);
+        }
         if let Some(held) = self.held_version(&version) {
             return self.read_kept(held);
         }
@@ -1097,6 +1140,29 @@ impl IncomingBaoOperation {
     fn serves_own_data(&self) -> bool {
         self.local_owner
             .is_some_and(|owner| self.peer_is_infra || self.request.auth_context.user_id == owner)
+    }
+
+    /// Probes an authorized link version without exposing target bytes or synthetic digests.
+    fn probe_link(&mut self, version: &BlobVersion) -> ServeTurn {
+        if !self.request.metadata_only
+            || self.request.range.is_some()
+            || self.request.expected_blake3.is_some()
+        {
+            return self.send_refusal(BaoReadRefusal::InvalidTarget);
+        }
+        if !self.policy_allowed || !self.version_refs.is_empty() {
+            return self.send_refusal(BaoReadRefusal::ReadDenied);
+        }
+        let BlobVersionState::Reference { source, .. } = &version.state else {
+            return self.send_refusal(BaoReadRefusal::NotFound);
+        };
+        if LinkTarget::of(source, self.local_realm).is_none() {
+            return self.send_refusal(BaoReadRefusal::NotFound);
+        }
+        self.version_key = self
+            .exact_target()
+            .map(|target| VersionKey::new(&target.bucket, &target.key, target.version));
+        self.observation_settings()
     }
 
     /// Serves one version this node never materialized: a device streams the

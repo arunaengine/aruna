@@ -204,6 +204,7 @@ mod pure_tests {
             disk_bytes: 0,
             max_walltime_ms: 1_000,
             preemptible: false,
+            gpus: 0,
         }
     }
 

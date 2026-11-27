@@ -5,13 +5,13 @@
 use std::collections::HashMap;
 
 use super::paths::{
-    CONFIG_COMPUTE_PATH, CONFIG_DESCRIPTION_PATH, CONFIG_DISCOVERY_PATH, CONFIG_FEDERATION_PATH,
-    CONFIG_POLICIES_PATH, CONFIG_PORTAL_PATH, CONFIG_QUOTA_PATH, CONFIG_REPLICAS_PATH,
-    DISPLAY_NAME_PATH, GROUP_OWNER_PATH, GROUP_POLICIES_PATH, METADATA_REPLICATION_PATH,
-    REALM_ID_PATH, USER_NAME_PATH, config_node_path, group_role_path, group_user_path,
-    parse_config_node, parse_config_oidc, parse_group_assignment, parse_group_role,
-    parse_realm_assignment, realm_role_path, realm_user_path, user_attribute_path,
-    user_subject_path,
+    CONFIG_COMPUTE_PATH, CONFIG_DESCRIPTION_PATH, CONFIG_DISCOVERY_PATH, CONFIG_FEATURES_PATH,
+    CONFIG_FEDERATION_PATH, CONFIG_POLICIES_PATH, CONFIG_PORTAL_PATH, CONFIG_QUOTA_PATH,
+    CONFIG_REPLICAS_PATH, DISPLAY_NAME_PATH, GROUP_OWNER_PATH, GROUP_POLICIES_PATH,
+    METADATA_REPLICATION_PATH, REALM_ID_PATH, USER_NAME_PATH, config_node_path, group_role_path,
+    group_user_path, parse_config_node, parse_config_oidc, parse_group_assignment,
+    parse_group_role, parse_realm_assignment, realm_role_path, realm_user_path,
+    user_attribute_path, user_subject_path,
 };
 use super::placement::overlay_placement;
 use super::*;
@@ -214,6 +214,11 @@ pub fn overlay_realm_config(
     {
         config.replica_quota = replicas;
     }
+    if !reducer_state.conflicts.contains_key(CONFIG_FEATURES_PATH)
+        && let Some(features) = reducer_state.materialized_realm_features()
+    {
+        config.features = features;
+    }
     config.email = reducer_state.materialized_realm_email();
     config.vault = reducer_state.materialized_realm_vault();
     config.secrets = reducer_state.materialized_realm_secrets();
@@ -318,6 +323,7 @@ pub fn materialized_realm_config(
         secrets: Vec::new(),
         plugins: Vec::new(),
         installs: Vec::new(),
+        features: Default::default(),
     };
     overlay_realm_config(&mut config, reducer_state, now, now_ms, revocation_index);
     Some(config)

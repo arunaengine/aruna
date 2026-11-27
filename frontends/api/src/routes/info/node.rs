@@ -605,11 +605,27 @@ pub(crate) async fn run_node_info(state: &ServerState, auth: Option<AuthContext>
             interfaces,
         },
         warnings: Vec::new(),
+        applets: None,
     };
 
     if !realm {
         return response;
     }
+    let applets = state.applet_settings();
+    let hosting = match applets.hosting.as_ref() {
+        Some(hosting) => aruna_runner::driver::drive(
+            aruna_ops_identity::document_repository::GetConfigOperation::new(state.get_realm_id()),
+            &state.get_ctx(),
+        )
+        .await
+        .ok()
+        .is_some_and(|config| hosting.provider_conflict(&config.oidc_providers).is_none()),
+        None => false,
+    };
+    response.applets = Some(aruna_wire::info::AppletCapabilities {
+        hosting,
+        building: applets.building.is_some(),
+    });
 
     let ctx = state.get_ctx();
     let snapshot = ctx.status().await;

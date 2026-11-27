@@ -1,0 +1,5 @@
+# Keeps local installs and builds of the starter out of the builder image.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+starter/node_modules
+starter/dist

@@ -20,6 +20,7 @@ pub const MAX_RESTRICTIONS_BYTES: usize = 16 * 1024;
 pub fn compile_permission_matcher(pattern: &str) -> Result<GlobMatcher, globset::Error> {
     Ok(globset::GlobBuilder::new(pattern)
         .literal_separator(true)
+        .backslash_escape(true)
         .build()?
         .compile_matcher())
 }
@@ -58,21 +59,45 @@ pub fn path_within(path: &str, root: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
-/// The pattern with each whole `*` segment after a literal prefix taken from `path`, so a
-/// restriction naming any node yields this node's literal root.
+/// Escapes a literal permission path so glob metacharacters and backslashes in bucket or prefix
+/// names match only themselves when a recursive wildcard is appended.
+pub fn escape_permission_path(path: &str) -> String {
+    globset::escape(path).replace('\\', "\\\\")
+}
+
+/// Whether `pattern` can match any path at or below `subtree_root` (fail-closed on globs and
+/// malformed patterns).
+pub fn pattern_overlaps_subtree(pattern: &str, subtree_root: &str) -> bool {
+    if compile_permission_matcher(pattern).is_err() {
+        return true;
+    }
+    let bound = bind_wildcards(pattern, subtree_root);
+    let (literal, has_glob) = literal_prefix(bound.as_ref());
+    if !has_glob {
+        return path_within(literal.trim_end_matches('/'), subtree_root);
+    }
+    let dir = literal.trim_end_matches('/');
+    path_within(dir, subtree_root) || subtree_root.starts_with(&literal)
+}
+
+/// The pattern with each whole `*` segment after a literal prefix taken from `path` and escaped
+/// as a literal segment, so a restriction naming any node yields this node's literal root.
 pub fn bind_wildcards<'a>(pattern: &'a str, path: &str) -> Cow<'a, str> {
     if !pattern.split('/').any(|segment| segment == "*") {
         return Cow::Borrowed(pattern);
     }
     let mut concrete = path.split('/');
     let mut aligned = true;
-    let bound: Vec<&str> = (pattern.split('/'))
+    let bound: Vec<Cow<'_, str>> = (pattern.split('/'))
         .map(|segment| match (segment, concrete.next()) {
-            ("*", Some(own)) if aligned && !own.is_empty() => own,
+            ("*", Some(own)) if aligned && !own.is_empty() => {
+                Cow::Owned(escape_permission_path(own))
+            }
             _ => {
                 // Later segments align with `path` only while each one matches one segment.
-                aligned &= segment != "*" && !segment.contains(GLOB_CHARS);
-                segment
+                aligned &=
+                    segment != "*" && !segment.contains(GLOB_CHARS) && !segment.contains('\\');
+                Cow::Borrowed(segment)
             }
         })
         .collect();
@@ -92,9 +117,16 @@ pub fn restrictions_cover_subtree<'a>(
         let pattern = bound.as_ref();
         match permission {
             Permission::DENY => {
-                let literal = &pattern[..pattern.find(GLOB_CHARS).unwrap_or(pattern.len())];
-                let literal = literal.trim_end_matches('/');
-                if literal.is_empty() || root.starts_with(literal) || path_within(literal, root) {
+                if compile_permission_matcher(pattern).is_err() {
+                    return false;
+                }
+                let (literal, has_glob) = literal_prefix(pattern);
+                let dir = literal.trim_end_matches('/');
+                if dir.is_empty()
+                    || path_within(dir, root)
+                    || (has_glob && root.starts_with(&literal))
+                    || (!has_glob && path_within(root, dir))
+                {
                     return false;
                 }
             }
@@ -121,22 +153,41 @@ fn pattern_root(pattern: &str) -> Option<String> {
     literal_path(pattern)
 }
 
-/// The path a pattern without wildcards names. A one-character class such as `[*]`, as
-/// `globset::escape` writes a glob character, is that character.
-fn literal_path(pattern: &str) -> Option<String> {
+/// Decodes the leading literal prefix of `pattern` (handling backslash escapes and singleton
+/// character classes such as `[*]`) and stops before the first genuine wildcard or malformed escape.
+fn literal_prefix(pattern: &str) -> (String, bool) {
     let mut literal = String::with_capacity(pattern.len());
     let mut chars = pattern.chars();
     while let Some(next) = chars.next() {
         match next {
+            '\\' => match chars.next() {
+                Some(escaped) => literal.push(escaped),
+                None => return (literal, true),
+            },
             '[' => {
-                let escaped = chars.next()?;
-                (chars.next()? == ']').then(|| literal.push(escaped))?;
+                let mut look = chars.clone();
+                if let (Some(escaped), Some(']')) = (look.next(), look.next())
+                    && escaped.is_ascii()
+                    && !matches!(escaped, '!' | '^' | '-' | '\\' | '/')
+                {
+                    chars = look;
+                    literal.push(escaped);
+                } else {
+                    return (literal, true);
+                }
             }
-            next if GLOB_CHARS.contains(&next) => return None,
+            next if GLOB_CHARS.contains(&next) => return (literal, true),
             next => literal.push(next),
         }
     }
-    Some(literal)
+    (literal, false)
+}
+
+/// The path a pattern without wildcards names. A one-character class such as `[*]` or a
+/// backslash escape such as `\\` decodes to that literal character.
+fn literal_path(pattern: &str) -> Option<String> {
+    let (literal, has_glob) = literal_prefix(pattern);
+    (!has_glob).then_some(literal)
 }
 
 /// Splits patterns into the allowed and denied roots at or below `root`. A
@@ -364,6 +415,20 @@ mod tests {
         assert!(check(&elsewhere, Permission::WRITE));
     }
 
+    // The exact group data path is the marker that lets a restricted token run work in a group;
+    // it grants no child path, and a subtree pattern never names the group root itself.
+    #[test]
+    fn marker_matches_exactly() {
+        let marker = "/r/g/G/data/n1";
+        assert!(permission_pattern_matches(marker, marker));
+        assert!(!permission_pattern_matches(marker, "/r/g/G/data/n1/b/key"));
+        assert!(!permission_pattern_matches("/r/g/G/data/n1/**", marker));
+        assert!(permission_pattern_matches(
+            "/r/g/G/data/n1/**",
+            "/r/g/G/data/n1/b"
+        ));
+    }
+
     #[test]
     fn binds_aligned_wildcards() {
         use super::bind_wildcards;
@@ -509,11 +574,132 @@ mod tests {
             permission: Permission::READ,
         }];
         assert!(readable_roots(&granted, Some(&class), "/r/g/G/data/n2/b").is_empty());
+
+        // Backslashes in literal prefixes are escaped so globset matches only literal backslashes
+        // and derived roots decode them back consistently.
+        let raw = "/r/g/G/data/n2/b/team\\west [1]?";
+        let pat = format!("{}/**", super::escape_permission_path(raw));
+        assert!(permission_pattern_matches(&pat, &format!("{raw}/a.txt")));
+        assert!(!permission_pattern_matches(
+            &pat,
+            "/r/g/G/data/n2/b/teamwest [1]?/a.txt"
+        ));
+        let escaped_restr = [PathRestriction {
+            pattern: pat.clone(),
+            permission: Permission::READ,
+        }];
+        assert_eq!(
+            readable_roots(&granted, Some(&escaped_restr), "/r/g/G/data/n2/b"),
+            vec![raw.to_string()]
+        );
+        assert!(super::restrictions_cover_subtree(
+            [(pat.as_str(), &Permission::READ)],
+            raw,
+            &Permission::READ
+        ));
+        // Concrete segments bound into a `*` wildcard preserve literal backslashes and globs.
+        let bound_root = "/r/g/G/data/team\\west/sub";
+        let wild = "/r/g/G/data/*/sub/**";
+        assert!(super::restrictions_cover_subtree(
+            [(wild, &Permission::READ)],
+            bound_root,
+            &Permission::READ
+        ));
+        let wild_restr = [PathRestriction {
+            pattern: wild.to_string(),
+            permission: Permission::READ,
+        }];
+        assert_eq!(
+            readable_roots(&granted, Some(&wild_restr), "/r/g/G/data/team\\west"),
+            vec![bound_root.to_string()]
+        );
+
+        // Escaped literal glob characters do not trigger false overlaps or sibling denies.
+        let lit_public = "/r/g/G/data/n1/b/team*/public";
+        let lit_private = format!(
+            "{}/**",
+            super::escape_permission_path("/r/g/G/data/n1/b/team*/private")
+        );
+        assert!(!super::pattern_overlaps_subtree(&lit_private, lit_public));
+        assert!(super::restrictions_cover_subtree(
+            [
+                ("/r/g/G/data/**", &Permission::READ),
+                (lit_private.as_str(), &Permission::DENY),
+            ],
+            lit_public,
+            &Permission::READ
+        ));
+        let lit_public_pat = format!("{}/**", super::escape_permission_path(lit_public));
+        assert!(!super::restrictions_cover_subtree(
+            [
+                ("/r/g/G/data/**", &Permission::READ),
+                (lit_public_pat.as_str(), &Permission::DENY),
+            ],
+            lit_public,
+            &Permission::READ
+        ));
     }
 
     #[test]
     fn wildcard_grants_nothing() {
         let granted = granted(&[("/realm/g/group/data/node/study/*/imaging", Permission::READ)]);
         assert!(readable_roots(&granted, None, BUCKET).is_empty());
+    }
+
+    #[test]
+    fn detects_subtree_overlap() {
+        use super::pattern_overlaps_subtree;
+        let sub = "/r/g/G/data/n1/uploads/bakta";
+        for overlapping in [
+            "/**",
+            "/r/g/G/**",
+            "/r/g/G/data/**",
+            "/r/g/G/data/*/uploads/**",
+            "/r/g/G/data/n1/uploads/**",
+            "/r/g/G/data/n1/uploads/bak*/**",
+            "/r/g/G/data/n1/uploads/bakta/**",
+            "/r/g/G/data/n1/uploads/b\\akta/**",
+            "/r/g/G/data/n1/uploads/[é]/**",
+            "/r/g/G/data/n1/uploads/bak[é]/**",
+            "/r/g/G/data/n1/uploads/other\\",
+            "/r/g/G/data/n1/uploads/bakta/cd/**",
+            "/r/g/G/data/n1/uploads/bakta",
+        ] {
+            assert!(pattern_overlaps_subtree(overlapping, sub), "{overlapping}");
+        }
+        let escaped_ref = format!(
+            "{}/**",
+            super::escape_permission_path("/r/g/G/data/n1/uploads/team\\west/ref")
+        );
+        for disjoint in [
+            "/r/g/G/data/n1/uploads/ref/**",
+            "/r/g/G/data/n1/uploads/bakta_ref/**",
+            "/r/g/G/data/*/other/**",
+            "/r/g/G/data/n2/uploads/**",
+            escaped_ref.as_str(),
+        ] {
+            assert!(!pattern_overlaps_subtree(disjoint, sub), "{disjoint}");
+        }
+        // Non-ASCII bracket classes stay wildcards for DENY coverage and derived roots too.
+        assert!(!super::restrictions_cover_subtree(
+            [
+                ("/r/g/G/data/**", &Permission::READ),
+                ("/r/g/G/data/n1/uploads/[é]/**", &Permission::DENY),
+            ],
+            sub,
+            &Permission::READ
+        ));
+        let non_ascii_grant = [PathRestriction {
+            pattern: "/r/g/G/data/n1/uploads/[é]/**".to_string(),
+            permission: Permission::READ,
+        }];
+        assert!(
+            readable_roots(
+                &granted(&[("/r/g/G/data/**", Permission::READ)]),
+                Some(&non_ascii_grant),
+                "/r/g/G/data/n1/uploads",
+            )
+            .is_empty()
+        );
     }
 }

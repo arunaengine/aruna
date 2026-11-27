@@ -486,6 +486,46 @@ pub async fn edit(
     ))
 }
 
+/// Commits `files` on top of `head`: each path gets its bytes as a regular file, `None` removes
+/// it. An unchanged tree answers `head` itself; an invalid path is an `Err` value.
+pub async fn commit_files(
+    directory: &Path,
+    head: &str,
+    files: Vec<(String, Option<Bytes>)>,
+    (message, occurred_at_ms): (String, u64),
+) -> std::io::Result<Result<String, String>> {
+    let mut overlay = Files::new();
+    let mut removed = Vec::new();
+    for (path, content) in files {
+        if !aruna_core::git::valid_path(&path) {
+            return Ok(Err(format!("{path} is not a valid repository path")));
+        }
+        match content {
+            Some(bytes) => {
+                overlay.insert(path, ("100644".into(), bytes.to_vec()));
+            }
+            None => removed.push(path),
+        }
+    }
+    let tree = write_tree(directory, Some(head), &overlay, &removed).await?;
+    let current = command(directory, &["rev-parse", &format!("{head}^{{tree}}")]).await?;
+    if std::str::from_utf8(&current)
+        .map_err(std::io::Error::other)?
+        .trim()
+        == tree
+    {
+        return Ok(Ok(head.to_string()));
+    }
+    Ok(Ok(commit_tree(
+        directory,
+        &tree,
+        &[head],
+        message,
+        occurred_at_ms,
+    )
+    .await?))
+}
+
 async fn metadata_file(directory: &Path, revision: &str) -> Option<String> {
     let bytes = command(
         directory,

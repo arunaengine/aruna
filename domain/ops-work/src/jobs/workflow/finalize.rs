@@ -15,7 +15,7 @@ use aruna_core::events::Event;
 use aruna_core::jobs::JobEvent;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::family::{MAX_MESSAGE_BYTES, tail_str};
-use aruna_core::structs::execution::job::input::{PLUGIN_REPORT_TAG, tagged};
+use aruna_core::structs::execution::job::input::{PLUGIN_REPORT_TAG, WORKFLOW_SECRETS_TAG, tagged};
 use aruna_core::structs::execution::job::local::{
     AttemptControl, JobError, JobErrorKind, JobProgress, JobRecord, JobResultPayload, OutputObject,
 };
@@ -414,6 +414,10 @@ impl FinalizeOperation {
                 }
             }
             Task::Logs => {
+                // Never persist container stdout/stderr for secret-bearing workflow tasks.
+                if scope.spec.tags.contains_key(WORKFLOW_SECRETS_TAG) {
+                    return self.next_task();
+                }
                 let defaults = LogLimits::default();
                 let limits = LogLimits {
                     max_stream_bytes: defaults.inline_tail_bytes,

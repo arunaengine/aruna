@@ -319,7 +319,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "aruna"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-api",
  "aruna-blob",
@@ -329,6 +329,7 @@ dependencies = [
  "aruna-config",
  "aruna-core",
  "aruna-egress",
+ "aruna-gateway",
  "aruna-kpabe",
  "aruna-ops-data",
  "aruna-ops-identity",
@@ -342,6 +343,8 @@ dependencies = [
  "aruna-test-harness",
  "aruna-wasm-host",
  "aruna-wire",
+ "aruna-workflow",
+ "aruna-workflow-contract",
  "astral_async_zip",
  "async-trait",
  "aws-sdk-s3",
@@ -397,7 +400,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-api"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "ahash",
  "aruna-blob",
@@ -414,6 +417,8 @@ dependencies = [
  "aruna-storage",
  "aruna-test-harness",
  "aruna-wire",
+ "aruna-workflow",
+ "aruna-workflow-contract",
  "astral_async_zip",
  "async-trait",
  "axum",
@@ -473,7 +478,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-blob"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-clock",
  "aruna-core",
@@ -526,7 +531,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-cli"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "apple-native-keyring-store",
  "aruna-plugin-contract",
@@ -557,7 +562,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-clock"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-core",
  "nix",
@@ -567,7 +572,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-compute"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-clock",
  "aruna-core",
@@ -598,7 +603,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-compute-helper"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "rustix",
  "serde_json",
@@ -608,7 +613,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-config"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-clock",
  "aruna-core",
@@ -642,11 +647,12 @@ dependencies = [
 
 [[package]]
 name = "aruna-core"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aes-gcm 0.11.1",
  "argon2",
  "aruna-kpabe",
+ "aruna-workflow-contract",
  "async-trait",
  "base64 0.23.1",
  "blake3",
@@ -700,7 +706,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-doctor"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "ahash",
  "aruna",
@@ -751,7 +757,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-egress"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-core",
  "async-trait",
@@ -770,8 +776,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "aruna-gateway"
+version = "3.0.0-alpha.211"
+dependencies = [
+ "axum",
+ "base64 0.23.1",
+ "blake3",
+ "bytes",
+ "chacha20poly1305",
+ "futures-util",
+ "lru 0.19.2",
+ "rand 0.10.4",
+ "reqwest 0.13.5",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "aruna-kpabe"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aes-gcm 0.11.1",
  "bls12_381_plus",
@@ -787,7 +814,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-kpabe-wasm"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-kpabe",
  "blake3",
@@ -801,7 +828,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-ops-data"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-blob",
  "aruna-core",
@@ -849,7 +876,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-ops-identity"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-core",
  "aruna-p2p",
@@ -883,7 +910,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-ops-work"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-blob",
  "aruna-compute",
@@ -899,6 +926,7 @@ dependencies = [
  "aruna-scheduler",
  "aruna-storage",
  "aruna-test-harness",
+ "aruna-workflow-contract",
  "astral_async_zip",
  "async-trait",
  "axum",
@@ -927,6 +955,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "sha2 0.11.2",
  "spareval",
  "tempfile",
  "thiserror 2.0.21",
@@ -940,7 +969,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-p2p"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-clock",
  "aruna-core",
@@ -970,7 +999,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-plugin"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-plugin-contract",
  "serde",
@@ -980,7 +1009,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-plugin-contract"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "hex",
  "regex",
@@ -996,7 +1025,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-plugin-fixture"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-plugin",
  "serde_json",
@@ -1005,7 +1034,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-rdf-graph"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-core",
  "chrono",
@@ -1028,7 +1057,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-registry"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-blob",
  "aruna-clock",
@@ -1059,7 +1088,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-runner"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-blob",
  "aruna-clock",
@@ -1094,7 +1123,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-scheduler"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-core",
  "async-trait",
@@ -1108,7 +1137,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-storage"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-clock",
  "aruna-core",
@@ -1132,7 +1161,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-test-harness"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-blob",
  "aruna-core",
@@ -1164,7 +1193,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-wasm-host"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-plugin-contract",
  "async-trait",
@@ -1194,11 +1223,36 @@ dependencies = [
 
 [[package]]
 name = "aruna-wire"
-version = "3.0.0-alpha.210"
+version = "3.0.0-alpha.211"
 dependencies = [
  "aruna-core",
  "serde",
  "utoipa",
+]
+
+[[package]]
+name = "aruna-workflow"
+version = "3.0.0-alpha.211"
+dependencies = [
+ "aruna-compute",
+ "aruna-core",
+ "aruna-workflow-contract",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "ulid 3.0.0",
+]
+
+[[package]]
+name = "aruna-workflow-contract"
+version = "3.0.0-alpha.211"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1793,6 +1847,7 @@ dependencies = [
  "matchit",
  "memchr",
  "mime",
+ "multer",
  "percent-encoding",
  "pin-project-lite",
  "serde_core",
@@ -6021,6 +6076,23 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "multer"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83e87776546dc87511aa5ee218730c92b666d7264ab6ed41f9d215af9cd5224b"
+dependencies = [
+ "bytes",
+ "encoding_rs",
+ "futures-util",
+ "http",
+ "httparse",
+ "memchr",
+ "mime",
+ "spin 0.9.9",
+ "version_check",
 ]
 
 [[package]]

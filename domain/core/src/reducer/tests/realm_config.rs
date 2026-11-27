@@ -1349,3 +1349,42 @@ fn clocks_compare_componentwise() {
     assert!(!one.covers(&two) && !two.covers(&one));
     assert!(one.covers(&AdminDocumentClock::default()));
 }
+
+#[test]
+fn feature_policy_converges() {
+    use crate::structs::identity::features::{Feature, FeatureMode};
+    let set = |mode: FeatureMode| AdminDocumentOperation::ConfigFeaturesSet {
+        features: [(Feature::Shares, mode)].into(),
+    };
+    let scoped = FeatureMode::Scoped {
+        default: true,
+        groups: [(Ulid::from_bytes([1; 16]), false)].into(),
+    };
+    let mut state = realm_config_state();
+    let first = set(scoped.clone());
+    let clock = AdminDocumentClock::default();
+    state
+        .apply(&realm_config_event(1, node(1), 1, clock.clone(), first))
+        .unwrap();
+    let expected = [(Feature::Shares, scoped)].into();
+    assert_eq!(state.materialized_realm_features(), Some(expected));
+
+    // A later write that observed the first replaces it.
+    let observed = state.clock.clone();
+    let forced = set(FeatureMode::ForcedOff);
+    state
+        .apply(&realm_config_event(2, node(1), 2, observed, forced))
+        .unwrap();
+    let expected = [(Feature::Shares, FeatureMode::ForcedOff)].into();
+    assert_eq!(state.materialized_realm_features(), Some(expected));
+
+    // A concurrent write from another node conflicts instead of silently winning.
+    let concurrent = set(FeatureMode::Scoped {
+        default: false,
+        groups: Default::default(),
+    });
+    state
+        .apply(&realm_config_event(3, node(2), 1, clock, concurrent))
+        .unwrap();
+    assert!(state.conflicts.contains_key(CONFIG_FEATURES_PATH));
+}

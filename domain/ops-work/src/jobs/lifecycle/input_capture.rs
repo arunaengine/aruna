@@ -9,7 +9,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::errors::AuthorizationError;
 use aruna_core::events::{Event, NetEvent};
-use aruna_core::keyspaces::BLOB_VERSIONS_KEYSPACE;
+use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE};
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::rows::read_row;
@@ -23,6 +23,7 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::bucket_metadata::{BucketMetadata, CapturedDatabase, ReleaseRef};
 use aruna_core::structs::storage::dataset_description::{DatasetDescription, DescriptionError};
+use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::origin::SourcePin;
 use aruna_core::structs::storage::read_grant::{
     GrantScope, HEAD_OPERATION, READ_OPERATION, ReadGrant, SignedGrant,
@@ -60,6 +61,8 @@ pub(super) struct CaptureCaller {
     pub(super) expires_at: u64,
     /// Lets range coordinators answer release membership.
     pub(super) bearer: Option<String>,
+    /// Refuse local buckets with encryption enabled (unprotected workflow runs).
+    pub(super) disallow_encrypted: bool,
 }
 
 /// The blake3 of a version this node does not hold locally, from its replicated record.
@@ -281,6 +284,7 @@ enum CaptureStep {
     Head,
     Hash(Box<HeadObjectResult>, Ulid),
     Access(Located),
+    Encryption(Located, GroupId),
     Public(Located, GroupId),
     Bucket(Readable),
     Database(Readable, Box<BucketInfo>),
@@ -442,7 +446,7 @@ impl CaptureInputOperation {
             issuer: caller.local,
             submission_id: self.caller.submission_id,
             user_id: caller.created_by,
-            restrictions: None,
+            restrictions: caller.path_restrictions.clone(),
             scope: GrantScope::Version(VersionedObjectArn {
                 realm_id: caller.realm_id,
                 node_id: caller.local,
@@ -535,6 +539,25 @@ impl Operation for CaptureInputOperation {
             CaptureStep::Access(located) => {
                 let read = result.child::<GroupId, SourceReadError>()?;
                 let group_id = read.map_err(|error| source_error(&self.reference, error))?;
+                if self.caller.disallow_encrypted {
+                    let (bucket, _, _) = source_parts(&self.input);
+                    let key = Key::from(bucket.as_bytes().to_vec());
+                    self.step = CaptureStep::Encryption(located, group_id);
+                    return Ok(Next::Call(read_row(BUCKET_ENCRYPTION_KEYSPACE, key)));
+                }
+                self.step = CaptureStep::Public(located, group_id);
+                Ok(Next::Call(IoCall::child(self.public_check(group_id))))
+            }
+            CaptureStep::Encryption(located, group_id) => {
+                let row = result.value()?;
+                let settings = BucketEncryption::from_row(row.as_deref())
+                    .map_err(|error| self.unavailable(error))?;
+                if settings.is_encrypted() {
+                    return Err(SubmitJobError::InputDenied(format!(
+                        "{}: encrypted input requires a protected run",
+                        self.reference
+                    )));
+                }
                 self.step = CaptureStep::Public(located, group_id);
                 Ok(Next::Call(IoCall::child(self.public_check(group_id))))
             }
@@ -663,10 +686,12 @@ mod tests {
                 created_by: user(),
                 realm_id: REALM,
                 local: node(1),
+                path_restrictions: None,
             },
             submission_id: SubmissionId([4; 32]),
             expires_at: 10,
             bearer: None,
+            disallow_encrypted: false,
         }
     }
 

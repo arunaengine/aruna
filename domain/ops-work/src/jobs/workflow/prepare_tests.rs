@@ -143,6 +143,7 @@ fn plain_run_prepared() {
         inputs: Vec::new(),
         mounts: Vec::new(),
         secrets: BTreeMap::new(),
+        vault_env: BTreeMap::new(),
         staging: StagingMode::Files,
         workspace: None,
     };

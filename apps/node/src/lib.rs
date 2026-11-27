@@ -6,6 +6,7 @@
 #![recursion_limit = "512"]
 #![allow(clippy::result_large_err)]
 
+pub mod applets;
 pub mod application;
 pub mod backup;
 pub mod bootstrap;

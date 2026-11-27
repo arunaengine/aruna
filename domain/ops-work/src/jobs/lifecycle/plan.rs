@@ -15,9 +15,11 @@ use aruna_core::scheduling::inputs::{
 use aruna_core::scheduling::scan::Planner;
 use aruna_core::structs::execution::job::family::LogicalJobSpec;
 use aruna_core::structs::execution::job::input::{
-    CapturedInput, InputSource, named_install, object_count, tagged,
+    CapturedInput, InputSource, WORKFLOW_SECRETS_TAG, named_install, object_count,
+    parse_workflow_secrets, tagged,
 };
 use aruna_core::structs::execution::job::local::WorkspaceMode;
+use aruna_core::structs::execution::workflow_run::WorkflowSecretScope;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::structs::placement::node_subject::storage_subject;
@@ -537,6 +539,16 @@ fn candidates(
         scanned: 0,
     };
     let mut page = Vec::new();
+    let secret_bindings = match spec.payload.tags.contains_key(WORKFLOW_SECRETS_TAG) {
+        true => parse_workflow_secrets(&spec.payload.tags).unwrap_or_default(),
+        false => BTreeMap::new(),
+    };
+    let needs_management = secret_bindings
+        .values()
+        .any(|binding| binding.scope != WorkflowSecretScope::Node);
+    let needs_local_vault = secret_bindings
+        .values()
+        .any(|binding| binding.scope == WorkflowSecretScope::Node);
     // Members come out of the map in node id byte order and every document's
     // backends are walked by name: the canonical order pages must continue in.
     for (node_id, document) in documents {
@@ -547,6 +559,14 @@ fn candidates(
         }
         // A plugin task runs only on its install's receiver, whichever holder plans it.
         if pinned.is_some_and(|pinned| pinned != Some(*node_id)) {
+            continue;
+        }
+        if needs_management
+            && !aruna_ops_identity::realm::mutate_placement::is_management(config, *node_id)
+        {
+            continue;
+        }
+        if needs_local_vault && *node_id != spec.ingress_node_id {
             continue;
         }
         let Some(kind) = node_kind(config, *node_id) else {
@@ -1160,6 +1180,7 @@ mod tests {
             disk_bytes: 0,
             max_walltime_ms: 1_000,
             preemptible: false,
+            gpus: 0,
         };
         let mut planning = round(&config, &spec, &[]);
         planning.now_ms = 10_000;

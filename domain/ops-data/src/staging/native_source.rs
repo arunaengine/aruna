@@ -36,8 +36,11 @@ use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
+use aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE;
 use aruna_core::request_policy::PolicyRequestExtras;
+use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::object_read::ObjectRangeRequest;
+use aruna_core::types::Key;
 use aruna_ops_identity::auth::error::{AuthorizeError, PolicyEnforcementError};
 use aruna_ops_identity::auth::request_authorization::AuthorizeOperation;
 use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
@@ -327,6 +330,7 @@ impl Operation for PrepareReferenceOperation {
 enum ReadStep {
     Bucket,
     Authorize,
+    Encryption,
     Head,
     Get,
 }
@@ -408,7 +412,8 @@ impl ReadExactOperation {
             user_identity: self.auth.user_id,
             realm_id: self.auth.realm_id,
             node_id: self.node_id,
-        });
+        })
+        .with_disallow_encrypted(request.disallow_encrypted);
         self.step = ReadStep::Get;
         Ok(Next::Call(IoCall::child(get)))
     }
@@ -434,6 +439,23 @@ impl Operation for ReadExactOperation {
             ReadStep::Authorize => {
                 let allowed = result.child::<(), AuthorizeError>()?;
                 allowed.map_err(map_authorize_error)?;
+                if self.request.disallow_encrypted {
+                    let key = Key::from(self.request.bucket.as_bytes().to_vec());
+                    self.step = ReadStep::Encryption;
+                    return Ok(Next::Call(IoCall::Read(vec![(
+                        BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+                        key,
+                    )])));
+                }
+                self.read()
+            }
+            ReadStep::Encryption => {
+                let row = result.value()?;
+                let settings = BucketEncryption::from_row(row.as_deref())
+                    .map_err(|error| Reject::Unavailable(error.to_string()))?;
+                if settings.is_encrypted() {
+                    return Err(Reject::AccessDenied);
+                }
                 self.read()
             }
             ReadStep::Head => {
@@ -448,6 +470,14 @@ impl Operation for ReadExactOperation {
             ReadStep::Get => {
                 let get = result.child::<GetObjectResult, GetObjectError>()?;
                 let get = get.map_err(map_get_error)?;
+                if self.request.disallow_encrypted
+                    && get
+                        .location
+                        .as_ref()
+                        .is_some_and(|loc| loc.format.bucket_key().is_some())
+                {
+                    return Err(Reject::AccessDenied);
+                }
                 Ok(Next::Done(PreparedReference {
                     metadata: result_metadata(&get, version_id)?,
                     group_id: Some(self.group()?),
@@ -565,6 +595,7 @@ fn map_get_error(error: GetObjectError) -> NativeReferenceReject {
         // Drift and exhausted bindings remain retryable through rebinding.
         | GetObjectError::HistoricalReferenceUnavailable
         | GetObjectError::ReferenceChecksumMismatch => NativeReferenceReject::NotFound,
+        GetObjectError::EncryptedDisallowed => NativeReferenceReject::AccessDenied,
         GetObjectError::ReferenceSourceChanged | GetObjectError::ReferenceAdvanceExhausted => {
             NativeReferenceReject::Unavailable(error.to_string())
         }
@@ -727,6 +758,7 @@ mod tests {
             version_id: Ulid::from_bytes([3; 16]),
             head: false,
             range: None,
+            disallow_encrypted: false,
         }
     }
 
@@ -934,6 +966,7 @@ mod tests {
             version_id: Ulid::generate(),
             head: true,
             range: None,
+            disallow_encrypted: false,
         };
 
         assert_eq!(
@@ -944,5 +977,50 @@ mod tests {
         assert!(validate_relationship((node, realm_id), peer, &relationship, &request).is_ok());
         relationship.set_reference_handling(ReferenceHandling::Materialize);
         assert!(validate_relationship((node, realm_id), peer, &relationship, &request).is_ok());
+    }
+
+    // Disallowing encrypted reads refuses an encrypting bucket before opening the object.
+    #[test]
+    fn refuses_encrypted_read() {
+        use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode};
+        use aruna_core::structs::storage::format::Compression;
+        let authority = NativeAuthority::Relationship(Ulid::from_bytes([4; 16]));
+        let mut request = read_request(authority);
+        request.disallow_encrypted = true;
+        let auth = AuthContext {
+            user_id: aruna_core::user::id::UserId::local(Ulid::from_bytes([5; 16]), ids().1),
+            realm_id: ids().1,
+            path_restrictions: None,
+            session: None,
+        };
+        let mut read = ReadExactOperation::new(auth, ids().0, request);
+        read.first().unwrap();
+        let info = BucketInfo {
+            group_id: GroupId::from_bytes([6; 16]),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: aruna_core::user::id::UserId::local(Ulid::from_bytes([5; 16]), ids().1),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Off,
+            distribution: None,
+        };
+        assert!(matches!(
+            read.next(child(Ok::<_, GetBucketError>(info))),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        assert!(matches!(
+            read.next(child(Ok::<(), AuthorizeError>(()))),
+            Ok(Next::Call(IoCall::Read(_)))
+        ));
+        let encrypted = BucketEncryption {
+            mode: EncryptionMode::VaultLocked,
+            bucket_id: Some(Ulid::from(30u128)),
+            key_generation: 1,
+            ..BucketEncryption::default()
+        };
+        let row = IoResult::Values(vec![Some(encrypted.to_bytes().unwrap().into())]);
+        assert_eq!(read.next(row), Err(Reject::AccessDenied));
     }
 }

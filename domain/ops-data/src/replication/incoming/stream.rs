@@ -888,7 +888,9 @@ impl ReadPolicyOperation {
 
     fn bucket_known(&mut self, group_id: Ulid) -> ReadPolicyTurn {
         let request = &self.request;
-        let BaoReadTarget::ExactVersion(target) = &request.target else {
+        let (BaoReadTarget::ExactVersion(target) | BaoReadTarget::LinkAccess(target)) =
+            &request.target
+        else {
             return Err(IoError::Unfinished.into());
         };
         let path = object_permission_path(
@@ -974,7 +976,7 @@ impl Operation for ReadPolicyOperation {
             return no_read();
         }
         match &request.target {
-            BaoReadTarget::ExactVersion(target) => {
+            BaoReadTarget::ExactVersion(target) | BaoReadTarget::LinkAccess(target) => {
                 if target.realm_id != request.realm_id || target.node_id != self.local_node {
                     return no_read();
                 }

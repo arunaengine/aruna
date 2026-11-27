@@ -354,6 +354,7 @@ mod tests {
                         disk_bytes: 0,
                         max_walltime_ms: 1,
                         preemptible: false,
+                        gpus: 0,
                     },
                 })
                 .rev()

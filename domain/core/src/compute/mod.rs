@@ -784,19 +784,23 @@ impl TaskSpec {
     /// the task's own env, its credential or a name Aruna or S3 tools read.
     pub fn check_vault_env(&self) -> Result<(), String> {
         for name in self.vault_env.keys() {
-            let plain = !name.is_empty()
-                && !name.as_bytes()[0].is_ascii_digit()
-                && name
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
-            let reserved = name.starts_with("ARUNA_") || name.starts_with("AWS_");
             let taken = self.env.contains_key(name) || self.secret_env.contains_key(name);
-            if !plain || reserved || taken {
+            if !valid_vault_env(name) || taken {
                 return Err(format!("`{name}` cannot carry a released secret"));
             }
         }
         Ok(())
     }
+}
+
+/// Whether `name` is a plain environment variable name that never shadows Aruna or AWS names.
+pub fn valid_vault_env(name: &str) -> bool {
+    let plain = !name.is_empty()
+        && !name.as_bytes()[0].is_ascii_digit()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    plain && !name.starts_with("ARUNA_") && !name.starts_with("AWS_")
 }
 
 pub fn normalize_container_path(path: &str) -> Result<PathBuf, String> {
@@ -1217,6 +1221,7 @@ mod tests {
             disk_bytes: 2048,
             max_walltime_ms: 60_000,
             preemptible: false,
+            gpus: 0,
         }
     }
 

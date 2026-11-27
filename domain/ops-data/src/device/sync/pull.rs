@@ -70,6 +70,10 @@ impl PullWalk {
         }
     }
 
+    pub fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
     /// Asks the node for the pull.
     pub fn request(&mut self) -> PullStep {
         let message = MetadataTransportMessage::ForwardSyncPull {
@@ -185,7 +189,7 @@ impl ForwardPullOperation {
         }
     }
 
-    fn follow(&mut self, step: PullStep) -> Result<Next<SyncPullAck>, SyncRefusal> {
+    fn follow(&mut self, step: PullStep) -> Result<Next<(NodeId, SyncPullAck)>, SyncRefusal> {
         match step {
             PullStep::Ask(call) => {
                 self.step = ForwardStep::Answer;
@@ -199,21 +203,21 @@ impl ForwardPullOperation {
                 self.step = ForwardStep::Delay;
                 Ok(Next::Call(IoCall::Delay(delay)))
             }
-            PullStep::Ended(end) => Ok(Next::Done(end?)),
+            PullStep::Ended(end) => Ok(Next::Done((self.walk.node_id(), end?))),
         }
     }
 }
 
 impl Operation for ForwardPullOperation {
-    type Output = SyncPullAck;
+    type Output = (NodeId, SyncPullAck);
     type Error = SyncRefusal;
 
-    fn first(&mut self) -> Result<Next<SyncPullAck>, SyncRefusal> {
+    fn first(&mut self) -> Result<Next<(NodeId, SyncPullAck)>, SyncRefusal> {
         let step = self.walk.request();
         self.follow(step)
     }
 
-    fn next(&mut self, result: IoResult) -> Result<Next<SyncPullAck>, SyncRefusal> {
+    fn next(&mut self, result: IoResult) -> Result<Next<(NodeId, SyncPullAck)>, SyncRefusal> {
         let step = match self.step {
             ForwardStep::Answer => self.walk.answered(result)?,
             ForwardStep::Delay => self.walk.poll(),

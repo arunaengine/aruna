@@ -757,6 +757,41 @@ pub enum MetadataTransportMessage {
     LaunchClosureAnswered {
         answer: crate::jobs::LaunchClosureAnswer,
     },
+    /// The run node hands a holder of the run group's records the run and its log pages from
+    /// `first_page` on, each encoded as one stored page row, so another node can resume it.
+    StoreRunLog {
+        run: Box<crate::structs::execution::workflow_run::WorkflowRunRecord>,
+        first_page: u32,
+        pages: Vec<Vec<u8>>,
+        #[serde(default)]
+        workflow: Option<crate::structs::execution::workflow_run::ReplicatedWorkflow>,
+    },
+    /// The pages the holder now keeps of the run.
+    RunLogStored {
+        result: Result<u32, MetadataReadError>,
+    },
+    /// An applet's host node hands a holder of the group's records a copy of the applet.
+    StoreApplet {
+        applet: Box<crate::applet::record::Applet>,
+    },
+    /// The revision of the copy the holder now keeps.
+    AppletStored {
+        result: Result<u64, MetadataReadError>,
+    },
+    /// An executor asks an authoritative realm server to verify a run's vault secret bindings.
+    ReadWorkflowRun {
+        run_id: Ulid,
+        group_id: GroupId,
+        #[serde(default)]
+        bindings: Vec<crate::structs::execution::job::input::TaskSecretBinding>,
+    },
+    /// Constant-size authoritative run verdict, or `None` when the server holds no matching run.
+    WorkflowRunRead {
+        result: Result<
+            Option<crate::structs::execution::workflow_run::WorkflowRunAuth>,
+            MetadataReadError,
+        >,
+    },
 }
 
 /// PKCS8 PEM of the realm signing key; Debug never prints it.
@@ -929,6 +964,11 @@ pub fn metadata_read_error(error: MetadataError) -> MetadataReadError {
 pub enum WriteAuthError {
     Unauthorized,
     Forbidden,
+}
+
+/// Encoded byte length of `message` without applying frame limits or allocating a buffer.
+pub fn message_size(message: &MetadataTransportMessage) -> Result<usize, String> {
+    postcard::experimental::serialized_size(message).map_err(|err| err.to_string())
 }
 
 pub fn encode_message(message: &MetadataTransportMessage) -> Result<Vec<u8>, String> {
@@ -1291,6 +1331,12 @@ pub fn transport_message_kind(message: &MetadataTransportMessage) -> &'static st
         MetadataTransportMessage::ExportAnswer { .. } => "export_answer",
         MetadataTransportMessage::QuerySubmissionClaim { .. } => "query_submission_claim",
         MetadataTransportMessage::SubmissionClaimAnswered { .. } => "submission_claim_answered",
+        MetadataTransportMessage::StoreRunLog { .. } => "store_run_log",
+        MetadataTransportMessage::RunLogStored { .. } => "run_log_stored",
+        MetadataTransportMessage::StoreApplet { .. } => "store_applet",
+        MetadataTransportMessage::AppletStored { .. } => "applet_stored",
+        MetadataTransportMessage::ReadWorkflowRun { .. } => "read_workflow_run",
+        MetadataTransportMessage::WorkflowRunRead { .. } => "workflow_run_read",
     }
 }
 

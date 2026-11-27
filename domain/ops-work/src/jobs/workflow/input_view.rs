@@ -592,6 +592,7 @@ impl ViewEntryOperation {
             destination: None,
             known_refs: Vec::new(),
             range: self.range.clone(),
+            disallow_encrypted: false,
         }
     }
 }
@@ -667,9 +668,9 @@ impl Operation for ViewEntryOperation {
                 match (read, self.head) {
                     (_, true) => Ok(Next::Done(None)),
                     (BaoReadOutput::Stream { blob, .. }, false) => Ok(Next::Done(Some(blob))),
-                    (BaoReadOutput::Metadata { .. }, false) => Err(ViewError::Unavailable(
-                        "the holder sent no bytes".to_string(),
-                    )),
+                    (BaoReadOutput::Metadata { .. } | BaoReadOutput::Authorized, false) => Err(
+                        ViewError::Unavailable("the holder sent no bytes".to_string()),
+                    ),
                 }
             }
             EntryStep::Granted => {

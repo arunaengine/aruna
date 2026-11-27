@@ -123,9 +123,9 @@ fn served(turn: Turn) -> GetObjectResult {
     }
 }
 
-/// A restart reads the records again, each outside the first snapshot.
+/// A restart delegates to a fresh child read in its own snapshot.
 fn restarted(turn: &Turn, operation: &GetObjectOperation) -> bool {
-    matches!(turn, Ok(Next::Call(IoCall::Child(_)))) && operation.restarted
+    matches!(turn, Ok(Next::Call(IoCall::Child(_)))) && operation.state == GetObjectState::Restarted
 }
 
 fn test_node_id() -> aruna_core::id::NodeId {
@@ -394,7 +394,7 @@ fn range_drift_restarts() {
     );
 
     assert!(restarted(&turn, &operation));
-    assert_eq!(operation.state, GetObjectState::GetCurrentVersion);
+    assert_eq!(operation.state, GetObjectState::Restarted);
 }
 
 #[tokio::test]
@@ -1668,8 +1668,23 @@ fn read_drift_restarts() {
     let turn = step(&mut operation, source_read(read));
 
     assert!(restarted(&turn, &operation));
-    assert_eq!(operation.state, GetObjectState::GetCurrentVersion);
+    assert_eq!(operation.state, GetObjectState::Restarted);
     assert!(operation.advance_observation.is_none());
+    assert_eq!(operation.drift_attempts, 1);
+
+    // Exhausted drift budget fails with ReferenceSourceChanged instead of recursing unboundedly.
+    let mut exhausted = drifted_operation();
+    let headed = observation(9);
+    let mut changed = headed.clone();
+    changed.etag = Some("changed-etag".to_string());
+    exhausted.drift_attempts = MAX_DRIFT_ATTEMPTS;
+    exhausted.advance_observation = None;
+    exhausted.source_metadata = Some(headed);
+    exhausted.state = GetObjectState::ReadReferenceSource;
+    assert_eq!(
+        step(&mut exhausted, source_read(changed)).err(),
+        Some(GetObjectError::ReferenceSourceChanged)
+    );
 }
 
 #[test]
@@ -2405,6 +2420,50 @@ mod sealed {
             (asked(&turn)).as_blob(),
             Some(BlobEffect::Read { .. })
         ));
+    }
+
+    #[test]
+    fn disallows_encrypted_read() {
+        // Bucket settings are checked at the start of the snapshot before version or blob lookups,
+        // so a missing local blob in an encrypting bucket fails closed instead of BlobNotLocal.
+        let mut op = operation().with_disallow_encrypted(true);
+        assert!(matches!(op.first(), Ok(Next::Call(IoCall::Read(_)))));
+        assert_eq!(op.state, super::GetObjectState::CheckEncryption);
+        let row = encrypting().to_bytes().unwrap();
+        assert_eq!(
+            op.next(IoResult::Values(vec![Some(row.clone().into())]))
+                .err(),
+            Some(GetObjectError::EncryptedDisallowed)
+        );
+        // Plain bucket passes the initial check and advances to the version lookup.
+        let mut op = operation().with_disallow_encrypted(true);
+        assert!(matches!(op.first(), Ok(Next::Call(IoCall::Read(_)))));
+        assert!(matches!(
+            op.next(IoResult::Values(vec![None])),
+            Ok(Next::Call(IoCall::Read(_)))
+        ));
+        assert_eq!(op.state, super::GetObjectState::GetCurrentVersion);
+        // Plain copy in an encrypting bucket is refused inside GetObjectOperation when disallowed.
+        let mut location = sealed_location();
+        location.format = StoredFormat::default();
+        op.location = Some(location);
+        assert!(matches!(op.read_blob(), Ok(Next::Call(IoCall::Read(_)))));
+        assert_eq!(
+            op.next(IoResult::Values(vec![Some(row.clone().into())]))
+                .err(),
+            Some(GetObjectError::EncryptedDisallowed)
+        );
+        // Reference in an encrypting bucket is refused before HEADing the source.
+        assert_eq!(
+            op.reference_settings_read(Some(row.into())).err(),
+            Some(GetObjectError::EncryptedDisallowed)
+        );
+        // A sealed copy is refused before admitting a bucket key lease.
+        op.location = Some(sealed_location());
+        assert_eq!(
+            op.read_blob().err(),
+            Some(GetObjectError::EncryptedDisallowed)
+        );
     }
 
     #[test]

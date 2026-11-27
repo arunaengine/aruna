@@ -1322,7 +1322,9 @@ fn map_get_error(error: GetObjectError) -> CallToolResult {
         error @ (GetObjectError::BlobNotLocal { .. } | GetObjectError::HeldElsewhere(_)) => {
             internal_error(error)
         }
-        GetObjectError::HolderAccessDenied => server_error(crate::error::ServerError::Forbidden),
+        GetObjectError::HolderAccessDenied | GetObjectError::EncryptedDisallowed => {
+            server_error(crate::error::ServerError::Forbidden)
+        }
         error @ (GetObjectError::HoldersUnavailable | GetObjectError::HolderIntegrityFailure) => {
             internal_error(error)
         }

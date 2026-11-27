@@ -125,9 +125,9 @@ impl ArunaS3Service {
         let encode = |value: String| self.encoded(value, url_encoded);
         Ok(S3Response::new(ListMultipartUploadsOutput {
             bucket: Some(input.bucket.clone()),
-            prefix: input.prefix.clone().map(&encode),
-            delimiter: input.delimiter.clone().map(&encode),
-            key_marker: input.key_marker.clone().map(&encode),
+            prefix: input.prefix.clone().map(encode),
+            delimiter: input.delimiter.clone().map(encode),
+            key_marker: input.key_marker.clone().map(encode),
             upload_id_marker: input.upload_id_marker.clone(),
             max_uploads: Some(i32::try_from(max_uploads).unwrap_or(i32::MAX)),
             is_truncated: Some(next.is_some()),

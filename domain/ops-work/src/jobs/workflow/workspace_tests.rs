@@ -948,10 +948,7 @@ fn expanded_keys(output: &OutputSelection, matched: Vec<String>) -> Vec<String> 
     expand_selection(output, matched, &[])
         .unwrap()
         .iter()
-        .map(|output| {
-            let OutputDestination::S3 { key, .. } = &output.destination;
-            key.clone()
-        })
+        .map(|output| s3_destination(output).unwrap().1.to_owned())
         .collect()
 }
 

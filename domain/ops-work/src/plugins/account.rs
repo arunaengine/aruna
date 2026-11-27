@@ -89,7 +89,7 @@ fn stored_auth(row: Option<Vec<u8>>) -> Result<Option<GroupAuthorizationDocument
 }
 
 /// Runs `operation` as a child that answers only whether it worked and why not.
-fn step<O>(operation: O) -> IoCall
+pub(crate) fn step<O>(operation: O) -> IoCall
 where
     O: Operation + 'static,
     O::Output: Send + 'static,

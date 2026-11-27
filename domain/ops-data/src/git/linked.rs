@@ -131,6 +131,7 @@ impl Operation for ResolveExactOperation {
             destination: None,
             known_refs: Vec::new(),
             range: None,
+            disallow_encrypted: false,
         };
         let read = ManagedReadOperation::new(self.exact.node_id, request);
         Ok(Next::Call(IoCall::child(read)))

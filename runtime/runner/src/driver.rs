@@ -803,7 +803,8 @@ fn hang_limit(effect: &Effect, limits: HangLimits) -> Option<Duration> {
         | Effect::Group(_)
         | Effect::Delay(_)
         | Effect::Job(_)
-        | Effect::Git(_) => None,
+        | Effect::Git(_)
+        | Effect::Workflow(_) => None,
     }
 }
 

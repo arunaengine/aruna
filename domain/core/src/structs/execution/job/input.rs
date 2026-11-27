@@ -137,7 +137,22 @@ pub struct InputSelection {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OutputDestination {
-    S3 { bucket: String, key: String },
+    S3 {
+        bucket: String,
+        key: String,
+    },
+    /// Below `prefix` in the group's run area on the node that executes the job, which the
+    /// executing node binds when it captures the output; it is never pinned at admission.
+    RunArea {
+        prefix: String,
+    },
+}
+
+/// The run area bucket of `group_id` on `node_id`: one reusable bucket per group and node,
+/// owned by the group and named the same on every retry.
+pub fn run_area_bucket(group_id: GroupId, node_id: NodeId) -> String {
+    let node = hex::encode(&node_id.as_bytes()[..6]);
+    format!("runs-{}-{node}", group_id.to_string().to_lowercase())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -171,6 +186,8 @@ pub struct ComputeResources {
     pub disk_bytes: Option<u64>,
     pub max_walltime_ms: Option<u64>,
     pub preemptible: bool,
+    #[serde(default)]
+    pub gpus: Option<u32>,
 }
 
 /// Tags only the plugin host sets, on the jobs of plugin tasks; every job ingress refuses them.
@@ -181,6 +198,53 @@ pub const PLUGIN_INSTALL_TAG: &str = "aruna-engine.org/plugin-install";
 pub const PLUGIN_WORK_TAG: &str = "aruna-engine.org/plugin-work";
 /// The container file the node reads into the work's report; never exported.
 pub const PLUGIN_REPORT_TAG: &str = "aruna-engine.org/plugin-report";
+
+/// Tags only the node sets, on the child jobs of a workflow run; every job ingress refuses them.
+pub const WORKFLOW_TAG_PREFIX: &str = "aruna-engine.org/workflow-";
+/// The run a child job belongs to; such a child may carry inline inputs and writes no run crate.
+pub const WORKFLOW_RUN_TAG: &str = "aruna-engine.org/workflow-run";
+/// The task key of a workflow child job.
+pub const WORKFLOW_TASK_TAG: &str = "aruna-engine.org/workflow-task";
+/// The vault secret bindings of a workflow child job, as JSON; never carries secret values.
+pub const WORKFLOW_SECRETS_TAG: &str = "aruna-engine.org/workflow-secrets";
+/// Marks an unprotected workflow child job so input staging refuses encrypted buckets.
+pub const WORKFLOW_UNPROTECTED_TAG: &str = "aruna-engine.org/workflow-unprotected";
+
+/// One vault secret binding carried by a workflow child job for attempt-time `vault_env` release.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskSecretBinding {
+    pub workflow_id: Ulid,
+    pub scope: crate::structs::execution::workflow_run::WorkflowSecretScope,
+    pub name: crate::secrets::SecretName,
+    #[serde(default)]
+    pub field: Option<String>,
+}
+
+/// Encodes the workflow child job's secret bindings for `WORKFLOW_SECRETS_TAG`.
+pub fn encode_workflow_secrets(
+    bindings: &BTreeMap<String, TaskSecretBinding>,
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string(bindings)
+}
+
+/// Decodes the workflow child job's secret bindings from `tags`, if present.
+pub fn parse_workflow_secrets(
+    tags: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, TaskSecretBinding>, serde_json::Error> {
+    match tags.get(WORKFLOW_SECRETS_TAG) {
+        Some(text) => serde_json::from_str(text),
+        None => Ok(BTreeMap::new()),
+    }
+}
+
+/// The first tag of `tags` only the node sets: a plugin task tag or a workflow tag.
+pub fn node_tag(tags: &BTreeMap<String, String>) -> Option<&str> {
+    plugin_tag(tags).or_else(|| {
+        tags.keys()
+            .find(|key| key.starts_with(WORKFLOW_TAG_PREFIX))
+            .map(String::as_str)
+    })
+}
 
 /// The first tag of `tags` only the plugin host may set.
 pub fn plugin_tag(tags: &BTreeMap<String, String>) -> Option<&str> {
@@ -820,6 +884,24 @@ impl ExecutionSpec {
             });
         }
     }
+
+    /// Binds every run area output to the group's run area bucket on `node_id`, the node that
+    /// executes the job, and names that bucket when there was one.
+    pub fn bind_run_areas(&mut self, node_id: NodeId) -> Option<String> {
+        let bucket = run_area_bucket(self.group_id, node_id);
+        let mut bound = false;
+        for output in &mut self.file_outputs {
+            if let OutputDestination::RunArea { prefix } = &output.destination {
+                output.destination = OutputDestination::S3 {
+                    bucket: bucket.clone(),
+                    key: prefix.trim_matches('/').to_owned(),
+                };
+                output.destination_node_id = Some(node_id);
+                bound = true;
+            }
+        }
+        bound.then_some(bucket)
+    }
 }
 
 /// Closed job payload enum, keeping the typed-queue discipline of `TaskKey` and
@@ -878,6 +960,9 @@ pub enum JobPayload {
     /// One native work of a plugin install. Safe to requeue: each action writes a version id
     /// minted once, and its attempts check the install again.
     PluginWork(PluginWorkSpec),
+    /// One workflow run on this node. Safe to requeue: an attempt replays the stored run log and
+    /// adopts the keyed child jobs of earlier attempts.
+    WorkflowRun(Box<crate::structs::execution::workflow_run::WorkflowRunSpec>),
 }
 
 impl ExecutionSpec {
@@ -906,6 +991,7 @@ impl JobPayload {
             Self::CopyObject(spec) => Some(spec.group_id),
             Self::BackendImport(spec) => Some(spec.group_id),
             Self::PluginWork(spec) => Some(spec.group_id),
+            Self::WorkflowRun(spec) => Some(spec.group_id),
             Self::Probe { .. }
             | Self::WriteRunCrate { .. }
             | Self::TerminalCleanup { .. }
@@ -937,6 +1023,7 @@ impl JobPayload {
             JobPayload::WebhookDelivery(_) => "webhook_delivery",
             JobPayload::EmailDelivery(_) => "email_delivery",
             JobPayload::PluginWork(_) => "plugin_work",
+            JobPayload::WorkflowRun(_) => "workflow_run",
         }
     }
 
@@ -952,6 +1039,7 @@ impl JobPayload {
             JobPayload::Harvest(_) => "records",
             JobPayload::StoragePurge(_) | JobPayload::StoragePurgeFiles(_) => "entries",
             JobPayload::CopyObject(_) | JobPayload::PluginWork(_) => "bytes",
+            JobPayload::WorkflowRun(_) => "tasks",
             JobPayload::MintPersistentId(_)
             | JobPayload::WriteRunCrate { .. }
             | JobPayload::TerminalCleanup { .. }
@@ -980,7 +1068,8 @@ impl JobPayload {
             | JobPayload::BackendImport(_)
             | JobPayload::WebhookDelivery(_)
             | JobPayload::EmailDelivery(_)
-            | JobPayload::PluginWork(_) => JobExecutionClass::InProcess,
+            | JobPayload::PluginWork(_)
+            | JobPayload::WorkflowRun(_) => JobExecutionClass::InProcess,
             JobPayload::Execution(_) => JobExecutionClass::ExternalAttempt,
         }
     }
@@ -1014,6 +1103,7 @@ impl JobPayload {
                     | JobPayload::WebhookDelivery(_)
                     | JobPayload::EmailDelivery(_)
                     | JobPayload::PluginWork(_)
+                    | JobPayload::WorkflowRun(_)
             )
     }
 

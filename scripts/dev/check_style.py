@@ -39,6 +39,7 @@ SMALL_DOMAINS = {
     "apps/doctor/src/explorer": "grouped shared-prefix domain",
     "apps/doctor/src/migrate": "grouped shared-prefix domain",
     "apps/node/src/compute_setup": "coherent ownership scope",
+    "domain/core/src/workflow": "coherent ownership scope",
     "runtime/blob/src/blob/pithos": "grouped shared-prefix domain",
     "runtime/compute/src/executor/apptainer": "grouped shared-prefix domain",
     "runtime/compute/src/executor/docker": "grouped shared-prefix domain",
@@ -123,6 +124,7 @@ HEADER_EXCEPTIONS = {
 # Folders whose files carry no repository header, each with its reason.
 HEADER_FOLDERS = {
     "plugins/templates": "scaffold copied into plugin authors' own projects; no Aruna copyright",
+    "apps/applet-builder/starter": "scaffold copied into each applet's own source; no Aruna copyright",
 }
 
 WORD_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+")

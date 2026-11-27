@@ -30,6 +30,7 @@ pub struct ResolveCaller {
     pub created_by: UserId,
     pub submission_id: SubmissionId,
     pub expires_at: u64,
+    pub disallow_encrypted: bool,
 }
 
 type RemoteAnswers = Vec<(InputSelection, CapturedInput)>;
@@ -90,6 +91,7 @@ impl RemoteInputsOperation {
                 submission_id: self.caller.submission_id,
                 expires_at: self.caller.expires_at,
                 inputs: batch.to_vec(),
+                disallow_encrypted: self.caller.disallow_encrypted,
             }),
         };
         let frame = encode_message(&message).map_err(|error| {
@@ -174,6 +176,7 @@ mod tests {
             created_by: user(),
             submission_id: SubmissionId([7u8; 32]),
             expires_at: 9,
+            disallow_encrypted: false,
         };
         RemoteInputsOperation::new(node(2), vec![input()], caller, token)
     }

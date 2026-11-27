@@ -4,6 +4,7 @@
 
 mod backoff;
 pub mod connection;
+mod dns;
 pub mod mail;
 pub mod member_read;
 pub mod range_listing;
@@ -37,6 +38,8 @@ struct Inner {
     mail: MailProfiles,
     backoffs: Backoffs,
     connections: Arc<dyn ConnectionSender>,
+    /// Made on the first lookup, inside the runtime that answers it.
+    resolver: std::sync::OnceLock<iroh::dns::DnsResolver>,
 }
 
 impl OutboundHandle {
@@ -76,6 +79,7 @@ impl OutboundHandle {
                 mail: MailProfiles::new(builder),
                 backoffs: Backoffs::default(),
                 connections,
+                resolver: std::sync::OnceLock::new(),
             }),
         }
     }
@@ -114,6 +118,12 @@ impl OutboundHandle {
             OutboundEffect::Connection(call) => OutboundEvent::ConnectionAnswered {
                 result: self.inner.connections.send(*call).await,
             },
+            OutboundEffect::Dns(query) => {
+                let resolver = (self.inner.resolver).get_or_init(iroh::dns::DnsResolver::new);
+                OutboundEvent::DnsAnswered {
+                    result: Ok(dns::lookup(resolver, *query).await),
+                }
+            }
         }
     }
 

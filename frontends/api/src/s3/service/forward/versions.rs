@@ -140,9 +140,9 @@ impl ArunaS3Service {
         let encode = |value: String| self.encoded(value, url_encoded);
         Ok(ListObjectVersionsOutput {
             name: Some(input.bucket.clone()),
-            prefix: input.prefix.clone().map(&encode),
-            delimiter: input.delimiter.clone().map(&encode),
-            key_marker: input.key_marker.clone().map(&encode),
+            prefix: input.prefix.clone().map(encode),
+            delimiter: input.delimiter.clone().map(encode),
+            key_marker: input.key_marker.clone().map(encode),
             version_id_marker: input.version_id_marker.clone(),
             max_keys: Some(i32::try_from(max_keys).unwrap_or(i32::MAX)),
             is_truncated: Some(next.is_some()),

@@ -4,12 +4,12 @@
 
 use super::*;
 use crate::reducer::paths::{
-    CONFIG_COMPUTE_PATH, CONFIG_DESCRIPTION_PATH, CONFIG_EMAIL_PATH, CONFIG_FEDERATION_PATH,
-    CONFIG_MERGE_PATH, CONFIG_POLICIES_PATH, CONFIG_PORTAL_PATH, CONFIG_QUOTA_PATH,
-    CONFIG_REPLICAS_PATH, compute_value, federation_value, node_kind_value, node_name_path,
-    node_place_path, oidc_provider_value, plugin_entry_path, plugin_install_path, policies_value,
-    portal_value, publisher_cutoffs_path, quota_value, replicas_value, secret_info_path,
-    vault_entry_path,
+    CONFIG_COMPUTE_PATH, CONFIG_DESCRIPTION_PATH, CONFIG_EMAIL_PATH, CONFIG_FEATURES_PATH,
+    CONFIG_FEDERATION_PATH, CONFIG_MERGE_PATH, CONFIG_POLICIES_PATH, CONFIG_PORTAL_PATH,
+    CONFIG_QUOTA_PATH, CONFIG_REPLICAS_PATH, compute_value, features_value, federation_value,
+    node_kind_value, node_name_path, node_place_path, oidc_provider_value, plugin_entry_path,
+    plugin_install_path, policies_value, portal_value, publisher_cutoffs_path, quota_value,
+    replicas_value, secret_info_path, vault_entry_path,
 };
 
 impl AdminDocumentState {
@@ -135,6 +135,9 @@ impl AdminDocumentState {
             AdminDocumentOperation::ConfigReplicasSet { replicas } => {
                 let value = replicas_value(replicas);
                 self.apply_config_setting(event, CONFIG_REPLICAS_PATH, value);
+            }
+            AdminDocumentOperation::ConfigFeaturesSet { features } => {
+                self.apply_config_setting(event, CONFIG_FEATURES_PATH, features_value(features));
             }
             AdminDocumentOperation::NodeNameSet {
                 node_id,

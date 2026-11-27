@@ -300,6 +300,64 @@ jobs:
           --profile ci --run-ignored only --no-tests fail
           -E "package(aruna) & binary(regimes) & test(/^metadata_regime::git_native::/)"'
 
+  # Builds, lints, and tests the standalone workflow coordinator and the real-binary tests against it.
+  coordinator:
+    name: Workflow coordinator
+    needs: [test-build-crates, test-build-node]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Set up Rust
+        uses: ./.github/actions/rust-setup
+        with:
+          shared-key: coordinator
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
+        with:
+          tool: cargo-nextest@0.9.140
+
+      - name: Lint coordinator
+        run: |
+          rustup component add clippy
+          cargo clippy --manifest-path apps/coordinator/Cargo.toml --all-targets --locked -- -D warnings
+
+      - name: Test coordinator
+        run: cargo test --manifest-path apps/coordinator/Cargo.toml --locked
+
+      - name: Build coordinator binary
+        run: cargo build --manifest-path apps/coordinator/Cargo.toml --locked
+
+      - name: Download the crate test archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: nextest-crates
+
+      - name: Download the node test archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: nextest-node
+
+      - name: Run real coordinator runtime tests
+        env:
+          ARUNA_WORKFLOW_COORDINATOR_BIN: ${{ github.workspace }}/apps/coordinator/target/debug/aruna-coordinator
+        run: >-
+          cargo-nextest nextest run --archive-file nextest-crates.tar.zst --workspace-remap . --extract-to . --extract-overwrite
+          --profile ci --run-ignored only --no-tests fail
+          -E 'package(aruna-workflow) & binary(coordinator) & test(=checks_with_binary)'
+
+      - name: Run real coordinator API tests
+        env:
+          ARUNA_WORKFLOW_COORDINATOR_BIN: ${{ github.workspace }}/apps/coordinator/target/debug/aruna-coordinator
+        run: >-
+          cargo-nextest nextest run --archive-file nextest-node.tar.zst --workspace-remap . --extract-to . --extract-overwrite
+          --profile ci --run-ignored only --no-tests fail
+          -E 'package(aruna-api) & kind(lib) & (test(=routes::execution::workflow::tests::drives_real_coordinator) | test(=routes::execution::workflow::run_tests::drives_real_run) | test(=routes::execution::workflow::run_tests::plans_real_run) | test(=routes::execution::workflow::run_tests::reports_real_runs))'
+
   # The example's own Python tests; the plugin examples job runs it in the plugin runtime.
   elabftw-python:
     name: eLabFTW Python example
@@ -589,7 +647,9 @@ jobs:
 
       - name: Check formatting
         if: ${{ !cancelled() }}
-        run: cargo +nightly-2026-09-14 fmt --all -- --check
+        run: |
+          cargo +nightly-2026-09-14 fmt --all -- --check
+          cargo +nightly-2026-09-14 fmt --manifest-path apps/coordinator/Cargo.toml -- --check
 
       - name: Run the checker self-tests
         if: ${{ !cancelled() }}

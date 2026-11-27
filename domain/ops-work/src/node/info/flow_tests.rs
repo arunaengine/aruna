@@ -49,6 +49,7 @@ use aruna_core::storage_entries::metadata_registry_key;
 use aruna_core::structs::execution::job::family::{
     JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordKind, LogicalJobState,
 };
+use aruna_core::structs::execution::job::input::WORKFLOW_RUN_TAG;
 use aruna_core::structs::execution::job::record_keys::kind_prefix;
 use aruna_core::structs::execution::job::record_rows::ProjectionCache;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
@@ -617,6 +618,7 @@ fn spec_record(realm_id: RealmId, family: JobFamilyId, group_id: Ulid) -> JobRec
         disk_bytes: 2_048,
         max_walltime_ms: 60_000,
         preemptible: false,
+        gpus: 0,
     };
     let job_id = aruna_core::structs::execution::job::identity::JobId::from_bytes([9u8; 16]);
     let origin = node(1);
@@ -737,6 +739,7 @@ async fn write_reservation(ctx: &DriverContext, execution_id: Ulid, cpu: u32) {
             disk_bytes: 0,
             max_walltime_ms: 1_000,
             preemptible: false,
+            gpus: 0,
         },
         created_at_ms: 5,
         subject_generation: 1,
@@ -879,6 +882,7 @@ async fn merges_group_demand() {
             disk_bytes: 2_048,
             max_walltime_ms: 60_000,
             preemptible: false,
+            gpus: 0,
         },
     };
     let own = DemandFamily {
@@ -1160,6 +1164,49 @@ async fn truncates_busy_group() {
     let quiet_group = snapshot.group(&quiet).expect("quiet group");
     assert!(!quiet_group.truncated);
     assert_eq!(quiet_group.families.len(), 1);
+}
+
+#[tokio::test]
+async fn groups_run_tasks() {
+    // Every child task of one workflow run is one family, so a scatter past the
+    // family budget keeps its group's view complete and sums its ceilings.
+    let ctx = test_ctx();
+    let realm_id = RealmId::from_bytes([14u8; 32]);
+    let group = Ulid::from_bytes([1u8; 16]);
+    let tasks = MAX_DEMAND_FAMILIES + 2;
+    for index in 0..tasks {
+        let family = indexed_family(index);
+        write_family(&ctx, realm_id, family, group, LogicalJobState::Queued).await;
+        let run = format!("run-{}", index % 2);
+        let mut record = spec_record(realm_id, family, group);
+        if let JobFamilyRecord::Spec(spec) = &mut record.record {
+            spec.payload.tags.insert(WORKFLOW_RUN_TAG.to_owned(), run);
+        }
+        let mut key = kind_prefix(&family, JobRecordKind::Spec).to_vec();
+        key.extend_from_slice(&[0u8; 40]);
+        let bytes = postcard::to_allocvec(&record).unwrap();
+        write_row(
+            &ctx,
+            FAMILY_RECORD_KEYSPACE,
+            Key::from(key.as_slice()),
+            bytes,
+        )
+        .await;
+    }
+    write_family(&ctx, realm_id, family(200), group, LogicalJobState::Queued).await;
+
+    let snapshot = demand_snapshot(&ctx).await;
+
+    assert!(snapshot.validate().is_ok());
+    let view = snapshot.group(&group).expect("group");
+    assert!(!view.truncated);
+    assert_eq!(view.families.len(), 3);
+    let cpu: u32 = view
+        .families
+        .iter()
+        .map(|family| family.resources.cpu_cores)
+        .sum();
+    assert_eq!(cpu as usize, 2 * (tasks + 1));
 }
 
 #[tokio::test]

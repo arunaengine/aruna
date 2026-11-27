@@ -17,7 +17,6 @@ use crate::s3::object::source::choice::{Candidate, choose_source};
 use crate::s3::usage::{RowChange, UsageCounterUpdate, UsageUpdateError};
 use aruna_core::id_mint::IdMint;
 use aruna_core::live_version::{LiveVersionInput, LiveVersionOperation};
-use aruna_core::rows::{StagedCall, outside_answer};
 use aruna_core::structs::storage::replication_queue::MAX_AUTO_ADVANCES;
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
@@ -113,6 +112,10 @@ pub enum GetObjectState {
     /// A reference version of an encrypting bucket needs its bucket unlocked.
     ReadReferenceSettings,
     CheckReferenceKey,
+    /// Checks bucket encryption settings at the start of the snapshot when encrypted reads are disallowed.
+    CheckEncryption,
+    /// A lost reference advance restarts inside a fresh child read snapshot.
+    Restarted,
     Init,
 }
 
@@ -209,6 +212,9 @@ pub enum GetObjectError {
     /// The version is a link: the caller reads its target under its own rights there.
     #[error("The version links to another object.")]
     Link(Box<(VersionSourceBinding, SourceMetadata)>),
+    /// The read forbade encrypted buckets or sealed copies (unprotected workflow runs).
+    #[error("Encrypted inputs require a protected workflow run.")]
+    EncryptedDisallowed,
     #[error(transparent)]
     Abe(#[from] aruna_core::structs::storage::abe::AbeError),
 }
@@ -266,8 +272,6 @@ pub struct GetObjectOperation {
     state: GetObjectState,
     /// Still reading the object's records, before the bytes or the source are read.
     reading: bool,
-    /// A reference advance lost to another writer: the records are read again, each on its own.
-    restarted: bool,
     location: Option<BackendLocation>,
     reference_access: Option<ResolvedSourceAccess>,
     /// Stored observation of the reference version being read, the drift baseline.
@@ -331,6 +335,8 @@ pub struct GetObjectOperation {
     reference_lease: Option<ReadLease>,
     /// The request has a token, so a pending version answers `PendingContent`.
     token: bool,
+    /// Refuse reads of sealed blobs or objects in encrypting buckets inside this read snapshot.
+    disallow_encrypted: bool,
     object: Option<(
         aruna_core::structs::storage::abe::ObjectEnvelope,
         aruna_core::structs::storage::abe::EnvelopeArchive,
@@ -344,7 +350,6 @@ impl GetObjectOperation {
             input,
             state: GetObjectState::Init,
             reading: true,
-            restarted: false,
             location: None,
             reference_access: None,
             reference_cached: None,
@@ -382,8 +387,15 @@ impl GetObjectOperation {
             reference_key: None,
             reference_lease: None,
             token: false,
+            disallow_encrypted: false,
             object: None,
         }
+    }
+
+    /// Refuses sealed copies and encrypting buckets atomically within the read snapshot.
+    pub fn with_disallow_encrypted(mut self, disallow: bool) -> Self {
+        self.disallow_encrypted = disallow;
+        self
     }
 
     pub fn with_restrictions(mut self, restrictions: Option<Vec<PathRestriction>>) -> Self {
@@ -425,12 +437,8 @@ impl GetObjectOperation {
         self.call(state, effect.into())
     }
 
-    /// A read of the object's records: in the read snapshot, or on its own after a restart.
+    /// A read of the object's records inside the operation's read snapshot.
     fn read(&mut self, state: GetObjectState, call: IoCall) -> Turn {
-        let call = match self.restarted {
-            true => StagedCall::Outside(call).into_call(),
-            false => call,
-        };
         self.call(state, call)
     }
 
@@ -450,8 +458,29 @@ impl GetObjectOperation {
         }
     }
 
-    /// The version the caller named, or the head pointer of the key.
+    /// Checks bucket encryption settings first when encrypted reads are disallowed, then reads
+    /// the named version or head pointer inside the same snapshot.
     fn read_first(&mut self) -> Turn {
+        if self.disallow_encrypted {
+            let key = self.input.bucket.as_bytes().to_vec();
+            return self.read(
+                GetObjectState::CheckEncryption,
+                read_row(BUCKET_ENCRYPTION_KEYSPACE, key),
+            );
+        }
+        self.read_object()
+    }
+
+    fn encryption_checked(&mut self, value: Option<Value>) -> Turn {
+        let settings = BucketEncryption::from_row(value.as_deref())?;
+        if settings.is_encrypted() {
+            return Err(GetObjectError::EncryptedDisallowed);
+        }
+        self.read_object()
+    }
+
+    /// The version the caller named, or the head pointer of the key.
+    fn read_object(&mut self) -> Turn {
         if let Some(version_id) = self.input.version_id {
             let key =
                 VersionKey::new(&self.input.bucket, &self.input.key, version_id).to_bytes()?;
@@ -939,6 +968,9 @@ impl GetObjectOperation {
         };
         // A sealed copy is read only under a lease of its key, admitted after the record reads.
         if let Some(key) = location.format.bucket_key() {
+            if self.disallow_encrypted {
+                return Err(GetObjectError::EncryptedDisallowed);
+            }
             let archive = ArchiveKey::of(&location);
             let admit = if let Some((envelope, mapping, private)) = self.object.take() {
                 if mapping.archive != archive
@@ -982,6 +1014,9 @@ impl GetObjectOperation {
 
     fn content_settings_read(&mut self, value: Option<Value>) -> Turn {
         let settings = BucketEncryption::from_row(value.as_deref())?;
+        if self.disallow_encrypted && settings.is_encrypted() {
+            return Err(GetObjectError::EncryptedDisallowed);
+        }
         let (Some(read_effect), Some(location)) = (self.plain_read(), self.location.as_ref())
         else {
             return Err(GetObjectError::GetObjectFailed);
@@ -1078,6 +1113,9 @@ impl GetObjectOperation {
     /// this read serves, advances the binding, or 404s. A locked bucket refuses first.
     fn reference_settings_read(&mut self, value: Option<Value>) -> Turn {
         let settings = BucketEncryption::from_row(value.as_deref())?;
+        if self.disallow_encrypted && settings.is_encrypted() {
+            return Err(GetObjectError::EncryptedDisallowed);
+        }
         self.reference_key = settings.active_key();
         self.reading = false;
         if let Some(key) = self.reference_key {
@@ -1372,8 +1410,8 @@ impl GetObjectOperation {
         self.serve_reference_source(observation, true)
     }
 
-    /// Reads the records again after a lost advance. The preserved advance counter makes
-    /// repeated source drift terminate.
+    /// Reads the records again inside a fresh read snapshot after a lost advance. The preserved
+    /// advance counter makes repeated source drift terminate.
     fn restart(&mut self) -> Turn {
         self.reference_access = None;
         self.source_queue.clear();
@@ -1386,8 +1424,14 @@ impl GetObjectOperation {
         self.advance_observation = None;
         self.resolved_version_id = None;
         self.reading = true;
-        self.restarted = true;
-        self.read_first()
+        let mut retry = GetObjectOperation::new(self.input.clone())
+            .with_restrictions(self.restrictions.clone())
+            .with_token(self.token)
+            .with_disallow_encrypted(self.disallow_encrypted);
+        retry.drift_attempts = self.drift_attempts;
+        retry.chosen_source = self.chosen_source.clone();
+        retry.object = self.object.take();
+        self.call(GetObjectState::Restarted, IoCall::child(retry))
     }
 
     /// Authoritative facts of the object this read serves. A local location
@@ -1466,6 +1510,10 @@ impl GetObjectOperation {
                     if self.reference_explicit {
                         return self.proof_failed(GetObjectError::HistoricalReferenceUnavailable);
                     }
+                    if self.drift_attempts >= MAX_DRIFT_ATTEMPTS {
+                        return Err(GetObjectError::ReferenceSourceChanged);
+                    }
+                    self.drift_attempts = self.drift_attempts.saturating_add(1);
                     return self.restart();
                 }
                 // Without digests, only the read's own validators prove a pinned version.
@@ -1645,33 +1693,24 @@ impl Operation for GetObjectOperation {
 
     fn next(&mut self, result: IoResult) -> Turn {
         match self.state {
-            GetObjectState::GetVersion => {
-                self.handle_received_version(outside_answer(result)?.value()?)
+            GetObjectState::CheckEncryption => self.encryption_checked(result.value()?),
+            GetObjectState::Restarted => {
+                let output = result.child::<GetObjectResult, GetObjectError>()??;
+                Ok(Next::Done(output))
             }
-            GetObjectState::CheckManagedCopy => {
-                self.handle_managed_copy(outside_answer(result)?.values()?)
-            }
-            GetObjectState::GetBlobLocation => self.location_read(outside_answer(result)?.value()?),
-            GetObjectState::GetCurrentVersion => {
-                self.current_version_received(outside_answer(result)?.value()?)
-            }
-            GetObjectState::ReadKept => self.kept_read(keyed(&outside_answer(result)?.values()?)),
-            GetObjectState::ReadSourceBucket => {
-                self.source_bucket_read(outside_answer(result)?.value()?)
-            }
-            GetObjectState::ReadSourceKept => {
-                self.source_kept_read(keyed(&outside_answer(result)?.values()?))
-            }
+            GetObjectState::GetVersion => self.handle_received_version(result.value()?),
+            GetObjectState::CheckManagedCopy => self.handle_managed_copy(result.values()?),
+            GetObjectState::GetBlobLocation => self.location_read(result.value()?),
+            GetObjectState::GetCurrentVersion => self.current_version_received(result.value()?),
+            GetObjectState::ReadKept => self.kept_read(keyed(&result.values()?)),
+            GetObjectState::ReadSourceBucket => self.source_bucket_read(result.value()?),
+            GetObjectState::ReadSourceKept => self.source_kept_read(keyed(&result.values()?)),
             GetObjectState::ResolveReferenceAccess => {
                 self.reference_access_resolved(result.event()?)
             }
-            GetObjectState::ReadSourceWeights => {
-                self.weights_read(outside_answer(result)?.values()?)
-            }
+            GetObjectState::ReadSourceWeights => self.weights_read(result.values()?),
             GetObjectState::RankSources => self.sources_ranked(result.event()?),
-            GetObjectState::ReadMultipartSummary => {
-                self.summary_read(outside_answer(result)?.value()?)
-            }
+            GetObjectState::ReadMultipartSummary => self.summary_read(result.value()?),
             GetObjectState::HeadReferenceSource => self.reference_head_received(result.event()?),
             GetObjectState::AdvanceReference => self.reference_advanced(result),
             GetObjectState::QueueSuccessorReplication => {
@@ -1682,13 +1721,9 @@ impl Operation for GetObjectOperation {
             GetObjectState::QueueChangedRefresh => self.handle_refresh_queued(result.event()?),
             GetObjectState::SpoolReference => self.handle_reference_spooled(result.event()?),
             GetObjectState::AdmitRead => self.read_admitted(result.event()?),
-            GetObjectState::ReadContentSettings => {
-                self.content_settings_read(outside_answer(result)?.value()?)
-            }
+            GetObjectState::ReadContentSettings => self.content_settings_read(result.value()?),
             GetObjectState::AdmitPlain => self.plain_admitted(result.event()?),
-            GetObjectState::ReadReferenceSettings => {
-                self.reference_settings_read(outside_answer(result)?.value()?)
-            }
+            GetObjectState::ReadReferenceSettings => self.reference_settings_read(result.value()?),
             GetObjectState::CheckReferenceKey => self.reference_key_checked(result.event()?),
             GetObjectState::Init => Err(GetObjectError::InvalidState {
                 current: GetObjectState::Init,

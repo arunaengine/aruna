@@ -12,6 +12,7 @@ use utoipa::openapi::{Components, OpenApi};
 use utoipa_axum::router::{OpenApiRouter, UtoipaMethodRouter};
 
 pub mod access;
+pub mod applets;
 pub mod assistant;
 pub mod audit;
 pub mod device;
@@ -19,6 +20,7 @@ pub mod drs;
 pub mod email_profile;
 pub mod emails;
 pub mod execution;
+pub mod features;
 pub mod federation;
 pub mod git;
 pub mod hooks;
@@ -61,6 +63,7 @@ pub mod webhooks;
 /// handler, so the runtime router and the generated document cannot diverge.
 fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new()
+        .merge(applets::router())
         .merge(audit::router())
         .merge(assistant::router())
         .merge(info::router())
@@ -115,6 +118,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(execution::job::session::router())
         .merge(execution::jobs::router())
         .merge(execution::runs::router())
+        .merge(execution::workflow::router())
         .merge(execution::job::audit::router())
         .merge(metadata::router())
         .merge(git::router())
@@ -138,6 +142,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(hooks::router())
         .merge(policies::router())
         .merge(portal::router())
+        .merge(features::router())
         .merge(oidc_providers::router())
         .merge(promotion::router())
         .merge(realm_admins::router())
@@ -160,6 +165,10 @@ pub fn rest_router(state: Arc<ServerState>) -> Router {
         .layer(from_fn_with_state(
             state.clone(),
             management_relay::relay_middleware,
+        ))
+        .layer(from_fn_with_state(
+            state.clone(),
+            crate::features::gate_middleware,
         ))
         .layer(from_fn_with_state(
             state.clone(),
@@ -213,6 +222,56 @@ pub(crate) mod tests {
     /// Runtime method/path pairs registered before REST/OpenAPI co-registration.
     /// A route added or removed without this fixture changing is a regression.
     const RUNTIME_ROUTES: &[(&str, &str)] = &[
+        ("GET", "/applets"),
+        ("POST", "/applets"),
+        ("GET", "/applets/{applet_id}"),
+        ("POST", "/applets/{applet_id}/request-approval"),
+        ("POST", "/applets/{applet_id}/approve"),
+        ("POST", "/applets/{applet_id}/reject"),
+        ("POST", "/applets/{applet_id}/rollback"),
+        ("POST", "/applets/{applet_id}/pause"),
+        ("POST", "/applets/{applet_id}/resume"),
+        ("POST", "/applets/{applet_id}/takedown"),
+        ("PUT", "/applets/{applet_id}/embedding"),
+        ("PUT", "/applets/{applet_id}/guests"),
+        ("GET", "/applets/{applet_id}/source"),
+        ("POST", "/applets/{applet_id}/source/commits"),
+        ("POST", "/applets/{applet_id}/versions"),
+        ("GET", "/applets/{applet_id}/signin-info"),
+        ("POST", "/applets/{applet_id}/signin-code"),
+        ("POST", "/applets/{applet_id}/builds"),
+        ("GET", "/applets/{applet_id}/drafts"),
+        ("POST", "/applets/{applet_id}/drafts"),
+        ("DELETE", "/applets/{applet_id}/drafts/{build_id}"),
+        ("POST", "/applets/{applet_id}/drafts/{build_id}/keep"),
+        ("GET", "/applets/{applet_id}/versions/{version}/diff"),
+        ("GET", "/applets/{applet_id}/domains"),
+        ("POST", "/applets/{applet_id}/domains"),
+        ("DELETE", "/applets/{applet_id}/domains/{domain}"),
+        ("POST", "/applets/{applet_id}/domains/{domain}/verify"),
+        ("GET", "/edge/v1/hosts/{host}"),
+        (
+            "GET",
+            "/edge/v1/applets/{applet_id}/versions/{version}/source-map",
+        ),
+        ("GET", "/edge/v1/applets/{applet_id}/drafts/{build_id}/file"),
+        (
+            "GET",
+            "/edge/v1/applets/{applet_id}/drafts/{build_id}/source-map",
+        ),
+        ("GET", "/edge/v1/notices"),
+        ("GET", "/edge/v1/applets/{applet_id}/session"),
+        ("POST", "/edge/v1/applets/{applet_id}/uploads"),
+        ("POST", "/edge/v1/applets/{applet_id}/submissions"),
+        ("POST", "/edge/v1/applets/{applet_id}/runs"),
+        ("GET", "/edge/v1/applets/{applet_id}/runs/{run_id}"),
+        ("GET", "/edge/v1/applets/{applet_id}/runs/{run_id}/results"),
+        (
+            "GET",
+            "/edge/v1/applets/{applet_id}/versions/{version}/file",
+        ),
+        ("POST", "/edge/v1/signin/redeem"),
+        ("GET", "/system/applets"),
         ("GET", "/metadata/{document_id}/git"),
         ("GET", "/metadata/{document_id}/storage-location"),
         ("PUT", "/metadata/{document_id}/storage-location"),
@@ -493,6 +552,8 @@ pub(crate) mod tests {
         ("GET", "/system/realm/federation"),
         ("GET", "/system/realm/placement"),
         ("GET", "/system/realm/portal-features"),
+        ("GET", "/system/realm/features"),
+        ("GET", "/system/realm/features/effective"),
         ("GET", "/system/usage"),
         ("GET", "/compute/jobs"),
         ("DELETE", "/compute/jobs/{job_id}"),
@@ -664,6 +725,70 @@ pub(crate) mod tests {
         ),
         ("POST", "/access/groups/{id}/roles"),
         ("POST", "/compute/jobs"),
+        ("GET", "/compute/workflows"),
+        ("POST", "/compute/workflows"),
+        ("GET", "/compute/workflows/{workflow_id}"),
+        ("PATCH", "/compute/workflows/{workflow_id}"),
+        ("DELETE", "/compute/workflows/{workflow_id}"),
+        ("GET", "/compute/workflows/{workflow_id}/versions"),
+        ("POST", "/compute/workflows/{workflow_id}/versions"),
+        ("GET", "/compute/workflows/{workflow_id}/versions/{version}"),
+        (
+            "GET",
+            "/compute/workflows/{workflow_id}/versions/{version}/check",
+        ),
+        (
+            "GET",
+            "/compute/workflows/{workflow_id}/versions/{version}/schema",
+        ),
+        (
+            "GET",
+            "/compute/workflows/{workflow_id}/versions/{version}/graph",
+        ),
+        (
+            "GET",
+            "/compute/workflows/{workflow_id}/versions/{version}/tools",
+        ),
+        (
+            "POST",
+            "/compute/workflows/{workflow_id}/versions/{version}/values/validate",
+        ),
+        ("POST", "/compute/workflows/validate"),
+        ("GET", "/compute/tools"),
+        ("POST", "/compute/tools"),
+        ("GET", "/compute/tools/{tool_id}/versions/{version}"),
+        ("DELETE", "/compute/tools/{tool_id}/versions/{version}"),
+        ("POST", "/compute/tools/extract"),
+        ("POST", "/compute/tools/suggest"),
+        ("GET", "/compute/workflow-runs"),
+        ("POST", "/compute/workflow-runs"),
+        ("POST", "/compute/workflow-runs/plan"),
+        ("GET", "/compute/workflow-runs/{run_id}"),
+        ("DELETE", "/compute/workflow-runs/{run_id}"),
+        ("GET", "/compute/workflow-runs/{run_id}/graph"),
+        ("GET", "/compute/workflow-runs/{run_id}/origin"),
+        ("POST", "/compute/workflow-runs/{run_id}/cancel"),
+        ("POST", "/compute/workflow-runs/{run_id}/resume"),
+        ("POST", "/compute/workflow-runs/{run_id}/repeat"),
+        ("GET", "/compute/workflow-runs/compare"),
+        ("GET", "/compute/workflow-runs/{run_id}/time"),
+        ("GET", "/compute/workflow-runs/{run_id}/changes"),
+        ("GET", "/compute/workflow-runs/{run_id}/crate"),
+        ("GET", "/compute/workflow-runs/{run_id}/report"),
+        ("GET", "/compute/workflow-runs/{run_id}/events"),
+        ("GET", "/compute/workflow-runs/{run_id}/tasks"),
+        ("GET", "/compute/workflow-runs/{run_id}/tasks/{task_id}"),
+        (
+            "GET",
+            "/compute/workflow-runs/{run_id}/tasks/{task_id}/logs",
+        ),
+        ("GET", "/compute/workflow-runs/{run_id}/tasks/{task_id}/why"),
+        ("GET", "/ga4gh/wes/v1/service-info"),
+        ("GET", "/ga4gh/wes/v1/runs"),
+        ("POST", "/ga4gh/wes/v1/runs"),
+        ("GET", "/ga4gh/wes/v1/runs/{run_id}"),
+        ("GET", "/ga4gh/wes/v1/runs/{run_id}/status"),
+        ("POST", "/ga4gh/wes/v1/runs/{run_id}/cancel"),
         ("POST", "/compute/jobs/{job_id}/cancel"),
         ("POST", "/compute/jobs/{job_id}/session/cells"),
         ("POST", "/compute/jobs/{job_id}/session/end"),
@@ -796,6 +921,7 @@ pub(crate) mod tests {
         ("PUT", "/system/realm/oidc-providers/{id}"),
         ("PUT", "/system/realm/admins/{user_id}"),
         ("PUT", "/system/realm/portal-features"),
+        ("PUT", "/system/realm/features"),
         ("PUT", "/system/realm/quota"),
         ("PUT", "/metadata/{document_id}/rocrate"),
         (

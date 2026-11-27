@@ -169,6 +169,7 @@ impl JobsRuntime {
             .running
             .values()
             .map(|job| RunningJobView {
+                cancel_requested: job.view.cancel_requested || job.cancel.is_cancelled(),
                 progress: job
                     .progress
                     .as_ref()
@@ -244,7 +245,10 @@ impl JobsRuntime {
                 nonce,
                 class,
                 view: RunningJobView {
+                    job_id,
                     kind: JobKind::Probe,
+                    session: false,
+                    cancel_requested: false,
                     target: None,
                     group_id: None,
                     created_by: aruna_core::user::id::UserId::nil(

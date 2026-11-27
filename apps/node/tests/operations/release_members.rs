@@ -289,6 +289,7 @@ async fn releases_pin_versions() -> TestResult<()> {
         created_by: realm.user_id,
         submission_id: SubmissionId([7; 32]),
         expires_at: u64::MAX,
+        disallow_encrypted: false,
     };
     let resolved = drive(
         RemoteInputsOperation::new(holder.node_id(), inputs, caller, Some(realm.bearer_token())),
@@ -334,6 +335,7 @@ async fn releases_pin_versions() -> TestResult<()> {
         created_by: one_key,
         submission_id: SubmissionId([8; 32]),
         expires_at: u64::MAX,
+        disallow_encrypted: false,
     };
     let one_key_token = Some(realm.bearer_for(one_key));
     let resolved = drive(

@@ -297,6 +297,32 @@ async fn bind_all(
         }
         false => None,
     };
+    if let Some(hosting) = config.applets.hosting.as_ref() {
+        match aruna_runner::driver::drive(
+            aruna_ops_identity::document_repository::GetConfigOperation::new(config.realm_id),
+            &driver_ctx,
+        )
+        .await
+        {
+            Ok(realm) => {
+                if let Some(host) = hosting.provider_conflict(&realm.oidc_providers) {
+                    return Err(format!(
+                        "APPLETS_DOMAIN {} must use its own registered domain separate from realm OIDC provider ({host})",
+                        hosting.applet_domain
+                    )
+                    .into());
+                }
+            }
+            Err(aruna_ops_identity::document_repository::GetConfigError::DocumentNotFound) => {}
+            Err(error) => {
+                return Err(format!(
+                    "cannot verify APPLETS_DOMAIN {} against realm OIDC providers: {error}",
+                    hosting.applet_domain
+                )
+                .into());
+            }
+        }
+    }
     let mut state = ServerState::new(
         driver_ctx.clone(),
         config.realm_id,
@@ -309,7 +335,9 @@ async fn bind_all(
     .await
     .with_metrics(metrics.clone())
     .with_rocrate_limits(config.rocrate_limits.clone())
+    .with_applets(config.applets.clone())
     .with_assistant_proxy(config.assistant_proxy)
+    .with_disabled_features(config.disabled_features.clone())
     .with_import_roots(served_roots(&config.blob_backends))
     .with_trusted_proxies(config.trusted_proxies.clone())
     .with_rate_limits(aruna_api::rate_limit::ApiRateLimits::new(
@@ -963,6 +991,83 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(10), handle.wait())
             .await
             .expect("a forced abort must still await every connection child");
+    }
+
+    // Startup refuses applet hosting when APPLETS_DOMAIN shares a site with a realm OIDC provider.
+    #[tokio::test]
+    async fn rejects_conflicting_oidc() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let rest = free_port();
+        let map: std::collections::BTreeMap<String, String> = [
+            (
+                "DATABASE_DIR".to_string(),
+                temp.path().to_str().expect("utf8 path").to_string(),
+            ),
+            ("SOCKET_ADDRESS".to_string(), rest.to_string()),
+            ("P2P_SOCKET_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
+            ("S3_HOST".to_string(), "127.0.0.1".to_string()),
+            ("S3_ADDRESS".to_string(), free_port().to_string()),
+            ("PORTAL_MODE".to_string(), "disabled".to_string()),
+            ("ARUNA_FJALL_PERSIST_MODE".to_string(), "buffer".to_string()),
+            ("APPLETS_DOMAIN".to_string(), "apps.example.net".to_string()),
+            ("APPLETS_EDGE_KEY_SHA256".to_string(), "1".repeat(64)),
+        ]
+        .into_iter()
+        .collect();
+        let (config, storage) = crate::startup::resources::resolve_settings(
+            aruna_config::settings::read_settings_from(&map).expect("settings parse"),
+        )
+        .await
+        .expect("settings resolve");
+        let mut realm =
+            aruna_core::structs::identity::realm::RealmConfigDocument::default_for_realm(
+                config.realm_id,
+                vec![aruna_core::structs::identity::realm::OidcProviderConfig {
+                    id: "idp".into(),
+                    issuer: "https://auth.example.net/realms/main".into(),
+                    audience: "client".into(),
+                    discovery_url: "https://auth.example.net/.well-known/openid-configuration"
+                        .into(),
+                }],
+            );
+        realm.ensure_node(
+            config.node_id,
+            aruna_core::structs::identity::realm::RealmNodeKind::Server,
+        );
+        let actor = aruna_core::structs::identity::auth::Actor {
+            node_id: config.node_id,
+            user_id: aruna_core::user::id::UserId::nil(config.realm_id),
+            realm_id: config.realm_id,
+        };
+        storage
+            .send_storage_effect(aruna_core::effects::StorageEffect::Write {
+                key_space: aruna_core::keyspaces::REALM_CONFIG_KEYSPACE.to_string(),
+                key: config.realm_id.as_bytes().to_vec().into(),
+                value: realm.to_bytes(&actor).expect("realm bytes").into(),
+                txn_id: None,
+            })
+            .await;
+
+        let error = bind_error(&config, storage.clone()).await;
+        assert!(error.contains("APPLETS_DOMAIN"), "{error}");
+        assert!(error.contains("auth.example.net"), "{error}");
+        std::net::TcpListener::bind(rest).expect("no REST listener was started");
+
+        // A corrupt realm config row also refuses startup instead of silently bypassing the check.
+        storage
+            .send_storage_effect(aruna_core::effects::StorageEffect::Write {
+                key_space: aruna_core::keyspaces::REALM_CONFIG_KEYSPACE.to_string(),
+                key: config.realm_id.as_bytes().to_vec().into(),
+                value: b"corrupt-realm-config".to_vec().into(),
+                txn_id: None,
+            })
+            .await;
+        let corrupt = bind_error(&config, storage).await;
+        assert!(
+            corrupt.contains("cannot verify APPLETS_DOMAIN"),
+            "{corrupt}"
+        );
+        std::net::TcpListener::bind(rest).expect("no REST listener was started");
     }
 }
 

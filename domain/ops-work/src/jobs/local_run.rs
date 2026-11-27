@@ -12,7 +12,7 @@ use aruna_core::operation::Operation;
 use aruna_core::scheduling::eligibility::RejectionVerdict;
 use aruna_core::structs::execution::job::identity::JobState;
 use aruna_core::structs::execution::job::input::{
-    ExecutionSpec, InputMode, InputSource, JobPayload,
+    ExecutionSpec, InputMode, InputSource, JobPayload, OutputDestination, WORKFLOW_RUN_TAG,
 };
 use aruna_core::structs::execution::job::local::{JobRecord, LocalAdmission, WorkspaceMode};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -176,6 +176,9 @@ impl LocalRunOperation {
                 version_id,
             } = &input.source
             else {
+                if self.config.spec.tags.contains_key(WORKFLOW_RUN_TAG) {
+                    continue;
+                }
                 return Err(LocalExecutionError::Unsupported(
                     "inline inputs are for plugin tasks only",
                 ));
@@ -299,7 +302,9 @@ impl Operation for LocalRunOperation {
 /// write them.
 fn pin_outputs(spec: &mut ExecutionSpec, node_id: NodeId) {
     for output in &mut spec.file_outputs {
-        output.destination_node_id = Some(node_id);
+        if let OutputDestination::S3 { .. } = output.destination {
+            output.destination_node_id = Some(node_id);
+        }
     }
 }
 

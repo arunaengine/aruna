@@ -48,6 +48,7 @@ use aruna_core::structs::execution::job::record_rows::{
 };
 use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorSecret};
 use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
+use aruna_core::structs::identity::features::{Feature, FeatureMode};
 use aruna_core::structs::identity::node_state::PersistedNodeState;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, ReplicaQuota};
 use aruna_core::structs::identity::user::session::UserSession;
@@ -961,8 +962,8 @@ fn rewrite_rows(
 }
 
 /// Realm configs gained the catch-up wait, idle timeout, federation, portal features, replica
-/// quota, email profile, realm vault and named secrets, in that order. Postcard is positional,
-/// so appending the defaults an older row lacks re-encodes it.
+/// quota, email, vault, secrets, plugins, installs and feature policy, in that order. Postcard
+/// is positional, so appending the defaults an older row lacks re-encodes it.
 fn realm_configs(
     db: &OptimisticTxDatabase,
     keyspace: &OptimisticTxKeyspace,
@@ -987,7 +988,12 @@ fn realm_configs(
 /// Appends the trailing defaults an older row lacks, shortest suffix first, so
 /// a row missing only the newest value keeps the one it already has.
 fn realm_config_suffix(value: &[u8]) -> Option<Vec<u8>> {
-    let installs = postcard::to_allocvec(&Vec::<PluginInstall>::new()).ok()?;
+    let policy = postcard::to_allocvec(&BTreeMap::<Feature, FeatureMode>::new()).ok()?;
+    let installs = [
+        postcard::to_allocvec(&Vec::<PluginInstall>::new()).ok()?,
+        policy.clone(),
+    ]
+    .concat();
     let plugins = [
         postcard::to_allocvec(&Vec::<PublishedPlugin>::new()).ok()?,
         installs.clone(),
@@ -1022,6 +1028,7 @@ fn realm_config_suffix(value: &[u8]) -> Option<Vec<u8>> {
     let idle_on = [idle.as_slice(), &federation_on].concat();
     let both = [catch_up.as_slice(), &idle_on].concat();
     for suffix in [
+        policy,
         installs,
         plugins,
         secrets,
@@ -1257,6 +1264,7 @@ mod tests {
     use aruna_core::structs::execution::job::record_rows::{
         PendingNeed, PendingRecord, ProjectionCache,
     };
+    use aruna_core::structs::identity::features::{Feature, FeatureMode};
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
     use aruna_core::structs::placement::compute_config::{CATCH_UP_MS, IDLE_AFTER_MS};
     use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
@@ -1457,7 +1465,9 @@ mod tests {
         let secrets = postcard::to_allocvec(&Vec::<super::SecretRecord>::new()).unwrap();
         let plugins = postcard::to_allocvec(&Vec::<super::PublishedPlugin>::new()).unwrap();
         let installs = postcard::to_allocvec(&Vec::<super::PluginInstall>::new()).unwrap();
-        let installless = current[..current.len() - installs.len()].to_vec();
+        let policy = postcard::to_allocvec(&BTreeMap::<Feature, FeatureMode>::new()).unwrap();
+        let policyless = current[..current.len() - policy.len()].to_vec();
+        let installless = policyless[..policyless.len() - installs.len()].to_vec();
         let pluginless = installless[..installless.len() - plugins.len()].to_vec();
         let secretless = pluginless[..pluginless.len() - secrets.len()].to_vec();
         let vaultless = secretless[..secretless.len() - vault.len()].to_vec();
@@ -1479,6 +1489,7 @@ mod tests {
                 (b"secretless", secretless),
                 (b"pluginless", pluginless),
                 (b"installless", installless),
+                (b"policyless", policyless),
                 (b"vaultless", vaultless),
                 (b"emailless", emailless),
                 (b"new", current.clone()),
@@ -1489,12 +1500,13 @@ mod tests {
 
         assert_eq!(
             (output.realm_configs_scanned, output.realm_configs_rewritten),
-            (11, 10)
+            (12, 11)
         );
         let rows = read(&path, REALM_CONFIG_KEYSPACE);
         assert_eq!(rows[b"new".as_slice()], current);
         assert_eq!(rows[b"pluginless".as_slice()], current);
         assert_eq!(rows[b"installless".as_slice()], current);
+        assert_eq!(rows[b"policyless".as_slice()], current);
         assert_eq!(rows[b"replicaless".as_slice()], current);
         assert_eq!(rows[b"secretless".as_slice()], current);
         assert_eq!(rows[b"vaultless".as_slice()], current);

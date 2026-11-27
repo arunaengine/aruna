@@ -136,7 +136,7 @@ pub(super) fn upgraded(value: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn upgraded_from<T: DeserializeOwned + Into<PluginInstall>>(value: &[u8]) -> Option<Vec<u8>> {
-    // An empty list is one zero byte, so a config with no installs already decodes.
+    // An empty list or map is one zero byte, so a config with no installs already decodes.
     for split in (0..value.len()).rev() {
         let Ok((stored, rest)) = postcard::take_from_bytes::<Vec<T>>(&value[split..]) else {
             continue;
@@ -144,7 +144,8 @@ fn upgraded_from<T: DeserializeOwned + Into<PluginInstall>>(value: &[u8]) -> Opt
         if !rest.is_empty() || stored.is_empty() {
             continue;
         }
-        let head = [&value[..split], &[0u8][..]].concat();
+        // An empty install list, then the feature policy the old row predates.
+        let head = [&value[..split], &[0u8, 0u8][..]].concat();
         let Ok(mut config) = RealmConfigDocument::from_bytes(&head) else {
             continue;
         };
@@ -262,10 +263,10 @@ mod tests {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let empty = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         let current = postcard::to_allocvec(&empty).unwrap();
-        // The old row: the config without its empty install list, then two old installs.
+        // The old row: the config without its install list and policy, then two old installs.
         let olds = vec![old_install(1, realm_id), old_install(2, realm_id)];
         let old = [
-            &current[..current.len() - 1],
+            &current[..current.len() - 2],
             &postcard::to_allocvec(&olds).unwrap(),
         ]
         .concat();
@@ -298,7 +299,7 @@ mod tests {
         };
         let olds = vec![(old_install(1, realm_id), Some(node), Some(widened))];
         let old = [
-            &current[..current.len() - 1],
+            &current[..current.len() - 2],
             &postcard::to_allocvec(&olds).unwrap(),
         ]
         .concat();

@@ -5,13 +5,15 @@
 use std::collections::HashSet;
 
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::compute::valid_vault_env;
 use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::family::MAX_EXECUTION_OUTPUTS;
 use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::execution::job::input::{
-    ExecutionSpec, InputSource, JobPayload, MAX_INLINE_BYTES, OutputDestination, plugin_tag,
+    ExecutionSpec, InputSource, JobPayload, MAX_INLINE_BYTES, OutputDestination, WORKFLOW_RUN_TAG,
+    WORKFLOW_SECRETS_TAG, parse_workflow_secrets, plugin_tag,
 };
 use aruna_core::structs::execution::job::local::{LocalAdmission, WorkspaceMode, user_dedup_key};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -50,16 +52,43 @@ pub(crate) fn validate_execution(
             input.dest_key
         )));
     }
-    // Only the plugin host writes bytes into a spec, and only a few.
+    // Only the plugin host and workflow runs write bytes into a spec, and only a few.
     let inline = (spec.inputs.iter()).filter_map(|input| match &input.source {
         InputSource::Inline { bytes } => Some(bytes.len()),
         InputSource::S3 { .. } => None,
     });
     let (count, bytes) = inline.fold((0, 0usize), |(count, sum), len| (count + 1, sum + len));
-    if (count > 0 && plugin_tag(&spec.tags).is_none()) || bytes > MAX_INLINE_BYTES {
+    let tagged = plugin_tag(&spec.tags).is_some() || spec.tags.contains_key(WORKFLOW_RUN_TAG);
+    if (count > 0 && !tagged) || bytes > MAX_INLINE_BYTES {
         return Err(SubmitJobError::InvalidWorkspace(
-            "inline inputs are for plugin tasks only, at most 64 KiB together".to_string(),
+            "inline inputs are for plugin and workflow tasks only, at most 64 KiB together"
+                .to_string(),
         ));
+    }
+    // Only a workflow run's tasks write into a group's run area.
+    let run_area = (spec.file_outputs.iter())
+        .any(|output| matches!(output.destination, OutputDestination::RunArea { .. }));
+    if run_area && !spec.tags.contains_key(WORKFLOW_RUN_TAG) {
+        return Err(SubmitJobError::InvalidWorkspace(
+            "run area outputs are for workflow tasks only".to_string(),
+        ));
+    }
+    if spec.tags.contains_key(WORKFLOW_SECRETS_TAG) {
+        if !spec.tags.contains_key(WORKFLOW_RUN_TAG) {
+            return Err(SubmitJobError::InvalidWorkspace(
+                "workflow secret bindings are for workflow tasks only".to_string(),
+            ));
+        }
+        let bindings = parse_workflow_secrets(&spec.tags).map_err(|_| {
+            SubmitJobError::InvalidWorkspace("workflow secret bindings are malformed".to_string())
+        })?;
+        for name in bindings.keys() {
+            if !valid_vault_env(name) || spec.env.contains_key(name) {
+                return Err(SubmitJobError::InvalidWorkspace(format!(
+                    "`{name}` cannot carry a released secret"
+                )));
+            }
+        }
     }
     // One bound governs declaration, expansion, the local result, and the
     // immutable output record, so a valid success is always publishable.
@@ -109,9 +138,9 @@ pub(crate) fn validate_execution(
         .file_outputs
         .iter()
         .filter(|output| !aruna_core::compute::has_wildcard(&output.container_path))
-        .map(|output| {
-            let OutputDestination::S3 { bucket, key } = &output.destination;
-            (bucket.as_str(), key.as_str())
+        .map(|output| match &output.destination {
+            OutputDestination::S3 { bucket, key } => (bucket.as_str(), key.as_str()),
+            OutputDestination::RunArea { prefix } => ("run area", prefix.as_str()),
         });
     for (bucket, key) in explicit.chain(workspace) {
         if !destinations.insert((bucket, key)) {

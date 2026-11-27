@@ -60,6 +60,10 @@ Native Git/LFS also accepts HTTP Basic with an Aruna bearer token as the passwor
         (name = "access/groups", description = "Group management operations"),
         (name = "compute/sessions", description = "Interactive notebook sessions"),
         (name = "compute/jobs", description = "Durable background jobs"),
+        (name = "applets", description = "Applets: web pages a group publishes, with versions, approvals, grants and hosts"),
+        (name = "compute/workflows", description = "The workflow registry: workflows, versions and their stored checks"),
+        (name = "compute/tools", description = "The tool catalog of the groups, tool extraction and suggestions"),
+        (name = "compute/workflow-runs", description = "Workflow runs on this node: start, follow, tasks, cancel and delete"),
         (name = "metadata/documents", description = "Metadata document lifecycle"),
         (name = "metadata/query", description = "Metadata search and SPARQL"),
         (name = "metadata/references", description = "Metadata reference resolution"),
@@ -82,6 +86,7 @@ Native Git/LFS also accepts HTTP Basic with an Aruna bearer token as the passwor
         (name = "access/service-accounts", description = "Service accounts of a group"),
         (name = "access/sessions", description = "User bearer sessions"),
         (name = "tes", description = "GA4GH TES v1.1 task execution facade"),
+        (name = "wes", description = "GA4GH WES v1.1 facade over the workflow runs of this node"),
         (name = "access/tokens", description = "Bearer token revocation"),
         (name = "access/users", description = "User operations"),
         (name = "access/devices", description = "User device administration")

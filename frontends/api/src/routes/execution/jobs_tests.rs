@@ -59,6 +59,7 @@ fn family_report_fixture() -> FamilyReport {
         disk_bytes: 0,
         max_walltime_ms: 1_000,
         preemptible: false,
+        gpus: 0,
     };
     let payload = ExecutionSpec {
         group_id: Ulid::from_bytes([6u8; 16]),
@@ -99,6 +100,9 @@ fn family_report_fixture() -> FamilyReport {
             locally_exhausted: false,
             session_runtime: None,
             awaiting_keys: Vec::new(),
+            group_id: None,
+            started_at_ms: None,
+            node_id: None,
         },
         spec: LogicalJobSpec {
             submission_id,
@@ -1169,6 +1173,33 @@ async fn refuses_plugin_tags() {
     match result {
         Err(ServerError::BadRequestMessage(message)) => {
             assert!(message.contains("reserved for plugin tasks"), "{message}");
+        }
+        other => panic!("expected a refusal, got {:?}", other.err()),
+    }
+}
+
+#[tokio::test]
+async fn refuses_workflow_tags() {
+    // Only a workflow run tags its child jobs; REST and MCP share this check.
+    let (_dir, state) = build_state().await;
+    let mut request = local_request();
+    request.target = None;
+    request.tags.insert(
+        "aruna-engine.org/workflow-task".to_string(),
+        "key".to_string(),
+    );
+
+    let result = submit_job(
+        State(state),
+        Extension(auth_for(user(2))),
+        Extension(None),
+        Json(request),
+    )
+    .await;
+
+    match result {
+        Err(ServerError::BadRequestMessage(message)) => {
+            assert!(message.contains("reserved for workflow tasks"), "{message}");
         }
         other => panic!("expected a refusal, got {:?}", other.err()),
     }

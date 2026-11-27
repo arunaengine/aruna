@@ -137,6 +137,7 @@ fn execution_spec(
             disk_bytes: None,
             max_walltime_ms: Some(120_000),
             preemptible: false,
+            gpus: None,
         },
         executor_constraint: Some("docker".to_string()),
         backend: None,

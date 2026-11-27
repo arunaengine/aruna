@@ -12,6 +12,7 @@ use crate::routes::storage::relay::{RestRead, holder_json, missed_json, query_pa
 use crate::server::state::ServerState;
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
+use aruna_core::structs::identity::features::Feature;
 use aruna_core::structs::placement::policy::attachment::{PolicyBlockedReason, PolicyStatus};
 use aruna_core::structs::placement::policy::document::PlacementPolicyDocument;
 use aruna_core::structs::placement::policy::{
@@ -787,8 +788,11 @@ pub async fn create_placement_policy(
         .collect::<ServerResult<Vec<PlacementSelector>>>()?;
     let mut policy = PlacementPolicy::new(policy_id, request.name, allowed)
         .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
-    if let Some(owner_group_id) = request.owner_group_id.as_deref() {
-        let owner = Ulid::from_string(owner_group_id).map_err(|_| ServerError::BadRequest)?;
+    let owner = (request.owner_group_id.as_deref())
+        .map(|owner| Ulid::from_string(owner).map_err(|_| ServerError::BadRequest))
+        .transpose()?;
+    crate::features::require(&state, Feature::Placement, owner).await?;
+    if let Some(owner) = owner {
         policy = policy
             .owned_by(owner)
             .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;

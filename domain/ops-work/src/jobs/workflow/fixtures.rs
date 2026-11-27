@@ -109,6 +109,7 @@ pub(super) fn prepared() -> PreparedTask {
         inputs: Vec::new(),
         mounts: Vec::new(),
         secrets: BTreeMap::new(),
+        vault_env: BTreeMap::new(),
         staging: StagingMode::Files,
         workspace: None,
     }
@@ -178,6 +179,7 @@ pub(super) fn reservation(subject_generation: u64) -> JobReservationRecord {
             disk_bytes: 0,
             max_walltime_ms: 1,
             preemptible: false,
+            gpus: 0,
         },
         created_at_ms: 1,
         subject_generation,

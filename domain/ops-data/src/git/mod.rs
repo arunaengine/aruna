@@ -7,6 +7,7 @@ mod calls;
 pub mod capture_drain;
 pub mod changes;
 pub mod cleanup;
+pub mod commit;
 mod dataset;
 pub mod download;
 mod generate;

@@ -17,6 +17,7 @@ use aruna_core::onboarding::{OnboardingSecretError, OnboardingTicket};
 use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::auth::TokenClaims;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
+use aruna_core::structs::identity::features::Feature;
 use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmId};
 use aruna_core::structs::storage::backends::ImportRoot;
 use aruna_ops_data::metadata::api::node_fanout::DiscoveryOperation;
@@ -40,7 +41,7 @@ use ed25519_dalek::Signer;
 use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -210,8 +211,13 @@ pub struct ServerState {
     assistant: AssistantConnections,
     /// The operator's import roots that groups may use on this node.
     import_roots: Arc<BTreeMap<String, ImportRoot>>,
+    /// Features the operator turned off on this node.
+    disabled_features: Arc<BTreeSet<Feature>>,
+    /// Applet hosting and building on this node; both off unless configured.
+    applets: Arc<aruna_core::applet::settings::AppletSettings>,
     started: (SystemTime, Instant),
     archive_links: Arc<crate::routes::storage::archive::ArchiveLinks>,
+    signin_codes: Arc<crate::routes::applets::signin::SigninCodes>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -323,8 +329,11 @@ impl ServerState {
                 chatgpt_base_url: "https://chatgpt.com/backend-api/codex".to_string(),
             },
             import_roots: Arc::default(),
+            disabled_features: Arc::default(),
+            applets: Arc::default(),
             started: (SystemTime::now(), Instant::now()),
             archive_links: Arc::default(),
+            signin_codes: Arc::default(),
         };
         state
             .identity
@@ -393,6 +402,10 @@ impl ServerState {
     }
 
     /// The unredeemed archive download links of this node.
+    pub(crate) fn signin_codes(&self) -> &crate::routes::applets::signin::SigninCodes {
+        &self.signin_codes
+    }
+
     pub(crate) fn archive_links(&self) -> &crate::routes::storage::archive::ArchiveLinks {
         &self.archive_links
     }
@@ -428,6 +441,15 @@ impl ServerState {
         &self.identity.credential_encryption_key
     }
 
+    pub fn with_applets(mut self, settings: aruna_core::applet::settings::AppletSettings) -> Self {
+        self.applets = Arc::new(settings);
+        self
+    }
+
+    pub fn applet_settings(&self) -> &aruna_core::applet::settings::AppletSettings {
+        &self.applets
+    }
+
     pub fn with_import_roots(mut self, roots: BTreeMap<String, ImportRoot>) -> Self {
         self.import_roots = Arc::new(roots);
         self
@@ -435,6 +457,26 @@ impl ServerState {
 
     pub fn import_roots(&self) -> &BTreeMap<String, ImportRoot> {
         &self.import_roots
+    }
+
+    pub fn with_disabled_features(mut self, features: BTreeSet<Feature>) -> Self {
+        self.disabled_features = Arc::new(features);
+        self
+    }
+
+    /// Features off on this node: the operator's list, `workflows` without a workflow runtime
+    /// and `applets` when this node is not configured to host applets.
+    pub fn disabled_features(&self) -> BTreeSet<Feature> {
+        let mut off = (*self.disabled_features).clone();
+        let context = self.get_ctx();
+        let compute = context.compute_handle.as_ref();
+        if !compute.is_some_and(|registry| registry.workflow().is_some()) {
+            off.insert(Feature::Workflows);
+        }
+        if self.applets.hosting.is_none() {
+            off.insert(Feature::Applets);
+        }
+        off
     }
 
     pub fn with_assistant_proxy(mut self, enabled: bool) -> Self {

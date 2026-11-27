@@ -217,9 +217,9 @@ impl Operation for ProbeSourcesOperation {
                 CandidateOpen::Opened(BaoReadOutput::Metadata { size, blake3, .. }) => {
                     self.opened(size, blake3)
                 }
-                CandidateOpen::Opened(BaoReadOutput::Stream { .. }) => {
+                CandidateOpen::Opened(BaoReadOutput::Stream { .. } | BaoReadOutput::Authorized) => {
                     Err(ExportFailure::Retryable(
-                        "source probe unexpectedly opened a stream".to_string(),
+                        "source probe unexpectedly returned no metadata".to_string(),
                     ))
                 }
                 CandidateOpen::Status(status) => {

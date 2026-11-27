@@ -14,7 +14,7 @@ use aruna_core::native_reference::GrantedBody;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::execution::job::input::{
-    CapturedInput, ExecutionSpec, InputSelection, InputSource,
+    CapturedInput, ExecutionSpec, InputSelection, InputSource, JobPayload, WORKFLOW_UNPROTECTED_TAG,
 };
 use aruna_core::structs::execution::job::local::{JobError, JobRecord};
 use aruna_core::structs::execution::staging::VersionSourceBinding;
@@ -110,6 +110,13 @@ impl InputSourceOperation {
             .find(|captured| captured.destination_key == self.input.dest_key)
     }
 
+    fn disallow_encrypted(&self) -> bool {
+        match &self.record.payload {
+            JobPayload::Execution(spec) => spec.tags.contains_key(WORKFLOW_UNPROTECTED_TAG),
+            _ => false,
+        }
+    }
+
     fn call(&mut self, step: SourceStep, call: IoCall) -> SourceNext {
         self.step = step;
         Ok(Next::Call(call))
@@ -132,16 +139,19 @@ impl InputSourceOperation {
     }
 
     fn get_call(&self, source: &SourceObject, group_id: GroupId) -> IoCall {
-        IoCall::child(GetObjectOperation::new(GetObjectInput {
-            bucket: source.bucket.clone(),
-            key: source.key.clone(),
-            version_id: source.version,
-            range: None,
-            group_id,
-            user_identity: self.run.user_id,
-            realm_id: self.run.realm_id,
-            node_id: self.run.node_id,
-        }))
+        IoCall::child(
+            GetObjectOperation::new(GetObjectInput {
+                bucket: source.bucket.clone(),
+                key: source.key.clone(),
+                version_id: source.version,
+                range: None,
+                group_id,
+                user_identity: self.run.user_id,
+                realm_id: self.run.realm_id,
+                node_id: self.run.node_id,
+            })
+            .with_disallow_encrypted(self.disallow_encrypted()),
+        )
     }
 
     /// Stages one exact version from a legal holder. The stored version and hash are resolved
@@ -170,7 +180,8 @@ impl InputSourceOperation {
                 return self.fail(JobError::permanent(error));
             };
             let read =
-                GrantedReadOperation::new(serving, captured.source_node_id, grant, None, false);
+                GrantedReadOperation::new(serving, captured.source_node_id, grant, None, false)
+                    .with_disallow_encrypted(self.disallow_encrypted());
             return self.call(SourceStep::Granted, IoCall::child(read));
         };
         let stage = StageInputOperation::new(
@@ -221,6 +232,7 @@ impl InputSourceOperation {
             destination: None,
             known_refs: Vec::new(),
             range: None,
+            disallow_encrypted: self.disallow_encrypted(),
         };
         let read = ManagedReadOperation::new(holder, request);
         self.call(SourceStep::Device(bucket, key), IoCall::child(read))
@@ -313,6 +325,9 @@ impl Operation for InputSourceOperation {
             }
             SourceStep::Read => match result.child::<GetObjectResult, GetObjectError>()? {
                 Ok(get) => Ok(Next::Done(StagedSource::from_local(get))),
+                Err(GetObjectError::EncryptedDisallowed) => Err(JobError::permanent(
+                    "encrypted inputs require a protected workflow run",
+                )),
                 Err(failure) => self.local_read_failed(failure),
             },
             SourceStep::Copies => {
@@ -375,9 +390,9 @@ impl Operation for InputSourceOperation {
                         size: Some(size),
                         served_source: None,
                     })),
-                    Ok(BaoReadOutput::Metadata { .. }) => Err(JobError::retryable(format!(
-                        "staging {bucket}/{key} received no bytes"
-                    ))),
+                    Ok(BaoReadOutput::Metadata { .. } | BaoReadOutput::Authorized) => Err(
+                        JobError::retryable(format!("staging {bucket}/{key} received no bytes")),
+                    ),
                     Err(error) => Err(device_read_error(&bucket, &key, error)),
                 }
             }

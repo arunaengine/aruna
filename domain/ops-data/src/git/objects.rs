@@ -80,6 +80,22 @@ impl EnsureBucketOperation {
         }
     }
 
+    /// The bucket `name` of `group_id` on this node, created by `creator` when missing.
+    pub fn named(
+        name: String,
+        group_id: GroupId,
+        creator: aruna_core::user::id::UserId,
+        created_at_ms: u64,
+    ) -> Self {
+        Self {
+            name,
+            group_id,
+            created_at_ms,
+            creator,
+            step: BucketStep::Found,
+        }
+    }
+
     fn read(&self) -> IoCall {
         IoCall::child(GetBucketOperation::new(self.name.clone()))
     }

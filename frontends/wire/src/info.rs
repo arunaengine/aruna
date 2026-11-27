@@ -26,6 +26,17 @@ pub struct InfoResponse {
     pub services: ServicesStatus,
     /// Operational warnings. Realm config admins only, else empty.
     pub warnings: Vec<String>,
+    /// Whether this node hosts and builds applets. Realm-authenticated callers only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applets: Option<AppletCapabilities>,
+}
+
+/// Applet work this node takes; the portal offers "New applet" for hosting and the assistant
+/// chat for building, both only while the applets feature is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct AppletCapabilities {
+    pub hosting: bool,
+    pub building: bool,
 }
 
 /// Node health and identity. `status`, `realm_id` and `peer_id` are public, as the

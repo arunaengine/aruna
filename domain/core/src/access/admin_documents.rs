@@ -477,6 +477,14 @@ pub enum AdminDocumentOperation {
         install_id: ulid::Ulid,
         install: Option<Box<crate::plugin_installs::PluginInstall>>,
     },
+    /// Replaces the realm feature policy (postcard append-only: new variants only at the end).
+    #[serde(rename = "RealmConfigFeaturesSet")]
+    ConfigFeaturesSet {
+        features: BTreeMap<
+            crate::structs::identity::features::Feature,
+            crate::structs::identity::features::FeatureMode,
+        >,
+    },
 }
 
 impl AdminDocumentOperation {
@@ -676,6 +684,15 @@ mod tests {
             },
             AdminDocumentOperation::ConfigReplicasSet {
                 replicas: Default::default(),
+            },
+            AdminDocumentOperation::ConfigFeaturesSet {
+                features: BTreeMap::from([(
+                    crate::structs::identity::features::Feature::Runs,
+                    crate::structs::identity::features::FeatureMode::Scoped {
+                        default: false,
+                        groups: BTreeMap::from([(group_id(4), true)]),
+                    },
+                )]),
             },
             AdminDocumentOperation::NodePlacementSet {
                 entry: placement_entry(node(1)),

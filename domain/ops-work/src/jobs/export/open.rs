@@ -76,11 +76,13 @@ impl OpenCandidateOperation {
     fn open_remote(&mut self, node_id: NodeId, target: BaoReadTarget) -> OpenTurn {
         let expected_blake3 = self.candidate.expected_blake3;
         let wait = match &target {
-            BaoReadTarget::ExactVersion(arn) => WaitTarget::Object {
-                bucket: arn.bucket.clone(),
-                key: arn.key.clone(),
-                version_id: arn.version,
-            },
+            BaoReadTarget::ExactVersion(arn) | BaoReadTarget::LinkAccess(arn) => {
+                WaitTarget::Object {
+                    bucket: arn.bucket.clone(),
+                    key: arn.key.clone(),
+                    version_id: arn.version,
+                }
+            }
             BaoReadTarget::Blake3(blake3) => WaitTarget::Content { blake3: *blake3 },
             BaoReadTarget::Version { .. } => WaitTarget::Content {
                 blake3: expected_blake3.unwrap_or_default(),
@@ -100,6 +102,7 @@ impl OpenCandidateOperation {
                 destination: None,
                 known_refs: Vec::new(),
                 range: None,
+                disallow_encrypted: false,
             },
         );
         self.step = OpenStep::Remote {

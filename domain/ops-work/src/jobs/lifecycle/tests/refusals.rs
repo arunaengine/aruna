@@ -48,6 +48,7 @@ fn reserve() -> ReserveExecutionOperation {
             disk_bytes: 0,
             max_walltime_ms: 1_000,
             preemptible: false,
+            gpus: 0,
         },
         subject_generation: receipt.subject_generation,
         subject_digest: receipt.subject_digest,

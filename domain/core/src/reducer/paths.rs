@@ -28,6 +28,7 @@ pub const CONFIG_PORTAL_PATH: &str = "realm_config.portal_features";
 pub const CONFIG_MERGE_PATH: &str = "realm_config.merge_coordinator";
 pub const CONFIG_EMAIL_PATH: &str = "realm_config.email";
 pub const CONFIG_REPLICAS_PATH: &str = "realm_config.replica_quota";
+pub const CONFIG_FEATURES_PATH: &str = "realm_config.features";
 pub const CONFIG_POLICIES_PATH: &str = "realm_config.request_policies";
 pub const CONFIG_STRATEGY_PATH: &str = "realm_config.placement.default_strategy";
 pub const JOB_FAMILY_PATH: &str = "realm_config.placement.job_family_strategy";
@@ -121,6 +122,9 @@ pub(super) fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
         }
         AdminDocumentOperation::ConfigReplicasSet { .. } => {
             vec![CONFIG_REPLICAS_PATH.to_string()]
+        }
+        AdminDocumentOperation::ConfigFeaturesSet { .. } => {
+            vec![CONFIG_FEATURES_PATH.to_string()]
         }
         AdminDocumentOperation::MergeCoordinatorSet { .. } => {
             vec![CONFIG_MERGE_PATH.to_string()]
@@ -541,6 +545,16 @@ pub(super) fn replicas_value(replicas: &ReplicaQuota) -> String {
 /// JSON maps keep key order, so equal feature sets encode to equal values.
 pub(super) fn portal_value(features: &BTreeMap<String, bool>) -> String {
     serde_json::to_string(features).expect("admin document portal features serialize")
+}
+
+/// Sorted maps keep key order, so equal policies encode to equal values.
+pub(super) fn features_value(
+    features: &BTreeMap<
+        crate::structs::identity::features::Feature,
+        crate::structs::identity::features::FeatureMode,
+    >,
+) -> String {
+    serde_json::to_string(features).expect("admin document feature policy serializes")
 }
 
 pub(super) fn quota_from_value(value: &str) -> Option<QuotaConfig> {

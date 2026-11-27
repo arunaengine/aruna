@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -14,6 +14,7 @@ use aruna_core::listener::{HostRoutes, MAX_BODY_SIZE, S3ServerTimeouts, cors_all
 use aruna_core::persistence::{CACHE_BYTES, FjallPersistPolicy};
 use aruna_core::search::MetadataSearchStorage;
 use aruna_core::structs::execution::job::input::RoCrateLimits;
+use aruna_core::structs::identity::features::Feature;
 use aruna_core::structs::identity::realm::OidcProviderConfig;
 use aruna_core::structs::storage::backends::{BackendsFile, NodeBackendsConfig};
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BlobTimeoutConfig};
@@ -109,6 +110,7 @@ pub struct Settings {
     pub registry_url: Option<reqwest::Url>,
     pub trusted_proxies: Vec<ipnet::IpNet>,
     pub rocrate_limits: RoCrateLimits,
+    pub applets: aruna_core::applet::settings::AppletSettings,
     pub rate_limits: RateLimitSettings,
     pub s3_address: Option<String>,
     pub onboarding_secret: Option<String>,
@@ -116,6 +118,8 @@ pub struct Settings {
     pub realm_description: String,
     pub portal: PortalConfig,
     pub assistant_proxy: bool,
+    /// Features `ARUNA_DISABLED_FEATURES` turns off on this node; nothing turns them on here.
+    pub disabled_features: BTreeSet<Feature>,
     pub node_labels: BTreeMap<String, String>,
     pub node_location: Option<String>,
     pub node_weight: Option<u32>,
@@ -301,6 +305,7 @@ pub fn read_settings_from(env: &dyn SettingsEnv) -> Result<Settings, SetupError>
     let registry_url = registry_url_env(env)?;
     let trusted_proxies = trusted_proxies_env(env)?;
     let rocrate_limits = rocrate_limits_env(env)?;
+    let applets = applets_env(env)?;
     let rate_limits = rate_limits_env(env)?;
     // Devices may omit both S3 values, but supplying only one is always invalid.
     // The node identity later decides whether the listener is required.
@@ -336,6 +341,7 @@ pub fn read_settings_from(env: &dyn SettingsEnv) -> Result<Settings, SetupError>
     let oidc_providers = load_oidc_providers(env)?;
     let portal = portal_config_env(env)?;
     let assistant_proxy = assistant_proxy_env(env)?;
+    let disabled_features = disabled_features_env(env)?;
     // The SPA is served from another origin than the API, so it cannot reach a
     // relative API path and needs the advertised one.
     if matches!(portal, PortalConfig::Artifact { .. }) && api_public_url.is_none() {
@@ -385,6 +391,7 @@ pub fn read_settings_from(env: &dyn SettingsEnv) -> Result<Settings, SetupError>
         registry_url,
         trusted_proxies,
         rocrate_limits,
+        applets,
         rate_limits,
         s3_address,
         onboarding_secret,
@@ -392,12 +399,14 @@ pub fn read_settings_from(env: &dyn SettingsEnv) -> Result<Settings, SetupError>
         realm_description,
         portal,
         assistant_proxy,
+        disabled_features,
         node_labels,
         node_location,
         node_weight,
         https: None,
     };
     settings.https = https_env(env, &mut settings)?;
+    check_applets(&mut settings)?;
     Ok(settings)
 }
 
@@ -562,6 +571,177 @@ fn positive_u32_env(
         ));
     }
     Ok(parsed)
+}
+
+/// Applet hosting from `APPLETS_DOMAIN` and building from `APPLETS_BUILD_BACKEND` with
+/// `APPLETS_BUILD_IMAGE`; each stays off while its main variable is unset.
+fn applets_env(
+    env: &dyn SettingsEnv,
+) -> Result<aruna_core::applet::settings::AppletSettings, SetupError> {
+    use aruna_core::applet::settings::{
+        AppletSettings, BuildingSettings, DEFAULT_DRAFT_HOURS, DEFAULT_DRAFTS, DEFAULT_ORIGINS,
+        HostingSettings, default_catalogue, image_pinned,
+    };
+    let flag = |name: &'static str| {
+        env.var(name)
+            .map(|value| value.trim().parse::<bool>())
+            .transpose()
+            .map_err(|_| invalid_config_value(name, String::new(), "must be true or false"))
+            .map(Option::unwrap_or_default)
+    };
+    let hosting = match optional_nonempty_env(env, "APPLETS_DOMAIN")? {
+        Some(domain) => {
+            let applet_domain =
+                aruna_core::applet::hosts::normalize_host(&domain).map_err(|error| {
+                    invalid_config_value("APPLETS_DOMAIN", domain.clone(), error.to_string())
+                })?;
+            let key_hash = optional_nonempty_env(env, "APPLETS_EDGE_KEY_SHA256")?
+                .ok_or(SetupError::MissingConfigValue("APPLETS_EDGE_KEY_SHA256"))?;
+            let edge_key_sha256 = hex::decode(key_hash.trim())
+                .ok()
+                .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                .ok_or_else(|| {
+                    let reason = "must be 64 hex characters".to_string();
+                    invalid_config_value("APPLETS_EDGE_KEY_SHA256", String::new(), reason)
+                })?;
+            let max_origins = env
+                .var("APPLETS_MAX_ORIGINS")
+                .map(|value| value.trim().parse::<usize>())
+                .transpose()?
+                .unwrap_or(DEFAULT_ORIGINS);
+            let portal_origin = optional_nonempty_env(env, "APPLETS_PORTAL_ORIGIN")?
+                .map(|raw| applet_portal_origin(&raw))
+                .transpose()?;
+            Some(HostingSettings {
+                applet_domain,
+                edge_key_sha256,
+                custom_domains: flag("APPLETS_CUSTOM_DOMAINS")?,
+                guests: flag("APPLETS_GUESTS")?,
+                embedding: flag("APPLETS_EMBEDDING")?,
+                max_origins,
+                portal_origin,
+                protected_hosts: Vec::new(),
+            })
+        }
+        None => None,
+    };
+    let building = match optional_nonempty_env(env, "APPLETS_BUILD_BACKEND")? {
+        Some(backend) => {
+            let image = optional_nonempty_env(env, "APPLETS_BUILD_IMAGE")?
+                .ok_or(SetupError::MissingConfigValue("APPLETS_BUILD_IMAGE"))?;
+            if !image_pinned(&image) {
+                let reason = "must be pinned by @sha256 digest".to_string();
+                return Err(invalid_config_value("APPLETS_BUILD_IMAGE", image, reason));
+            }
+            let mirror = optional_nonempty_env(env, "APPLETS_BUILD_MIRROR")?;
+            let max_drafts = env
+                .var("APPLETS_MAX_DRAFTS")
+                .map(|value| value.trim().parse::<usize>())
+                .transpose()?
+                .unwrap_or(DEFAULT_DRAFTS);
+            let draft_ttl_hours = env
+                .var("APPLETS_DRAFT_TTL_HOURS")
+                .map(|value| value.trim().parse::<u64>())
+                .transpose()?
+                .unwrap_or(DEFAULT_DRAFT_HOURS);
+            // A JSON list of `{name, version, role, license, license_source}` replaces the defaults.
+            let catalogue = match optional_nonempty_env(env, "APPLETS_CATALOGUE")? {
+                Some(text) => serde_json::from_str(&text).map_err(|error| {
+                    invalid_config_value("APPLETS_CATALOGUE", String::new(), error)
+                })?,
+                None => default_catalogue(),
+            };
+            Some(BuildingSettings {
+                backend,
+                image,
+                mirror,
+                max_drafts,
+                draft_ttl_hours,
+                catalogue,
+            })
+        }
+        None => None,
+    };
+    Ok(AppletSettings { hosting, building })
+}
+
+/// Exact HTTPS origin (or loopback HTTP for local development) for `APPLETS_PORTAL_ORIGIN`.
+fn applet_portal_origin(raw: &str) -> Result<String, SetupError> {
+    const KEY: &str = "APPLETS_PORTAL_ORIGIN";
+    let trimmed = raw.trim();
+    let url =
+        reqwest::Url::parse(trimmed).map_err(|error| invalid_config_value(KEY, trimmed, error))?;
+    let loopback = url.host_str().is_some_and(|host| {
+        let bare = host.trim_start_matches('[').trim_end_matches(']');
+        bare.eq_ignore_ascii_case("localhost")
+            || bare
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    });
+    let secure = url.scheme() == "https" || (url.scheme() == "http" && loopback);
+    let exact = secure
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && matches!(url.path(), "" | "/")
+        && url.query().is_none()
+        && url.fragment().is_none();
+    if !exact {
+        return Err(invalid_config_value(
+            KEY,
+            trimmed,
+            "expected an HTTPS origin (or loopback HTTP) with no path, query or user",
+        ));
+    }
+    Ok(url.origin().ascii_serialization())
+}
+
+/// Refuses startup when `APPLETS_DOMAIN` shares a registered domain with the portal, API, S3 or
+/// OIDC hosts, and records those normalized hosts for custom-domain checks.
+fn check_applets(settings: &mut Settings) -> Result<(), SetupError> {
+    let Some(hosting) = settings.applets.hosting.as_mut() else {
+        return Ok(());
+    };
+    let mut named: Vec<(&str, String)> = Vec::new();
+    let mut add_url = |label: &'static str, raw: Option<&str>| {
+        let Some(host) = raw
+            .and_then(|value| reqwest::Url::parse(value.trim()).ok())
+            .and_then(|url| url.host_str().map(str::to_string))
+        else {
+            return;
+        };
+        if let Ok(host) = aruna_core::applet::hosts::normalize_host(&host) {
+            named.push((label, host));
+        }
+    };
+    add_url("APPLETS_PORTAL_ORIGIN", hosting.portal_origin.as_deref());
+    add_url("PORTAL_PUBLIC_URL", settings.portal_public_url.as_deref());
+    add_url("API_PUBLIC_URL", settings.api_public_url.as_deref());
+    add_url("S3_PUBLIC_URL", settings.s3_public_url.as_deref());
+    for provider in &settings.oidc_providers {
+        add_url("OIDC issuer", Some(provider.issuer.as_str()));
+        add_url("OIDC discovery URL", Some(provider.discovery_url.as_str()));
+    }
+    if let Some(s3_host) = settings.s3_host.as_deref() {
+        let bare = s3_host.split(':').next().unwrap_or_default();
+        if let Ok(host) = aruna_core::applet::hosts::normalize_host(bare) {
+            named.push(("S3_HOST", host));
+        }
+    }
+    for (label, host) in &named {
+        if aruna_core::applet::hosts::same_site(&hosting.applet_domain, host) {
+            return Err(invalid_config_value(
+                "APPLETS_DOMAIN",
+                hosting.applet_domain.as_str(),
+                format!("must use its own registered domain separate from {label} ({host})"),
+            ));
+        }
+    }
+    let mut protected: Vec<String> = named.into_iter().map(|(_, host)| host).collect();
+    protected.sort();
+    protected.dedup();
+    hosting.protected_hosts = protected;
+    Ok(())
 }
 
 fn rocrate_limits_env(env: &dyn SettingsEnv) -> Result<RoCrateLimits, SetupError> {
@@ -930,6 +1110,21 @@ fn assistant_proxy_env(env: &dyn SettingsEnv) -> Result<bool, SetupError> {
             "expected enabled or disabled",
         )),
     }
+}
+
+/// A comma-separated list of feature keys; an unknown key fails the start.
+fn disabled_features_env(env: &dyn SettingsEnv) -> Result<BTreeSet<Feature>, SetupError> {
+    const KEY: &str = "ARUNA_DISABLED_FEATURES";
+    let Some(value) = optional_nonempty_env(env, KEY)? else {
+        return Ok(BTreeSet::new());
+    };
+    (value.split(',').map(str::trim))
+        .filter(|name| !name.is_empty())
+        .map(|name| {
+            Feature::from_name(name)
+                .ok_or_else(|| invalid_config_value(KEY, name, "expected a feature key"))
+        })
+        .collect()
 }
 
 fn mcp_env(env: &dyn SettingsEnv) -> Result<bool, SetupError> {
@@ -1524,6 +1719,19 @@ mod tests {
     }
 
     #[test]
+    fn parses_disabled_features() {
+        assert!(parse(&[]).unwrap().disabled_features.is_empty());
+        let list = [("ARUNA_DISABLED_FEATURES", " shares, s3-keys ,,")];
+        let expected = BTreeSet::from([Feature::Shares, Feature::S3Keys]);
+        assert_eq!(parse(&list).unwrap().disabled_features, expected);
+        let unknown = [("ARUNA_DISABLED_FEATURES", "shares,compute")];
+        assert_eq!(
+            invalid_key(parse(&unknown).unwrap_err()),
+            "ARUNA_DISABLED_FEATURES"
+        );
+    }
+
+    #[test]
     fn assistant_proxy_conventions() {
         assert!(parse(&[]).unwrap().assistant_proxy);
         assert!(
@@ -1988,5 +2196,68 @@ mod tests {
                 "{value}"
             );
         }
+    }
+
+    #[test]
+    fn applets_domain_isolated() {
+        let hash = "a".repeat(64);
+        let base = |extra: &[(&str, &str)]| {
+            let mut pairs = vec![
+                ("APPLETS_DOMAIN", "apps.example.net"),
+                ("APPLETS_EDGE_KEY_SHA256", hash.as_str()),
+                ("APPLETS_PORTAL_ORIGIN", "https://portal.example.org/"),
+                ("API_PUBLIC_URL", "https://api.example.org"),
+                ("S3_PUBLIC_URL", "https://s3.example.org"),
+                ("OIDC_PROVIDER_IDS", "main"),
+                ("OIDC_MAIN_ISSUER", "https://id.example.org/realms/aruna"),
+                ("OIDC_MAIN_AUDIENCE", "aruna"),
+                (
+                    "OIDC_MAIN_DISCOVERY_URL",
+                    "https://id.example.org/realms/aruna/.well-known/openid-configuration",
+                ),
+            ];
+            pairs.extend_from_slice(extra);
+            parse(&pairs)
+        };
+        let ok = base(&[]).unwrap();
+        let hosting = ok.applets.hosting.unwrap();
+        assert_eq!(
+            hosting.portal_origin.as_deref(),
+            Some("https://portal.example.org")
+        );
+        assert!(
+            hosting
+                .protected_hosts
+                .contains(&"portal.example.org".to_string())
+        );
+        assert!(
+            hosting
+                .protected_hosts
+                .contains(&"id.example.org".to_string())
+        );
+        for clash in [
+            ("APPLETS_DOMAIN", "apps.example.org"),
+            ("APPLETS_PORTAL_ORIGIN", "https://portal.example.net"),
+            ("PORTAL_PUBLIC_URL", "https://portal.example.net"),
+            ("API_PUBLIC_URL", "https://api.example.net"),
+            ("S3_PUBLIC_URL", "https://s3.example.net"),
+            ("OIDC_MAIN_ISSUER", "https://id.example.net/realms/aruna"),
+        ] {
+            let err = base(&[clash]).unwrap_err();
+            assert_eq!(invalid_key(err), "APPLETS_DOMAIN", "{clash:?}");
+        }
+        assert_eq!(
+            invalid_key(
+                base(&[("APPLETS_PORTAL_ORIGIN", "http://portal.example.org")]).unwrap_err()
+            ),
+            "APPLETS_PORTAL_ORIGIN"
+        );
+        assert_eq!(
+            invalid_key(
+                base(&[("APPLETS_PORTAL_ORIGIN", "https://portal.example.org/p")]).unwrap_err()
+            ),
+            "APPLETS_PORTAL_ORIGIN"
+        );
+        assert!(base(&[("APPLETS_PORTAL_ORIGIN", "http://localhost:5173")]).is_ok());
     }
 }

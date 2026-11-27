@@ -214,6 +214,7 @@ pub(super) fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Session(_) => "session",
         Effect::Compute(_) => "compute",
         Effect::Git(_) => "git",
+        Effect::Workflow(_) => "workflow",
         Effect::Outbound(_) => "outbound",
         Effect::Plugin(_) => "plugin",
         Effect::Delay(_) => "delay",

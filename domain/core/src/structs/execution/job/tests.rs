@@ -24,7 +24,7 @@ use super::input::{
     CollisionPolicy, CompositionError, ExecutionSpec, ImportMetadataTarget, ImportRoCrateSource,
     ImportRoCrateSpec, ImportRoCrateTarget, InputMode, InputSelection, InputSource, JobPayload,
     OutputDestination, OutputSelection, PLUGIN_INSTALL_TAG, PLUGIN_WORK_TAG, RoCrateLimits,
-    TagError, Tagged, WorkspaceOutput, named_install, plan_composition, tagged,
+    TagError, Tagged, WorkspaceOutput, named_install, plan_composition, run_area_bucket, tagged,
 };
 use super::local::{
     AttemptControl, JobRecord, JobResultPayload, JobTransitionError, OutputCommitIntent,
@@ -411,6 +411,73 @@ fn resolves_workspace_outputs() {
 }
 
 #[test]
+fn binds_run_areas() {
+    // A run area output binds on the executing node to one bucket per group and node.
+    let (here, other) = (
+        iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
+        iroh::SecretKey::from_bytes(&[4u8; 32]).public(),
+    );
+    let output = |prefix: &str| OutputSelection {
+        container_path: "/work/**".to_string(),
+        path_prefix: Some("/work".to_string()),
+        destination_node_id: None,
+        destination: OutputDestination::RunArea {
+            prefix: prefix.to_string(),
+        },
+        name: None,
+        description: None,
+    };
+    let mut spec: ExecutionSpec = serde_json::from_value(serde_json::json!({
+        "group_id": Ulid::from_bytes([2u8; 16]), "name": null, "description": null,
+        "tags": {}, "image": "alpine", "entrypoint": null, "command": [], "workdir": null,
+        "env": {}, "resources": {"cpu_cores": null, "ram_bytes": null, "disk_bytes": null,
+            "max_walltime_ms": null, "preemptible": false},
+        "executor_constraint": null, "inputs": [], "file_outputs": [], "workspace_outputs": [],
+        "output_prefixes": [], "collision_policy": "reject", "backend": null
+    }))
+    .expect("a spec without gpus still reads");
+    assert_eq!(spec.resources.gpus, None);
+    spec.file_outputs = vec![output("run-1/tasks/a/work/"), output("run-2/work")];
+    let encoded = serde_json::to_string(&spec.file_outputs[0]).expect("encodes");
+    assert_eq!(
+        serde_json::from_str::<OutputSelection>(&encoded).expect("decodes"),
+        spec.file_outputs[0]
+    );
+
+    let bucket = spec.bind_run_areas(here).expect("a run area was bound");
+    assert_eq!(bucket, run_area_bucket(spec.group_id, here));
+    assert_ne!(bucket, run_area_bucket(spec.group_id, other));
+    assert!(crate::structs::storage::group_backend::valid_bucket(
+        &bucket
+    ));
+    let keys: Vec<_> = (spec.file_outputs.iter())
+        .map(|output| (output.destination_node_id, output.destination.clone()))
+        .collect();
+    let key = |key: &str| OutputDestination::S3 {
+        bucket: bucket.clone(),
+        key: key.to_string(),
+    };
+    assert_eq!(
+        keys,
+        [
+            (Some(here), key("run-1/tasks/a/work")),
+            (Some(here), key("run-2/work"))
+        ]
+    );
+    assert_eq!(spec.bind_run_areas(here), None);
+}
+
+#[test]
+fn reads_missing_gpus() {
+    let resources: EffectiveResources = serde_json::from_value(serde_json::json!({
+        "cpu_cores": 1, "ram_bytes": 2, "disk_bytes": 0, "max_walltime_ms": 3,
+        "preemptible": false
+    }))
+    .expect("stored resources without gpus still read");
+    assert_eq!(resources.gpus, 0);
+}
+
+#[test]
 fn external_name_deterministic() {
     let id = JobId::from_bytes([0xAB; 16]);
     let name = attempt_external_name(id, 2);
@@ -631,6 +698,7 @@ fn sample_resources() -> EffectiveResources {
         disk_bytes: 32 * 1024 * 1024 * 1024,
         max_walltime_ms: 3_600_000,
         preemptible: false,
+        gpus: 0,
     }
 }
 
@@ -895,15 +963,15 @@ fn canonical_encodings() {
         digests,
         [
             "2e3adfb3440145e2f0acf7dcac006c00cdbccb0fa8df37b935fc0ba4055993d2",
-            "240e97a3ad85964661055de2abcda8424c44612245aa3d2c7d46132973e13383",
-            "1c4dc854b3931565ff75fafec7a24673cc03c1989516f9b46dc93a093ec2bfeb",
-            "3bc380ef38b8aea7a61f277e383118ad35a7b5ed4130d3d52debb38a7e0cef42",
-            "67f5b55b2fb8a390fdc60fdaaba482585584f7a3413eec06415a0ce55f3c34b9",
-            "da6ae1482014c0c1535e57ae4632b530681fc0b8c6b4ba2bdbbb80c434c971f6",
-            "d14be59bb9e621e1117b683cb3f7ce6aa4625c1a016ca46566425c393767c3b4",
-            "4edb0f0f8747740b198088daa5871fc6cb1f7ef6c5a1374718c7fef8f6b63ce3",
-            "f5857651315f67e941101ee28b569748662845c823407846b6f87269bc84a66c",
-            "ee8318c302baf68aab8c51c3dd55d7966a1516206a92dc9582930d30a82aee97",
+            "82df1160068a95a1bbc7e7f7c35f7d26f852fda6fe5ead1b8361da79507d3eef",
+            "dbf2e891f86ecc501865cc534fc54319e31258b38e83a3b5787cabe98d466547",
+            "1a27d20bb23cbd8d961014bbbb505d555039e8cb631383515abc6cc4b5baceb4",
+            "348021af7e7900faf65ede976a43fdfb00bf1a42f26c821772a59b34fd26f46d",
+            "5a950925dd15248da24cb2c6d70b3584f2c51270125363f409e532cb3eaae360",
+            "c16329566ab10bc6d1516f66adaa6bb95c0aabe3b0061f63e3204813e41ee58a",
+            "fcce6edd3a31904205618d7b992c1e6b86c7f806a55db7c72e47a463477ddacc",
+            "ef41145d60d92be31c4789591b2c3e5b5f64bce53d8ea8c97be00c529ea8fbc3",
+            "8d9df8b5138fba963a1ab4b42ea59d979fe744565d553d8b6c376a9650358e5d",
             "4fc7a54b9e841491ec560e5aa7d9c7559b9bbdb966cb63dc7e97a0d93ad64894",
         ]
     );

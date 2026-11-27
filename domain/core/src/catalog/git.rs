@@ -259,6 +259,15 @@ pub enum GitEffect {
         from: Option<String>,
         to: String,
     },
+    /// Commits file contents (`None` removes the path) on top of `head` without moving any ref;
+    /// answered by [`GitEvent::Edited`].
+    Commit {
+        document_id: Ulid,
+        head: String,
+        files: Vec<(String, Option<Bytes>)>,
+        message: String,
+        occurred_at_ms: u64,
+    },
     /// Commits the snapshot's metadata on top of `head` without moving any ref.
     Edit {
         head: String,
@@ -358,6 +367,7 @@ impl std::fmt::Debug for GitEffect {
             Self::Commits { .. } => "Commits",
             Self::Log { .. } => "Log",
             Self::Diff { .. } => "Diff",
+            Self::Commit { .. } => "Commit",
             Self::Edit { .. } => "Edit",
             Self::Merge { .. } => "Merge",
             Self::MergeMetadata { .. } => "MergeMetadata",

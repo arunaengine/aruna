@@ -2,11 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::{JobTargetResponse, NodeJobsResponse, visible_jobs};
+use super::{JobTargetResponse, NodeJobsResponse, kind_filter, kind_name, visible_jobs};
 use crate::server::state::ServerState;
 use crate::tests::routes::{seed_group_docs, test_storage};
 use aruna_core::jobs::{JobKind, JobTarget, RunningJobView};
 use aruna_core::keys::generate_signing_key;
+use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::execution::job::local::JobProgress;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::RealmId;
@@ -93,7 +94,10 @@ fn auth(fixture: &Fixture, user_id: UserId) -> AuthContext {
 
 fn copy_job(group: Ulid, bucket: &str, created_by: UserId, started: u64) -> RunningJobView {
     RunningJobView {
+        job_id: JobId::from_bytes([started as u8; 16]),
         kind: JobKind::CopyObject,
+        session: false,
+        cancel_requested: false,
         target: Some(JobTarget::Bucket {
             bucket: bucket.to_string(),
             path: Some("assemblies/2025/".to_string()),
@@ -114,7 +118,10 @@ fn copy_job(group: Ulid, bucket: &str, created_by: UserId, started: u64) -> Runn
 fn node_jobs(fixture: &Fixture) -> Vec<RunningJobView> {
     let stranger = UserId::local(Ulid::generate(), fixture.state.get_realm_id());
     let dataset = RunningJobView {
+        job_id: JobId::from_bytes([3; 16]),
         kind: JobKind::RegisterIdentifiers,
+        session: false,
+        cancel_requested: true,
         target: Some(JobTarget::Dataset {
             dataset_id: Ulid::generate(),
         }),
@@ -153,6 +160,9 @@ async fn admin_sees_everything() {
     assert!(response.jobs.iter().all(|job| job.started_at.is_some()));
     let dataset = &response.jobs[2];
     assert_eq!(dataset.kind, "register_identifiers");
+    assert_eq!(dataset.job_id, Some(JobId::from_bytes([3; 16]).to_string()));
+    assert_eq!(dataset.state, "cancelling");
+    assert_eq!(response.jobs[0].state, "running");
     assert!(matches!(
         dataset.target,
         Some(JobTargetResponse::Dataset { .. })
@@ -210,7 +220,10 @@ async fn visitor_sees_kinds() {
             ["copy_object", "copy_object", "register_identifiers"]
         );
         assert!(response.jobs.iter().all(|job| {
-            job.target.is_none() && job.progress.is_none() && job.started_at.is_none()
+            job.target.is_none()
+                && job.progress.is_none()
+                && job.started_at.is_none()
+                && job.job_id.is_none()
         }));
     }
 }
@@ -350,4 +363,19 @@ async fn path_policy_hides() {
         .await
         .unwrap();
     assert_eq!((response.jobs.len(), response.hidden), (1, 1));
+}
+
+#[test]
+fn filters_job_kinds() {
+    // `session` names notebook sessions, `execution` only the runs that are not sessions.
+    let mut job = copy_job(Ulid::generate(), "bakta-runs", UserId::default(), 1);
+    assert_eq!(kind_name(&job), "copy_object");
+    job.kind = JobKind::Execution;
+    assert_eq!(kind_name(&job), "execution");
+    job.session = true;
+    assert_eq!(kind_name(&job), "session");
+    let kinds = kind_filter(Some("workflow_run, session")).unwrap();
+    assert_eq!(kinds, Some(vec!["workflow_run", "session"]));
+    assert_eq!(kind_filter(None).unwrap(), None);
+    assert!(kind_filter(Some("notebooks")).is_err());
 }

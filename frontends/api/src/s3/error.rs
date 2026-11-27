@@ -728,6 +728,12 @@ impl IntoS3Error for GetObjectError {
                     "Access to the object was denied by its holder."
                 )
             }
+            GetObjectError::EncryptedDisallowed => {
+                s3_error!(
+                    AccessDenied,
+                    "Encrypted inputs require a protected workflow run."
+                )
+            }
             // No holder served and at least one failed: a fault a retry may
             // clear, never object absence.
             GetObjectError::HoldersUnavailable => {

@@ -34,7 +34,7 @@ const REQUEST_DIGEST_DOMAIN: &[u8] = b"aruna-job-request-v1";
 const WORKSPACE_MODE_TAG: &str = "aruna-engine.org/workspace-mode";
 const WORKSPACE_BUCKET_TAG: &str = "aruna-engine.org/workspace-bucket";
 /// `aruna-engine.org/label/<key> = <value>` is one required target label.
-const LABEL_TAG_PREFIX: &str = "aruna-engine.org/label/";
+pub const LABEL_TAG_PREFIX: &str = "aruna-engine.org/label/";
 
 /// Cores assumed when a request declares none.
 const DEFAULT_CPU_CORES: u32 = 1;
@@ -267,6 +267,7 @@ pub fn effective_resources(spec: &ExecutionSpec) -> EffectiveResources {
             .max_walltime_ms
             .unwrap_or(DEFAULT_WALLTIME_MS),
         preemptible: spec.resources.preemptible,
+        gpus: spec.resources.gpus.unwrap_or_default(),
     }
 }
 

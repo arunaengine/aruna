@@ -808,6 +808,7 @@ pub(super) mod tests {
             disk_bytes: 0,
             max_walltime_ms: 60_000,
             preemptible: false,
+            gpus: 0,
         };
         let group_id = Ulid::from_bytes([14u8; 16]);
         let job_id = JobId::from_bytes([5u8; 16]);

@@ -268,6 +268,31 @@ impl SecretFields {
         }
     }
 
+    /// Resolves one scalar field value for environment injection: an explicit field name, else
+    /// the kind's single credential field or the sole stored field.
+    pub fn resolve_field(
+        &self,
+        kind: &SecretKind,
+        field: Option<&str>,
+    ) -> Result<Secret, SecretError> {
+        if let Some(name) = field {
+            return self.0.get(name).cloned().ok_or(SecretError::Fields);
+        }
+        let default = match kind.as_str() {
+            "bearer" => Some("token"),
+            "header" => Some("value"),
+            "hmac" => Some("key"),
+            _ => None,
+        };
+        if let Some(name) = default {
+            return self.0.get(name).cloned().ok_or(SecretError::Fields);
+        }
+        match self.0.len() {
+            1 => Ok(self.0.values().next().cloned().ok_or(SecretError::Fields)?),
+            _ => Err(SecretError::Fields),
+        }
+    }
+
     pub fn encode(&self) -> Result<SecretBytes, SecretError> {
         postcard::to_allocvec(&self.0)
             .map(SecretBytes::new)
@@ -298,11 +323,12 @@ pub enum SecretScope {
     User(UserId),
 }
 
-/// Who may use a secret. Group plugin installs are the only consumers for now.
+/// Who may use a secret: a group plugin install or a registered workflow.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SecretConsumer {
     Plugin { plugin_id: String, install_id: Ulid },
+    Workflow { workflow_id: Ulid },
 }
 
 /// How a consumer gets a secret.
@@ -362,18 +388,23 @@ pub fn check_rules(
 ) -> Result<(), SecretError> {
     let spec = kind.spec()?;
     for rule in rules {
-        let SecretConsumer::Plugin { plugin_id, .. } = &rule.consumer;
-        let consumer = !plugin_id.is_empty()
-            && plugin_id.len() <= MAX_NAME * 2
-            && plugin_id.bytes().all(|byte| byte.is_ascii_graphic());
+        let (consumer, workflow) = match &rule.consumer {
+            SecretConsumer::Plugin { plugin_id, .. } => (
+                !plugin_id.is_empty()
+                    && plugin_id.len() <= MAX_NAME * 2
+                    && plugin_id.bytes().all(|byte| byte.is_ascii_graphic()),
+                false,
+            ),
+            SecretConsumer::Workflow { .. } => (true, true),
+        };
         let groups = match scope {
             SecretScope::Node | SecretScope::Realm => !rule.groups.is_empty(),
             SecretScope::Group(_) => rule.groups.is_empty(),
-            // A plugin acts as its install's service account, never as a user.
+            // User secrets belong to one user and take no use rules.
             SecretScope::User(_) => false,
         };
         let request = match rule.delivery {
-            Delivery::Inject => {
+            Delivery::Inject if !workflow => {
                 spec.inject.is_some()
                     && !rule.origins.is_empty()
                     && rule.origins.iter().all(|origin| https_origin(origin))
@@ -381,13 +412,20 @@ pub fn check_rules(
                     && rule.methods.iter().all(|method| http_method(method))
                     && exposure_valid(&rule.response)
             }
-            Delivery::Verify | Delivery::Value => {
-                (rule.delivery == Delivery::Value || spec.verify.is_some())
+            Delivery::Verify if !workflow => {
+                spec.verify.is_some()
                     && rule.origins.is_empty()
                     && rule.paths.is_empty()
                     && rule.methods.is_empty()
                     && rule.response == ResponseExposure::Status
             }
+            Delivery::Value => {
+                rule.origins.is_empty()
+                    && rule.paths.is_empty()
+                    && rule.methods.is_empty()
+                    && rule.response == ResponseExposure::Status
+            }
+            Delivery::Inject | Delivery::Verify => false,
         };
         if !consumer || !groups || !request {
             return Err(SecretError::Rule);

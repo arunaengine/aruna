@@ -614,6 +614,34 @@ pub const SHARE_USE_KEYSPACE: &str = "share_uses";
 /// Upload names claimed by running share uploads, by bucket and key, with the claim's end.
 pub const SHARE_NAME_KEYSPACE: &str = "share_upload_names";
 
+/// Workflows of the registry by workflow id, with their group, visibility and version count.
+pub const WORKFLOW_KEYSPACE: &str = "workflows";
+/// Workflow versions by workflow id and big-endian version number, with stored preflight results.
+pub const WORKFLOW_VERSION_KEYSPACE: &str = "workflow_versions";
+/// The files of each workflow version, keyed like its version row.
+pub const WORKFLOW_SOURCE_KEYSPACE: &str = "workflow_sources";
+/// Tool definitions of the catalog by tool id, version and group.
+pub const WORKFLOW_TOOL_KEYSPACE: &str = "workflow_tools";
+/// Workflow runs of this node by run id.
+pub const WORKFLOW_RUN_KEYSPACE: &str = "workflow_runs";
+/// The tasks of each workflow run by run id and big-endian task number.
+pub const WORKFLOW_TASK_KEYSPACE: &str = "workflow_tasks";
+/// The event stream rows of each run by run id and big-endian sequence.
+pub const RUN_EVENT_KEYSPACE: &str = "workflow_run_events";
+/// The run log pages of each run by run id and big-endian page number, outside the job family.
+pub const RUN_LOG_KEYSPACE: &str = "workflow_run_logs";
+/// The run each idempotency key started, by group, caller and key.
+pub const RUN_IDEMPOTENCY_KEYSPACE: &str = "workflow_run_keys";
+/// Reusable task results by scope namespace and task key; a newer result replaces an older one.
+pub const WORKFLOW_CACHE_KEYSPACE: &str = "workflow_task_cache";
+/// The finished RO-Crate JSON-LD of each workflow run, by run id.
+pub const WORKFLOW_CRATE_KEYSPACE: &str = "workflow_run_crates";
+
+/// Applet records by applet id, and an index row per group and applet with an empty value.
+pub const APPLETS_KEYSPACE: &str = "applets";
+/// Applet hosts and verified custom domains by normalized host name, naming their applet.
+pub const APPLET_HOSTS_KEYSPACE: &str = "applet_hosts";
+
 /// Every keyspace this crate defines, so tooling reports a missing one without
 /// maintaining its own copy of the list.
 pub const KEYSPACE_CATALOG: &[&str] = &[
@@ -927,6 +955,19 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     SHARE_EVENT_KEYSPACE,
     SHARE_USE_KEYSPACE,
     SHARE_NAME_KEYSPACE,
+    WORKFLOW_KEYSPACE,
+    WORKFLOW_VERSION_KEYSPACE,
+    WORKFLOW_SOURCE_KEYSPACE,
+    WORKFLOW_TOOL_KEYSPACE,
+    WORKFLOW_RUN_KEYSPACE,
+    APPLETS_KEYSPACE,
+    APPLET_HOSTS_KEYSPACE,
+    WORKFLOW_TASK_KEYSPACE,
+    RUN_EVENT_KEYSPACE,
+    RUN_LOG_KEYSPACE,
+    RUN_IDEMPOTENCY_KEYSPACE,
+    WORKFLOW_CACHE_KEYSPACE,
+    WORKFLOW_CRATE_KEYSPACE,
 ];
 
 /// Smallest key strictly greater than every key starting with `prefix`,

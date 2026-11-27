@@ -10,6 +10,9 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_ops_work::jobs::route::JobRouteError;
 use aruna_ops_work::jobs::runs::RunReadError;
+use aruna_ops_work::workflows::runs::RunAccessOperation;
+use aruna_ops_work::workflows::{CatalogError, Need};
+use aruna_runner::driver::drive;
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::{Extension, Json};
@@ -62,6 +65,8 @@ restrictions; anyone else needs READ on the run crate with their own token.
 - A caller who may not see the run gets 404, as for job reads.
 - The submitter also gets `run_crate_status`, so a crate that is still being written
   (`pending`), was denied, failed or is kept on a device says why instead of only being absent.
+- A workflow run id of this node leads to the run's crate document too; anyone who reads the
+  run sees it.
 
 **Limits**
 - One run per call."#,
@@ -91,6 +96,39 @@ pub async fn get_run(
     run_answer(&state, &auth, bearer, &headers, (&run_id, deadline)).await
 }
 
+/// What a reader of a workflow run of this node sees of its crate; `None` for any other id.
+async fn workflow_run(
+    state: &ServerState,
+    auth: &AuthContext,
+    run_id: &str,
+) -> ServerResult<Option<RunResponse>> {
+    let Ok(id) = ulid::Ulid::from_string(run_id) else {
+        return Ok(None);
+    };
+    let access = RunAccessOperation::new(auth, id, Need::Read);
+    let record = match drive(access, &state.get_ctx()).await {
+        Ok((record, _)) => record,
+        Err(CatalogError::NotFound | CatalogError::Forbidden) => return Ok(None),
+        Err(error) => return Err(ServerError::ServiceUnavailableReason(error.to_string())),
+    };
+    let creator = auth.user_id == record.created_by && auth.path_restrictions.is_none();
+    let status = (record.provenance_status.clone()).map(|status| {
+        serde_json::json!({
+            "status": status,
+            "resource": record.provenance_document_id.map(|id| id.to_string()),
+        })
+    });
+    Ok(Some(RunResponse {
+        run_id: record.run_id.to_string(),
+        logical_job_id: (record.parent_job_id.filter(|_| creator)).map(|id| id.to_string()),
+        run_crate: record.provenance_document_id.map(|id| id.to_string()),
+        run_crate_iri: record
+            .provenance_document_id
+            .map(MetadataRegistryRecord::graph_iri_for),
+        run_crate_status: status.filter(|_| creator),
+    }))
+}
+
 /// What the caller may see of run `run_id`, read on the node that ran it.
 pub(crate) async fn run_answer(
     state: &ServerState,
@@ -99,6 +137,9 @@ pub(crate) async fn run_answer(
     headers: &HeaderMap,
     (run_id, deadline): (&str, tokio::time::Instant),
 ) -> ServerResult<Json<RunResponse>> {
+    if let Some(answer) = workflow_run(state, auth, run_id).await? {
+        return Ok(Json(answer));
+    }
     let run_id = crate::jobs::parse_job_id(run_id).map_err(|_| ServerError::NotFound)?;
     let context = state.get_ctx();
     if !node_directed(state, headers)? && context.net_handle.is_some() {

@@ -52,6 +52,7 @@ pub fn run_cleanup(payload: &JobPayload) {
         | JobPayload::BackendImport(_)
         | JobPayload::WebhookDelivery(_)
         | JobPayload::EmailDelivery(_)
-        | JobPayload::PluginWork(_) => {}
+        | JobPayload::PluginWork(_)
+        | JobPayload::WorkflowRun(_) => {}
     }
 }
