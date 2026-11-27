@@ -12,10 +12,11 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::vfs::{
     BucketScope, DirectoryWitness, FileIdentity, HandleIdentity, HandleKind, NfsStageRecord,
-    StageBase, StageDisposition,
+    StageBase,
 };
 use aruna_core::user::id::UserId;
 use aruna_core::vfs_effects::{InstanceSummary, ReadLockCheck, VfsFailure, VfsProtocol};
+use aruna_ops_data::replication::live_queue::{CompletePutInput, CompletePutOperation};
 use aruna_ops_data::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use aruna_ops_data::s3::object::put::{PutObjectConfig, PutObjectInput};
 use aruna_ops_data::vfs::io::{DispositionInput, ReadInput};
@@ -23,7 +24,7 @@ use aruna_ops_data::vfs::mutate::{MkdirInput, RenameInput};
 use aruna_ops_data::vfs::path::{NameUse, check_component, child_key, marker_key, split_parent};
 use aruna_ops_data::vfs::policy::{VfsAccess, VfsRequest};
 use aruna_ops_data::vfs::publish::{CloseInput, CloseOutcome, PublishInput, Published};
-use aruna_ops_data::vfs::recovery::ReceiptInput;
+use aruna_ops_data::vfs::recovery::{ReceiptInput, ReceiptOutcome};
 use aruna_ops_data::vfs::{
     AuthorizeVfsOperation, InstanceTarget, LiveStageOperation, LookupInstanceOperation,
     VfsAccessContext, VfsCloseOperation, VfsDispositionOperation, VfsError, VfsMkdirOperation,
@@ -74,7 +75,7 @@ struct Prepared {
 }
 
 /// What a close needs of the backend, owned, so a background retry outlives a borrow of it.
-struct CloseRunner {
+pub(super) struct CloseRunner {
     driver: Arc<DriverContext>,
     realm_id: RealmId,
     node_id: NodeId,
@@ -250,10 +251,30 @@ impl CloseRunner {
         Ok((input, put))
     }
 
+    /// The ordinary post-PUT completion of the version `prior` committed for `open`.
+    pub(super) fn completion_input(
+        &self,
+        open: &FileOpen,
+        prior: &PublishRetry,
+        version_id: Ulid,
+    ) -> CompletePutInput {
+        CompletePutInput {
+            realm_id: self.realm_id,
+            node_id: self.node_id,
+            auth: open.auth.clone(),
+            group_id: open.info.group_id,
+            bucket: open.bucket.clone(),
+            key: prior.key.clone(),
+            version_id,
+            size_bytes: prior.logical_size,
+        }
+    }
+
     /// Settles the publication attempt an earlier try of `entry` left, so a write whose
-    /// outcome stayed unknown releases its attempt before another one starts.
+    /// outcome stayed unknown releases its attempt before another one starts. A committed
+    /// attempt gets the post-PUT completion its lost close never ran.
     async fn settle_publish(&self, entry: &PendingDelete) -> Result<(), VfsError> {
-        let prior = *entry.publish.lock();
+        let prior = entry.publish.lock().clone();
         let Some(prior) = prior else {
             return Ok(());
         };
@@ -266,7 +287,17 @@ impl CloseRunner {
             logical_size: Some(prior.logical_size),
             expected_edit: prior.expected_edit,
         };
-        drive(VfsReceiptOperation::new(receipt), &self.driver).await?;
+        let outcome = drive(VfsReceiptOperation::new(receipt), &self.driver).await?;
+        if let ReceiptOutcome::Applied {
+            version_id: Some(version_id),
+            ..
+        } = outcome
+        {
+            let complete =
+                CompletePutOperation::new(self.completion_input(open, &prior, version_id));
+            // Best effort, matching VfsPublishOperation and REST stage publish.
+            let _ = drive(complete, &self.driver).await;
+        }
         *entry.publish.lock() = None;
         Ok(())
     }
@@ -285,9 +316,8 @@ impl CloseRunner {
         let mut owner = false;
         if let Some(summary) = found.filter(|summary| summary.instance_id == open.instance_id) {
             parts.stage = self.live_stage(open, &summary).await?;
-            let stage = parts.stage.as_ref();
-            owner = open.write && summary.detached.is_none() && !is_quota_blocked(stage);
-            if owns_publish(open, &summary, stage) {
+            owner = open.write && summary.detached.is_none();
+            if owns_publish(open, &summary) {
                 let live = current_open(open, Some(&summary));
                 let stage = parts.stage.clone();
                 let publish = self.prepare(&live, &summary, stage).await;
@@ -320,28 +350,18 @@ fn retry_of(publish: &(PublishInput, PutObjectConfig)) -> PublishRetry {
     let (input, _) = publish;
     PublishRetry {
         attempt_id: input.attempt_id,
+        key: input.key.clone(),
         logical_size: input.logical_size,
         expected_edit: input.expected_edit,
     }
 }
 
-/// True when the node's quota retry owns the live checkpoint `stage`.
-pub(super) fn is_quota_blocked(stage: Option<&NfsStageRecord>) -> bool {
-    stage.is_some_and(|stage| {
-        stage.disposition == StageDisposition::Live && stage.quota_retry.is_some()
-    })
-}
-
 /// True when the close of `open` publishes the dirty bytes itself: it is the last writer,
-/// with no pending delete, a name left and no quota retry owning the checkpoint.
-pub(super) fn owns_publish(
-    open: &FileOpen,
-    summary: &InstanceSummary,
-    stage: Option<&NfsStageRecord>,
-) -> bool {
+/// with no pending delete and a name left. A full quota fails that close.
+pub(super) fn owns_publish(open: &FileOpen, summary: &InstanceSummary) -> bool {
     let deleting = summary.delete_pending || open.delete_on_close;
     let last = summary.writer_count <= 1 && !deleting && summary.detached.is_none();
-    open.write && summary.dirty && last && !is_quota_blocked(stage)
+    open.write && summary.dirty && last
 }
 
 /// A close failure a later retry may still get past; any other one ended the close for good.
@@ -440,7 +460,7 @@ async fn finish_pending(
 }
 
 impl ArunaSmbBackend {
-    fn close_runner(&self) -> CloseRunner {
+    pub(super) fn close_runner(&self) -> CloseRunner {
         CloseRunner {
             driver: Arc::clone(&self.driver),
             realm_id: self.realm_id,
@@ -656,7 +676,7 @@ impl ArunaSmbBackend {
         parts: &mut CloseParts,
     ) -> Result<(), BackendError> {
         parts.stage = self.live_stage(open, summary).await?;
-        if owns_publish(open, summary, parts.stage.as_ref()) {
+        if owns_publish(open, summary) {
             let stage = parts.stage.clone();
             parts.publish = Some(self.prepare(open, summary, stage).await?);
         }
@@ -681,7 +701,6 @@ impl ArunaSmbBackend {
             Ok(None) => {}
             Err(error) => failure = Some(error),
         }
-        let quota_blocked = is_quota_blocked(parts.stage.as_ref());
         let publish = parts.publish.as_ref().map(retry_of);
         // Retry in the background if the marker template fails so a final delete never lacks it.
         let put = match self.close_runner().marker_template(&open).await {
@@ -710,9 +729,9 @@ impl ArunaSmbBackend {
                 time = Some(published.version_id);
             }
             CloseOutcome::Closed | CloseOutcome::Deleted | CloseOutcome::Discarded => {}
-            // A detached instance has no name left to publish to; a read-only open or a
-            // quota-blocked checkpoint leaves publication to its writer or the quota retry.
-            CloseOutcome::Pending if detached || !open.write || quota_blocked => {}
+            // A detached instance has no name left to publish to; a read-only open leaves
+            // publication (and any scheduled quota retry) to its writer.
+            CloseOutcome::Pending if detached || !open.write => {}
             CloseOutcome::QuotaBlocked => return Err(BackendError::DiskFull),
             CloseOutcome::Retained(_) => return Err(BackendError::Denied),
             // The backend keeps the close and publishes the dirty bytes on a later retry.

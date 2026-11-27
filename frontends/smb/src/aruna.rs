@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::id::NodeId;
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::vfs::{
@@ -68,6 +69,8 @@ struct FileOpen {
     /// Opened with FILE_DELETE_ON_CLOSE, so its close may be the final delete.
     delete_on_close: bool,
     owner: StageOwner,
+    /// The caller context the open was granted under, for the work after a publication.
+    auth: AuthContext,
     info: BucketInfo,
     opened_ms: u64,
 }
@@ -85,9 +88,11 @@ struct PendingDelete {
 }
 
 /// One publication attempt whose uncertain outcome must be settled before another write.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct PublishRetry {
     attempt_id: Ulid,
+    /// The key the attempt published to, which a rename while open may have changed.
+    key: String,
     logical_size: u64,
     expected_edit: Option<u64>,
 }

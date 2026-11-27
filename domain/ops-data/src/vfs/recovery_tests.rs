@@ -67,7 +67,13 @@ fn removal_receipt_detaches() {
     let Ok(Next::Then { output, calls }) = operation.next(IoResult::Values(vec![None])) else {
         panic!("expected the settled outcome");
     };
-    assert_eq!(output, ReceiptOutcome::Applied { life_id: None });
+    assert_eq!(
+        output,
+        ReceiptOutcome::Applied {
+            life_id: None,
+            version_id: None,
+        }
+    );
     // Detach the surviving open, release the attempt, then retire the receipt last.
     assert_eq!(calls.len(), 4);
     let receipt_key = state_key(&VfsKey::Receipt(id(20))).unwrap();
@@ -99,7 +105,13 @@ fn smb_receipt_detaches() {
     let Ok(Next::Then { output, calls }) = operation.next(IoResult::Values(vec![None])) else {
         panic!("expected the settled outcome");
     };
-    assert_eq!(output, ReceiptOutcome::Applied { life_id: None });
+    assert_eq!(
+        output,
+        ReceiptOutcome::Applied {
+            life_id: None,
+            version_id: None,
+        }
+    );
     let detach = super::vfs_call(VfsEffect::DetachInstance {
         scope: scope(),
         handle_id: 0,
@@ -179,7 +191,8 @@ fn publish_receipt_advances() {
     assert_eq!(
         output,
         ReceiptOutcome::Applied {
-            life_id: Some(id(8))
+            life_id: Some(id(8)),
+            version_id: Some(id(2)),
         }
     );
     let rebind = calls.iter().any(|call| {
@@ -387,7 +400,10 @@ fn finished_receipts_settle() {
     assert!(matches!(asked(&turn), VfsEffect::ActiveAttempts { .. }));
     let turn = operation.next(vfs(VfsEvent::Attempts { ids: Vec::new() }));
     assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
-    let settled = ReceiptOutcome::Applied { life_id: None };
+    let settled = ReceiptOutcome::Applied {
+        life_id: None,
+        version_id: None,
+    };
     let turn = operation.next(child(settled));
     assert!(matches!(turn, Ok(Next::Call(IoCall::Delete(_)))));
 

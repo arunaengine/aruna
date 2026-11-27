@@ -464,6 +464,7 @@ fn publish_completes_put() {
     operation.next(IoResult::Done).unwrap();
     let settled = ReceiptOutcome::Applied {
         life_id: Some(id(31)),
+        version_id: None,
     };
     let Ok(Next::Then { calls, .. }) = operation.next(child(settled)) else {
         panic!("the publication settles with its follow-up calls");
@@ -1103,7 +1104,10 @@ fn retry_settles_receipt() {
     };
     let turn = retry.next(vfs(VfsEvent::Instance(Some(found))));
     assert_eq!(turn, Ok(Next::Call(settling())));
-    let turn = retry.next(child(ReceiptOutcome::Applied { life_id: None }));
+    let turn = retry.next(child(ReceiptOutcome::Applied {
+        life_id: None,
+        version_id: None,
+    }));
     assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
     assert_eq!(retry.next(child(())), Ok(Next::Call(IoCall::Sync)));
     let remove = VfsEffect::RemoveCheckpoint {

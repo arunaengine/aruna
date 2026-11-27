@@ -6,12 +6,13 @@
 use std::time::{Duration, SystemTime};
 
 use aruna_core::effects::StorageEffect;
-use aruna_core::keyspaces::{S3_BUCKET_KEYSPACE, USER_ACCESS_KEYSPACE};
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::{NFS_STATE_KEYSPACE, S3_BUCKET_KEYSPACE, USER_ACCESS_KEYSPACE};
 use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::structs::storage::distribution::{DistributionBinding, DistributionRevision};
 use aruna_core::structs::storage::vfs::{
-    DetachReason, FileIdentity, NfsStageRecord, QuotaRetry, StageBase, StageDisposition, StageScope,
+    FileIdentity, ReceiptChange, StageScope, VfsKey, VfsReceipt, VfsRecord,
 };
 use aruna_core::user::id::UserId;
 use aruna_core::vfs_effects::InstanceSummary;
@@ -169,6 +170,7 @@ fn joined_open(version_id: Option<Ulid>) -> FileOpen {
             mount_id: Ulid::nil(),
             scope: StageScope::User,
         },
+        auth: AuthContext::new(user, realm()),
         info,
         opened_ms: 0,
     }
@@ -505,33 +507,8 @@ fn prepare_errors_retry() {
     assert!(writes::retry_done(Err(directory)));
 }
 
-/// A live checkpoint row of `open`, waiting for quota when `retry` is set.
-fn stage_row(open: &FileOpen, retry: Option<QuotaRetry>) -> NfsStageRecord {
-    NfsStageRecord {
-        stage_id: Ulid::from_parts(2, 2),
-        handle_id: 4,
-        owner: open.owner.clone(),
-        key: open.key.clone(),
-        generation: 1,
-        checkpoint: "c-1".into(),
-        logical_size: 12,
-        base: StageBase::Unpublished {
-            token: Ulid::from_parts(3, 3),
-            predecessor: None,
-        },
-        source_copies: Vec::new(),
-        source_policies: Vec::new(),
-        destination_copies: Vec::new(),
-        destination_policies: Vec::new(),
-        disposition: StageDisposition::Live,
-        quota_retry: retry,
-        foreign_life: None,
-        updated_at_ms: 0,
-    }
-}
-
-/// Only the last writer publishes dirty bytes at close; a read-only open and a checkpoint the
-/// quota retry owns leave them to their owner.
+/// Only the last writer publishes dirty bytes at close, also over a checkpoint waiting for
+/// quota; a read-only open leaves them and any quota retry to their writer.
 #[test]
 fn reader_skips_publish() {
     let writer = joined_open(None);
@@ -540,28 +517,11 @@ fn reader_skips_publish() {
     let mut summary = renamed_instance(None, Ulid::from_parts(1, 1));
     summary.dirty = true;
     summary.writer_count = 0;
-    let live = stage_row(&writer, None);
-    let retry = QuotaRetry {
-        attempts: 1,
-        next_at_ms: 10,
-    };
-    let waiting = stage_row(&writer, Some(retry));
-    let mut kept = waiting.clone();
-    kept.disposition = StageDisposition::Retained {
-        reason: DetachReason::LostLife,
-    };
-    assert!(writes::is_quota_blocked(Some(&waiting)));
-    assert!(!writes::is_quota_blocked(Some(&live)));
-    assert!(!writes::is_quota_blocked(Some(&kept)));
-    assert!(!writes::is_quota_blocked(None));
-
-    assert!(!writes::owns_publish(&reader, &summary, None));
-    assert!(!writes::owns_publish(&reader, &summary, Some(&live)));
-    assert!(!writes::owns_publish(&writer, &summary, Some(&waiting)));
-    assert!(writes::owns_publish(&writer, &summary, None));
-    assert!(writes::owns_publish(&writer, &summary, Some(&live)));
+    assert!(!writes::owns_publish(&reader, &summary));
+    summary.writer_count = 1;
+    assert!(writes::owns_publish(&writer, &summary));
     summary.writer_count = 2;
-    assert!(!writes::owns_publish(&writer, &summary, None));
+    assert!(!writes::owns_publish(&writer, &summary));
 }
 
 /// A queued close keeps the publication attempt it left until a retry settles it, and the
@@ -574,17 +534,18 @@ async fn publish_retry_tracked() {
     let key = (scope.clone(), open.open_id);
     let attempt = PublishRetry {
         attempt_id: Ulid::from_parts(5, 5),
+        key: open.key.clone(),
         logical_size: 12,
         expected_edit: Some(3),
     };
-    server.queue_pending(open.clone(), None, Some(attempt));
+    server.queue_pending(open.clone(), None, Some(attempt.clone()));
     let entry = server.pending.lock().get(&key).cloned();
     let entry = entry.expect("the failed close is queued");
-    assert_eq!(*entry.publish.lock(), Some(attempt));
+    assert_eq!(*entry.publish.lock(), Some(attempt.clone()));
     // Another failed close of the same open never replaces the attempt still to settle.
     let other = PublishRetry {
         attempt_id: Ulid::from_parts(6, 6),
-        ..attempt
+        ..attempt.clone()
     };
     server.queue_pending(open.clone(), None, Some(other));
     assert_eq!(*entry.publish.lock(), Some(attempt));
@@ -594,4 +555,73 @@ async fn publish_retry_tracked() {
     assert!(!server.drain_pending(&scope).await);
     assert!(server.pending.lock().contains_key(&key));
     assert_eq!(*entry.publish.lock(), None);
+}
+
+/// A queued close whose publication committed before its sync failed settles the receipt as
+/// applied and builds the post-PUT completion of that version under the renamed key.
+#[tokio::test(start_paused = true)]
+async fn applied_retry_completes() {
+    let storage = MemoryStorage::open();
+    let server = backend(storage.clone());
+    let open = joined_open(None);
+    let scope = BucketScope::new(open.bucket.clone(), open.incarnation);
+    let prior = PublishRetry {
+        attempt_id: Ulid::from_parts(7, 7),
+        key: "moved.txt".into(),
+        logical_size: 12,
+        expected_edit: Some(3),
+    };
+    let version_id = Ulid::from_parts(8, 8);
+    let receipt = VfsReceipt {
+        attempt_id: prior.attempt_id,
+        scope: scope.clone(),
+        created_at_ms: 0,
+        change: ReceiptChange::FilePublish {
+            key: prior.key.clone(),
+            version_id,
+            life_id: Ulid::from_parts(9, 9),
+            handle_id: None,
+            stage_id: None,
+        },
+    };
+    let row_key = VfsKey::Receipt(prior.attempt_id).to_bytes();
+    let row_key = row_key.expect("the receipt key encodes");
+    let row = receipt.to_bytes().expect("the receipt encodes");
+    write_row(&storage, NFS_STATE_KEYSPACE, &row_key, row).await;
+
+    let complete = server
+        .close_runner()
+        .completion_input(&open, &prior, version_id);
+    assert_eq!(complete.realm_id, realm());
+    assert_eq!(complete.node_id, node());
+    assert_eq!(complete.auth, open.auth);
+    assert_eq!(complete.group_id, open.info.group_id);
+    assert_eq!(complete.bucket, open.bucket);
+    assert_eq!(complete.key, prior.key);
+    assert_eq!(complete.version_id, version_id);
+    assert_eq!(complete.size_bytes, prior.logical_size);
+
+    server.queue_pending(open.clone(), None, Some(prior));
+    let entry = server
+        .pending
+        .lock()
+        .get(&(scope.clone(), open.open_id))
+        .cloned();
+    let entry = entry.expect("the failed close is queued");
+    // The lookup after the settled receipt fails on a node without file servers.
+    assert!(!server.drain_pending(&scope).await);
+    assert_eq!(*entry.publish.lock(), None);
+    let read = StorageEffect::Read {
+        key_space: NFS_STATE_KEYSPACE.to_string(),
+        key: row_key.as_slice().into(),
+        txn_id: None,
+    };
+    let left = storage.send_storage_effect(read).await;
+    assert!(
+        matches!(
+            left,
+            Event::Storage(StorageEvent::ReadResult { value: None, .. })
+        ),
+        "the applied receipt is retired: {left:?}"
+    );
 }

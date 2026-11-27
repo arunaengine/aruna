@@ -298,6 +298,7 @@ fn committed_file_moves() {
     assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
     let settled = ReceiptOutcome::Applied {
         life_id: Some(id(31)),
+        version_id: None,
     };
     let Ok(Next::Then { calls, .. }) = operation.next(child(settled)) else {
         panic!("the move settles with its releases");
@@ -583,6 +584,7 @@ fn unpublished_replaces_live() {
     assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
     let settled = ReceiptOutcome::Applied {
         life_id: Some(id(31)),
+        version_id: None,
     };
     let Ok(Next::Then { output: (), calls }) = operation.next(child(settled)) else {
         panic!("the move settles with its releases");

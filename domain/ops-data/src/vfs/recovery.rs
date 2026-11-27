@@ -36,8 +36,12 @@ use ulid::Ulid;
 /// How one attempt ended once its receipt was read after a sync.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReceiptOutcome {
-    /// The change committed; the life its target now holds, when it has one.
-    Applied { life_id: Option<Ulid> },
+    /// The change committed; the life its target now holds and the published version, when
+    /// the receipt carried one.
+    Applied {
+        life_id: Option<Ulid>,
+        version_id: Option<Ulid>,
+    },
     /// No receipt after a successful sync: the change did not commit.
     RolledBack,
 }
@@ -359,9 +363,14 @@ impl VfsReceiptOperation {
         calls.push(IoCall::Delete(vec![state_delete(&VfsKey::Receipt(
             receipt.attempt_id,
         ))?]));
+        let version_id = match &receipt.change {
+            ReceiptChange::FilePublish { version_id, .. } => Some(*version_id),
+            _ => None,
+        };
         Ok(Next::Then {
             output: ReceiptOutcome::Applied {
                 life_id: self.life_id,
+                version_id,
             },
             calls,
         })

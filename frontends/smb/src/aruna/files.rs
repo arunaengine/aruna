@@ -274,6 +274,7 @@ impl ArunaSmbBackend {
                 mount_id: Ulid::nil(),
                 scope: stage_scope(&access_key),
             },
+            auth: opened.grant.context,
             info: opened.grant.bucket,
             opened_ms,
         };

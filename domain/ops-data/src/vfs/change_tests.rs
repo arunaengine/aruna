@@ -297,7 +297,10 @@ fn unpublished_remove_settles() {
     assert_eq!(operation.next(child(())), Ok(Next::Call(IoCall::Sync)));
     let turn = operation.next(IoResult::Done);
     assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
-    let settled = ReceiptOutcome::Applied { life_id: None };
+    let settled = ReceiptOutcome::Applied {
+        life_id: None,
+        version_id: None,
+    };
     let Ok(Next::Then { calls, .. }) = operation.next(child(settled)) else {
         panic!("expected the outcome with the permit release");
     };

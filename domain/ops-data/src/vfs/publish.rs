@@ -444,7 +444,7 @@ impl VfsPublishOperation {
         self.begun = false;
         let version_id = self.version_id.ok_or(VfsError::Conflict)?;
         let output = match outcome {
-            ReceiptOutcome::Applied { life_id } => Published {
+            ReceiptOutcome::Applied { life_id, .. } => Published {
                 version_id,
                 life_id,
             },
