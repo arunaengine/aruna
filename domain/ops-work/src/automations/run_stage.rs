@@ -30,9 +30,10 @@ use crate::workflows::runs::admit::{
 };
 use crate::workflows::runs::run::merge_run_inputs;
 
-fn template_values(firing: &Firing) -> BTreeMap<String, Value> {
+/// Builds `trigger.*` template variables for a trigger payload using execution binding rules.
+pub(crate) fn trigger_vars(trigger: &TriggerPayload) -> BTreeMap<String, Value> {
     let mut map = BTreeMap::new();
-    match &firing.trigger {
+    match trigger {
         TriggerPayload::Manual { values_json, .. } => {
             let parsed = serde_json::from_str::<Value>(values_json)
                 .unwrap_or_else(|_| Value::String(values_json.clone()));
@@ -101,6 +102,11 @@ fn template_values(firing: &Firing) -> BTreeMap<String, Value> {
             map.insert("trigger.key".into(), Value::String(key.clone()));
         }
     }
+    map
+}
+
+fn template_values(firing: &Firing) -> BTreeMap<String, Value> {
+    let mut map = trigger_vars(&firing.trigger);
     for stage in &firing.stages {
         if let Some(run_id) = stage.receipt.workflow_run_id {
             map.insert(

@@ -4,8 +4,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use aruna_core::applet::record::{Access, Applet};
+use aruna_core::applet::record::{Access, Applet, SubmissionFile};
 use aruna_core::automation::dag::{validate_scope, validate_spec};
+use aruna_core::automation::firing::TriggerPayload;
 use aruna_core::automation::glob::{expand_copy, format_date};
 use aruna_core::automation::record::{Automation, RunStatus, Spec, StageKind, Trigger};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -14,10 +15,11 @@ use aruna_core::operation::Operation;
 use aruna_core::permission_path::permission_pattern_matches;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::object_permission_path;
-use serde_json::{Value, json};
+use aruna_core::user::id::UserId;
+use serde_json::Value;
 use ulid::Ulid;
 
-use super::run_stage::{parse_inputs_with, render_json_with};
+use super::run_stage::{parse_inputs_with, render_json_with, trigger_vars};
 use super::{AutoAccessOperation, AutoError, Need};
 use crate::applets::AppletError;
 use crate::applets::backends::{SandboxOperation, Sandboxing, public_ready};
@@ -49,61 +51,158 @@ enum CheckStep {
     Access,
     Applets,
     Backends,
-    Workflow(String),
+    Workflow(String, bool),
 }
 
-fn sample_vars(spec: &Spec, sample: Option<&Value>) -> BTreeMap<String, Value> {
-    let mut vars = BTreeMap::new();
-    let nil = Ulid::nil().to_string();
-    vars.insert(
-        "trigger.values".into(),
-        sample.cloned().unwrap_or_else(|| json!({})),
-    );
-    for trigger in &spec.triggers {
-        match trigger {
-            Trigger::DataUploaded { bucket, prefix, .. } => {
-                let key = format!("{prefix}sample.dat");
-                vars.entry("trigger.bucket".into())
-                    .or_insert_with(|| Value::String(bucket.clone()));
-                vars.entry("trigger.key".into())
-                    .or_insert_with(|| Value::String(key.clone()));
-                vars.entry("trigger.version_id".into())
-                    .or_insert_with(|| Value::String(nil.clone()));
-                vars.entry("trigger.path".into())
-                    .or_insert_with(|| Value::String(format!("/{bucket}/{key}")));
-                vars.entry("trigger.filename".into())
-                    .or_insert_with(|| Value::String("sample.dat".into()));
-                vars.entry("trigger.size_bytes".into())
-                    .or_insert_with(|| Value::Number(0.into()));
-            }
-            Trigger::RunFinished {
-                workflow_id,
-                status,
-                ..
-            } => {
-                vars.entry("trigger.workflow_id".into())
-                    .or_insert_with(|| Value::String(workflow_id.to_string()));
-                vars.entry("trigger.run_id".into())
-                    .or_insert_with(|| Value::String(nil.clone()));
-                vars.entry("trigger.status".into()).or_insert_with(|| {
-                    Value::String(status.unwrap_or(RunStatus::Succeeded).as_str().into())
-                });
-            }
-            Trigger::AppletSubmission { applet_id } => {
-                vars.entry("trigger.applet_id".into())
-                    .or_insert_with(|| Value::String(applet_id.to_string()));
-                vars.entry("trigger.version_id".into())
-                    .or_insert_with(|| Value::String(nil.clone()));
-                vars.entry("trigger.pseudonym".into())
-                    .or_insert_with(|| Value::String("sample".into()));
-                vars.entry("trigger.bucket".into())
-                    .or_insert_with(|| Value::String("sample".into()));
-                vars.entry("trigger.key".into())
-                    .or_insert_with(|| Value::String("sample".into()));
-            }
-            Trigger::Manual { .. } => {}
-        }
+#[derive(Debug, PartialEq)]
+struct RunCheck {
+    stage: String,
+    workflow_id: Ulid,
+    version: u32,
+    values: Value,
+    no_files: bool,
+}
+
+fn sample_str(sample: Option<&Value>, key: &str) -> Option<String> {
+    sample
+        .and_then(|v| v.get(key))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn sample_ulid(sample: Option<&Value>, key: &str) -> Option<Ulid> {
+    sample
+        .and_then(|v| v.get(key))
+        .and_then(Value::as_str)
+        .and_then(|s| Ulid::from_string(s).ok())
+}
+
+fn sample_u64(sample: Option<&Value>, key: &str) -> Option<u64> {
+    sample.and_then(|v| v.get(key)).and_then(Value::as_u64)
+}
+
+fn sample_files(sample: Option<&Value>) -> Result<Vec<SubmissionFile>, AutoError> {
+    let Some(raw) = sample.and_then(|v| v.get("files")) else {
+        return Ok(Vec::new());
+    };
+    if raw.is_null() {
+        return Ok(Vec::new());
     }
+    let Some(items) = raw.as_array() else {
+        return Err(AutoError::Invalid(
+            "sample files must be a JSON array".into(),
+        ));
+    };
+    let mut files = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(obj) = item.as_object() else {
+            return Err(AutoError::Invalid(
+                "sample file entry must be a JSON object".into(),
+            ));
+        };
+        let name = obj
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| AutoError::Invalid("sample file missing name".into()))?;
+        let bucket = obj
+            .get("bucket")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| AutoError::Invalid(format!("sample file `{name}` missing bucket")))?;
+        let key = obj
+            .get("key")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| AutoError::Invalid(format!("sample file `{name}` missing key")))?;
+        let version_id = match obj.get("version_id") {
+            None | Some(Value::Null) => Ulid::nil(),
+            Some(Value::String(text)) => Ulid::from_string(text).map_err(|_| {
+                AutoError::Invalid(format!("sample file `{name}` has invalid ULID version_id"))
+            })?,
+            Some(_) => {
+                return Err(AutoError::Invalid(format!(
+                    "sample file `{name}` version_id must be a string"
+                )));
+            }
+        };
+        files.push(SubmissionFile {
+            name: name.to_string(),
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            version_id,
+        });
+    }
+    Ok(files)
+}
+
+fn sample_trigger(
+    trigger: &Trigger,
+    sample: Option<&Value>,
+    actor: UserId,
+) -> Result<TriggerPayload, AutoError> {
+    Ok(match trigger {
+        Trigger::Manual { .. } => TriggerPayload::Manual {
+            values_json: sample.map(Value::to_string).unwrap_or_else(|| "{}".into()),
+            actor,
+        },
+        Trigger::DataUploaded { bucket, prefix, .. } => {
+            let bkt = sample_str(sample, "bucket").unwrap_or_else(|| bucket.clone());
+            let key = sample_str(sample, "key").unwrap_or_else(|| {
+                let file = sample_str(sample, "filename").unwrap_or_else(|| "sample.dat".into());
+                format!("{prefix}{file}")
+            });
+            let version_id = sample_ulid(sample, "version_id").unwrap_or(Ulid::nil());
+            let path = sample_str(sample, "path").unwrap_or_else(|| format!("/{bkt}/{key}"));
+            let size_bytes = sample_u64(sample, "size_bytes").unwrap_or(0);
+            TriggerPayload::DataUploaded {
+                bucket: bkt,
+                key,
+                version_id,
+                path,
+                size_bytes,
+            }
+        }
+        Trigger::RunFinished {
+            workflow_id,
+            status,
+            applet_id,
+        } => {
+            let run_id = sample_ulid(sample, "run_id").unwrap_or(Ulid::nil());
+            let st = sample_str(sample, "status")
+                .and_then(|s| match s.as_str() {
+                    "succeeded" => Some(RunStatus::Succeeded),
+                    "failed" => Some(RunStatus::Failed),
+                    _ => None,
+                })
+                .or(*status)
+                .unwrap_or(RunStatus::Succeeded);
+            TriggerPayload::RunFinished {
+                workflow_id: *workflow_id,
+                run_id,
+                status: st,
+                outputs: Vec::new(),
+                applet_id: *applet_id,
+                outside_input: false,
+                depth: 1,
+            }
+        }
+        Trigger::AppletSubmission { applet_id } => TriggerPayload::AppletSubmission {
+            applet_id: *applet_id,
+            version_id: sample_ulid(sample, "version_id").unwrap_or(Ulid::nil()),
+            pseudonym: sample_str(sample, "pseudonym").unwrap_or_else(|| "sample".into()),
+            guest: false,
+            outside_input: false,
+            bucket: sample_str(sample, "bucket").unwrap_or_else(|| "sample".into()),
+            key: sample_str(sample, "key").unwrap_or_else(|| "sample".into()),
+            files: sample_files(sample)?,
+        },
+    })
+}
+
+fn seed_stage_vars(spec: &Spec, vars: &mut BTreeMap<String, Value>) {
+    let nil = Ulid::nil().to_string();
     for stage in &spec.stages {
         vars.insert(
             format!("stages.{}.run_id", stage.name),
@@ -118,15 +217,6 @@ fn sample_vars(spec: &Spec, sample: Option<&Value>) -> BTreeMap<String, Value> {
             Value::String("aruna://sample/sample.dat".into()),
         );
     }
-    if let Some(sample) = sample {
-        vars.insert("trigger.values".into(), sample.clone());
-        if let Value::Object(obj) = sample {
-            for (key, value) in obj {
-                vars.insert(format!("trigger.{key}"), value.clone());
-            }
-        }
-    }
-    vars
 }
 
 fn seed_stage_outputs(raw: &str, stages: &BTreeSet<&str>, vars: &mut BTreeMap<String, Value>) {
@@ -150,14 +240,18 @@ fn seed_stage_outputs(raw: &str, stages: &BTreeSet<&str>, vars: &mut BTreeMap<St
     }
 }
 
-pub(crate) fn render_sample_stage(
+pub(crate) fn render_trigger_stage(
     raw_values: &str,
     raw_inputs: Option<&str>,
+    trigger: &Trigger,
     spec: &Spec,
     sample: Option<&Value>,
+    actor: UserId,
     local: NodeId,
-) -> Result<Value, AutoError> {
-    let mut vars = sample_vars(spec, sample);
+) -> Result<(Value, bool), AutoError> {
+    let payload = sample_trigger(trigger, sample, actor)?;
+    let mut vars = trigger_vars(&payload);
+    seed_stage_vars(spec, &mut vars);
     let stages: BTreeSet<&str> = spec.stages.iter().map(|s| s.name.as_str()).collect();
     seed_stage_outputs(raw_values, &stages, &mut vars);
     if let Some(inputs) = raw_inputs {
@@ -169,9 +263,14 @@ pub(crate) fn render_sample_stage(
             "run values_json must render to a JSON object".into(),
         ));
     }
-    let (_, rendered_inputs) = parse_inputs_with(raw_inputs, &vars, &[], local)?;
-    merge_run_inputs(local, &values.to_string(), rendered_inputs.as_deref())
-        .map_err(|err| AutoError::Invalid(err.to_string()))
+    let (files, no_files) = match &payload {
+        TriggerPayload::AppletSubmission { files, .. } => (files.as_slice(), files.is_empty()),
+        _ => (&[][..], false),
+    };
+    let (_, rendered_inputs) = parse_inputs_with(raw_inputs, &vars, files, local)?;
+    let merged = merge_run_inputs(local, &values.to_string(), rendered_inputs.as_deref())
+        .map_err(|err| AutoError::Invalid(err.to_string()))?;
+    Ok((merged, no_files))
 }
 
 /// Validates an automation's DAG, scope, workflow forms, copy templates and sandbox posture.
@@ -184,7 +283,7 @@ pub struct CheckAutoOperation {
     now_ms: u64,
     auto: Option<Automation>,
     applet_ids: Vec<Ulid>,
-    run_checks: Vec<(String, Ulid, u32, Value)>,
+    run_checks: Vec<RunCheck>,
     outside_input: bool,
     unsandboxed: bool,
     diagnostics: Vec<String>,
@@ -242,22 +341,42 @@ impl CheckAutoOperation {
                     values_json,
                     inputs_json,
                     ..
-                } => match render_sample_stage(
-                    values_json,
-                    inputs_json.as_deref(),
-                    spec,
-                    self.sample.as_ref(),
-                    self.local,
-                ) {
-                    Ok(values) => {
-                        self.run_checks
-                            .push((stage.name.clone(), *workflow_id, *version, values));
+                } => {
+                    for trigger in &spec.triggers {
+                        match render_trigger_stage(
+                            values_json,
+                            inputs_json.as_deref(),
+                            trigger,
+                            spec,
+                            self.sample.as_ref(),
+                            self.auth.user_id,
+                            self.local,
+                        ) {
+                            Ok((values, no_files)) => {
+                                if let Some(prev) = self.run_checks.iter_mut().find(|c| {
+                                    c.stage == stage.name
+                                        && c.workflow_id == *workflow_id
+                                        && c.version == *version
+                                        && c.values == values
+                                }) {
+                                    prev.no_files |= no_files;
+                                } else {
+                                    self.run_checks.push(RunCheck {
+                                        stage: stage.name.clone(),
+                                        workflow_id: *workflow_id,
+                                        version: *version,
+                                        values,
+                                        no_files,
+                                    });
+                                }
+                            }
+                            Err(err) => {
+                                self.diagnostics
+                                    .push(format!("stage `{}`: {err}", stage.name));
+                            }
+                        }
                     }
-                    Err(err) => {
-                        self.diagnostics
-                            .push(format!("stage `{}`: {err}", stage.name));
-                    }
-                },
+                }
                 StageKind::Copy {
                     dest_bucket,
                     dest_template,
@@ -303,10 +422,15 @@ impl CheckAutoOperation {
             self.step = CheckStep::Applets;
             return Next::Call(IoCall::child(LoadAppletOperation::new(applet_id)));
         }
-        if let Some((stage, workflow_id, version, values)) = self.run_checks.pop() {
-            self.step = CheckStep::Workflow(stage);
-            let check = ValidateValuesOperation::new(&self.auth, workflow_id, version, values);
-            return Next::Call(IoCall::child(check));
+        if let Some(check) = self.run_checks.pop() {
+            self.step = CheckStep::Workflow(check.stage, check.no_files);
+            let op = ValidateValuesOperation::new(
+                &self.auth,
+                check.workflow_id,
+                check.version,
+                check.values,
+            );
+            return Next::Call(IoCall::child(op));
         }
         let ok = self.diagnostics.is_empty();
         Next::Done(AutoCheckReport {
@@ -380,7 +504,7 @@ impl Operation for CheckAutoOperation {
                 }
                 Ok(self.next_step())
             }
-            CheckStep::Workflow(stage) => {
+            CheckStep::Workflow(stage, no_files) => {
                 self.workflows_checked += 1;
                 match result.child::<ValuesReport, CatalogError>()? {
                     Ok(report) if report.ok => {}
@@ -389,7 +513,13 @@ impl Operation for CheckAutoOperation {
                             let msg = item["message"]
                                 .as_str()
                                 .unwrap_or("invalid workflow values");
-                            self.diagnostics.push(format!("stage `{stage}`: {msg}"));
+                            let line = match no_files {
+                                true => format!(
+                                    "stage `{stage}`: {msg} (no sample applet submission files provided in sample_values.files; file inputs could not be verified)"
+                                ),
+                                false => format!("stage `{stage}`: {msg}"),
+                            };
+                            self.diagnostics.push(line);
                         }
                     }
                     Err(err) => self.diagnostics.push(format!("stage `{stage}`: {err}")),
