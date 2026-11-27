@@ -4,26 +4,32 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use aruna_core::applet::record::{Access, Applet, applet_key};
+use aruna_core::applet::record::{Access, Applet, SubmissionFile, applet_key};
 use aruna_core::automation::firing::{Firing, FiringState, StageState, TriggerPayload};
+use aruna_core::automation::keys::active_key;
 use aruna_core::automation::record::{Spec, Stage, StageKind, Trigger, When};
-use aruna_core::automation::scope::Scope;
+use aruna_core::automation::scope::{Audience, Scope};
 use aruna_core::calls::{ChildOutcome, IoResult};
-use aruna_core::keyspaces::{APPLETS_KEYSPACE, WORKFLOW_RUN_KEYSPACE};
+use aruna_core::keyspaces::{
+    APPLETS_KEYSPACE, AUTOMATION_INTENTS_KEYSPACE, AUTOMATION_RUNS_KEYSPACE,
+    RUN_IDEMPOTENCY_KEYSPACE, WORKFLOW_RUN_KEYSPACE,
+};
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::workflow_run::{RunState, run_key};
+use aruna_core::structs::execution::workflow_run::{RunKeyRecord, RunState, run_key, run_key_row};
 use aruna_core::structs::identity::features::Feature;
 use aruna_runner::driver::drive;
 use ulid::Ulid;
 
 use super::AutoError;
 use super::control::CancelFiringOperation;
+use super::copy_stage::{call_intent, stage_intent_id};
 use super::firing_reads::GetFiringOperation;
 use super::flow_tests::Env;
-use super::run_stage::{StartStageRun, render_json};
+use super::run_stage::{StartStageRun, parse_inputs, render_json, run_idempotency_key};
 use super::runner::StepFiringsOperation;
 use super::start::new_firing_rows;
 use crate::applets::AppletError;
+use crate::plugins::intents::{IntentRecord, IntentState, intent_key, settled_row_in};
 
 #[tokio::test]
 async fn runner_guards_recovery() {
@@ -79,7 +85,64 @@ async fn runner_guards_recovery() {
     );
     let rendered = render_json(r#"{"name": "{{trigger.filename}}"}"#, &qf).unwrap();
     assert_eq!(rendered["name"], "a\"b\\c\nd.csv");
+    // Unquoted whole-value templates preserve JSON types without double-substituting values (#10).
+    let manual_f = Firing::new(
+        Ulid::from_bytes([115; 16]),
+        auto.automation_id,
+        auto.group_id,
+        auto.revision,
+        &spec,
+        TriggerPayload::Manual {
+            values_json: r#"{"sample": "{{trigger.key}}", "count": 7}"#.into(),
+            actor: env.owner.user_id,
+        },
+        10,
+    );
+    let whole = render_json("{{trigger.values}}", &manual_f).unwrap();
+    assert_eq!(whole["sample"], "{{trigger.key}}");
+    assert_eq!(whole["count"], 7);
+    let num = render_json(r#"{"sz": {{trigger.size_bytes}}}"#, &qf).unwrap();
+    assert_eq!(num["sz"], 5);
     assert!(StartStageRun::new(auto.clone(), qf.clone(), 0, (env.node, env.realm)).is_ok());
+    // Submission files with inputs_json=None and explicit source_node_id stay identical across pins/JSON (#9).
+    let sub_f = Firing::new(
+        Ulid::from_bytes([116; 16]),
+        auto.automation_id,
+        auto.group_id,
+        auto.revision,
+        &spec,
+        TriggerPayload::AppletSubmission {
+            applet_id: Ulid::from_bytes([117; 16]),
+            version_id: ver,
+            pseudonym: "u1".into(),
+            guest: false,
+            outside_input: false,
+            bucket: "raw".into(),
+            key: "sub/meta.json".into(),
+            files: vec![SubmissionFile {
+                name: "reads".into(),
+                bucket: "raw".into(),
+                key: "sub/r1.fq".into(),
+                version_id: ver,
+            }],
+        },
+        10,
+    );
+    let (sub_pins, sub_json) = parse_inputs(None, &sub_f, env.node).unwrap();
+    assert_eq!(sub_pins.len(), 1);
+    let parsed_sub: serde_json::Value = serde_json::from_str(&sub_json.unwrap()).unwrap();
+    assert_eq!(parsed_sub["reads"]["key"], "sub/r1.fq");
+    let remote_node = iroh::SecretKey::from_bytes(&[12; 32]).public();
+    let explicit = format!(
+        r#"{{"reads": {{"bucket": "raw", "key": "x", "version_id": "{ver}", "source_node_id": "{remote_node}"}}}}"#
+    );
+    let (rem_pins, rem_json) = parse_inputs(Some(&explicit), &qf, env.node).unwrap();
+    assert_eq!(rem_pins[0].source_node_id, Some(remote_node));
+    let parsed_rem: serde_json::Value = serde_json::from_str(&rem_json.unwrap()).unwrap();
+    assert_eq!(
+        parsed_rem["reads"]["source_node_id"],
+        remote_node.to_string()
+    );
     let mut bad_spec = spec.clone();
     if let StageKind::Run { inputs_json, .. } = &mut bad_spec.stages[0].kind {
         *inputs_json =
@@ -235,8 +298,8 @@ async fn runner_guards_recovery() {
     )
     .await
     .unwrap();
-    assert!(!cancelling.stages[0].receipt.cancel_sent);
-    assert!(cancelling.stages[0].error.is_some());
+    assert!(!cancelling.firing.stages[0].receipt.cancel_sent);
+    assert!(cancelling.firing.stages[0].error.is_some());
     remote_child.node_id = env.node;
     env.write_row(
         WORKFLOW_RUN_KEYSPACE,
@@ -244,9 +307,10 @@ async fn runner_guards_recovery() {
         remote_child.to_bytes().unwrap(),
     )
     .await;
-    drive(StepFiringsOperation::new((env.node, env.realm)), &env.ctx)
+    let step_rep = drive(StepFiringsOperation::new((env.node, env.realm)), &env.ctx)
         .await
         .unwrap();
+    assert!(step_rep.wake_runs.contains(&remote_child_id));
     let (retried, _) = drive(
         GetFiringOperation::new(&env.owner, f3.firing_id, env.node),
         &env.ctx,
@@ -254,6 +318,169 @@ async fn runner_guards_recovery() {
     .await
     .unwrap();
     assert!(retried.stages[0].receipt.cancel_sent);
+
+    // Stranded claimed Run recovers existing child via idempotency key even when Cancelling (#1, #2).
+    let recovered_child_id = Ulid::from_bytes([118; 16]);
+    let recovered_child = env.sample_run(recovered_child_id, wf_id, RunState::Running, None);
+    env.write_row(
+        WORKFLOW_RUN_KEYSPACE,
+        run_key(recovered_child_id),
+        recovered_child.to_bytes().unwrap(),
+    )
+    .await;
+    let mut stranded_run = Firing::new(
+        Ulid::from_bytes([119; 16]),
+        auto.automation_id,
+        auto.group_id,
+        auto.revision,
+        &spec,
+        TriggerPayload::Manual {
+            values_json: "{}".into(),
+            actor: env.owner.user_id,
+        },
+        14,
+    );
+    stranded_run.state = FiringState::Cancelling;
+    stranded_run.stages[0].state = StageState::Cancelling;
+    let idem_key = run_idempotency_key(stranded_run.firing_id, "run", stranded_run.attempt);
+    let key_rec = RunKeyRecord {
+        run_id: recovered_child_id,
+        request_digest: [0; 32],
+    };
+    env.write_row(
+        RUN_IDEMPOTENCY_KEYSPACE,
+        run_key_row(auto.group_id, auto.account.unwrap(), &idem_key),
+        key_rec.to_bytes().unwrap(),
+    )
+    .await;
+    for (ks, k, v) in new_firing_rows(&stranded_run).unwrap() {
+        env.write_row(&ks, k, v).await;
+    }
+    let rec_rep = drive(StepFiringsOperation::new((env.node, env.realm)), &env.ctx)
+        .await
+        .unwrap();
+    assert!(rec_rep.wake_runs.contains(&recovered_child_id));
+    let (rec_f, _) = drive(
+        GetFiringOperation::new(&env.owner, stranded_run.firing_id, env.node),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rec_f.stages[0].receipt.workflow_run_id,
+        Some(recovered_child_id)
+    );
+    assert!(rec_f.stages[0].receipt.cancel_sent);
+
+    // Stranded claimed Notify recovers its settled intent instead of stalling (#1).
+    let notify_spec = Spec {
+        triggers: vec![Trigger::Manual { form_json: None }],
+        stages: vec![Stage {
+            name: "ping".into(),
+            needs: Some(vec![]),
+            when: When::Passed,
+            kind: StageKind::Notify {
+                audience: Audience::GroupAdmins,
+                message: "done".into(),
+            },
+        }],
+        scope: Scope {
+            audiences: vec![Audience::GroupAdmins],
+            ..Scope::default()
+        },
+    };
+    let notify_auto = env.create_active(notify_spec.clone()).await;
+    let mut stranded_notify = Firing::new(
+        Ulid::from_bytes([120; 16]),
+        notify_auto.automation_id,
+        notify_auto.group_id,
+        notify_auto.revision,
+        &notify_spec,
+        TriggerPayload::Manual {
+            values_json: "{}".into(),
+            actor: env.owner.user_id,
+        },
+        15,
+    );
+    stranded_notify.stages[0].state = StageState::Running;
+    let n_stage_id = stage_intent_id(stranded_notify.firing_id, "ping");
+    let n_intent = call_intent(0, &[b"group_admins", b"done"]);
+    let (_, nk, nv) = settled_row_in(
+        AUTOMATION_INTENTS_KEYSPACE,
+        n_stage_id,
+        &n_intent,
+        "3".into(),
+    )
+    .unwrap();
+    env.write_row(AUTOMATION_INTENTS_KEYSPACE, nk, nv).await;
+    for (ks, k, v) in new_firing_rows(&stranded_notify).unwrap() {
+        env.write_row(&ks, k, v).await;
+    }
+    drive(StepFiringsOperation::new((env.node, env.realm)), &env.ctx)
+        .await
+        .unwrap();
+    let (done_notify, _) = drive(
+        GetFiringOperation::new(&env.owner, stranded_notify.firing_id, env.node),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(done_notify.state, FiringState::Succeeded);
+    assert_eq!(done_notify.stages[0].receipt.notified, Some(3));
+    assert!(
+        env.read_row(
+            AUTOMATION_RUNS_KEYSPACE,
+            &active_key(stranded_notify.firing_id)
+        )
+        .await
+        .is_none()
+    );
+    // Stranded Pending intent on a Cancelling notify stage turns Unknown and finishes Cancelled.
+    let mut stranded_cancel = Firing::new(
+        Ulid::from_bytes([121; 16]),
+        notify_auto.automation_id,
+        notify_auto.group_id,
+        notify_auto.revision,
+        &notify_spec,
+        TriggerPayload::Manual {
+            values_json: "{}".into(),
+            actor: env.owner.user_id,
+        },
+        16,
+    );
+    stranded_cancel.state = FiringState::Cancelling;
+    stranded_cancel.stages[0].state = StageState::Cancelling;
+    let c_stage_id = stage_intent_id(stranded_cancel.firing_id, "ping");
+    let pend_rec = IntentRecord {
+        digest: n_intent.digest,
+        state: IntentState::Pending,
+    };
+    env.write_row(
+        AUTOMATION_INTENTS_KEYSPACE,
+        intent_key(c_stage_id, 0),
+        postcard::to_allocvec(&pend_rec).unwrap(),
+    )
+    .await;
+    for (ks, k, v) in new_firing_rows(&stranded_cancel).unwrap() {
+        env.write_row(&ks, k, v).await;
+    }
+    drive(StepFiringsOperation::new((env.node, env.realm)), &env.ctx)
+        .await
+        .unwrap();
+    let (fin_cancel, _) = drive(
+        GetFiringOperation::new(&env.owner, stranded_cancel.firing_id, env.node),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(fin_cancel.state, FiringState::Cancelled);
+    let unk_after: IntentRecord = postcard::from_bytes(
+        &env.read_row(AUTOMATION_INTENTS_KEYSPACE, &intent_key(c_stage_id, 0))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(unk_after.state, IntentState::Unknown { .. }));
 
     // Missing child workflow row moves Running stage to NeedsAttention instead of stalling.
     let mut f4 = Firing::new(
