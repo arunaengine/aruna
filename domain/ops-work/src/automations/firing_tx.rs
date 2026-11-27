@@ -3,19 +3,21 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::automation::firing::{CopiedFile, Firing, FiringState, StageState};
-use aruna_core::automation::keys::{active_key, firing_key};
-use aruna_core::automation::record::{DEFAULT_APPROVAL_MS, StageKind};
+use aruna_core::automation::keys::{active_key, firing_key, record_key};
+use aruna_core::automation::record::{Automation, DEFAULT_APPROVAL_MS, StageKind};
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::keyspaces::AUTOMATION_RUNS_KEYSPACE;
+use aruna_core::keyspaces::{AUTOMATION_RUNS_KEYSPACE, AUTOMATIONS_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::execution::workflow_run::RunFile;
+use aruna_core::types::{Key, KeySpace, Value};
 use aruna_core::user::id::UserId;
 use byteview::ByteView;
 use ulid::Ulid;
 
 use super::copy_stage::StageOutcome;
+use super::firing_reads::decode_ulid;
 use super::run_stage::render_text;
-use super::{AutoError, firing_row};
+use super::{AutoError, active_page, firing_row};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PollDelta {
@@ -79,8 +81,16 @@ pub(crate) struct FiringTxResult {
 #[derive(Clone, Debug, PartialEq)]
 enum TxStep {
     Read,
-    Write(Box<FiringTxResult>, bool),
-    DropActive(Box<FiringTxResult>),
+    CheckActive {
+        out: Box<FiringTxResult>,
+        limit: u32,
+        active_count: u32,
+    },
+    Write {
+        out: Box<FiringTxResult>,
+        deletes: Vec<(KeySpace, Key)>,
+    },
+    Delete(Box<FiringTxResult>),
 }
 
 /// Applies one conditional [`FiringDelta`] inside a write transaction and reconciles `active_key`.
@@ -89,6 +99,8 @@ pub(crate) struct FiringTxOp {
     auto_id: Ulid,
     firing_id: Ulid,
     delta: FiringDelta,
+    extra_writes: Vec<(KeySpace, Key, Value)>,
+    extra_deletes: Vec<(KeySpace, Key)>,
     now_ms: u64,
     step: TxStep,
 }
@@ -101,9 +113,21 @@ impl FiringTxOp {
             auto_id,
             firing_id,
             delta,
+            extra_writes: Vec::new(),
+            extra_deletes: Vec::new(),
             now_ms: 0,
             step: TxStep::Read,
         }
+    }
+
+    pub(crate) fn with_extras(
+        mut self,
+        writes: Vec<(KeySpace, Key, Value)>,
+        deletes: Vec<(KeySpace, Key)>,
+    ) -> Self {
+        self.extra_writes = writes;
+        self.extra_deletes = deletes;
+        self
     }
 
     fn apply_delta(&self, firing: &mut Firing) -> Result<DeltaOutcome, AutoError> {
@@ -165,6 +189,12 @@ impl FiringTxOp {
                 actor,
                 note,
             } => {
+                if firing.state == FiringState::Cancelling || firing.state.is_terminal() {
+                    return Err(AutoError::Conflict(format!(
+                        "firing is already {}",
+                        firing.state.as_str()
+                    )));
+                }
                 let idx = firing.stage_index(stage).ok_or(AutoError::NotFound)?;
                 if !matches!(firing.spec.stages[idx].kind, StageKind::Approval { .. })
                     || firing.stages[idx].state != StageState::WaitingForApproval
@@ -247,6 +277,9 @@ impl FiringTxOp {
                 }
             }
             FiringDelta::Evaluate(dispatch) => {
+                if firing.state.is_terminal() {
+                    return Ok((false, false, Vec::new()));
+                }
                 let before = (firing.state, firing.stages.clone());
                 firing.evaluate(now_ms);
                 if firing.state == FiringState::Cancelling {
@@ -377,13 +410,13 @@ impl FiringTxOp {
                         StageOutcome::CopiedAll | StageOutcome::Failed(_) => {
                             st.receipt.pending_copy = None;
                             st.finished_at_ms = Some(now_ms);
+                            if let StageOutcome::Failed(err) = outcome {
+                                st.error = Some(err.clone());
+                            }
                             st.state = match (stage_cancel, outcome) {
                                 (true, _) => StageState::Cancelled,
                                 (false, StageOutcome::CopiedAll) => StageState::Succeeded,
-                                (false, StageOutcome::Failed(err)) => {
-                                    st.error = Some(err.clone());
-                                    StageState::Failed
-                                }
+                                (false, StageOutcome::Failed(_)) => StageState::Failed,
                                 _ => unreachable!(),
                             };
                         }
@@ -425,45 +458,91 @@ impl Operation for FiringTxOp {
 
     fn first(&mut self) -> Result<Next<FiringTxResult>, AutoError> {
         self.step = TxStep::Read;
-        let key = firing_key(self.auto_id, self.firing_id);
-        Ok(Next::Call(IoCall::Read(vec![(
+        let mut reads = vec![(
             AUTOMATION_RUNS_KEYSPACE.to_string(),
-            key,
-        )])))
+            firing_key(self.auto_id, self.firing_id),
+        )];
+        if matches!(self.delta, FiringDelta::Resume) {
+            reads.push((AUTOMATIONS_KEYSPACE.to_string(), record_key(self.auto_id)));
+        }
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<FiringTxResult>, AutoError> {
         match std::mem::replace(&mut self.step, TxStep::Read) {
             TxStep::Read => {
-                let bytes = result.value()?.ok_or(AutoError::NotFound)?;
+                let (bytes, auto_bytes) = if matches!(self.delta, FiringDelta::Resume) {
+                    let values = result.values()?;
+                    let firing_bytes = values
+                        .first()
+                        .and_then(Option::as_ref)
+                        .cloned()
+                        .ok_or(AutoError::NotFound)?;
+                    let auto_bytes = values
+                        .get(1)
+                        .and_then(Option::as_ref)
+                        .cloned()
+                        .ok_or(AutoError::NotFound)?;
+                    (firing_bytes, Some(auto_bytes))
+                } else {
+                    (result.value()?.ok_or(AutoError::NotFound)?, None)
+                };
                 let mut firing = Firing::from_bytes(&bytes)?;
                 let (changed, claimed, child_runs) = self.apply_delta(&mut firing)?;
-                let terminal = firing.state.is_terminal();
                 let out = FiringTxResult {
                     firing,
                     changed,
                     claimed,
                     child_runs,
                 };
-                if !changed {
-                    return self.finish_active(out, terminal);
+                if let Some(auto_bytes) = auto_bytes {
+                    let auto = Automation::from_bytes(&auto_bytes)?;
+                    self.step = TxStep::CheckActive {
+                        out: Box::new(out),
+                        limit: auto.spec.scope.limits.max_active_firings,
+                        active_count: 0,
+                    };
+                    return Ok(Next::Call(active_page(None)));
                 }
-                let mut writes = vec![firing_row(&out.firing)?];
-                if !terminal {
-                    writes.push((
-                        AUTOMATION_RUNS_KEYSPACE.to_string(),
-                        active_key(out.firing.firing_id),
-                        ByteView::from(out.firing.automation_id.to_bytes().to_vec()),
+                self.commit_out(out)
+            }
+            TxStep::CheckActive {
+                out,
+                limit,
+                mut active_count,
+            } => {
+                let (rows, next) = result.page()?;
+                for (key, value) in rows {
+                    let same_auto = decode_ulid(&value) == Some(self.auto_id);
+                    let same_firing = key.get(1..17).and_then(decode_ulid) == Some(self.firing_id);
+                    if same_auto && !same_firing {
+                        active_count = active_count.saturating_add(1);
+                    }
+                }
+                if let Some(after) = next {
+                    self.step = TxStep::CheckActive {
+                        out,
+                        limit,
+                        active_count,
+                    };
+                    return Ok(Next::Call(active_page(Some(after))));
+                }
+                if active_count >= limit {
+                    return Err(AutoError::Limited(
+                        "max_active_firings limit reached".into(),
                     ));
                 }
-                self.step = TxStep::Write(Box::new(out), terminal);
-                Ok(Next::Call(IoCall::Write(writes)))
+                self.commit_out(*out)
             }
-            TxStep::Write(out, terminal) => {
+            TxStep::Write { out, deletes } => {
                 result.done()?;
-                self.finish_active(*out, terminal)
+                if !deletes.is_empty() {
+                    self.step = TxStep::Delete(out);
+                    return Ok(Next::Call(IoCall::Delete(deletes)));
+                }
+                Ok(Next::Done(*out))
             }
-            TxStep::DropActive(out) => {
+            TxStep::Delete(out) => {
                 result.done()?;
                 Ok(Next::Done(*out))
             }
@@ -476,19 +555,37 @@ impl Operation for FiringTxOp {
 }
 
 impl FiringTxOp {
-    fn finish_active(
-        &mut self,
-        out: FiringTxResult,
-        terminal: bool,
-    ) -> Result<Next<FiringTxResult>, AutoError> {
-        if !terminal {
-            return Ok(Next::Done(out));
+    fn commit_out(&mut self, out: FiringTxResult) -> Result<Next<FiringTxResult>, AutoError> {
+        let terminal = out.firing.state.is_terminal();
+        let mut writes = std::mem::take(&mut self.extra_writes);
+        let mut deletes = std::mem::take(&mut self.extra_deletes);
+        if out.changed {
+            writes.push(firing_row(&out.firing)?);
+            if !terminal {
+                writes.push((
+                    AUTOMATION_RUNS_KEYSPACE.to_string(),
+                    active_key(out.firing.firing_id),
+                    ByteView::from(out.firing.automation_id.to_bytes().to_vec()),
+                ));
+            }
         }
-        let key = active_key(out.firing.firing_id);
-        self.step = TxStep::DropActive(Box::new(out));
-        Ok(Next::Call(IoCall::Delete(vec![(
-            AUTOMATION_RUNS_KEYSPACE.to_string(),
-            key,
-        )])))
+        if terminal {
+            deletes.push((
+                AUTOMATION_RUNS_KEYSPACE.to_string(),
+                active_key(out.firing.firing_id),
+            ));
+        }
+        if !writes.is_empty() {
+            self.step = TxStep::Write {
+                out: Box::new(out),
+                deletes,
+            };
+            return Ok(Next::Call(IoCall::Write(writes)));
+        }
+        if !deletes.is_empty() {
+            self.step = TxStep::Delete(Box::new(out));
+            return Ok(Next::Call(IoCall::Delete(deletes)));
+        }
+        Ok(Next::Done(out))
     }
 }

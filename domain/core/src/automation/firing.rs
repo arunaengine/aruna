@@ -276,6 +276,9 @@ impl Firing {
 
     /// Evaluates stage readiness in topological order and recomputes firing state.
     pub fn evaluate(&mut self, now_ms: u64) {
+        if self.state.is_terminal() {
+            return;
+        }
         for stage in &mut self.stages {
             if stage.state == StageState::WaitingForApproval
                 && stage.receipt.expires_at_ms.is_some_and(|exp| now_ms >= exp)
@@ -377,12 +380,25 @@ impl Firing {
         note: Option<String>,
         now_ms: u64,
     ) -> Result<(), String> {
+        if self.state == FiringState::Cancelling || self.state.is_terminal() {
+            return Err(format!("firing is already {}", self.state.as_str()));
+        }
         let index = self
             .stage_index(stage_name)
             .ok_or_else(|| format!("unknown stage `{stage_name}`"))?;
         if self.stages[index].state != StageState::NeedsAttention {
             return Err(format!("stage `{stage_name}` is not in needs_attention"));
         }
+        let recovered_copy = if done && let Some((recovered, total_files)) = copy_progress {
+            let file = recovered
+                .or_else(|| self.stages[index].receipt.pending_copy.clone())
+                .ok_or_else(|| {
+                    "missing verified copy destination for done resolution".to_string()
+                })?;
+            Some((file, total_files))
+        } else {
+            None
+        };
         self.resolutions.push(Resolution {
             stage: stage_name.to_string(),
             done,
@@ -391,11 +407,15 @@ impl Firing {
             at_ms: now_ms,
         });
         let stage = &mut self.stages[index];
-        let planned = stage.receipt.pending_copy.take();
+        stage.receipt.pending_copy = None;
         if done {
             stage.error = None;
-            if let Some((recovered, total_files)) = copy_progress {
-                if let Some(file) = recovered.or(planned) {
+            if let Some((file, total_files)) = recovered_copy {
+                let exists =
+                    stage.receipt.copied.iter().any(|c| {
+                        c.dest_version == file.dest_version && c.dest_key == file.dest_key
+                    });
+                if !exists {
                     stage.receipt.copied.push(file);
                 }
                 if stage.receipt.copied.len() < total_files {

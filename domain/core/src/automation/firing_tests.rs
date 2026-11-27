@@ -235,4 +235,49 @@ fn resolves_copy_item() {
     assert_eq!(firing.stages[1].state, StageState::Succeeded);
     assert_eq!(firing.state, FiringState::Succeeded);
     assert_eq!(firing.stages[1].receipt.copied.len(), 3);
+
+    // Resolving a cancelled firing is rejected, and evaluate never overwrites Cancelled (#5, #6).
+    let mut cancelled = Firing::new(
+        Ulid::from_parts(8, 9),
+        Ulid::from_parts(8, 2),
+        Ulid::from_parts(8, 3),
+        1,
+        &spec,
+        manual_trigger(),
+        200,
+    );
+    cancelled.stages[0].state = StageState::Succeeded;
+    cancelled.stages[1].state = StageState::NeedsAttention;
+    cancelled.stages[1].receipt.pending_copy = Some(file("f1", 1));
+    cancelled.evaluate(210);
+    cancelled.begin_cancel(220);
+    assert_eq!(cancelled.state, FiringState::Cancelled);
+    assert!(
+        cancelled
+            .resolve_item(
+                "deliver",
+                true,
+                Some((Some(file("f1", 1)), 2)),
+                actor,
+                None,
+                230
+            )
+            .is_err()
+    );
+    assert_eq!(cancelled.state, FiringState::Cancelled);
+
+    let mut race = Firing::new(
+        Ulid::from_parts(8, 10),
+        Ulid::from_parts(8, 2),
+        Ulid::from_parts(8, 3),
+        1,
+        &spec,
+        manual_trigger(),
+        200,
+    );
+    race.stages[0].state = StageState::Succeeded;
+    race.stages[1].state = StageState::Succeeded;
+    race.state = FiringState::Cancelled;
+    race.evaluate(240);
+    assert_eq!(race.state, FiringState::Cancelled);
 }
