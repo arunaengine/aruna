@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::automation::firing::{Firing, TriggerPayload};
+use aruna_core::automation::glob::glob_match;
 use aruna_core::automation::keys::{
     active_key, firing_key, index_key, kept_key, record_key, replay_key, seen_key,
 };
@@ -12,6 +13,7 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{AUTOMATION_RUNS_KEYSPACE, AUTOMATIONS_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::types::{Key, KeySpace, Value};
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
 use ulid::Ulid;
 
@@ -59,8 +61,14 @@ pub(crate) fn parse_replay(bytes: &[u8]) -> Option<(Ulid, u64)> {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum AdmitSource {
     Manual,
-    Journal { source: String },
-    Replay { event_id: Ulid },
+    Journal {
+        source: String,
+        matched_revision: u64,
+        actor: Option<UserId>,
+    },
+    Replay {
+        event_id: Ulid,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -68,6 +76,61 @@ pub(crate) enum AdmitOutcome {
     Created(Firing),
     Existing(Firing),
     AlreadySeen,
+    Unmatched,
+}
+
+fn matches_payload(auto: &Automation, payload: &TriggerPayload, actor: Option<UserId>) -> bool {
+    if auto.account.is_some() && actor == auto.account {
+        return false;
+    }
+    match payload {
+        TriggerPayload::Manual { .. } => auto
+            .spec
+            .triggers
+            .iter()
+            .any(|t| matches!(t, Trigger::Manual { .. })),
+        TriggerPayload::DataUploaded { bucket, key, .. } => {
+            let file = key.rsplit('/').next().unwrap_or(key);
+            auto.spec.triggers.iter().any(|trigger| match trigger {
+                Trigger::DataUploaded {
+                    bucket: tb,
+                    prefix,
+                    pattern,
+                } => {
+                    bucket == tb
+                        && key.starts_with(prefix)
+                        && pattern.as_deref().is_none_or(|p| glob_match(p, file))
+                }
+                _ => false,
+            })
+        }
+        TriggerPayload::AppletSubmission { applet_id, .. } => auto
+            .spec
+            .triggers
+            .iter()
+            .any(|t| matches!(t, Trigger::AppletSubmission { applet_id: a } if a == applet_id)),
+        TriggerPayload::RunFinished {
+            workflow_id,
+            status,
+            applet_id,
+            depth,
+            ..
+        } => {
+            *depth < auto.spec.scope.limits.max_chain_depth
+                && auto.spec.triggers.iter().any(|t| match t {
+                    Trigger::RunFinished {
+                        workflow_id: w,
+                        status: want_status,
+                        applet_id: want_applet,
+                    } => {
+                        w == workflow_id
+                            && want_status.is_none_or(|s| s == *status)
+                            && want_applet.is_none_or(|a| Some(a) == *applet_id)
+                    }
+                    _ => false,
+                })
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -107,9 +170,20 @@ impl AdmitFiringOp {
         auto_id: Ulid,
         firing_id: Ulid,
         source: String,
+        matched_revision: u64,
+        actor: Option<UserId>,
         payload: TriggerPayload,
     ) -> Self {
-        Self::new(auto_id, firing_id, payload, AdmitSource::Journal { source })
+        Self::new(
+            auto_id,
+            firing_id,
+            payload,
+            AdmitSource::Journal {
+                source,
+                matched_revision,
+                actor,
+            },
+        )
     }
 
     pub(crate) fn replay(
@@ -174,7 +248,7 @@ impl Operation for AdmitFiringOp {
         ];
         match &self.source {
             AdmitSource::Manual => {}
-            AdmitSource::Journal { source } => {
+            AdmitSource::Journal { source, .. } => {
                 reads.push((
                     AUTOMATIONS_KEYSPACE.to_string(),
                     seen_key(self.auto_id, source),
@@ -231,9 +305,18 @@ impl Operation for AdmitFiringOp {
                             ));
                         }
                     }
-                    AdmitSource::Journal { .. } => {
+                    AdmitSource::Journal {
+                        matched_revision,
+                        actor,
+                        ..
+                    } => {
                         if values.get(3).and_then(Option::as_ref).is_some() {
                             return Ok(Next::Done(AdmitOutcome::AlreadySeen));
+                        }
+                        if auto.revision != *matched_revision
+                            && !matches_payload(&auto, &self.payload, *actor)
+                        {
+                            return Ok(Next::Done(AdmitOutcome::Unmatched));
                         }
                     }
                     AdmitSource::Replay { .. } => {
@@ -309,7 +392,7 @@ impl Operation for AdmitFiringOp {
                 let mut drop_kept = None;
                 match &self.source {
                     AdmitSource::Manual => {}
-                    AdmitSource::Journal { source } => {
+                    AdmitSource::Journal { source, .. } => {
                         writes.push((
                             AUTOMATIONS_KEYSPACE.to_string(),
                             seen_key(auto.automation_id, source),

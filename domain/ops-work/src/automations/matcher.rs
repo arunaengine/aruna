@@ -232,8 +232,16 @@ impl MatchEventsOperation {
             return self.write_kept(idx, event, "applets_disabled");
         }
         let auto_id = auto.automation_id;
+        let matched_revision = auto.revision;
         let firing_id = self.ids.mint(self.now_ms);
-        let admit = AdmitFiringOp::journal(auto_id, firing_id, event.source.clone(), payload);
+        let admit = AdmitFiringOp::journal(
+            auto_id,
+            firing_id,
+            event.source.clone(),
+            matched_revision,
+            event.actor,
+            payload,
+        );
         self.step = MatchStep::Admit(idx, Box::new(event));
         Ok(Next::Call(IoCall::retry(admit, &auto_id.to_bytes())))
     }
@@ -440,7 +448,9 @@ impl Operation for MatchEventsOperation {
                     self.report.fired += 1;
                     self.next_match()
                 }
-                Ok(AdmitOutcome::AlreadySeen | AdmitOutcome::Existing(_)) => self.next_match(),
+                Ok(
+                    AdmitOutcome::AlreadySeen | AdmitOutcome::Existing(_) | AdmitOutcome::Unmatched,
+                ) => self.next_match(),
                 Err(AutoError::Limited(msg)) => {
                     let reason = if msg.contains("active") {
                         "max_active_firings"

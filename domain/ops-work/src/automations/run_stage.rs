@@ -160,26 +160,73 @@ fn render_str(raw: &str, vars: &BTreeMap<String, Value>) -> String {
     out
 }
 
-fn sub_json(value: Value, vars: &BTreeMap<String, Value>) -> Value {
-    match value {
-        Value::String(text) => {
-            if let Some(inner) = text.strip_prefix("{{").and_then(|s| s.strip_suffix("}}"))
+fn render_json_template(raw: &str, vars: &BTreeMap<String, Value>) -> Result<String, AutoError> {
+    let bytes = raw.as_bytes();
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            let start = i;
+            i += 1;
+            let mut escaped = false;
+            while i < bytes.len() {
+                if escaped {
+                    escaped = false;
+                } else if bytes[i] == b'\\' {
+                    escaped = true;
+                } else if bytes[i] == b'"' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            let decoded: String = serde_json::from_str(&raw[start..i]).map_err(|err| {
+                AutoError::Invalid(format!("invalid template JSON string: {err}"))
+            })?;
+            let is_key = raw[i..].trim_start().starts_with(':');
+            if !is_key
+                && let Some(inner) = decoded
+                    .strip_prefix("{{")
+                    .and_then(|s| s.strip_suffix("}}"))
                 && !inner.contains("{{")
                 && !inner.contains("}}")
                 && let Some(typed) = vars.get(inner)
             {
-                return typed.clone();
+                let encoded = serde_json::to_string(typed)
+                    .map_err(|err| AutoError::Invalid(err.to_string()))?;
+                out.push_str(&encoded);
+            } else {
+                let substituted = render_str(&decoded, vars);
+                let encoded = serde_json::to_string(&substituted)
+                    .map_err(|err| AutoError::Invalid(err.to_string()))?;
+                out.push_str(&encoded);
             }
-            Value::String(render_str(&text, vars))
+            continue;
         }
-        Value::Array(items) => Value::Array(items.into_iter().map(|v| sub_json(v, vars)).collect()),
-        Value::Object(map) => Value::Object(
-            map.into_iter()
-                .map(|(k, v)| (k, sub_json(v, vars)))
-                .collect(),
-        ),
-        other => other,
+        if raw[i..].starts_with("{{")
+            && let Some(rel_end) = raw[i + 2..].find("}}")
+        {
+            let name = &raw[i + 2..i + 2 + rel_end];
+            if !name.contains('{')
+                && !name.contains('}')
+                && !name.contains('"')
+                && let Some(typed) = vars.get(name)
+            {
+                let encoded = serde_json::to_string(typed)
+                    .map_err(|err| AutoError::Invalid(err.to_string()))?;
+                out.push_str(&encoded);
+                i += 2 + rel_end + 2;
+                continue;
+            }
+        }
+        let ch = raw[i..]
+            .chars()
+            .next()
+            .ok_or_else(|| AutoError::Invalid("invalid UTF-8 in template JSON".into()))?;
+        out.push(ch);
+        i += ch.len_utf8();
     }
+    Ok(out)
 }
 
 /// Resolves `{{trigger.*}}` and `{{stages.<name>.*}}` references inside plain text templates.
@@ -188,84 +235,143 @@ pub(crate) fn render_text(raw: &str, firing: &Firing) -> String {
     render_str(raw, &vars)
 }
 
-/// Parses `raw` as JSON and substitutes `{{...}}` placeholders with typed JSON values/escaping.
+/// Substitutes `{{...}}` placeholders in both JSON value positions and string literals, then parses.
 pub(crate) fn render_json(raw: &str, firing: &Firing) -> Result<Value, AutoError> {
-    let parsed: Value = serde_json::from_str(raw)
-        .map_err(|err| AutoError::Invalid(format!("invalid template JSON: {err}")))?;
     let vars = template_values(firing);
-    Ok(sub_json(parsed, &vars))
+    let rendered = render_json_template(raw, &vars)?;
+    serde_json::from_str(&rendered)
+        .map_err(|err| AutoError::Invalid(format!("invalid template JSON: {err}")))
 }
 
-fn parse_inputs(
+/// Deterministic idempotency key for a run stage attempt so restarts recover already-admitted runs.
+pub(crate) fn run_idempotency_key(firing_id: Ulid, stage_name: &str, attempt: u32) -> String {
+    format!("auto:{firing_id}:{stage_name}:{attempt}")
+}
+
+fn pin_to_json(pin: &PinnedInput) -> Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("bucket".into(), Value::String(pin.bucket.clone()));
+    obj.insert("key".into(), Value::String(pin.key.clone()));
+    obj.insert(
+        "version_id".into(),
+        Value::String(pin.version_id.to_string()),
+    );
+    if let Some(node) = pin.source_node_id {
+        obj.insert("source_node_id".into(), Value::String(node.to_string()));
+    }
+    Value::Object(obj)
+}
+
+pub(crate) fn parse_inputs(
     raw: Option<&str>,
     firing: &Firing,
     local: NodeId,
 ) -> Result<(Vec<PinnedInput>, Option<String>), AutoError> {
     let mut pins = Vec::new();
+    let mut grouped: BTreeMap<String, (bool, Vec<Value>)> = BTreeMap::new();
     if let TriggerPayload::AppletSubmission { files, .. } = &firing.trigger {
         for file in files {
-            pins.push(PinnedInput {
+            let pin = PinnedInput {
                 name: file.name.clone(),
                 bucket: file.bucket.clone(),
                 key: file.key.clone(),
                 version_id: file.version_id,
                 source_node_id: Some(local),
-            });
-        }
-    }
-    let Some(text) = raw else {
-        return Ok((pins, None));
-    };
-    let rendered = render_json(text, firing)?;
-    let Value::Object(map) = &rendered else {
-        return Err(AutoError::Invalid(
-            "run inputs_json must be a JSON object".into(),
-        ));
-    };
-    for (name, val) in map {
-        let items: Vec<&Value> = match val {
-            Value::Array(list) => list.iter().collect(),
-            Value::Object(_) => vec![val],
-            _ => {
-                return Err(AutoError::Invalid(format!(
-                    "input `{name}` must be an object or array of objects"
-                )));
-            }
-        };
-        for item in items {
-            let Some(obj) = item.as_object() else {
-                return Err(AutoError::Invalid(format!(
-                    "input `{name}` entry must be an object"
-                )));
             };
-            let bucket = obj
-                .get("bucket")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| AutoError::Invalid(format!("input `{name}` missing bucket")))?;
-            let key = obj
-                .get("key")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| AutoError::Invalid(format!("input `{name}` missing key")))?;
-            let ver = obj
-                .get("version_id")
-                .and_then(Value::as_str)
-                .and_then(|s| Ulid::from_string(s).ok())
-                .ok_or_else(|| {
-                    AutoError::Invalid(format!("input `{name}` missing valid ULID version_id"))
-                })?;
-            pins.push(PinnedInput {
-                name: name.clone(),
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-                version_id: ver,
-                source_node_id: Some(local),
-            });
+            grouped
+                .entry(pin.name.clone())
+                .or_insert_with(|| (false, Vec::new()))
+                .1
+                .push(pin_to_json(&pin));
+            pins.push(pin);
         }
     }
-    let encoded =
-        serde_json::to_string(&rendered).map_err(|err| AutoError::Invalid(err.to_string()))?;
+    if let Some(text) = raw {
+        let rendered = render_json(text, firing)?;
+        let Value::Object(map) = &rendered else {
+            return Err(AutoError::Invalid(
+                "run inputs_json must be a JSON object".into(),
+            ));
+        };
+        for (name, val) in map {
+            let (is_array, items): (bool, Vec<&Value>) = match val {
+                Value::Array(list) => (true, list.iter().collect()),
+                Value::Object(_) => (false, vec![val]),
+                _ => {
+                    return Err(AutoError::Invalid(format!(
+                        "input `{name}` must be an object or array of objects"
+                    )));
+                }
+            };
+            let entry = grouped
+                .entry(name.clone())
+                .or_insert_with(|| (is_array, Vec::new()));
+            entry.0 |= is_array;
+            for item in items {
+                let Some(obj) = item.as_object() else {
+                    return Err(AutoError::Invalid(format!(
+                        "input `{name}` entry must be an object"
+                    )));
+                };
+                let bucket = obj
+                    .get("bucket")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| AutoError::Invalid(format!("input `{name}` missing bucket")))?;
+                let key = obj
+                    .get("key")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| AutoError::Invalid(format!("input `{name}` missing key")))?;
+                let ver = obj
+                    .get("version_id")
+                    .and_then(Value::as_str)
+                    .and_then(|s| Ulid::from_string(s).ok())
+                    .ok_or_else(|| {
+                        AutoError::Invalid(format!("input `{name}` missing valid ULID version_id"))
+                    })?;
+                let source_node_id = match obj.get("source_node_id") {
+                    None | Some(Value::Null) => Some(local),
+                    Some(Value::String(node)) => {
+                        let parsed = node.parse::<NodeId>().map_err(|_| {
+                            AutoError::Invalid(format!("input `{name}` has invalid source_node_id"))
+                        })?;
+                        Some(parsed)
+                    }
+                    Some(_) => {
+                        return Err(AutoError::Invalid(format!(
+                            "input `{name}` source_node_id must be a string"
+                        )));
+                    }
+                };
+                let pin = PinnedInput {
+                    name: name.clone(),
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    version_id: ver,
+                    source_node_id,
+                };
+                entry.1.push(pin_to_json(&pin));
+                pins.push(pin);
+            }
+        }
+    }
+    if grouped.is_empty() {
+        return Ok((pins, None));
+    }
+    let map: serde_json::Map<String, Value> = grouped
+        .into_iter()
+        .map(|(name, (is_array, mut items))| {
+            let value = if !is_array && items.len() == 1 {
+                items.pop().unwrap_or(Value::Null)
+            } else {
+                Value::Array(items)
+            };
+            (name, value)
+        })
+        .collect();
+    let encoded = serde_json::to_string(&Value::Object(map))
+        .map_err(|err| AutoError::Invalid(err.to_string()))?;
     Ok((pins, Some(encoded)))
 }
 
@@ -433,9 +539,10 @@ impl StartStageRun {
             inputs_json: self.inputs_json.clone(),
             output,
             provenance_crate: self.provenance_crate,
-            idempotency_key: Some(format!(
-                "auto:{}:{}:{}",
-                self.firing.firing_id, stage_name, self.firing.attempt
+            idempotency_key: Some(run_idempotency_key(
+                self.firing.firing_id,
+                &stage_name,
+                self.firing.attempt,
             )),
             placement_site: self.placement_site.clone(),
             secrets: self.secrets.clone(),

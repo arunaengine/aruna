@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use aruna_core::applet::record::{SubmissionReceipt, submission_key};
 use aruna_core::automation::firing::{Firing, TriggerPayload};
 use aruna_core::automation::keys::{firing_key, kept_key, replay_key};
-use aruna_core::automation::record::{Automation, KeptEvent, Lifecycle, RunStatus};
+use aruna_core::automation::record::{Automation, KeptEvent, RunStatus};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
@@ -106,7 +106,9 @@ impl Operation for StartManualOperation {
                 AdmitOutcome::Created(firing) | AdmitOutcome::Existing(firing) => {
                     Ok(Next::Done(firing))
                 }
-                AdmitOutcome::AlreadySeen => Err(IoError::Unfinished.into()),
+                AdmitOutcome::AlreadySeen | AdmitOutcome::Unmatched => {
+                    Err(IoError::Unfinished.into())
+                }
             },
         }
     }
@@ -250,11 +252,6 @@ impl Operation for StartEventsOperation {
         match std::mem::replace(&mut self.step, ReplayStep::Admit) {
             ReplayStep::Access => {
                 let auto = result.child::<Automation, AutoError>()??;
-                if auto.lifecycle != Lifecycle::Active {
-                    return Err(AutoError::Conflict(
-                        "automation must be active to start".into(),
-                    ));
-                }
                 let mut reads = Vec::with_capacity(self.event_ids.len() * 2);
                 for eid in &self.event_ids {
                     reads.push((
@@ -272,13 +269,13 @@ impl Operation for StartEventsOperation {
             ReplayStep::ReadKept => {
                 let values = result.values()?;
                 for pair in values.as_chunks::<2>().0 {
-                    if let Some(bytes) = &pair[0] {
-                        let kept = KeptEvent::from_bytes(bytes)?;
-                        self.pending.push(ReplayItem::Kept(Box::new(kept)));
-                    } else if let Some(bytes) = &pair[1]
+                    if let Some(bytes) = &pair[1]
                         && let Some((firing_id, _)) = parse_replay(bytes)
                     {
                         self.pending.push(ReplayItem::Replayed(firing_id));
+                    } else if let Some(bytes) = &pair[0] {
+                        let kept = KeptEvent::from_bytes(bytes)?;
+                        self.pending.push(ReplayItem::Kept(Box::new(kept)));
                     }
                 }
                 if self.pending.is_empty() {
@@ -349,7 +346,7 @@ impl Operation for StartEventsOperation {
                     AdmitOutcome::Created(firing) | AdmitOutcome::Existing(firing) => {
                         self.started.push(firing);
                     }
-                    AdmitOutcome::AlreadySeen => {}
+                    AdmitOutcome::AlreadySeen | AdmitOutcome::Unmatched => {}
                 }
                 self.next_item()
             }
