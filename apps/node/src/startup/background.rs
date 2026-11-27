@@ -296,6 +296,7 @@ pub(crate) async fn start(
                 spawn_worker(driver_ctx.clone(), realm_id, node_id, &shutdown);
                 crate::automations::spawn_worker(
                     driver_ctx.clone(),
+                    jobs_runtime.clone(),
                     realm_id,
                     node_id,
                     disabled_features.clone(),

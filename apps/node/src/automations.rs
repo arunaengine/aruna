@@ -12,6 +12,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_ops_work::automations::matcher::MatchEventsOperation;
 use aruna_ops_work::automations::runner::StepFiringsOperation;
 use aruna_runner::driver::{DriverContext, drive};
+use aruna_runner::jobs::runtime::JobsRuntime;
 use aruna_scheduler::shutdown::Shutdown;
 use tracing::{debug, warn};
 
@@ -21,6 +22,7 @@ const WORKER_BUSY: Duration = Duration::from_millis(200);
 /// Runs automation journal matching and DAG firing advancement until shutdown.
 pub fn spawn_worker(
     context: Arc<DriverContext>,
+    jobs_runtime: Arc<JobsRuntime>,
     realm_id: RealmId,
     node_id: NodeId,
     disabled_features: BTreeSet<Feature>,
@@ -45,6 +47,14 @@ pub fn spawn_worker(
                 .with_disabled_features(disabled_features.clone());
             match drive(stepper, context.as_ref()).await {
                 Ok(report) => {
+                    for job_id in &report.cancel_jobs {
+                        jobs_runtime.request_cancel(*job_id);
+                    }
+                    if let Some(registry) = context.compute_handle.as_ref() {
+                        for run_id in &report.wake_runs {
+                            registry.wake_run(run_id.to_string());
+                        }
+                    }
                     if report.advanced > 0 || report.finished > 0 {
                         busy = true;
                         debug!(?report, "Advanced active automation firings");

@@ -135,8 +135,17 @@ pub async fn cancel_firing(
     let id = path_id(&id)?;
     let local = (state.get_node_id(), state.get_realm_id());
     let op = CancelFiringOperation::new(&auth, id, local);
-    let firing = drive(op, &state.get_ctx()).await.map_err(auto_error)?;
-    Ok(Json(FiringBody::from_domain(&firing)))
+    let cancelled = drive(op, &state.get_ctx()).await.map_err(auto_error)?;
+    let runtime = state.jobs_runtime();
+    for job_id in cancelled.running_jobs {
+        runtime.request_cancel(job_id);
+    }
+    if let Some(registry) = state.get_ctx().compute_handle.as_ref() {
+        for run_id in cancelled.woken_runs {
+            registry.wake_run(run_id.to_string());
+        }
+    }
+    Ok(Json(FiringBody::from_domain(&cancelled.firing)))
 }
 
 #[utoipa::path(

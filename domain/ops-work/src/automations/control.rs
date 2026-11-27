@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::automation::firing::{CopiedFile, Firing, StageState};
+use aruna_core::automation::firing::{CopiedFile, Firing, FiringState, StageState};
 use aruna_core::automation::keys::copy_plan_key;
 use aruna_core::automation::record::{Automation, StageKind};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -10,8 +10,10 @@ use aruna_core::errors::AuthorizationError;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{AUTOMATION_INTENTS_KEYSPACE, AUTOMATION_RUNS_KEYSPACE};
 use aruna_core::operation::Operation;
+use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::types::{Key, KeySpace, Value};
 use aruna_ops_data::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
@@ -22,12 +24,18 @@ use super::copy_stage::{source_count, source_length, stage_intent_id};
 use super::firing_reads::GetFiringOperation;
 pub(crate) use super::firing_tx::{FiringDelta, FiringTxOp, FiringTxResult};
 use super::{AutoAccessOperation, AutoError, Need, automation_auth_for};
-use crate::plugins::intents::{
-    IntentRecord, IntentState, intent_scan_in, resolved_rows_in, undone_keys_in,
-};
-use crate::plugins::rows::{Row, Rows, StoreError, decode, delete_call, encode, row, scan_rows};
+use crate::plugins::intents::{IntentRecord, IntentState, intent_scan_in, resolved_rows_in};
+use crate::plugins::rows::{Rows, StoreError, decode, encode, row, scan_rows};
 use crate::workflows::CatalogError;
 use crate::workflows::runs::cancel::{CancelRunOperation, CancelledRun};
+
+/// Result of cancelling a firing, including local job and coordinator run IDs to signal.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CancelledFiring {
+    pub firing: Firing,
+    pub running_jobs: Vec<JobId>,
+    pub woken_runs: Vec<Ulid>,
+}
 
 #[derive(Debug, PartialEq)]
 enum CancelStep {
@@ -39,7 +47,7 @@ enum CancelStep {
 }
 
 /// Moves a firing into `Cancelling`, persists it atomically, and propagates cancellation to every
-/// active child `WorkflowRunRecord`, recording acknowledgement or retryable failure on the stage.
+/// active child `WorkflowRunRecord`, returning local running job IDs and run IDs to signal.
 #[derive(Debug, PartialEq)]
 pub struct CancelFiringOperation {
     auth: AuthContext,
@@ -48,6 +56,8 @@ pub struct CancelFiringOperation {
     auto: Option<Automation>,
     firing: Option<Firing>,
     child_runs: Vec<(usize, Ulid)>,
+    running_jobs: Vec<JobId>,
+    woken_runs: Vec<Ulid>,
     step: CancelStep,
 }
 
@@ -60,13 +70,19 @@ impl CancelFiringOperation {
             auto: None,
             firing: None,
             child_runs: Vec::new(),
+            running_jobs: Vec::new(),
+            woken_runs: Vec::new(),
             step: CancelStep::Load,
         }
     }
 
-    fn next_child(&mut self) -> Result<Next<Firing>, AutoError> {
+    fn next_child(&mut self) -> Result<Next<CancelledFiring>, AutoError> {
         let Some((idx, run_id)) = self.child_runs.pop() else {
-            return Ok(Next::Done(self.firing.take().ok_or(IoError::Unfinished)?));
+            return Ok(Next::Done(CancelledFiring {
+                firing: self.firing.take().ok_or(IoError::Unfinished)?,
+                running_jobs: std::mem::take(&mut self.running_jobs),
+                woken_runs: std::mem::take(&mut self.woken_runs),
+            }));
         };
         let auto = self.auto.as_ref().ok_or(IoError::Unfinished)?;
         let firing = self.firing.as_ref().ok_or(IoError::Unfinished)?;
@@ -80,15 +96,15 @@ impl CancelFiringOperation {
 }
 
 impl Operation for CancelFiringOperation {
-    type Output = Firing;
+    type Output = CancelledFiring;
     type Error = AutoError;
 
-    fn first(&mut self) -> Result<Next<Firing>, AutoError> {
+    fn first(&mut self) -> Result<Next<CancelledFiring>, AutoError> {
         let get = GetFiringOperation::new(&self.auth, self.firing_id, self.local.0);
         Ok(Next::Call(IoCall::child(get)))
     }
 
-    fn next(&mut self, result: IoResult) -> Result<Next<Firing>, AutoError> {
+    fn next(&mut self, result: IoResult) -> Result<Next<CancelledFiring>, AutoError> {
         match std::mem::replace(&mut self.step, CancelStep::Load) {
             CancelStep::Load => {
                 let (_, auto) = result.child::<(Firing, Automation), AutoError>()??;
@@ -115,7 +131,12 @@ impl Operation for CancelFiringOperation {
             }
             CancelStep::ChildRun(idx, run_id) => {
                 let err = match result.child::<CancelledRun, CatalogError>()? {
-                    Ok(_) | Err(CatalogError::NotFound) => None,
+                    Ok(cancelled) => {
+                        self.running_jobs.extend(cancelled.running);
+                        self.woken_runs.push(cancelled.record.run_id);
+                        None
+                    }
+                    Err(CatalogError::NotFound) => None,
                     Err(e) => Some(format!("child cancel pending: {e}")),
                 };
                 let auto_id = self.auto.as_ref().ok_or(IoError::Unfinished)?.automation_id;
@@ -149,15 +170,13 @@ enum ResolveStep {
     Load,
     Access,
     ScanIntents,
-    LoadPlan(Rows, Option<(Vec<u8>, IntentRecord, u32)>),
-    HeadDest(Rows, Option<(Vec<u8>, IntentRecord, u32)>, Box<CopiedFile>),
-    WriteIntents(Rows, Vec<(&'static str, Vec<u8>)>),
-    DropKeys,
+    LoadPlan(Option<(Vec<u8>, IntentRecord, u32)>),
+    HeadDest(Option<(Vec<u8>, IntentRecord, u32)>, Box<CopiedFile>),
     Commit,
 }
 
-/// Records an audited human decision (`done: true | false`) for a `NeedsAttention` stage, settling
-/// its intent row and continuing multi-file `copy` stages from the next uncommitted file.
+/// Records an audited human decision (`done: true | false`) for a `NeedsAttention` stage, verifying
+/// planned copy destinations and committing intent and firing updates in one transaction.
 #[derive(Debug, PartialEq)]
 pub struct ResolveStageOperation {
     auth: AuthContext,
@@ -197,7 +216,11 @@ impl ResolveStageOperation {
         }
     }
 
-    fn commit(&mut self) -> Result<Next<Firing>, AutoError> {
+    fn commit_with(
+        &mut self,
+        writes: Vec<(KeySpace, Key, Value)>,
+        deletes: Vec<(KeySpace, Key)>,
+    ) -> Result<Next<Firing>, AutoError> {
         let auto_id = self.auto_id.ok_or(IoError::Unfinished)?;
         let copy_progress = self.copy_total.map(|total| (self.planned.clone(), total));
         let tx = FiringTxOp::new(
@@ -210,42 +233,24 @@ impl ResolveStageOperation {
                 actor: self.auth.user_id,
                 note: self.note.clone(),
             },
-        );
+        )
+        .with_extras(writes, deletes);
         self.step = ResolveStep::Commit;
         Ok(Next::Call(IoCall::retry(tx, &self.firing_id.to_bytes())))
     }
 
-    fn finish_copy_done(
+    fn head_planned(
         &mut self,
         open: Option<(Vec<u8>, IntentRecord, u32)>,
-    ) -> Result<Next<Firing>, AutoError> {
-        let stage_id = self.stage_id.ok_or(IoError::Unfinished)?;
-        let mut writes: Vec<Row> = Vec::new();
-        let mut drops = Vec::new();
-        if let Some((key, mut record, ordinal)) = open {
-            record.state = match &self.planned {
-                Some(file) => IntentState::Settled {
-                    reply: serde_json::to_string(file)
-                        .map_err(|e| AutoError::Storage(e.to_string()))?,
-                },
-                None => IntentState::Resolved { done: true },
-            };
-            let encoded = encode(&record).map_err(|e| AutoError::Storage(e.detail()))?;
-            writes.push(row(AUTOMATION_INTENTS_KEYSPACE, key, encoded));
-            drops.push((
-                AUTOMATION_RUNS_KEYSPACE,
-                copy_plan_key(stage_id, ordinal).to_vec(),
-            ));
-        }
-        if !writes.is_empty() {
-            self.step = ResolveStep::WriteIntents(Vec::new(), drops);
-            return Ok(Next::Call(IoCall::Write(writes)));
-        }
-        if !drops.is_empty() {
-            self.step = ResolveStep::DropKeys;
-            return Ok(Next::Call(delete_call(drops)));
-        }
-        self.commit()
+        planned: CopiedFile,
+    ) -> Next<Firing> {
+        let head = HeadObjectOperation::new(HeadObjectInput {
+            bucket: planned.dest_bucket.clone(),
+            key: planned.dest_key.clone(),
+            version_id: Some(planned.dest_version),
+        });
+        self.step = ResolveStep::HeadDest(open, Box::new(planned));
+        Next::Call(IoCall::child(head))
     }
 }
 
@@ -268,6 +273,12 @@ impl Operation for ResolveStageOperation {
         match std::mem::replace(&mut self.step, ResolveStep::Load) {
             ResolveStep::Load => {
                 let (firing, auto) = result.child::<(Firing, Automation), AutoError>()??;
+                if firing.state == FiringState::Cancelling || firing.state.is_terminal() {
+                    return Err(AutoError::Conflict(format!(
+                        "firing is already {}",
+                        firing.state.as_str()
+                    )));
+                }
                 let idx = firing.stage_index(&self.stage).ok_or_else(|| {
                     AutoError::Conflict(format!("unknown stage `{}`", self.stage))
                 })?;
@@ -321,92 +332,109 @@ impl Operation for ResolveStageOperation {
                         }
                     }
                     if !self.done {
-                        let mut drops = Vec::new();
+                        let mut deletes = Vec::new();
                         for (key, _, ord) in open_rows {
-                            drops.push((AUTOMATION_INTENTS_KEYSPACE, key));
-                            drops.push((
-                                AUTOMATION_RUNS_KEYSPACE,
-                                copy_plan_key(stage_id, ord).to_vec(),
+                            deletes.push((AUTOMATION_INTENTS_KEYSPACE.to_string(), Key::from(key)));
+                            deletes.push((
+                                AUTOMATION_RUNS_KEYSPACE.to_string(),
+                                copy_plan_key(stage_id, ord),
                             ));
                         }
-                        if !drops.is_empty() {
-                            self.step = ResolveStep::DropKeys;
-                            return Ok(Next::Call(delete_call(drops)));
-                        }
-                        return self.commit();
+                        return self.commit_with(Vec::new(), deletes);
                     }
                     let open = open_rows.into_iter().next();
-                    if self.planned.is_none()
-                        && let Some((_, _, ord)) = open.as_ref()
-                    {
+                    if let Some(planned) = self.planned.clone() {
+                        return Ok(self.head_planned(open, planned));
+                    }
+                    if let Some((_, _, ord)) = open.as_ref() {
                         let ord = *ord;
-                        self.step = ResolveStep::LoadPlan(rows, open);
+                        self.step = ResolveStep::LoadPlan(open);
                         return Ok(Next::Call(IoCall::Read(vec![(
                             AUTOMATION_RUNS_KEYSPACE.to_string(),
                             copy_plan_key(stage_id, ord),
                         )])));
                     }
-                    if let Some(planned) = self.planned.clone() {
-                        let head = HeadObjectOperation::new(HeadObjectInput {
-                            bucket: planned.dest_bucket.clone(),
-                            key: planned.dest_key.clone(),
-                            version_id: Some(planned.dest_version),
-                        });
-                        self.step = ResolveStep::HeadDest(rows, open, Box::new(planned));
-                        return Ok(Next::Call(IoCall::child(head)));
+                    return Err(AutoError::Conflict(
+                        "copy plan missing; resolve as done=false to retry".into(),
+                    ));
+                }
+                if !self.done {
+                    let mut deletes = Vec::new();
+                    for (key, value) in rows {
+                        let rec = decode::<IntentRecord>(&value)
+                            .map_err(|e| AutoError::Storage(e.detail()))?;
+                        if matches!(
+                            rec.state,
+                            IntentState::Pending
+                                | IntentState::Unknown { .. }
+                                | IntentState::Resolved { done: false }
+                        ) {
+                            deletes.push((AUTOMATION_INTENTS_KEYSPACE.to_string(), Key::from(key)));
+                        }
                     }
-                    return self.finish_copy_done(open);
+                    return self.commit_with(Vec::new(), deletes);
                 }
-                let updates =
-                    resolved_rows_in(AUTOMATION_INTENTS_KEYSPACE, rows.clone(), self.done)
-                        .map_err(|e| AutoError::Storage(e.detail()))?;
-                if updates.is_empty() {
-                    return self.commit();
-                }
-                self.step = ResolveStep::WriteIntents(rows, Vec::new());
-                Ok(Next::Call(IoCall::Write(updates)))
+                let writes = resolved_rows_in(AUTOMATION_INTENTS_KEYSPACE, rows, true)
+                    .map_err(|e| AutoError::Storage(e.detail()))?;
+                self.commit_with(writes, Vec::new())
             }
-            ResolveStep::LoadPlan(rows, open) => {
+            ResolveStep::LoadPlan(open) => {
                 if let Some(bytes) = result.value()? {
                     self.planned = postcard::from_bytes::<CopiedFile>(&bytes).ok();
                 }
-                if let Some(planned) = self.planned.clone() {
-                    let head = HeadObjectOperation::new(HeadObjectInput {
-                        bucket: planned.dest_bucket.clone(),
-                        key: planned.dest_key.clone(),
-                        version_id: Some(planned.dest_version),
-                    });
-                    self.step = ResolveStep::HeadDest(rows, open, Box::new(planned));
-                    return Ok(Next::Call(IoCall::child(head)));
-                }
-                self.finish_copy_done(open)
+                let Some(planned) = self.planned.clone() else {
+                    return Err(AutoError::Conflict(
+                        "copy plan missing; resolve as done=false to retry".into(),
+                    ));
+                };
+                Ok(self.head_planned(open, planned))
             }
-            ResolveStep::HeadDest(_rows, open, mut planned) => {
-                if let Ok(head) = result.child::<HeadObjectResult, HeadObjectError>()?
-                    && let Some(bytes) = source_length(&head)
-                {
+            ResolveStep::HeadDest(open, mut planned) => {
+                let head = match result.child::<HeadObjectResult, HeadObjectError>()? {
+                    Ok(head) => head,
+                    Err(
+                        HeadObjectError::NoSuchKey
+                        | HeadObjectError::NoSuchVersion
+                        | HeadObjectError::DeleteMarker,
+                    ) => {
+                        return Err(AutoError::Conflict(
+                            "planned copy destination version not found; resolve as done=false to retry"
+                                .into(),
+                        ));
+                    }
+                    Err(err) => {
+                        return Err(AutoError::Storage(format!(
+                            "failed to verify planned copy destination: {err}"
+                        )));
+                    }
+                };
+                let matched_ver = head.resolved_version_id == Some(planned.dest_version)
+                    || head.version_id == Some(planned.dest_version);
+                if !matched_ver {
+                    return Err(AutoError::Conflict(
+                        "destination object version does not match planned copy".into(),
+                    ));
+                }
+                if let Some(bytes) = source_length(&head) {
                     planned.bytes = planned.bytes.max(bytes);
                 }
+                let stage_id = self.stage_id.ok_or(IoError::Unfinished)?;
+                let mut writes = Vec::new();
+                let mut deletes = Vec::new();
+                if let Some((key, mut record, ordinal)) = open {
+                    record.state = IntentState::Settled {
+                        reply: serde_json::to_string(&*planned)
+                            .map_err(|e| AutoError::Storage(e.to_string()))?,
+                    };
+                    let encoded = encode(&record).map_err(|e| AutoError::Storage(e.detail()))?;
+                    writes.push(row(AUTOMATION_INTENTS_KEYSPACE, key, encoded));
+                    deletes.push((
+                        AUTOMATION_RUNS_KEYSPACE.to_string(),
+                        copy_plan_key(stage_id, ordinal),
+                    ));
+                }
                 self.planned = Some(*planned);
-                self.finish_copy_done(open)
-            }
-            ResolveStep::WriteIntents(rows, extra_drops) => {
-                result.done()?;
-                let mut drops = extra_drops;
-                if !self.done && !rows.is_empty() {
-                    let keys = undone_keys_in(AUTOMATION_INTENTS_KEYSPACE, rows)
-                        .map_err(|e| AutoError::Storage(e.detail()))?;
-                    drops.extend(keys);
-                }
-                if !drops.is_empty() {
-                    self.step = ResolveStep::DropKeys;
-                    return Ok(Next::Call(delete_call(drops)));
-                }
-                self.commit()
-            }
-            ResolveStep::DropKeys => {
-                result.done()?;
-                self.commit()
+                self.commit_with(writes, deletes)
             }
             ResolveStep::Commit => {
                 let tx = result.child::<FiringTxResult, AutoError>()??;
@@ -472,7 +500,10 @@ impl Operation for ResumeFiringOperation {
                 let auto = result.child::<Automation, AutoError>()??;
                 let tx = FiringTxOp::new(auto.automation_id, self.firing_id, FiringDelta::Resume);
                 self.step = ResumeStep::Commit;
-                Ok(Next::Call(IoCall::retry(tx, &self.firing_id.to_bytes())))
+                Ok(Next::Call(IoCall::retry(
+                    tx,
+                    &auto.automation_id.to_bytes(),
+                )))
             }
             ResumeStep::Commit => {
                 let tx = result.child::<FiringTxResult, AutoError>()??;
