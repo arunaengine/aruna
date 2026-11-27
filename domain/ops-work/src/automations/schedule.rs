@@ -10,21 +10,27 @@ use aruna_core::automation::record::{Automation, Lifecycle, StageKind};
 use aruna_core::calls::{IoCall, IoResult};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    AUTOMATION_RUNS_KEYSPACE, AUTOMATIONS_KEYSPACE, WORKFLOW_RUN_KEYSPACE,
+    AUTOMATION_INTENTS_KEYSPACE, AUTOMATION_RUNS_KEYSPACE, AUTOMATIONS_KEYSPACE,
+    RUN_IDEMPOTENCY_KEYSPACE, WORKFLOW_RUN_KEYSPACE,
 };
-use aruna_core::structs::execution::workflow_run::{RunState, WorkflowRunRecord, run_key};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::workflow_run::{
+    RunKeyRecord, RunState, WorkflowRunRecord, run_key, run_key_row,
+};
 use aruna_core::structs::identity::features::{Feature, resolve};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{GroupId, Key, Value};
 use ulid::Ulid;
 
-use super::copy_stage::{CopyStageOp, StageOutcome};
+use super::copy_stage::{CopyStageOp, StageOutcome, stage_intent_id};
 use super::dataset_stage::DatasetStageOp;
 use super::firing_reads::decode_ulid;
 use super::firing_tx::{FiringDelta, FiringTxOp, PollDelta};
 use super::notify_stage::NotifyStageOp;
-use super::run_stage::StartStageRun;
+use super::run_stage::{StartStageRun, run_idempotency_key};
 use super::{AutoError, automation_auth_for};
+use crate::plugins::intents::{IntentRecord, IntentState, intent_key};
+use crate::plugins::rows::{decode, encode, row};
 use crate::workflows::CatalogError;
 use crate::workflows::runs::cancel::{CancelRunOperation, CancelledRun};
 
@@ -37,11 +43,27 @@ pub(crate) enum StageWork {
 }
 
 #[derive(Debug, PartialEq)]
+pub(crate) enum ClaimRecovery {
+    RunIdem {
+        idx: usize,
+        stage: String,
+        attempt: u32,
+    },
+    StageIntent {
+        idx: usize,
+        stage_id: Ulid,
+        is_dataset: bool,
+    },
+}
+
+#[derive(Debug, PartialEq)]
 pub(crate) enum StepPhase {
     Config,
     Active,
     CountRuns(usize),
     LoadPair(Ulid, Ulid),
+    RecoverClaim(ClaimRecovery),
+    CommitRecovery,
     PollRuns(Vec<(usize, Ulid)>),
     CommitPoll,
     Evaluate,
@@ -243,16 +265,198 @@ fn pending_cancel(firing: &Firing, tried: &BTreeSet<Ulid>) -> Option<(usize, Uli
     })
 }
 
+pub(crate) fn first_stranded_claim(firing: &Firing) -> Option<ClaimRecovery> {
+    firing.stages.iter().enumerate().find_map(|(idx, stage)| {
+        if !stage.state.is_in_flight() {
+            return None;
+        }
+        match &firing.spec.stages[idx].kind {
+            StageKind::Run { .. } if stage.receipt.workflow_run_id.is_none() => {
+                Some(ClaimRecovery::RunIdem {
+                    idx,
+                    stage: stage.name.clone(),
+                    attempt: firing.attempt,
+                })
+            }
+            StageKind::Dataset { .. } => Some(ClaimRecovery::StageIntent {
+                idx,
+                stage_id: stage_intent_id(firing.firing_id, &stage.name),
+                is_dataset: true,
+            }),
+            StageKind::Notify { .. } => Some(ClaimRecovery::StageIntent {
+                idx,
+                stage_id: stage_intent_id(firing.firing_id, &stage.name),
+                is_dataset: false,
+            }),
+            _ => None,
+        }
+    })
+}
+
+pub(crate) fn claim_recovery_call(
+    claim: &ClaimRecovery,
+    auto: &Automation,
+    firing: &Firing,
+) -> Option<IoCall> {
+    match claim {
+        ClaimRecovery::RunIdem { stage, attempt, .. } => {
+            let account = auto.account?;
+            let key = run_key_row(
+                firing.group_id,
+                account,
+                &run_idempotency_key(firing.firing_id, stage, *attempt),
+            );
+            Some(IoCall::Read(vec![(
+                RUN_IDEMPOTENCY_KEYSPACE.to_string(),
+                key,
+            )]))
+        }
+        ClaimRecovery::StageIntent { stage_id, .. } => Some(IoCall::Read(vec![(
+            AUTOMATION_INTENTS_KEYSPACE.to_string(),
+            Key::from(intent_key(*stage_id, 0)),
+        )])),
+    }
+}
+
+pub(crate) fn resolve_claim_recovery(
+    claim: ClaimRecovery,
+    firing: &Firing,
+    result: IoResult,
+    track: &mut RunTrack,
+) -> Result<IoCall, AutoError> {
+    let bytes = result.value()?;
+    match claim {
+        ClaimRecovery::RunIdem { idx, .. } => {
+            if let Some(raw) = bytes {
+                let rec = RunKeyRecord::from_bytes(&raw)?;
+                return Ok(firing_tx_call(
+                    firing,
+                    FiringDelta::RunStarted {
+                        idx,
+                        outcome: Ok(rec.run_id),
+                    },
+                ));
+            }
+            if let Some(count) = track.active_runs.get_mut(&firing.automation_id) {
+                *count = count.saturating_sub(1);
+            }
+            Ok(firing_tx_call(firing, FiringDelta::ReleaseStage(idx)))
+        }
+        ClaimRecovery::StageIntent {
+            idx,
+            stage_id,
+            is_dataset,
+        } => {
+            let Some(raw) = bytes else {
+                return Ok(firing_tx_call(firing, FiringDelta::ReleaseStage(idx)));
+            };
+            let mut rec =
+                decode::<IntentRecord>(&raw).map_err(|e| AutoError::Storage(e.detail()))?;
+            let cancelling = firing.state == FiringState::Cancelling
+                || firing.stages[idx].state == StageState::Cancelling;
+            match rec.state {
+                IntentState::Settled { reply } => {
+                    let outcome = if is_dataset {
+                        let doc_id = reply
+                            .split_whitespace()
+                            .next()
+                            .and_then(|s| Ulid::from_string(s).ok())
+                            .ok_or_else(|| AutoError::Storage("invalid dataset receipt".into()))?;
+                        StageOutcome::Dataset(doc_id)
+                    } else {
+                        StageOutcome::Notified(reply.parse::<u32>().unwrap_or(0))
+                    };
+                    Ok(firing_tx_call(
+                        firing,
+                        FiringDelta::StageOutcome { idx, outcome },
+                    ))
+                }
+                IntentState::Pending => {
+                    let msg = "an earlier attempt of this call did not finish".to_string();
+                    rec.state = IntentState::Unknown {
+                        reason: msg.clone(),
+                    };
+                    let encoded = encode(&rec).map_err(|e| AutoError::Storage(e.detail()))?;
+                    let extra = vec![row(
+                        AUTOMATION_INTENTS_KEYSPACE,
+                        intent_key(stage_id, 0),
+                        encoded,
+                    )];
+                    let outcome = if cancelling {
+                        StageOutcome::Failed(msg)
+                    } else {
+                        StageOutcome::NeedsAttention(msg, None)
+                    };
+                    let op = FiringTxOp::new(
+                        firing.automation_id,
+                        firing.firing_id,
+                        FiringDelta::StageOutcome { idx, outcome },
+                    )
+                    .with_extras(extra, Vec::new());
+                    Ok(IoCall::retry(op, &firing.firing_id.to_bytes()))
+                }
+                IntentState::Unknown { reason } => {
+                    let outcome = if cancelling {
+                        StageOutcome::Failed(reason)
+                    } else {
+                        StageOutcome::NeedsAttention(reason, None)
+                    };
+                    Ok(firing_tx_call(
+                        firing,
+                        FiringDelta::StageOutcome { idx, outcome },
+                    ))
+                }
+                IntentState::Resolved { .. } => {
+                    let msg = "stage intent already resolved".to_string();
+                    let outcome = if cancelling {
+                        StageOutcome::Failed(msg)
+                    } else {
+                        StageOutcome::NeedsAttention(msg, None)
+                    };
+                    Ok(firing_tx_call(
+                        firing,
+                        FiringDelta::StageOutcome { idx, outcome },
+                    ))
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn cancel_reply_delta(
     idx: usize,
     run_id: Ulid,
     result: IoResult,
-) -> Result<FiringDelta, AutoError> {
-    let error = match result.child::<CancelledRun, CatalogError>()? {
-        Ok(_) | Err(CatalogError::NotFound) => None,
-        Err(err) => Some(format!("child cancel retry failed: {err}")),
-    };
-    Ok(FiringDelta::CancelReply { idx, run_id, error })
+) -> Result<(FiringDelta, Vec<JobId>, Option<Ulid>), AutoError> {
+    match result.child::<CancelledRun, CatalogError>()? {
+        Ok(cancelled) => Ok((
+            FiringDelta::CancelReply {
+                idx,
+                run_id,
+                error: None,
+            },
+            cancelled.running,
+            Some(cancelled.record.run_id),
+        )),
+        Err(CatalogError::NotFound) => Ok((
+            FiringDelta::CancelReply {
+                idx,
+                run_id,
+                error: None,
+            },
+            Vec::new(),
+            None,
+        )),
+        Err(err) => Ok((
+            FiringDelta::CancelReply {
+                idx,
+                run_id,
+                error: Some(format!("child cancel retry failed: {err}")),
+            },
+            Vec::new(),
+            None,
+        )),
+    }
 }
 
 fn next_work(firing: &Firing, can_run: bool, used_runs: usize) -> Option<(usize, StageWork)> {

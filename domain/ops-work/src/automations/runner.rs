@@ -10,6 +10,7 @@ use aruna_core::automation::record::Automation;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
+use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::identity::features::Feature;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
@@ -17,17 +18,20 @@ use ulid::Ulid;
 
 use super::firing_tx::{FiringDelta, FiringTxResult};
 use super::schedule::{
-    DispatchPlan, NextAction, RunTrack, StepPhase, build_poll_deltas, build_stage_dispatch,
-    cancel_reply_delta, decode_pair, drop_active_call, firing_tx_call, in_flight_runs,
-    load_pair_call, poll_reads_call, stage_outcome_delta, start_run_delta,
+    ClaimRecovery, DispatchPlan, NextAction, RunTrack, StepPhase, build_poll_deltas,
+    build_stage_dispatch, cancel_reply_delta, claim_recovery_call, decode_pair, drop_active_call,
+    firing_tx_call, first_stranded_claim, in_flight_runs, load_pair_call, poll_reads_call,
+    resolve_claim_recovery, stage_outcome_delta, start_run_delta,
 };
 use super::{AutoError, active_page};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StepReport {
     pub checked: usize,
     pub advanced: usize,
     pub finished: usize,
+    pub cancel_jobs: Vec<JobId>,
+    pub wake_runs: Vec<Ulid>,
 }
 
 /// Drives every active automation firing one tick forward on `local`.
@@ -87,7 +91,7 @@ impl StepFiringsOperation {
 
     fn next_firing(&mut self) -> Result<Next<StepReport>, AutoError> {
         let Some((firing_id, auto_id)) = self.track.queue.pop() else {
-            return Ok(Next::Done(self.report));
+            return Ok(Next::Done(std::mem::take(&mut self.report)));
         };
         (self.auto, self.firing) = (None, None);
         self.phase = StepPhase::LoadPair(firing_id, auto_id);
@@ -114,6 +118,30 @@ impl StepFiringsOperation {
             }
             NextAction::Tx(phase, delta) => self.tx_step(delta, phase),
         }
+    }
+
+    fn continue_after_load(&mut self) -> Result<Next<StepReport>, AutoError> {
+        let auto = self.auto.as_ref().ok_or(IoError::Unfinished)?;
+        let firing = self.firing.as_ref().ok_or(IoError::Unfinished)?;
+        if let Some(claim) = first_stranded_claim(firing) {
+            if let Some(call) = claim_recovery_call(&claim, auto, firing) {
+                self.phase = StepPhase::RecoverClaim(claim);
+                return Ok(Next::Call(call));
+            }
+            if let ClaimRecovery::RunIdem { idx, .. } = claim {
+                if let Some(count) = self.track.active_runs.get_mut(&firing.automation_id) {
+                    *count = count.saturating_sub(1);
+                }
+                return self.tx_step(FiringDelta::ReleaseStage(idx), StepPhase::CommitRecovery);
+            }
+        }
+        let polling = in_flight_runs(firing);
+        if polling.is_empty() {
+            return self.evaluate_current();
+        }
+        let call = poll_reads_call(&polling);
+        self.phase = StepPhase::PollRuns(polling);
+        Ok(Next::Call(call))
     }
 
     fn dispatch_next(&mut self) -> Result<Next<StepReport>, AutoError> {
@@ -160,15 +188,26 @@ impl Operation for StepFiringsOperation {
                     return Ok(Next::Call(drop_active_call(firing_id)));
                 };
                 self.report.checked += 1;
-                let polling = in_flight_runs(&firing);
                 (self.auto, self.firing) = (Some(auto), Some(firing));
-                if polling.is_empty() {
-                    return self.evaluate_current();
-                }
-                let call = poll_reads_call(&polling);
-                self.phase = StepPhase::PollRuns(polling);
+                self.continue_after_load()
+            }
+            StepPhase::RecoverClaim(claim) => {
+                let firing = self.firing.as_ref().ok_or(IoError::Unfinished)?;
+                let call = resolve_claim_recovery(claim, firing, result, &mut self.track)?;
+                self.phase = StepPhase::CommitRecovery;
                 Ok(Next::Call(call))
             }
+            StepPhase::CommitRecovery => match self.take_tx(result)?.1.into_iter().next() {
+                Some((idx, run_id)) => {
+                    let auto = self.auto.as_ref().ok_or(IoError::Unfinished)?;
+                    let firing = self.firing.as_ref().ok_or(IoError::Unfinished)?;
+                    let action = self
+                        .track
+                        .retry_cancel_action(auto, firing, self.local, idx, run_id);
+                    self.apply_action(action)
+                }
+                None => self.continue_after_load(),
+            },
             StepPhase::PollRuns(polling) => {
                 let aid = self
                     .firing
@@ -191,7 +230,11 @@ impl Operation for StepFiringsOperation {
                 self.dispatch_next()
             }
             StepPhase::RetryCancel(idx, run_id) => {
-                let delta = cancel_reply_delta(idx, run_id, result)?;
+                let (delta, running, woken) = cancel_reply_delta(idx, run_id, result)?;
+                self.report.cancel_jobs.extend(running);
+                if let Some(woken_id) = woken {
+                    self.report.wake_runs.push(woken_id);
+                }
                 self.tx_step(delta, StepPhase::CommitCancel)
             }
             StepPhase::Claim(work) => {
