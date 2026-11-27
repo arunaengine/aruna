@@ -2660,6 +2660,9 @@ fn keeps_empty_link() {
         directory_pins: Vec::new(),
         directory_roots: Vec::new(),
         used_tools: Vec::new(),
+        limits: None,
+        automation: None,
+        applet: None,
     };
     let info = || BucketInfo {
         group_id: aruna_core::types::GroupId::from_bytes([1; 16]),
