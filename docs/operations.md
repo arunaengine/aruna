@@ -16,9 +16,11 @@ upgrades).
   process environment win over the file. [`.env.example`](../.env.example) lists every variable
   with its default.
 - **Ports.** `3000` serves REST and the Swagger UI, `1337` S3, `3001` UDP for connections between
-  nodes, `3002` health and metrics, and `3003` the portal. Inside a container, bind `0.0.0.0` for
-  every port you publish. Port `3002` has no authentication, so publish it on loopback only. With
-  [native HTTPS](#native-https), one more port serves all three over TLS.
+  nodes, `3002` health and metrics, and `3003` the portal. Optional embedded file shares listen on
+  `ARUNA_VFS_SMB_LISTEN_ADDR` (typically `445`) and `ARUNA_VFS_NFS_LISTEN_ADDR` (typically `2049`).
+  Inside a container, bind `0.0.0.0` for every port you publish. Port `3002` has no authentication,
+  so publish it on loopback only. With [native HTTPS](#native-https), one more port serves REST, S3
+  and the portal over TLS.
 - **Data folder.** Everything below `DATABASE_DIR` is node state: the database, metadata, document
   sync, Git repositories, the node identity and, by default, the stored files (`blobstore`). One
   volume at `DATABASE_DIR` holds all of it unless you point `CONTENT_DIR` or `BLOB_BACKENDS_PATH`
@@ -65,6 +67,10 @@ upgrades).
   Both kinds can also be mixed in one list.
 - **Compute.** `ARUNA_COMPUTE_EXECUTOR` is `none` by default. The `docker` executor needs the host's
   Docker socket and an S3 address that job containers can reach.
+- **Native mounts.** Embedded SMB 3.1.1 and NFSv4.1 stay off while `ARUNA_VFS_SMB_LISTEN_ADDR` and
+  `ARUNA_VFS_NFS_LISTEN_ADDR` are unset. See
+  [Native filesystem mounts (SMB and NFS)](#native-filesystem-mounts-smb-and-nfs) and
+  [Production deployment guide](deployment.md#native-filesystem-mounts-smb-and-nfs).
 - **Applets.** Off while `APPLETS_DOMAIN` is unset. Give applets a dedicated registered domain
   separate from the portal, API, S3 and OIDC hosts (the node refuses to start if they share a
   registered domain), set `APPLETS_EDGE_KEY_SHA256` and `APPLETS_PORTAL_ORIGIN`, and keep the
@@ -286,6 +292,45 @@ writable = false                # the default; true lets Aruna write new files h
   server should export the share with `sync`. Aruna writes new files to a temporary name and links
   or renames them into place, which needs hard links on the share. Reading a large share hashes
   every new or changed file once, so schedule runs at quiet times.
+
+## Native filesystem mounts (SMB and NFS)
+
+While [Local and NFS folders](#local-and-nfs-folders) imports an external host directory into Aruna,
+native filesystem mounts work in the opposite direction: the node itself serves local Aruna buckets,
+folder prefixes and job workspaces as standard SMB 3.1.1 or NFSv4.1 shares.
+
+- **How edits become objects.** While a client holds a file open for writing, edits are written to a
+  local staging file under `ARUNA_VFS_STAGE_DIR` (default `<DATABASE_DIR>/vfs-stage`). When the last
+  writer closes the file, the node publishes the staged bytes into the bucket as a normal object
+  version. Staging usage is bounded by `ARUNA_VFS_NODE_STAGE_BYTES` (default 4 GiB) and
+  `ARUNA_VFS_GROUP_STAGE_BYTES` (default 1 GiB).
+- **Live permissions and instant revocation.** Every SMB and NFS operation checks the live S3 access
+  key, user status, group grants and bucket state. Revoking an S3 key, removing a user's access, or
+  locking a `vault_locked` encrypted bucket takes effect immediately, even for already-open mounts.
+  Only local ordinary buckets hosted on this node are served.
+- **SMB 3.1.1.** Users connect to `//<node-host>/<bucket>` with a local S3 access key as username
+  and its secret key as password. Job input views are served read-only at
+  `//<node-host>/in-<job-id>` (lowercase job ID).
+- **NFSv4.1 host and mount lifecycle.** NFS clients authenticate by enrolled host certificate (mTLS)
+  and client IP CIDR, never by trusting client UID/GID (`AUTH_SYS` IDs are ignored for identity):
+  - Enroll a host with `POST /data/nfs/hosts`, list or inspect with `GET /data/nfs/hosts` and
+    `GET /data/nfs/hosts/{host_id}`, rotate its certificate fingerprints with
+    `PUT /data/nfs/hosts/{host_id}`, and revoke it with `DELETE /data/nfs/hosts/{host_id}`.
+  - Bind a bucket, folder prefix or read-only job input view to a host with `POST /data/nfs/mounts`,
+    list or inspect bindings with `GET /data/nfs/mounts` and `GET /data/nfs/mounts/{mount_id}`, and
+    revoke a mount with `DELETE /data/nfs/mounts/{mount_id}`. Clients mount
+    `<node-host>:/m/<mount_id>` with `-o vers=4.1,xprtsec=mtls`.
+- **Quota retries and stage recovery.** If closing a modified file cannot publish immediately (for
+  example because a group quota is full or permissions changed while the file was open), the node
+  keeps the staged checkpoint safely instead of discarding the edits. Quota-blocked checkpoints are
+  retried automatically in the background; bucket admins can also inspect retained stages with
+  `GET /data/buckets/{bucket}/nfs/stages`, publish a retained stage manually with
+  `POST /data/buckets/{bucket}/nfs/stages/{stage_id}/publish`, or discard it with
+  `DELETE /data/buckets/{bucket}/nfs/stages/{stage_id}`.
+- **Retention and cleanup.** Retained stages expire after `ARUNA_VFS_STAGE_RETENTION_SECS` (default
+  7 days) and stale-handle tombstones expire after `ARUNA_VFS_TOMBSTONE_RETENTION_SECS` (default 24
+  hours). Keep `ARUNA_VFS_STAGE_DIR` on persistent local storage across restarts so crash recovery
+  can settle pending writes cleanly.
 
 ## Realm registry
 
