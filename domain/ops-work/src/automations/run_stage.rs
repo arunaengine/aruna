@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::applet::record::{Access, Applet};
+use aruna_core::applet::record::{Access, Applet, SubmissionFile};
 use aruna_core::automation::firing::{Firing, TriggerPayload};
 use aruna_core::automation::record::{Automation, StageKind};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -28,6 +28,7 @@ use crate::workflows::inspect::{ValidateValuesOperation, ValuesReport};
 use crate::workflows::runs::admit::{
     AdmittedRun, Lineage, PinnedInput, RunRequest, StartRunOperation,
 };
+use crate::workflows::runs::run::merge_run_inputs;
 
 fn template_values(firing: &Firing) -> BTreeMap<String, Value> {
     let mut map = BTreeMap::new();
@@ -236,11 +237,19 @@ pub(crate) fn render_text(raw: &str, firing: &Firing) -> String {
 }
 
 /// Substitutes `{{...}}` placeholders in both JSON value positions and string literals, then parses.
-pub(crate) fn render_json(raw: &str, firing: &Firing) -> Result<Value, AutoError> {
-    let vars = template_values(firing);
-    let rendered = render_json_template(raw, &vars)?;
+pub(crate) fn render_json_with(
+    raw: &str,
+    vars: &BTreeMap<String, Value>,
+) -> Result<Value, AutoError> {
+    let rendered = render_json_template(raw, vars)?;
     serde_json::from_str(&rendered)
         .map_err(|err| AutoError::Invalid(format!("invalid template JSON: {err}")))
+}
+
+/// Substitutes `{{...}}` placeholders from `firing` in JSON templates, then parses.
+pub(crate) fn render_json(raw: &str, firing: &Firing) -> Result<Value, AutoError> {
+    let vars = template_values(firing);
+    render_json_with(raw, &vars)
 }
 
 /// Deterministic idempotency key for a run stage attempt so restarts recover already-admitted runs.
@@ -267,27 +276,39 @@ pub(crate) fn parse_inputs(
     firing: &Firing,
     local: NodeId,
 ) -> Result<(Vec<PinnedInput>, Option<String>), AutoError> {
+    let vars = template_values(firing);
+    let files = match &firing.trigger {
+        TriggerPayload::AppletSubmission { files, .. } => files.as_slice(),
+        _ => &[],
+    };
+    parse_inputs_with(raw, &vars, files, local)
+}
+
+pub(crate) fn parse_inputs_with(
+    raw: Option<&str>,
+    vars: &BTreeMap<String, Value>,
+    files: &[SubmissionFile],
+    local: NodeId,
+) -> Result<(Vec<PinnedInput>, Option<String>), AutoError> {
     let mut pins = Vec::new();
     let mut grouped: BTreeMap<String, (bool, Vec<Value>)> = BTreeMap::new();
-    if let TriggerPayload::AppletSubmission { files, .. } = &firing.trigger {
-        for file in files {
-            let pin = PinnedInput {
-                name: file.name.clone(),
-                bucket: file.bucket.clone(),
-                key: file.key.clone(),
-                version_id: file.version_id,
-                source_node_id: Some(local),
-            };
-            grouped
-                .entry(pin.name.clone())
-                .or_insert_with(|| (false, Vec::new()))
-                .1
-                .push(pin_to_json(&pin));
-            pins.push(pin);
-        }
+    for file in files {
+        let pin = PinnedInput {
+            name: file.name.clone(),
+            bucket: file.bucket.clone(),
+            key: file.key.clone(),
+            version_id: file.version_id,
+            source_node_id: Some(local),
+        };
+        grouped
+            .entry(pin.name.clone())
+            .or_insert_with(|| (false, Vec::new()))
+            .1
+            .push(pin_to_json(&pin));
+        pins.push(pin);
     }
     if let Some(text) = raw {
-        let rendered = render_json(text, firing)?;
+        let rendered = render_json_with(text, vars)?;
         let Value::Object(map) = &rendered else {
             return Err(AutoError::Invalid(
                 "run inputs_json must be a JSON object".into(),
@@ -491,11 +512,20 @@ impl StartStageRun {
         }
     }
 
+    pub(crate) fn validation_values(&self) -> Result<Value, AutoError> {
+        merge_run_inputs(
+            self.local.0,
+            &self.values.to_string(),
+            self.inputs_json.as_deref(),
+        )
+        .map_err(|err| AutoError::Invalid(err.to_string()))
+    }
+
     fn validate_call(&mut self) -> Result<Next<Ulid>, AutoError> {
         let auth = self.auth.as_ref().ok_or(IoError::Unfinished)?;
+        let values = self.validation_values()?;
         self.step = RunStep::Validate;
-        let check =
-            ValidateValuesOperation::new(auth, self.workflow_id, self.version, self.values.clone());
+        let check = ValidateValuesOperation::new(auth, self.workflow_id, self.version, values);
         Ok(Next::Call(IoCall::child(check)))
     }
 

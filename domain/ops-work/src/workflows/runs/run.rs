@@ -317,11 +317,24 @@ pub(super) fn replay_chunks(pages: &[RunLogPage]) -> Vec<Vec<RunLogPage>> {
 /// The values of a run with its pinned inputs as addresses the coordinator reads through the
 /// node, a list where the request pinned several objects for one input.
 pub(crate) fn run_inputs(record: &WorkflowRunRecord) -> Result<Value, CatalogError> {
-    let mut values: Map<String, Value> = crate::workflows::from_text(&record.values_json)?;
+    merge_run_inputs(
+        record.node_id,
+        &record.values_json,
+        record.inputs_json.as_deref(),
+    )
+}
+
+/// Merges a JSON object of workflow values with optional pinned inputs as `aruna://` addresses.
+pub(crate) fn merge_run_inputs(
+    local: NodeId,
+    values_json: &str,
+    inputs_json: Option<&str>,
+) -> Result<Value, CatalogError> {
+    let mut values: Map<String, Value> = crate::workflows::from_text(values_json)?;
     for value in values.values_mut() {
-        normalize_remote_values(value, record.node_id);
+        normalize_remote_values(value, local);
     }
-    let Some(inputs) = record.inputs_json.as_deref() else {
+    let Some(inputs) = inputs_json else {
         return Ok(Value::Object(values));
     };
     let inputs: Map<String, Value> = crate::workflows::from_text(inputs)?;
@@ -332,7 +345,7 @@ pub(crate) fn run_inputs(record: &WorkflowRunRecord) -> Result<Value, CatalogErr
         let version = Ulid::from_string(pin.get("version_id")?.as_str()?).ok()?;
         let node = (pin.get("source_node_id").and_then(Value::as_str))
             .and_then(|node| node.parse::<NodeId>().ok())
-            .filter(|node| *node != record.node_id);
+            .filter(|node| *node != local);
         Some(Value::String(match node {
             Some(node) => super::data::address_on(bucket, key, Some(version), node),
             None => super::data::address_of(bucket, key, Some(version)),
