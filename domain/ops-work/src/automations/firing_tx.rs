@@ -254,8 +254,10 @@ impl FiringTxOp {
                             let cancelling = firing.state == FiringState::Cancelling;
                             if let Some(st) = firing.stages.get_mut(*idx)
                                 && st.state.is_in_flight()
-                                && st.receipt.workflow_run_id == Some(*run_id)
+                                && (st.receipt.workflow_run_id.is_none()
+                                    || st.receipt.workflow_run_id == Some(*run_id))
                             {
+                                st.receipt.workflow_run_id = Some(*run_id);
                                 if cancelling || st.state == StageState::Cancelling {
                                     st.state = StageState::Cancelled;
                                     st.finished_at_ms = Some(now_ms);

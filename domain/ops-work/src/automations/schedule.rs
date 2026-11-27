@@ -63,6 +63,11 @@ pub(crate) enum RecoveryStep {
     ReconcileRun(usize, IoCall),
 }
 
+pub(crate) enum ReconcileAction {
+    Commit(FiringDelta, bool),
+    Defer,
+}
+
 pub(crate) enum CancelRetryOutcome {
     Ack {
         running: Vec<JobId>,
@@ -458,31 +463,38 @@ pub(crate) fn resolve_reconciled_run(
     firing: &Firing,
     result: IoResult,
     track: &mut RunTrack,
-) -> Result<(FiringDelta, bool), AutoError> {
+) -> Result<ReconcileAction, AutoError> {
     let reconciled = result
         .child::<ReconciledRun, CatalogError>()?
         .map_err(|err| AutoError::Storage(err.to_string()))?;
     match reconciled {
-        ReconciledRun::Ready { run_id, terminal } => Ok((
+        ReconciledRun::Ready { run_id, terminal } => Ok(ReconcileAction::Commit(
             FiringDelta::RunStarted {
                 idx,
                 outcome: Ok(run_id),
             },
             terminal,
         )),
-        ReconciledRun::Missing => {
+        ReconciledRun::Missing(run_id) => {
             if let Some(count) = track.active_runs.get_mut(&firing.automation_id) {
                 *count = count.saturating_sub(1);
             }
-            Ok((FiringDelta::ReleaseStage(idx), false))
+            Ok(ReconcileAction::Commit(
+                FiringDelta::Poll(vec![PollDelta::Missing { idx, run_id }]),
+                true,
+            ))
         }
         ReconciledRun::Capacity => {
             track.capped.insert(firing.automation_id);
             if let Some(count) = track.active_runs.get_mut(&firing.automation_id) {
                 *count = count.saturating_sub(1);
             }
-            Ok((FiringDelta::ReleaseStage(idx), false))
+            Ok(ReconcileAction::Commit(
+                FiringDelta::ReleaseStage(idx),
+                false,
+            ))
         }
+        ReconciledRun::Deferred => Ok(ReconcileAction::Defer),
     }
 }
 

@@ -19,11 +19,11 @@ use ulid::Ulid;
 use super::control::CancelAck;
 use super::firing_tx::{FiringDelta, FiringTxResult};
 use super::schedule::{
-    CancelRetryOutcome, ClaimRecovery, DispatchPlan, NextAction, RecoveryStep, RunTrack, StepPhase,
-    build_poll_deltas, build_stage_dispatch, cancel_reply_outcome, claim_recovery_call,
-    decode_pair, drop_active_call, firing_tx_call, first_stranded_claim, in_flight_runs,
-    load_pair_call, poll_reads_call, resolve_claim_recovery, resolve_reconciled_run,
-    stage_outcome_delta, start_run_delta,
+    CancelRetryOutcome, ClaimRecovery, DispatchPlan, NextAction, ReconcileAction, RecoveryStep,
+    RunTrack, StepPhase, build_poll_deltas, build_stage_dispatch, cancel_reply_outcome,
+    claim_recovery_call, decode_pair, drop_active_call, firing_tx_call, first_stranded_claim,
+    in_flight_runs, load_pair_call, poll_reads_call, resolve_claim_recovery,
+    resolve_reconciled_run, stage_outcome_delta, start_run_delta,
 };
 use super::{AutoError, active_page};
 
@@ -212,9 +212,12 @@ impl Operation for StepFiringsOperation {
             }
             StepPhase::ReconcileRun(idx) => {
                 let firing = self.firing.as_ref().ok_or(IoError::Unfinished)?;
-                let (delta, terminal) =
-                    resolve_reconciled_run(idx, firing, result, &mut self.track)?;
-                self.tx_step(delta, StepPhase::CommitRecovery(terminal))
+                match resolve_reconciled_run(idx, firing, result, &mut self.track)? {
+                    ReconcileAction::Commit(delta, terminal) => {
+                        self.tx_step(delta, StepPhase::CommitRecovery(terminal))
+                    }
+                    ReconcileAction::Defer => self.next_firing(),
+                }
             }
             StepPhase::CommitRecovery(terminal) => {
                 let child = self.take_tx(result)?.1.into_iter().next();

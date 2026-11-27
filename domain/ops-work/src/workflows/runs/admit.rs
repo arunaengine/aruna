@@ -1369,8 +1369,9 @@ impl Operation for RecordRunOperation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReconciledRun {
     Ready { run_id: Ulid, terminal: bool },
-    Missing,
+    Missing(Ulid),
     Capacity,
+    Deferred,
 }
 
 #[derive(Debug, PartialEq)]
@@ -1429,7 +1430,7 @@ impl Operation for ReconcileRunOperation {
         match std::mem::replace(&mut self.step, ReconcileStep::ReadRun) {
             ReconcileStep::ReadRun => {
                 let Some(record) = super::run_answer(result)? else {
-                    return Ok(Next::Done(ReconciledRun::Missing));
+                    return Ok(Next::Done(ReconciledRun::Missing(self.run_id)));
                 };
                 if record.state.is_terminal() {
                     return Ok(Next::Done(ReconciledRun::Ready {
@@ -1449,18 +1450,37 @@ impl Operation for ReconcileRunOperation {
                 Ok(Next::Call(IoCall::child(find)))
             }
             ReconcileStep::LookupDedup(record) => {
-                let found = result
-                    .child::<Option<(
-                        aruna_core::structs::execution::job::identity::JobId,
-                        [u8; 32],
-                    )>, SubmitJobError>()?
-                    .map_err(|err| CatalogError::Storage(err.to_string()))?;
+                let found = match result.child::<Option<(
+                    aruna_core::structs::execution::job::identity::JobId,
+                    [u8; 32],
+                )>, SubmitJobError>()?
+                {
+                    Ok(found) => found,
+                    Err(
+                        SubmitJobError::Storage(_)
+                        | SubmitJobError::PlacementUnavailable(_)
+                        | SubmitJobError::ClockHealth(_)
+                        | SubmitJobError::RangeMoving(_),
+                    ) => return Ok(Next::Done(ReconciledRun::Deferred)),
+                    Err(err) => return Err(CatalogError::Storage(err.to_string())),
+                };
                 if let Some((job_id, _)) = found {
                     self.step = ReconcileStep::Attach;
                     return Ok(Next::Call(change_call(
                         record.run_id,
                         vec![RunChange::Job(job_id)],
                     )));
+                }
+                let never_started = record.attempts == 0
+                    && record.started_at_ms.is_none()
+                    && record.steps.is_empty();
+                if record.state == RunState::Cancelling && never_started {
+                    self.step = ReconcileStep::Attach;
+                    let change = RunChange::State {
+                        state: RunState::Cancelled,
+                        error: Some("cancelled before it started".into()),
+                    };
+                    return Ok(Next::Call(change_call(record.run_id, vec![change])));
                 }
                 if record.state != RunState::Queued {
                     return Ok(Next::Done(ReconciledRun::Ready {
@@ -1503,11 +1523,11 @@ impl Operation for ReconcileRunOperation {
                         Ok(Next::Call(IoCall::Delete(drops)))
                     }
                     Err(
-                        err @ (SubmitJobError::Storage(_)
+                        SubmitJobError::Storage(_)
                         | SubmitJobError::PlacementUnavailable(_)
                         | SubmitJobError::ClockHealth(_)
-                        | SubmitJobError::RangeMoving(_)),
-                    ) => Err(CatalogError::Storage(err.to_string())),
+                        | SubmitJobError::RangeMoving(_),
+                    ) => Ok(Next::Done(ReconciledRun::Deferred)),
                     Err(err) => {
                         let change = RunChange::State {
                             state: RunState::Failed,
