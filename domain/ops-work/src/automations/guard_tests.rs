@@ -11,17 +11,25 @@ use aruna_core::automation::record::{Spec, Stage, StageKind, Trigger, When};
 use aruna_core::automation::scope::{Audience, Scope};
 use aruna_core::calls::{ChildOutcome, IoResult};
 use aruna_core::keyspaces::{
-    APPLETS_KEYSPACE, AUTOMATION_INTENTS_KEYSPACE, AUTOMATION_RUNS_KEYSPACE,
+    APPLETS_KEYSPACE, AUTOMATION_INTENTS_KEYSPACE, AUTOMATION_RUNS_KEYSPACE, REALM_CONFIG_KEYSPACE,
     RUN_IDEMPOTENCY_KEYSPACE, WORKFLOW_RUN_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::workflow_run::{RunKeyRecord, RunState, run_key, run_key_row};
-use aruna_core::structs::identity::features::Feature;
+use aruna_core::structs::execution::job::identity::RETENTION_MS;
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::local::{WorkspaceMode, user_dedup_key};
+use aruna_core::structs::execution::workflow_run::{
+    RunKeyRecord, RunState, WorkflowRunRecord, WorkflowRunSpec, run_key, run_key_row,
+};
+use aruna_core::structs::identity::features::{Feature, FeatureMode};
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_runner::driver::drive;
+use serde_json::json;
 use ulid::Ulid;
 
 use super::AutoError;
-use super::control::CancelFiringOperation;
+use super::check::{CheckAutoOperation, render_sample_stage};
+use super::control::{AckCancelsOperation, CancelFiringOperation};
 use super::copy_stage::{call_intent, stage_intent_id};
 use super::firing_reads::GetFiringOperation;
 use super::flow_tests::Env;
@@ -29,6 +37,8 @@ use super::run_stage::{StartStageRun, parse_inputs, render_json, run_idempotency
 use super::runner::StepFiringsOperation;
 use super::start::new_firing_rows;
 use crate::applets::AppletError;
+use crate::jobs::submit::SubmitJobSpec;
+use crate::jobs::submit::local::SubmitLocalOperation;
 use crate::plugins::intents::{IntentRecord, IntentState, intent_key, settled_row_in};
 
 #[tokio::test]
@@ -132,6 +142,32 @@ async fn runner_guards_recovery() {
     assert_eq!(sub_pins.len(), 1);
     let parsed_sub: serde_json::Value = serde_json::from_str(&sub_json.unwrap()).unwrap();
     assert_eq!(parsed_sub["reads"]["key"], "sub/r1.fq");
+    // Stage validation merges pinned submission files into values_json before coordinator check.
+    let mut sub_spec = spec.clone();
+    if let StageKind::Run {
+        values_json,
+        inputs_json,
+        ..
+    } = &mut sub_spec.stages[0].kind
+    {
+        *values_json = "{}".into();
+        *inputs_json = None;
+    }
+    let sub_val_f = Firing::new(
+        Ulid::from_bytes([122; 16]),
+        auto.automation_id,
+        auto.group_id,
+        auto.revision,
+        &sub_spec,
+        sub_f.trigger.clone(),
+        10,
+    );
+    let stage_op = StartStageRun::new(auto.clone(), sub_val_f, 0, (env.node, env.realm)).unwrap();
+    let merged_vals = stage_op.validation_values().unwrap();
+    assert_eq!(
+        merged_vals["reads"],
+        format!("aruna://raw/sub/r1.fq?version={ver}")
+    );
     let remote_node = iroh::SecretKey::from_bytes(&[12; 32]).public();
     let explicit = format!(
         r#"{{"reads": {{"bucket": "raw", "key": "x", "version_id": "{ver}", "source_node_id": "{remote_node}"}}}}"#
@@ -142,6 +178,48 @@ async fn runner_guards_recovery() {
     assert_eq!(
         parsed_rem["reads"]["source_node_id"],
         remote_node.to_string()
+    );
+    // Check renderer agrees with execution on whole-value templates and reports render errors.
+    let mut tmpl_spec = spec.clone();
+    if let StageKind::Run {
+        values_json,
+        inputs_json,
+        ..
+    } = &mut tmpl_spec.stages[0].kind
+    {
+        *values_json = "{{trigger.values}}".into();
+        *inputs_json = None;
+    }
+    let sample_obj = json!({"count": 7});
+    let checked_vals = render_sample_stage(
+        "{{trigger.values}}",
+        None,
+        &tmpl_spec,
+        Some(&sample_obj),
+        env.node,
+    )
+    .unwrap();
+    assert_eq!(checked_vals, sample_obj);
+    let mut bad_tmpl_spec = tmpl_spec.clone();
+    if let StageKind::Run { values_json, .. } = &mut bad_tmpl_spec.stages[0].kind {
+        *values_json = "{broken".into();
+    }
+    let bad_auto = env.create_active(bad_tmpl_spec).await;
+    let bad_report = drive(
+        CheckAutoOperation::new(&env.owner, bad_auto.automation_id, env.node, None),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    assert!(!bad_report.ok);
+    assert_eq!(bad_report.workflows_checked, 0);
+    assert!(
+        bad_report
+            .diagnostics
+            .iter()
+            .any(|d| d.contains("invalid template JSON")),
+        "{:?}",
+        bad_report.diagnostics
     );
     let mut bad_spec = spec.clone();
     if let StageKind::Run { inputs_json, .. } = &mut bad_spec.stages[0].kind {
@@ -311,6 +389,23 @@ async fn runner_guards_recovery() {
         .await
         .unwrap();
     assert!(step_rep.wake_runs.contains(&remote_child_id));
+    assert!(
+        step_rep
+            .cancel_acks
+            .iter()
+            .any(|a| a.firing_id == f3.firing_id && a.run_id == remote_child_id)
+    );
+    // cancel_sent stays false in storage until the caller delivers signals and commits acks.
+    let (unacked, _) = drive(
+        GetFiringOperation::new(&env.owner, f3.firing_id, env.node),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    assert!(!unacked.stages[0].receipt.cancel_sent);
+    drive(AckCancelsOperation::new(step_rep.cancel_acks), &env.ctx)
+        .await
+        .unwrap();
     let (retried, _) = drive(
         GetFiringOperation::new(&env.owner, f3.firing_id, env.node),
         &env.ctx,
@@ -360,6 +455,15 @@ async fn runner_guards_recovery() {
         .await
         .unwrap();
     assert!(rec_rep.wake_runs.contains(&recovered_child_id));
+    assert!(
+        rec_rep
+            .cancel_acks
+            .iter()
+            .any(|a| a.firing_id == stranded_run.firing_id && a.run_id == recovered_child_id)
+    );
+    drive(AckCancelsOperation::new(rec_rep.cancel_acks), &env.ctx)
+        .await
+        .unwrap();
     let (rec_f, _) = drive(
         GetFiringOperation::new(&env.owner, stranded_run.firing_id, env.node),
         &env.ctx,
@@ -371,6 +475,255 @@ async fn runner_guards_recovery() {
         Some(recovered_child_id)
     );
     assert!(rec_f.stages[0].receipt.cancel_sent);
+
+    // Restart recovery reconciles missing parent_job_id on queued runs (both missing and deduped jobs).
+    let mut cfg = RealmConfigDocument::default_for_realm(env.realm, Vec::new());
+    cfg.seed_default_placement();
+    cfg.seed_job_control(env.node, 0);
+    let on = FeatureMode::Scoped {
+        default: true,
+        groups: BTreeMap::new(),
+    };
+    cfg.features.insert(Feature::Automations, on.clone());
+    cfg.features.insert(Feature::Applets, on);
+    env.write_row(
+        REALM_CONFIG_KEYSPACE,
+        env.realm.as_bytes().to_vec(),
+        cfg.to_bytes(&env.actor()).unwrap(),
+    )
+    .await;
+    let acct = auto.account.unwrap();
+    // Case A: Queued run committed before SubmitLocalOperation -> recovery submits job and sets parent_job_id.
+    let no_job_id = Ulid::from_bytes([123; 16]);
+    let mut no_job_run = env.sample_run(no_job_id, wf_id, RunState::Queued, None);
+    no_job_run.created_by = acct;
+    env.write_row(
+        WORKFLOW_RUN_KEYSPACE,
+        run_key(no_job_id),
+        no_job_run.to_bytes().unwrap(),
+    )
+    .await;
+    let mut stranded_q = Firing::new(
+        Ulid::from_bytes([124; 16]),
+        auto.automation_id,
+        auto.group_id,
+        auto.revision,
+        &spec,
+        TriggerPayload::Manual {
+            values_json: "{}".into(),
+            actor: env.owner.user_id,
+        },
+        17,
+    );
+    stranded_q.stages[0].state = StageState::Running;
+    let q_idem = run_idempotency_key(stranded_q.firing_id, "run", stranded_q.attempt);
+    env.write_row(
+        RUN_IDEMPOTENCY_KEYSPACE,
+        run_key_row(auto.group_id, acct, &q_idem),
+        RunKeyRecord {
+            run_id: no_job_id,
+            request_digest: [0; 32],
+        }
+        .to_bytes()
+        .unwrap(),
+    )
+    .await;
+    // Case B: Queued run whose workflow-run/{id} job exists -> recovery reuses that exact job_id.
+    let dedup_run_id = Ulid::from_bytes([125; 16]);
+    let mut dedup_run = env.sample_run(dedup_run_id, wf_id, RunState::Queued, None);
+    dedup_run.created_by = acct;
+    env.write_row(
+        WORKFLOW_RUN_KEYSPACE,
+        run_key(dedup_run_id),
+        dedup_run.to_bytes().unwrap(),
+    )
+    .await;
+    let dedup_spec = SubmitJobSpec {
+        payload: JobPayload::WorkflowRun(Box::new(WorkflowRunSpec {
+            run_id: dedup_run_id,
+            group_id: env.group,
+            created_by: acct,
+            realm_id: env.realm,
+        })),
+        created_by: acct,
+        owner_node_id: env.node,
+        dedup_key: Some(user_dedup_key(
+            acct,
+            &format!("workflow-run/{dedup_run_id}"),
+        )),
+        now_ms: 17,
+        retention_ms: RETENTION_MS,
+        workspace_mode: WorkspaceMode::None,
+        workspace_bucket: None,
+        active_cap: None,
+    };
+    let existing_job = drive(
+        SubmitLocalOperation::new(dedup_spec, env.realm, Some((env.node, env.realm))),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    let mut stranded_d = Firing::new(
+        Ulid::from_bytes([126; 16]),
+        auto.automation_id,
+        auto.group_id,
+        auto.revision,
+        &spec,
+        TriggerPayload::Manual {
+            values_json: "{}".into(),
+            actor: env.owner.user_id,
+        },
+        18,
+    );
+    stranded_d.stages[0].state = StageState::Running;
+    let d_idem = run_idempotency_key(stranded_d.firing_id, "run", stranded_d.attempt);
+    env.write_row(
+        RUN_IDEMPOTENCY_KEYSPACE,
+        run_key_row(auto.group_id, acct, &d_idem),
+        RunKeyRecord {
+            run_id: dedup_run_id,
+            request_digest: [0; 32],
+        }
+        .to_bytes()
+        .unwrap(),
+    )
+    .await;
+    // Case C: Cancelling firing with never-submitted Queued run -> marks run Cancelled & ends firing.
+    let cancel_q_id = Ulid::from_bytes([127; 16]);
+    let mut cancel_q_run = env.sample_run(cancel_q_id, wf_id, RunState::Queued, None);
+    cancel_q_run.created_by = acct;
+    env.write_row(
+        WORKFLOW_RUN_KEYSPACE,
+        run_key(cancel_q_id),
+        cancel_q_run.to_bytes().unwrap(),
+    )
+    .await;
+    let mut stranded_cq = Firing::new(
+        Ulid::from_bytes([128; 16]),
+        auto.automation_id,
+        auto.group_id,
+        auto.revision,
+        &spec,
+        TriggerPayload::Manual {
+            values_json: "{}".into(),
+            actor: env.owner.user_id,
+        },
+        19,
+    );
+    stranded_cq.state = FiringState::Cancelling;
+    stranded_cq.stages[0].state = StageState::Cancelling;
+    let cq_idem = run_idempotency_key(stranded_cq.firing_id, "run", stranded_cq.attempt);
+    env.write_row(
+        RUN_IDEMPOTENCY_KEYSPACE,
+        run_key_row(auto.group_id, acct, &cq_idem),
+        RunKeyRecord {
+            run_id: cancel_q_id,
+            request_digest: [0; 32],
+        }
+        .to_bytes()
+        .unwrap(),
+    )
+    .await;
+    for (ks, k, v) in new_firing_rows(&stranded_q)
+        .unwrap()
+        .into_iter()
+        .chain(new_firing_rows(&stranded_d).unwrap())
+        .chain(new_firing_rows(&stranded_cq).unwrap())
+    {
+        env.write_row(&ks, k, v).await;
+    }
+    drive(StepFiringsOperation::new((env.node, env.realm)), &env.ctx)
+        .await
+        .unwrap();
+    let rec_a = WorkflowRunRecord::from_bytes(
+        &env.read_row(WORKFLOW_RUN_KEYSPACE, &run_key(no_job_id))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(rec_a.parent_job_id.is_some());
+    let rec_b = WorkflowRunRecord::from_bytes(
+        &env.read_row(WORKFLOW_RUN_KEYSPACE, &run_key(dedup_run_id))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(rec_b.parent_job_id, Some(existing_job.job_id));
+    let (cq_done, _) = drive(
+        GetFiringOperation::new(&env.owner, stranded_cq.firing_id, env.node),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(cq_done.state, FiringState::Cancelled);
+    let rec_c = WorkflowRunRecord::from_bytes(
+        &env.read_row(WORKFLOW_RUN_KEYSPACE, &run_key(cancel_q_id))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(rec_c.state, RunState::Cancelled);
+
+    // Multi-child API cancel defers cancel_sent until caller delivers signals and runs AckCancels.
+    let two_stage_spec = Spec {
+        triggers: vec![Trigger::Manual { form_json: None }],
+        stages: vec![
+            spec.stages[0].clone(),
+            Stage {
+                name: "run2".into(),
+                ..spec.stages[0].clone()
+            },
+        ],
+        scope: spec.scope.clone(),
+    };
+    let two_auto = env.create_active(two_stage_spec.clone()).await;
+    let (c1, c2) = (Ulid::from_bytes([129; 16]), Ulid::from_bytes([130; 16]));
+    for cid in [c1, c2] {
+        let rec = env.sample_run(cid, wf_id, RunState::Running, None);
+        env.write_row(WORKFLOW_RUN_KEYSPACE, run_key(cid), rec.to_bytes().unwrap())
+            .await;
+    }
+    let mut two_f = Firing::new(
+        Ulid::from_bytes([131; 16]),
+        two_auto.automation_id,
+        two_auto.group_id,
+        two_auto.revision,
+        &two_stage_spec,
+        TriggerPayload::Manual {
+            values_json: "{}".into(),
+            actor: env.owner.user_id,
+        },
+        20,
+    );
+    two_f.stages[0].state = StageState::Running;
+    two_f.stages[0].receipt.workflow_run_id = Some(c1);
+    two_f.stages[1].state = StageState::Running;
+    two_f.stages[1].receipt.workflow_run_id = Some(c2);
+    for (ks, k, v) in new_firing_rows(&two_f).unwrap() {
+        env.write_row(&ks, k, v).await;
+    }
+    let multi = drive(
+        CancelFiringOperation::new(&env.owner, two_f.firing_id, (env.node, env.realm)),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(multi.woken_runs.len(), 2);
+    assert_eq!(multi.pending_acks.len(), 2);
+    let (before_ack, _) = drive(
+        GetFiringOperation::new(&env.owner, two_f.firing_id, env.node),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    assert!(!before_ack.stages[0].receipt.cancel_sent);
+    assert!(!before_ack.stages[1].receipt.cancel_sent);
+    let acked = drive(AckCancelsOperation::new(multi.pending_acks), &env.ctx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(acked.stages[0].receipt.cancel_sent);
+    assert!(acked.stages[1].receipt.cancel_sent);
 
     // Stranded claimed Notify recovers its settled intent instead of stalling (#1).
     let notify_spec = Spec {
