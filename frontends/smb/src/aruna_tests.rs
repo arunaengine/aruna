@@ -15,6 +15,7 @@ use aruna_core::user::id::UserId;
 use aruna_core::vfs_effects::InstanceSummary;
 use aruna_ops_data::vfs::CHUNK_BYTES;
 use aruna_ops_data::vfs::handles::{ListNext, ListResume};
+use aruna_ops_data::vfs::publish::{CloseOutcome, Published};
 use aruna_ops_work::jobs::workflow::input_view::ViewFrom;
 use aruna_storage::storage::memory::MemoryStorage;
 use futures_util::StreamExt;
@@ -458,4 +459,45 @@ async fn pending_delete_retries() {
     while Arc::strong_count(&pending) > 1 {
         tokio::task::yield_now().await;
     }
+}
+
+/// A retried close keeps going while an attached instance still holds unpublished dirty bytes
+/// or the failure may pass, and ends on any finished close or a definitive refusal.
+#[test]
+fn retry_keeps_unpublished() {
+    let published = Published {
+        version_id: Ulid::from_parts(1, 1),
+        life_id: None,
+    };
+    assert!(!writes::retry_done(Ok((CloseOutcome::Pending, false))));
+    assert!(writes::retry_done(Ok((CloseOutcome::Pending, true))));
+    assert!(writes::retry_done(Ok((CloseOutcome::Closed, false))));
+    assert!(writes::retry_done(Ok((
+        CloseOutcome::Published(published),
+        false
+    ))));
+    let unavailable = VfsError::Unavailable("store offline".into());
+    assert!(!writes::retry_done(Err(unavailable)));
+    assert!(writes::retry_done(Err(VfsError::Denied)));
+    assert!(writes::retry_done(Err(VfsError::NotFound)));
+}
+
+/// A publication rebuild that fails busy or internally retries; any other failure ends it.
+#[test]
+fn prepare_errors_retry() {
+    let transient = [
+        BackendError::Internal("routing offline".into()),
+        BackendError::Busy,
+        BackendError::Sharing,
+    ];
+    for error in transient {
+        let mapped = writes::retry_prepare_error(error);
+        assert!(matches!(mapped, VfsError::Unavailable(_)), "{mapped:?}");
+        assert!(!writes::retry_done(Err(mapped)));
+    }
+    let not_found = writes::retry_prepare_error(BackendError::NotFound);
+    assert!(matches!(not_found, VfsError::NotFound), "{not_found:?}");
+    let directory = writes::retry_prepare_error(BackendError::IsDirectory);
+    assert!(matches!(directory, VfsError::IsDirectory), "{directory:?}");
+    assert!(writes::retry_done(Err(directory)));
 }

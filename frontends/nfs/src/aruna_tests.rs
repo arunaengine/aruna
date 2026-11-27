@@ -5,6 +5,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::execution::job::local::workspace_credential_id;
 use aruna_core::structs::storage::vfs::{EnrolledHostRecord, FileIdentity, StageScope};
@@ -14,7 +15,7 @@ use aruna_ops_data::vfs::admin::{EnrollInput, HostChange};
 use aruna_ops_data::vfs::handles::{ListNext, ListResume};
 use aruna_ops_data::vfs::{EnrollHostOperation, RevokeHostOperation, RotateHostOperation};
 use aruna_runner::driver::drive;
-use aruna_runner::testing::memory_context;
+use aruna_runner::testing::{memory_context, write_value};
 
 use super::admit::{host_allows, owner_allows};
 use super::exports::{holds, resume_after, root_key};
@@ -662,6 +663,53 @@ async fn revoked_close_withholds() {
     let tables = backend.tables.lock();
     assert!(tables.opens.contains_key(&key));
     assert!(tables.closing.contains_key(&bucket.mount_id));
+}
+
+// A bucket row that cannot be read answers DELAY on close instead of a close without a parent
+// marker; only a missing row closes without one. A revoked close keeps its open as well.
+#[tokio::test]
+async fn marker_errors_delay() {
+    let backend = backend();
+    let bucket = bucket_binding();
+    assert_eq!(backend.marker_template(&bucket).await, Ok(None));
+    let storage = &backend.context.storage_handle;
+    write_value(
+        storage,
+        S3_BUCKET_KEYSPACE,
+        b"data".to_vec(),
+        vec![0xff, 0x00, 0x01],
+    )
+    .await;
+    assert_eq!(
+        backend.marker_template(&bucket).await,
+        Err(NfsStat4::Delay),
+        "a corrupt bucket row is a transient failure, not a missing bucket"
+    );
+    let caller = admitted(&backend, &bucket);
+    backend.publish_revocation(Revocation::Mount(bucket.mount_id));
+    let object = ObjectRef {
+        mount_id: bucket.mount_id,
+        object_id: 5,
+    };
+    let owner = client_owner(b"owner");
+    let slot = OpenSlot {
+        open_id: Ulid::from_parts(8, 1),
+        instance_id: 3,
+        key: "a/b".to_string(),
+        write: true,
+        identity: HandleIdentity::File(FileIdentity::Committed {
+            life_id: Ulid::from_parts(8, 2),
+        }),
+        version_id: Some(Ulid::from_parts(8, 3)),
+        size: 4,
+        access: share::BOTH,
+        deny: 0,
+    };
+    let key = (object, owner.clone());
+    backend.tables.lock().opens.insert(key.clone(), slot);
+    let closed = backend.close(&caller, object, &owner).await;
+    assert_eq!(closed, Err(NfsStat4::Delay));
+    assert!(backend.tables.lock().opens.contains_key(&key));
 }
 
 // A cleanup release whose close failed as stale while the backend still holds the open answers

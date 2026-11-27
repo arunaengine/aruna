@@ -781,10 +781,9 @@ fn settling() -> IoCall {
     }))
 }
 
-#[test]
-fn staged_delete_loads() {
-    // A refused delete of an instance whose checkpoint the close did not read loads the live
-    // stage row and retains it, never clearing the disposition first.
+/// A refused final delete of an instance that names checkpoint `id(12)` with no stage read,
+/// up to its answer to the live and retained row read.
+fn staged_refusal(live: Option<Value>, held: Option<Value>) -> (VfsCloseOperation, CloseTurn) {
     let mut operation = closing(context(), None);
     let last = CloseSummary {
         stage_id: Some(id(12)),
@@ -792,23 +791,126 @@ fn staged_delete_loads() {
     };
     operation.next(vfs(VfsEvent::Closed(last))).unwrap();
     let turn = operation.next(refused(VfsError::Denied));
-    let read = state_read(&[VfsKey::LiveStage(scope(), 4)]).unwrap();
-    assert_eq!(turn, Ok(Next::Call(read)));
-    let turn = operation.next(row(&stage()));
+    let keys = [
+        VfsKey::LiveStage(scope(), 4),
+        VfsKey::RetainedStage(scope(), id(12)),
+    ];
+    assert_eq!(turn, Ok(Next::Call(state_read(&keys).unwrap())));
+    let turn = operation.next(IoResult::Values(vec![live, held]));
+    (operation, turn)
+}
+
+fn encoded(record: &NfsStageRecord) -> Option<Value> {
+    Some(Value::from(record.to_bytes().unwrap()))
+}
+
+#[test]
+fn staged_delete_loads() {
+    // A refused delete of an instance whose checkpoint the close did not read loads the live
+    // stage row and retains it, never clearing the disposition first.
+    let (mut operation, turn) = staged_refusal(encoded(&stage()), None);
     let (output, calls) = kept(&mut operation, turn);
     assert_eq!(output, CloseOutcome::Retained(id(12)));
     assert_eq!(calls, vec![vfs_call(retention())]);
 
-    // Without a live stage row the disposition is cleared and the refusal is the error.
-    let mut gone = closing(context(), None);
-    let last = CloseSummary {
-        stage_id: Some(id(12)),
-        ..pending(Some(smb_owner()))
+    // A row an earlier attempt already moved to retention only syncs before the release.
+    let earlier = retained(&stage(), DetachReason::LostLife, 0);
+    let (mut operation, turn) = staged_refusal(None, encoded(&earlier));
+    assert_eq!(turn, Ok(Next::Call(IoCall::Sync)));
+    let Ok(Next::Then { output, calls }) = operation.next(IoResult::Done) else {
+        panic!("expected the retained outcome with the instance release");
     };
-    gone.next(vfs(VfsEvent::Closed(last))).unwrap();
-    gone.next(refused(VfsError::Denied)).unwrap();
-    assert_eq!(asked(&gone.next(IoResult::Values(vec![None]))), clear());
-    assert_eq!(gone.next(vfs(VfsEvent::Done)), Err(VfsError::Denied));
+    assert_eq!(output, CloseOutcome::Retained(id(12)));
+    assert_eq!(calls, vec![vfs_call(retention())]);
+
+    // Without either row the instance lets go of its checkpoint and the refusal is the error.
+    let (mut operation, turn) = staged_refusal(None, None);
+    assert_eq!(turn, Ok(Next::Call(IoCall::Sync)));
+    assert_eq!(asked(&operation.next(IoResult::Done)), retention());
+    assert_eq!(operation.next(vfs(VfsEvent::Done)), Err(VfsError::Denied));
+}
+
+#[test]
+fn discard_reclaims_stage() {
+    // A retried unlinked close whose earlier attempt deleted the live row before its sync
+    // failed still syncs and reclaims the checkpoint the instance names.
+    let input = CloseInput {
+        context: context(),
+        scope: scope(),
+        open_id: id(22),
+        publish: None,
+        stage: None,
+    };
+    let mut retry = VfsCloseOperation::new(input).with_instance(1);
+    retry.first().unwrap();
+    retry
+        .next(vfs(VfsEvent::Failed(VfsFailure::NotFound)))
+        .unwrap();
+    let found = InstanceSummary {
+        open_count: 0,
+        delete_pending: true,
+        disposition_owner: Some(smb_owner()),
+        detached: Some(DetachReason::Unlinked),
+        stage_id: Some(id(12)),
+        generation: 1,
+        handle_id: Some(9),
+        ..instance()
+    };
+    let turn = retry.next(vfs(VfsEvent::Instance(Some(found))));
+    assert_eq!(turn, Ok(Next::Call(settling())));
+    let turn = retry.next(child(ReceiptOutcome::RolledBack));
+    let read = state_read(&[VfsKey::LiveStage(scope(), 9)]).unwrap();
+    assert_eq!(turn, Ok(Next::Call(read)));
+    let turn = retry.next(IoResult::Values(vec![None]));
+    assert_eq!(turn, Ok(Next::Call(IoCall::Sync)));
+    let remove = VfsEffect::RemoveCheckpoint {
+        stage_id: id(12),
+        generation: 1,
+    };
+    assert_eq!(asked(&retry.next(IoResult::Done)), remove);
+    let turn = retry.next(vfs(VfsEvent::Done));
+    assert_eq!(turn, Ok(Next::Done(CloseOutcome::Deleted)));
+}
+
+#[test]
+fn retry_publishes_dirty() {
+    // A retried close whose open is gone publishes a writerless dirty instance only when the
+    // frontend prepared the publication again.
+    let found = InstanceSummary {
+        writer_count: 0,
+        dirty: true,
+        delete_pending: false,
+        detached: None,
+        ..instance()
+    };
+    for prepared_again in [true, false] {
+        let publish = prepared_again.then(|| (publish_input(), prepared("p/a")));
+        let input = CloseInput {
+            context: context(),
+            scope: scope(),
+            open_id: id(22),
+            publish,
+            stage: None,
+        };
+        let mut retry = VfsCloseOperation::new(input).with_instance(1);
+        retry.first().unwrap();
+        retry
+            .next(vfs(VfsEvent::Failed(VfsFailure::NotFound)))
+            .unwrap();
+        let turn = retry.next(vfs(VfsEvent::Instance(Some(found.clone()))));
+        if !prepared_again {
+            assert_eq!(turn, Err(VfsError::Vfs(VfsFailure::NotFound)));
+            continue;
+        }
+        let publish = VfsPublishOperation::new(publish_input(), prepared("p/a"));
+        assert_eq!(turn, Ok(Next::Call(IoCall::child(publish))));
+        let published = Published {
+            version_id: id(2),
+            life_id: None,
+        };
+        let turn = retry.next(child(published.clone()));
+        assert_eq!(turn, Ok(Next::Done(CloseOutcome::Published(published))));
+    }
 }
 
 #[test]

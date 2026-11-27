@@ -166,17 +166,111 @@ impl CloseRunner {
         self.put_config(open.owner.user, bucket, prepared).await
     }
 
-    /// Closes the open of `entry` again with the instance's live checkpoint row and a fresh
-    /// copy of its marker write; a pending delete is never published.
-    async fn retry_close(&self, entry: &PendingDelete) -> Result<CloseOutcome, VfsError> {
+    /// Who asks through the share of `open`, at this moment.
+    fn open_context(&self, open: &FileOpen) -> VfsAccessContext {
+        let node = (self.realm_id, self.node_id);
+        share_context(node, &open.access_key, &open.bucket, open.incarnation)
+    }
+
+    /// A read of the open's effective image over `version_id` as its own writer, which
+    /// byte-range locks never refuse.
+    fn image_read(&self, open: &FileOpen, version_id: Option<Ulid>) -> ReadInput {
+        ReadInput {
+            context: self.open_context(open),
+            key: open.key.clone(),
+            instance_id: Some(open.instance_id),
+            version_id,
+            offset: 0,
+            length: 0,
+            lock_check: ReadLockCheck::Bypass,
+        }
+    }
+
+    /// The `size` bytes `input` reads, each chunk read only when the write consumes it.
+    fn image(&self, input: ReadInput, size: u64) -> ByteStream {
+        let driver = self.driver.clone();
+        chunked_body(size, move |offset, length| {
+            let (driver, mut input) = (driver.clone(), input.clone());
+            input.offset = offset;
+            input.length = length;
+            async move {
+                let read = drive(VfsReadOperation::new(input), &driver).await;
+                read.map(|read| Bytes::from(read.data))
+            }
+        })
+    }
+
+    /// The publication of an open's dirty stage and its live checkpoint row, prepared outside
+    /// the namespace permit. It fences the edit generation it read against later writes.
+    async fn prepare(
+        &self,
+        open: &FileOpen,
+        summary: &InstanceSummary,
+        stage: Option<NfsStageRecord>,
+    ) -> Result<(PublishInput, PutObjectConfig), BackendError> {
+        let version_id = summary.base_version.or(open.version_id);
+        let base = match &summary.identity {
+            HandleIdentity::File(FileIdentity::Committed { life_id }) => StageBase::Committed {
+                version_id: version_id.ok_or(BackendError::Busy)?,
+                life_id: *life_id,
+            },
+            HandleIdentity::File(FileIdentity::Unpublished { token, predecessor }) => {
+                StageBase::Unpublished {
+                    token: *token,
+                    predecessor: *predecessor,
+                }
+            }
+            HandleIdentity::Directory(_) => return Err(BackendError::IsDirectory),
+        };
+        let size = summary.logical_size;
+        let prepared = Prepared {
+            key: summary.key.clone(),
+            body: self.image(self.image_read(open, version_id), size),
+            length: size,
+            exists: matches!(base, StageBase::Committed { .. }),
+            version_id: None,
+        };
+        let bucket = (open.bucket.as_str(), &open.info);
+        let put = self.put_config(open.owner.user, bucket, prepared).await?;
+        let input = PublishInput {
+            context: self.open_context(open),
+            instance_id: open.instance_id,
+            key: summary.key.clone(),
+            handle_id: summary.handle_id,
+            base,
+            replaces: false,
+            stage,
+            logical_size: size,
+            attempt_id: Ulid::generate(),
+            updates: Vec::new(),
+            expected_edit: Some(summary.edit_generation),
+            require_writerless: false,
+        };
+        Ok((input, put))
+    }
+
+    /// Closes the open of `entry` again with the instance's live checkpoint row, the rebuilt
+    /// publication of a dirty last writer and a fresh copy of its marker write; a pending
+    /// delete is never published. Also tells whether the instance was detached.
+    async fn retry_close(&self, entry: &PendingDelete) -> Result<(CloseOutcome, bool), VfsError> {
         let open = &entry.open;
         let scope = BucketScope::new(open.bucket.clone(), open.incarnation);
         let lookup =
             LookupInstanceOperation::new(scope, InstanceTarget::Instance(open.instance_id));
         let found = drive(lookup, &self.driver).await?;
         let mut parts = CloseParts::default();
+        let mut detached = false;
         if let Some(summary) = found.filter(|summary| summary.instance_id == open.instance_id) {
+            detached = summary.detached.is_some();
             parts.stage = self.live_stage(open, &summary).await?;
+            let deleting = summary.delete_pending || open.delete_on_close;
+            let last = summary.writer_count == 0 || (open.write && summary.writer_count <= 1);
+            if summary.dirty && last && !deleting && !detached {
+                let live = current_open(open, Some(&summary));
+                let stage = parts.stage.clone();
+                let publish = self.prepare(&live, &summary, stage).await;
+                parts.publish = Some(publish.map_err(retry_prepare_error)?);
+            }
         }
         let copy = |put: &PutObjectConfig| marker_copy(put, Some(BackendStream::empty()));
         let cached = entry.marker.lock().as_ref().map(copy);
@@ -191,7 +285,8 @@ impl CloseRunner {
                 Some(put)
             }
         };
-        self.run_close(open, parts).await
+        let outcome = self.run_close(open, parts).await?;
+        Ok((outcome, detached))
     }
 }
 
@@ -199,6 +294,30 @@ impl CloseRunner {
 fn is_transient_close(error: &VfsError) -> bool {
     matches!(error, VfsError::Unavailable(_) | VfsError::Storage(_))
         || matches!(error, VfsError::Vfs(failure) if *failure != VfsFailure::NotFound)
+}
+
+/// A failed rebuild of a publication as a close failure; a busy or internal one may pass on
+/// a later retry.
+pub(super) fn retry_prepare_error(error: BackendError) -> VfsError {
+    match error {
+        BackendError::Internal(message) => VfsError::Unavailable(message),
+        BackendError::Busy | BackendError::Sharing => {
+            VfsError::Unavailable("publish preparation busy".into())
+        }
+        BackendError::NotFound => VfsError::NotFound,
+        BackendError::IsDirectory => VfsError::IsDirectory,
+        _ => VfsError::Denied,
+    }
+}
+
+/// True once a retry ended the close. An attached instance whose dirty bytes stay unpublished
+/// keeps it, as does a failure a later retry may still get past.
+pub(super) fn retry_done(result: Result<(CloseOutcome, bool), VfsError>) -> bool {
+    match result {
+        Ok((CloseOutcome::Pending, false)) => false,
+        Ok(_) => true,
+        Err(error) => !is_transient_close(&error),
+    }
 }
 
 /// The marker write `put` with `body`, since a body stream is read only once.
@@ -238,10 +357,7 @@ async fn try_pending(
     }
     // A gone instance and a definitive refusal, which already cleared the disposition or
     // retained the checkpoint, end the retries as a finished close does.
-    let done = match runner.retry_close(entry).await {
-        Ok(_) => true,
-        Err(error) => !is_transient_close(&error),
-    };
+    let done = retry_done(runner.retry_close(entry).await);
     if done {
         pending.lock().remove(key);
     }
@@ -327,34 +443,6 @@ impl ArunaSmbBackend {
         self.close_runner().put_config(user, bucket, prepared).await
     }
 
-    /// A read of the open's effective image over `version_id` as its own writer, which
-    /// byte-range locks never refuse.
-    fn image_read(&self, open: &FileOpen, version_id: Option<Ulid>) -> ReadInput {
-        ReadInput {
-            context: self.open_context(open),
-            key: open.key.clone(),
-            instance_id: Some(open.instance_id),
-            version_id,
-            offset: 0,
-            length: 0,
-            lock_check: ReadLockCheck::Bypass,
-        }
-    }
-
-    /// The `size` bytes `input` reads, each chunk read only when the write consumes it.
-    fn image(&self, input: ReadInput, size: u64) -> ByteStream {
-        let driver = self.driver.clone();
-        chunked_body(size, move |offset, length| {
-            let (driver, mut input) = (driver.clone(), input.clone());
-            input.offset = offset;
-            input.length = length;
-            async move {
-                let read = drive(VfsReadOperation::new(input), &driver).await;
-                read.map(|read| Bytes::from(read.data))
-            }
-        })
-    }
-
     /// The durable checkpoint row an NFS writer keeps for the instance, as it reads now.
     async fn live_stage(
         &self,
@@ -426,53 +514,14 @@ impl ArunaSmbBackend {
         Ok(())
     }
 
-    /// The publication of an open's dirty stage and its live checkpoint row, prepared outside
-    /// the namespace permit. It fences the edit generation it read against later writes.
+    /// The publication of an open's dirty stage and its live checkpoint row.
     async fn prepare(
         &self,
         open: &FileOpen,
         summary: &InstanceSummary,
         stage: Option<NfsStageRecord>,
     ) -> Result<(PublishInput, PutObjectConfig), BackendError> {
-        let version_id = summary.base_version.or(open.version_id);
-        let base = match &summary.identity {
-            HandleIdentity::File(FileIdentity::Committed { life_id }) => StageBase::Committed {
-                version_id: version_id.ok_or(BackendError::Busy)?,
-                life_id: *life_id,
-            },
-            HandleIdentity::File(FileIdentity::Unpublished { token, predecessor }) => {
-                StageBase::Unpublished {
-                    token: *token,
-                    predecessor: *predecessor,
-                }
-            }
-            HandleIdentity::Directory(_) => return Err(BackendError::IsDirectory),
-        };
-        let size = summary.logical_size;
-        let prepared = Prepared {
-            key: summary.key.clone(),
-            body: self.image(self.image_read(open, version_id), size),
-            length: size,
-            exists: matches!(base, StageBase::Committed { .. }),
-            version_id: None,
-        };
-        let bucket = (open.bucket.as_str(), &open.info);
-        let put = self.put_config(open.owner.user, bucket, prepared).await?;
-        let input = PublishInput {
-            context: self.open_context(open),
-            instance_id: open.instance_id,
-            key: summary.key.clone(),
-            handle_id: summary.handle_id,
-            base,
-            replaces: false,
-            stage,
-            logical_size: size,
-            attempt_id: Ulid::generate(),
-            updates: Vec::new(),
-            expected_edit: Some(summary.edit_generation),
-            require_writerless: false,
-        };
-        Ok((input, put))
+        self.close_runner().prepare(open, summary, stage).await
     }
 
     /// Every open of the instance continues from the published version.
@@ -606,7 +655,9 @@ impl ArunaSmbBackend {
             CloseOutcome::Pending if detached => {}
             CloseOutcome::QuotaBlocked => return Err(BackendError::DiskFull),
             CloseOutcome::Retained(_) => return Err(BackendError::Denied),
+            // The backend keeps the close and publishes the dirty bytes on a later retry.
             CloseOutcome::Pending => {
+                self.queue_pending(open, marker);
                 let unpublished = BackendError::Internal("dirty bytes stay unpublished".into());
                 return Err(failure.unwrap_or(unpublished));
             }
@@ -684,13 +735,14 @@ impl ArunaSmbBackend {
             stage: self.live_stage(open, &summary).await?,
             source_version: copied.map(|(version_id, _)| version_id),
         };
+        let runner = self.close_runner();
         let moved = match (&summary.identity, copied) {
             (HandleIdentity::File(_), Some((version_id, size))) => {
-                let mut read = self.image_read(open, Some(version_id));
+                let mut read = runner.image_read(open, Some(version_id));
                 read.instance_id = None;
                 Some(Prepared {
                     key: to.clone(),
-                    body: self.image(read, size),
+                    body: runner.image(read, size),
                     length: size,
                     exists,
                     version_id: Some(attempt_id),
@@ -698,7 +750,7 @@ impl ArunaSmbBackend {
             }
             (HandleIdentity::File(_), None) if replaces => Some(Prepared {
                 key: to.clone(),
-                body: self.image(self.image_read(open, None), summary.logical_size),
+                body: runner.image(runner.image_read(open, None), summary.logical_size),
                 length: summary.logical_size,
                 exists,
                 version_id: Some(attempt_id),

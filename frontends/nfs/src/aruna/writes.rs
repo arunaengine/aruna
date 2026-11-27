@@ -409,7 +409,7 @@ impl ArunaNfsBackend {
         let mut close = VfsCloseOperation::new(input)
             .with_detach_unstable()
             .with_instance(slot.instance_id);
-        if let Some(put) = self.marker_template(binding).await.ok().flatten() {
+        if let Some(put) = self.marker_template(binding).await? {
             close = close.with_parent_marker(put);
         }
         let stage = match drive(close, &self.context).await {

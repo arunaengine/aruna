@@ -337,10 +337,10 @@ impl VfsReceiptOperation {
                 }
             }
             ReceiptChange::Remove { handle_id, .. } => {
-                if let Some(handle_id) = handle_id {
+                if handle_id.is_some() || self.input.instance_id.is_some() {
                     calls.push(vfs_call(VfsEffect::DetachInstance {
                         scope: scope.clone(),
-                        handle_id: *handle_id,
+                        handle_id: handle_id.unwrap_or(0),
                         instance_id: self.input.instance_id,
                         reason: DetachReason::Unlinked,
                     }));

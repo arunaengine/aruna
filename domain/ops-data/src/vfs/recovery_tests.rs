@@ -75,6 +75,43 @@ fn removal_receipt_detaches() {
 }
 
 #[test]
+fn smb_receipt_detaches() {
+    // An SMB-only open has no handle id: the exact instance detaches before the receipt goes.
+    let receipt = VfsReceipt {
+        attempt_id: id(20),
+        scope: scope(),
+        created_at_ms: 1,
+        change: ReceiptChange::Remove {
+            key: "p/a".to_string(),
+            marker_version: None,
+            handle_id: None,
+        },
+    };
+    let mut operation = VfsReceiptOperation::new(ReceiptInput {
+        instance_id: Some(7),
+        ..input()
+    });
+    operation.first().unwrap();
+    operation.next(IoResult::Done).unwrap();
+    operation
+        .next(IoResult::Values(vec![row(&receipt)]))
+        .unwrap();
+    let Ok(Next::Then { output, calls }) = operation.next(IoResult::Values(vec![None])) else {
+        panic!("expected the settled outcome");
+    };
+    assert_eq!(output, ReceiptOutcome::Applied { life_id: None });
+    let detach = super::vfs_call(VfsEffect::DetachInstance {
+        scope: scope(),
+        handle_id: 0,
+        instance_id: Some(7),
+        reason: aruna_core::structs::storage::vfs::DetachReason::Unlinked,
+    });
+    assert_eq!(calls.first(), Some(&detach));
+    let receipt_key = state_key(&VfsKey::Receipt(id(20))).unwrap();
+    assert!(matches!(calls.last(), Some(IoCall::Delete(rows)) if rows[0].1 == receipt_key));
+}
+
+#[test]
 fn publish_receipt_advances() {
     // The finalizer reads the committed life and advances the handle and the ancestor whose
     // witness rested on the unpublished name, in one guarded write.

@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::task::Poll;
 
-use aruna_core::bucket_read::GetBucketOperation;
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::stream::{BackendStream, ByteStream};
 use aruna_core::structs::storage::vfs::{NfsMountBinding, NfsMountTarget};
 use aruna_ops_data::s3::object::put::{PutObjectConfig, PutObjectInput};
@@ -112,7 +112,10 @@ impl ArunaNfsBackend {
         let bucket = bucket_name(binding)?;
         let info = drive(GetBucketOperation::new(bucket.to_string()), &self.context)
             .await
-            .map_err(|_| NfsStat4::Stale)?;
+            .map_err(|error| match error {
+                GetBucketError::NotFound => NfsStat4::Stale,
+                _ => NfsStat4::Delay,
+            })?;
         let realm = drive(GetConfigOperation::new(self.realm_id), &self.context)
             .await
             .map_err(|_| NfsStat4::Delay)?;

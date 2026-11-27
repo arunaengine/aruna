@@ -184,61 +184,77 @@ impl ArunaSmbBackend {
         let access_key = scope.credential.access_key.clone();
         let incarnation = self.incarnation(&access_key, bucket).await?;
         let context = self.context(&access_key, bucket, incarnation);
-        let (key, kind, version_id, existed) = match self.resolve(&context, &request.path).await? {
-            Resolution::Found(found) => (found.key, found.entry.kind, found.entry.version_id, true),
-            Resolution::Missing(key) => {
-                let kind = match request.kind {
-                    Some(ObjectKind::Directory) => HandleKind::Directory,
-                    _ => HandleKind::File,
-                };
-                (key, kind, None, false)
-            }
-        };
-        if key.is_empty() {
-            return self
-                .open_root(&context, access_key, bucket, incarnation, &request)
-                .await;
-        }
-        match (existed, request.disposition) {
-            (false, disposition) if !disposition.creates() => return Err(BackendError::NotFound),
-            (true, Disposition::Create) => return Err(BackendError::Exists),
-            (false, disposition) if kind == HandleKind::Directory => {
-                match self.make_directory(&context, &key).await {
-                    Ok(()) => {}
-                    Err(BackendError::Exists) if disposition != Disposition::Create => {}
-                    Err(error) => return Err(error),
-                }
-            }
-            _ => {}
-        }
-        let file = kind == HandleKind::File;
-        let truncate = existed && file && request.disposition.truncates();
-        let writes = request.granted & (FILE_WRITE_DATA | FILE_APPEND_DATA) != 0;
-        let write = file && (writes || truncate || !existed);
-        let open_id = Ulid::generate();
-        let input = OpenInput {
-            context: context.clone(),
-            key: key.clone(),
-            kind,
-            create: file && !existed,
-            exclusive: file && request.disposition == Disposition::Create,
-            write,
-            share: share_mode(request.granted, request.share_access),
-            delete_on_close: request.delete_on_close,
-            open_id,
-            stable: false,
-            mode: 0,
-            mount_id: Ulid::nil(),
-            stage_scope: stage_scope(&access_key),
-        };
         let bucket_scope = BucketScope::new(bucket.to_string(), incarnation);
-        let mut opened = drive(VfsOpenOperation::new(input.clone()), &self.driver).await;
-        // A close this backend still retries may hold the delete; finishing it frees the name.
-        let refused = matches!(opened, Err(VfsError::DeletePending));
-        if refused && self.drain_pending(&bucket_scope).await {
-            opened = drive(VfsOpenOperation::new(input), &self.driver).await;
-        }
-        let opened = opened.map_err(vfs_failure)?;
+        // A close this backend still retries may hold the delete; finishing it frees the name,
+        // and the open resolves, checks and admits the path once more.
+        let mut drained = false;
+        let (key, kind, version_id, existed, open_id, write, truncate, opened) = loop {
+            let (key, kind, version_id, existed) =
+                match self.resolve(&context, &request.path).await? {
+                    Resolution::Found(found) => {
+                        (found.key, found.entry.kind, found.entry.version_id, true)
+                    }
+                    Resolution::Missing(key) => {
+                        let kind = match request.kind {
+                            Some(ObjectKind::Directory) => HandleKind::Directory,
+                            _ => HandleKind::File,
+                        };
+                        (key, kind, None, false)
+                    }
+                };
+            if key.is_empty() {
+                return self
+                    .open_root(&context, access_key, bucket, incarnation, &request)
+                    .await;
+            }
+            match (existed, request.disposition) {
+                (false, disposition) if !disposition.creates() => {
+                    return Err(BackendError::NotFound);
+                }
+                (true, Disposition::Create) => return Err(BackendError::Exists),
+                (false, disposition) if kind == HandleKind::Directory => {
+                    match self.make_directory(&context, &key).await {
+                        Ok(()) => {}
+                        Err(BackendError::Exists) if disposition != Disposition::Create => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                _ => {}
+            }
+            let file = kind == HandleKind::File;
+            let truncate = existed && file && request.disposition.truncates();
+            let writes = request.granted & (FILE_WRITE_DATA | FILE_APPEND_DATA) != 0;
+            let write = file && (writes || truncate || !existed);
+            let open_id = Ulid::generate();
+            let input = OpenInput {
+                context: context.clone(),
+                key: key.clone(),
+                kind,
+                create: file && !existed,
+                exclusive: file && request.disposition == Disposition::Create,
+                write,
+                share: share_mode(request.granted, request.share_access),
+                delete_on_close: request.delete_on_close,
+                open_id,
+                stable: false,
+                mode: 0,
+                mount_id: Ulid::nil(),
+                stage_scope: stage_scope(&access_key),
+            };
+            match drive(VfsOpenOperation::new(input), &self.driver).await {
+                Ok(opened) => {
+                    break (
+                        key, kind, version_id, existed, open_id, write, truncate, opened,
+                    );
+                }
+                Err(VfsError::DeletePending)
+                    if !drained && self.drain_pending(&bucket_scope).await =>
+                {
+                    drained = true;
+                }
+                Err(error) => return Err(vfs_failure(error)),
+            }
+        };
         let opened_ms = aruna_clock::unix_timestamp_millis();
         let open = FileOpen {
             access_key: access_key.clone(),
