@@ -2867,4 +2867,86 @@ async fn enforces_run_limits() {
     )
     .await;
     assert_eq!(stored.len(), 1, "capacity refusal leaves no failed run");
+
+    // Repeating an automation run with outside_input preserves applet origin and enforces sandbox.
+    use super::control::{Follow, FollowRunOperation};
+    use aruna_core::applet::record::{Access, applet_key};
+    use aruna_core::keyspaces::APPLETS_KEYSPACE;
+    use aruna_core::structs::execution::workflow_run::{AutomationOrigin, CacheScope};
+
+    let app_id = Ulid::from_bytes([79; 16]);
+    let mut applet = crate::applets::change::tests::applet();
+    applet.applet_id = app_id;
+    applet.group_id = runs.fixture.group_a;
+    applet.host_node = runs.fixture.node;
+    applet.access = Access::GroupMembers;
+    applet.guests = None;
+    aruna_runner::testing::write_value(
+        &runs.fixture.context.storage_handle,
+        APPLETS_KEYSPACE,
+        applet_key(app_id),
+        applet.to_bytes().unwrap(),
+    )
+    .await;
+
+    let mut ended = first.record.clone();
+    ended.state = RunState::Succeeded;
+    ended.finished_at_ms = Some(100);
+    ended.limits = None;
+    ended.automation = Some(AutomationOrigin {
+        automation_id: Ulid::from_bytes([78; 16]),
+        firing_id: Ulid::from_bytes([77; 16]),
+        stage: "run".into(),
+        applet_id: Some(app_id),
+        outside_input: true,
+        depth: 0,
+    });
+    aruna_runner::testing::write_value(
+        &runs.fixture.context.storage_handle,
+        aruna_core::keyspaces::WORKFLOW_RUN_KEYSPACE,
+        aruna_core::structs::execution::workflow_run::run_key(ended.run_id),
+        ended.to_bytes().unwrap(),
+    )
+    .await;
+    // Without a sandboxed backend, repeating an outside-input automation run is forbidden.
+    let denied = drive(
+        FollowRunOperation::new(
+            &runs.fixture.alice,
+            runs.serving(),
+            ended.run_id,
+            Follow::Repeat,
+        ),
+        &runs.fixture.context,
+    )
+    .await;
+    assert_eq!(denied, Err(CatalogError::Forbidden));
+
+    // When the automation run has a group-only applet and outside_input=false, follow preserves applet_id.
+    ended.automation.as_mut().unwrap().outside_input = false;
+    aruna_runner::testing::write_value(
+        &runs.fixture.context.storage_handle,
+        aruna_core::keyspaces::WORKFLOW_RUN_KEYSPACE,
+        aruna_core::structs::execution::workflow_run::run_key(ended.run_id),
+        ended.to_bytes().unwrap(),
+    )
+    .await;
+    let repeated = drive(
+        FollowRunOperation::new(
+            &runs.fixture.alice,
+            runs.serving(),
+            ended.run_id,
+            Follow::Repeat,
+        ),
+        &runs.fixture.context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        repeated.applet,
+        Some(aruna_core::structs::execution::workflow_run::AppletOrigin {
+            applet_id: app_id,
+            outside_input: false,
+        })
+    );
+    assert_eq!(repeated.cache_scope, CacheScope::Run);
 }

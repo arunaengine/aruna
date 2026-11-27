@@ -50,6 +50,8 @@ pub struct PruneRunsOperation {
     retention_ms: u64,
     run_cap: usize,
     cache_cap: usize,
+    run_cursor: Option<Key>,
+    runs_exhausted: bool,
     pending: Vec<(Ulid, Option<Ulid>)>,
     current: Option<Ulid>,
     spaces: Vec<KeySpace>,
@@ -66,6 +68,8 @@ impl PruneRunsOperation {
             retention_ms: RETENTION_MS,
             run_cap: RUN_CAP,
             cache_cap: CACHE_CAP,
+            run_cursor: None,
+            runs_exhausted: false,
             pending: Vec::new(),
             current: None,
             spaces: Vec::new(),
@@ -77,6 +81,12 @@ impl PruneRunsOperation {
     /// Overrides the retention window, mainly for tests.
     pub fn with_retention(mut self, retention_ms: u64) -> Self {
         self.retention_ms = retention_ms;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_run_cap(mut self, cap: usize) -> Self {
+        self.run_cap = cap;
         self
     }
 
@@ -119,17 +129,25 @@ impl PruneRunsOperation {
     }
 
     fn next_run(&mut self) -> PruneNext {
-        let Some((run_id, firing_id)) = self.pending.pop() else {
+        if self.report.runs >= self.run_cap {
+            self.pending.clear();
             return self.scan_cache(None);
-        };
-        if let Some(firing_id) = firing_id {
-            self.step = PruneStep::CheckFiring(run_id);
-            return Ok(Next::Call(IoCall::Read(vec![(
-                AUTOMATION_RUNS_KEYSPACE.to_string(),
-                active_key(firing_id),
-            )])));
         }
-        self.start_run_drop(run_id)
+        if let Some((run_id, firing_id)) = self.pending.pop() {
+            if let Some(firing_id) = firing_id {
+                self.step = PruneStep::CheckFiring(run_id);
+                return Ok(Next::Call(IoCall::Read(vec![(
+                    AUTOMATION_RUNS_KEYSPACE.to_string(),
+                    active_key(firing_id),
+                )])));
+            }
+            return self.start_run_drop(run_id);
+        }
+        if !self.runs_exhausted {
+            let after = self.run_cursor.take();
+            return self.scan_runs(after);
+        }
+        self.scan_cache(None)
     }
 
     fn next_space(&mut self) -> PruneNext {
@@ -166,24 +184,21 @@ impl Operation for PruneRunsOperation {
         match std::mem::replace(&mut self.step, PruneStep::ScanCache) {
             PruneStep::ScanRuns => {
                 let (rows, next) = result.page()?;
+                self.run_cursor = next;
+                self.runs_exhausted = self.run_cursor.is_none();
+                let mut batch = Vec::new();
                 for (_, value) in rows {
-                    if self.pending.len() >= self.run_cap {
-                        break;
-                    }
                     let Ok(record) = WorkflowRunRecord::from_bytes(&value) else {
                         continue;
                     };
                     let ended = record.finished_at_ms.unwrap_or(record.created_at_ms);
                     if record.state.is_terminal() && self.expired(ended) {
                         let firing = record.automation.as_ref().map(|o| o.firing_id);
-                        self.pending.push((record.run_id, firing));
+                        batch.push((record.run_id, firing));
                     }
                 }
-                if self.pending.len() < self.run_cap
-                    && let Some(after) = next
-                {
-                    return self.scan_runs(Some(after));
-                }
+                batch.reverse();
+                self.pending = batch;
                 self.next_run()
             }
             PruneStep::CheckFiring(run_id) => {
@@ -512,5 +527,67 @@ mod tests {
                 .await
                 .is_some()
         );
+
+        // Protected child runs do not consume the prune budget before later eligible runs.
+        let mut eligible = Vec::new();
+        for idx in 0..3u8 {
+            let mut protected = sample_run();
+            protected.run_id = Ulid::from_bytes([10 + idx; 16]);
+            protected.state = RunState::Succeeded;
+            protected.finished_at_ms = Some(100);
+            let fid = Ulid::from_bytes([20 + idx; 16]);
+            protected.automation = Some(AutomationOrigin {
+                automation_id: auto_id,
+                firing_id: fid,
+                stage: "run".into(),
+                applet_id: None,
+                outside_input: false,
+                depth: 0,
+            });
+            write_value(
+                store,
+                WORKFLOW_RUN_KEYSPACE,
+                run_key(protected.run_id),
+                protected.to_bytes().unwrap(),
+            )
+            .await;
+            write_value(
+                store,
+                AUTOMATION_RUNS_KEYSPACE,
+                active_key(fid),
+                auto_id.to_bytes().to_vec(),
+            )
+            .await;
+        }
+        for idx in 0..2u8 {
+            let mut free = sample_run();
+            free.run_id = Ulid::from_bytes([50 + idx; 16]);
+            free.state = RunState::Succeeded;
+            free.finished_at_ms = Some(100);
+            write_value(
+                store,
+                WORKFLOW_RUN_KEYSPACE,
+                run_key(free.run_id),
+                free.to_bytes().unwrap(),
+            )
+            .await;
+            eligible.push(free.run_id);
+        }
+        let report = drive(
+            PruneRunsOperation::new(10_000)
+                .with_retention(1_000)
+                .with_run_cap(2),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.runs, 2);
+        for id in eligible {
+            assert!(
+                read_value(store, WORKFLOW_RUN_KEYSPACE, run_key(id).to_vec())
+                    .await
+                    .is_none()
+            );
+        }
     }
 }

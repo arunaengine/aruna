@@ -1901,13 +1901,13 @@ fn dedup_keeps_writer() {
     let writes = written(&turn);
     let version = BlobVersion::from_bytes(&writes[0].2).unwrap();
     assert_eq!(version.created_by, writer);
-    // The new version is journaled in the same write: a kept row, a pending row and its
-    // source-id row.
+    // The new version is journaled in the same write: a kept row, plugin and automation pending
+    // rows, and its source-id row.
     let journal: Vec<_> = (writes.iter())
         .filter(|(space, key, _)| space == "event_journal" && key[0] != b'i')
         .map(|(_, _, value)| SourceEvent::from_bytes(value).unwrap())
         .collect();
-    assert_eq!(journal.len(), 2);
+    assert_eq!(journal.len(), 3);
     assert_eq!(journal[0].revision, child.version_id.unwrap().to_string());
     assert!(journal[0].resource.ends_with("/mybucket/some-file.txt"));
 }
