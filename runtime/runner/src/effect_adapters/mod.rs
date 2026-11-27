@@ -13,8 +13,8 @@ mod session;
 pub(crate) mod shard;
 mod storage;
 pub mod task;
-mod workflow;
 mod vfs;
+mod workflow;
 
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, GroupEvent, GroupResult, NetEvent, SubOperationEvent};
