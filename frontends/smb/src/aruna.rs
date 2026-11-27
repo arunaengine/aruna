@@ -18,14 +18,18 @@ use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::id::NodeId;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
-use aruna_core::structs::storage::vfs::{HandleIdentity, HandleKind, NfsMountTarget, StageOwner};
+use aruna_core::structs::storage::vfs::{
+    BucketScope, HandleIdentity, HandleKind, NfsMountTarget, StageOwner,
+};
 use aruna_core::vfs_effects::{VfsFailure, VfsProtocol};
+use aruna_ops_data::s3::object::put::PutObjectConfig;
 use aruna_ops_data::vfs::{VfsAccessContext, VfsError};
 use aruna_ops_work::jobs::workflow::input_view::ViewError;
 use aruna_runner::driver::DriverContext;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 use crate::backend::{
@@ -68,6 +72,19 @@ struct FileOpen {
     opened_ms: u64,
 }
 
+/// One transiently failed close whose pending delete the backend finishes on its own.
+struct PendingDelete {
+    open: FileOpen,
+    /// The parent marker write of the first close without its body, copied for each retry;
+    /// locked since the write's body type is not shared between threads.
+    marker: Mutex<Option<PutObjectConfig>>,
+    /// Lets one retry run at a time, in the background or before a refused open.
+    gate: tokio::sync::Mutex<()>,
+}
+
+/// Transiently failed closes by bucket scope and open.
+type PendingMap = Mutex<HashMap<(BucketScope, Ulid), Arc<PendingDelete>>>;
+
 /// One open of the share root directory, which exists even when the bucket is empty.
 #[derive(Clone, Debug)]
 struct RootOpen {
@@ -105,6 +122,10 @@ pub struct ArunaSmbBackend {
     shares: Mutex<HashMap<(String, String), u128>>,
     opens: Mutex<HashMap<u64, Entry>>,
     next_handle: AtomicU64,
+    /// Closes whose SMB handle is gone but whose instance may still hold a pending delete.
+    pending: Arc<PendingMap>,
+    /// Ends the background retries of `pending` when the backend is dropped.
+    stop: CancellationToken,
 }
 
 impl ArunaSmbBackend {
@@ -119,6 +140,8 @@ impl ArunaSmbBackend {
             shares: Mutex::new(HashMap::new()),
             opens: Mutex::new(HashMap::new()),
             next_handle: AtomicU64::new(1),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            stop: CancellationToken::new(),
         }
     }
 
@@ -178,22 +201,40 @@ impl ArunaSmbBackend {
 
     /// Who asks through which share, at this moment.
     fn context(&self, access_key: &str, bucket: &str, incarnation: u128) -> VfsAccessContext {
-        VfsAccessContext {
-            realm_id: self.realm_id,
-            node_id: self.node_id,
-            access_key: access_key.to_string(),
-            protocol: VfsProtocol::Smb,
-            target: NfsMountTarget::Bucket {
-                bucket: bucket.to_string(),
-                bucket_incarnation: incarnation,
-            },
-            read_only: false,
-            now_ms: aruna_clock::unix_timestamp_millis(),
-        }
+        let node = (self.realm_id, self.node_id);
+        share_context(node, access_key, bucket, incarnation)
     }
 
     fn open_context(&self, open: &FileOpen) -> VfsAccessContext {
         self.context(&open.access_key, &open.bucket, open.incarnation)
+    }
+}
+
+impl Drop for ArunaSmbBackend {
+    fn drop(&mut self) {
+        self.stop.cancel();
+    }
+}
+
+/// Who asks through which share of the realm and node `node`, at this moment.
+fn share_context(
+    node: (RealmId, NodeId),
+    access_key: &str,
+    bucket: &str,
+    incarnation: u128,
+) -> VfsAccessContext {
+    let (realm_id, node_id) = node;
+    VfsAccessContext {
+        realm_id,
+        node_id,
+        access_key: access_key.to_string(),
+        protocol: VfsProtocol::Smb,
+        target: NfsMountTarget::Bucket {
+            bucket: bucket.to_string(),
+            bucket_incarnation: incarnation,
+        },
+        read_only: false,
+        now_ms: aruna_clock::unix_timestamp_millis(),
     }
 }
 

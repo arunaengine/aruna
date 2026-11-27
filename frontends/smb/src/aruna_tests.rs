@@ -1,5 +1,5 @@
-//! Unit tests for the Aruna SMB backend: error mapping, exact credential spelling, job view and
-//! distributed bucket refusal, cursors, revocation delivery and chunked write bodies.
+//! Unit tests for the Aruna SMB backend: error mapping, credential spelling, job view and
+//! distributed bucket refusal, cursors, revocations, write bodies and failed close retries.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -421,4 +421,41 @@ async fn read_error_propagates() {
     let chunk = usize::try_from(CHUNK_BYTES).expect("a chunk fits in memory");
     let missing = VfsError::NotFound.to_string();
     assert_eq!(drain(body).await, vec![Ok(chunk), Err(missing)]);
+}
+
+/// A delete-on-close the file server fails transiently stays with the backend once the SMB
+/// handle is gone: retried in the background and before an open, until the backend is dropped.
+#[tokio::test(start_paused = true)]
+async fn pending_delete_retries() {
+    let server = backend(MemoryStorage::open());
+    let mut open = joined_open(None);
+    open.delete_on_close = true;
+    let scope = BucketScope::new(open.bucket.clone(), open.incarnation);
+    let key = (scope.clone(), open.open_id);
+    // A node without file servers answers every close as unconfigured, which may pass later.
+    let closed = server.close_file(open.clone()).await;
+    assert!(
+        matches!(closed, Err(BackendError::Internal(_))),
+        "{closed:?}"
+    );
+    assert!(server.pending.lock().contains_key(&key));
+    server.queue_pending(open.clone(), None);
+    assert_eq!(server.pending.lock().len(), 1, "one retry per failed close");
+
+    tokio::time::advance(Duration::from_secs(10)).await;
+    assert!(
+        server.pending.lock().contains_key(&key),
+        "background retries keep a close that still fails"
+    );
+    assert!(!server.drain_pending(&scope).await);
+    assert!(server.pending.lock().contains_key(&key));
+    let other = BucketScope::new("other", open.incarnation);
+    assert!(!server.drain_pending(&other).await);
+
+    let pending = Arc::clone(&server.pending);
+    drop(server);
+    // The background retry ends with the backend and lets go of the shared table.
+    while Arc::strong_count(&pending) > 1 {
+        tokio::task::yield_now().await;
+    }
 }

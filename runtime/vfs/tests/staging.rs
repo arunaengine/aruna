@@ -72,14 +72,23 @@ async fn open_request(
     identity: HandleIdentity,
     base_size: u64,
 ) -> (u64, Ulid) {
-    let open_id = Ulid::generate();
-    let request = OpenRequest {
+    let request = request(key, identity, base_size);
+    let open_id = request.open_id;
+    match handle.execute(VfsEffect::OpenInstance(request)).await {
+        VfsEvent::Opened { instance_id, .. } => (instance_id, open_id),
+        other => panic!("unexpected answer {other:?}"),
+    }
+}
+
+/// A read and write open request for `key` with a fresh open id.
+fn request(key: &str, identity: HandleIdentity, base_size: u64) -> OpenRequest {
+    OpenRequest {
         scope: scope(),
         key: key.to_string(),
         kind: identity.kind(),
         handle_id: Some(11),
         identity,
-        open_id,
+        open_id: Ulid::generate(),
         protocol: VfsProtocol::Nfs,
         share: ShareMode {
             read_access: true,
@@ -94,10 +103,6 @@ async fn open_request(
         base_size,
         group_id: group(),
         base_version: None,
-    };
-    match handle.execute(VfsEffect::OpenInstance(request)).await {
-        VfsEvent::Opened { instance_id, .. } => (instance_id, open_id),
-        other => panic!("unexpected answer {other:?}"),
     }
 }
 
@@ -692,6 +697,49 @@ async fn retain_waits_reader() {
 }
 
 #[tokio::test]
+async fn clear_disposition_staged() {
+    let (folder, handle) = booted(MIB).await;
+    let stage_id = Ulid::generate();
+    let (instance_id, open_id) = retained_stage(&handle, stage_id).await;
+    write(&handle, instance_id, 5, b"!").await;
+    let pending = VfsEffect::SetDisposition {
+        scope: scope(),
+        instance_id,
+        open_id,
+        pending: true,
+        owner: None,
+    };
+    let marked = handle.execute(pending).await;
+    assert!(matches!(marked, VfsEvent::Instance(Some(_))), "{marked:?}");
+    close(&handle, open_id).await;
+    let clear = VfsEffect::ClearDisposition {
+        scope: scope(),
+        instance_id,
+    };
+    let refused = handle.execute(clear).await;
+    assert_eq!(refused, VfsEvent::Failed(VfsFailure::Conflict));
+    let retry = VfsEffect::OpenInstance(request("k.txt", unpublished(), 0));
+    let blocked = handle.execute(retry.clone()).await;
+    assert_eq!(blocked, VfsEvent::Failed(VfsFailure::DeletePending));
+    let stage = folder.path().join("stage");
+    let volatile = stage.join(format!("vol-{instance_id}.tmp"));
+    assert!(volatile.exists(), "the unstable write has no file");
+    assert_eq!(
+        handle.execute(retain(instance_id, stage_id)).await,
+        VfsEvent::Done
+    );
+    assert_eq!(by_id(&handle, instance_id).await, None);
+    assert!(!volatile.exists(), "the volatile file was kept");
+    let sealed = stage.join(format!("chk-{stage_id}-1.bin"));
+    assert!(sealed.exists(), "the sealed file was removed");
+    let reopened = handle.execute(retry).await;
+    assert!(
+        matches!(reopened, VfsEvent::Opened { created: true, .. }),
+        "{reopened:?}"
+    );
+}
+
+#[tokio::test]
 async fn detached_restore_collects() {
     let folder = tempfile::tempdir().unwrap();
     let stage_id = Ulid::generate();
@@ -1030,4 +1078,79 @@ async fn revoked_close_shared() {
     };
     assert_eq!(named.instance_id, instance_id);
     assert!(named.dirty && named.detached.is_none());
+}
+
+/// Promotes generation 1 of `s.txt` with 5 bytes, then seals generation 2 with 7 bytes.
+async fn two_generations(handle: &VfsHandle, stage_id: Ulid) -> (u64, Ulid) {
+    let (instance_id, open_id) = open_request(handle, "s.txt", unpublished(), 0).await;
+    write(handle, instance_id, 0, b"hello").await;
+    checkpoint(handle, instance_id, stage_id, 1).await;
+    write(handle, instance_id, 5, b"!!").await;
+    let plan = begin(handle, instance_id, stage_id, 2).await;
+    assert!(matches!(plan, VfsEvent::CheckpointPlan { .. }), "{plan:?}");
+    let seal = VfsEffect::SealCheckpoint {
+        scope: scope(),
+        instance_id,
+        stage_id,
+        generation: 2,
+    };
+    let sealed = handle.execute(seal).await;
+    assert!(
+        matches!(sealed, VfsEvent::CheckpointWritten { size: 7, .. }),
+        "{sealed:?}"
+    );
+    (instance_id, open_id)
+}
+
+/// Checks that only generation 2 and its 7-byte charge remain of the 14-byte budget.
+async fn assert_superseded(handle: &VfsHandle, folder: &Path, stage_id: Ulid) {
+    let stage = folder.join("stage");
+    let first = stage.join(format!("chk-{stage_id}-1.bin"));
+    assert!(!first.exists(), "the superseded generation was kept");
+    let second = stage.join(format!("chk-{stage_id}-2.bin"));
+    assert!(second.exists(), "the retained generation was removed");
+    let files = vec![DiskStage {
+        stage_id,
+        generation: 2,
+        bytes: 7,
+        corrupt: false,
+    }];
+    let inventory = handle.execute(VfsEffect::ScanStages).await;
+    assert_eq!(inventory, VfsEvent::StageInventory { files });
+    let other = opened(handle, "t.txt", unpublished(), 0).await;
+    let refused = write(handle, other, 0, &[1; 8]).await;
+    assert_eq!(refused, VfsEvent::Failed(VfsFailure::NoSpace));
+    let fits = write(handle, other, 0, &[1; 7]).await;
+    assert!(matches!(fits, VfsEvent::StageWritten { .. }), "{fits:?}");
+}
+
+#[tokio::test]
+async fn release_draft_supersedes() {
+    for held in [true, false] {
+        // Generation 1 (5), the overlay (2) and generation 2 (7) fill the budget exactly.
+        let (folder, handle) = booted(14).await;
+        let stage_id = Ulid::generate();
+        let (instance_id, open_id) = two_generations(&handle, stage_id).await;
+        if !held {
+            close(&handle, open_id).await;
+        }
+        let release = VfsEffect::ReleaseDraft {
+            scope: scope(),
+            instance_id,
+            stage_id,
+            generation: 2,
+        };
+        assert_eq!(handle.execute(release).await, VfsEvent::Done);
+        if held {
+            assert_eq!(
+                read(&handle, instance_id, 0, 5).await,
+                vec![written(0, b"hello")]
+            );
+            let first = (folder.path().join("stage")).join(format!("chk-{stage_id}-1.bin"));
+            assert!(first.exists(), "the holder lost its generation");
+            close(&handle, open_id).await;
+        }
+        assert_eq!(by_id(&handle, instance_id).await, None);
+        assert_superseded(&handle, folder.path(), stage_id).await;
+    }
 }

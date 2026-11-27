@@ -10,13 +10,14 @@ use aruna_ops_data::vfs::recovery::{ColdStart, ColdStartOperation};
 use aruna_runner::driver::{DriverContext, drive};
 use aruna_smb::status;
 use aruna_vfs::{VfsConfig, VfsHandle};
+use reqwest::StatusCode;
 use rustls::pki_types::CertificateDer;
 use ulid::Ulid;
 
 use super::nfs_client::{self, CREATOR, FILE_SYNC, NfsClient, READER, Share, UNSTABLE};
 use super::smb_client::{DELETE, FILE_CREATE, FILE_OPEN, NOT_DIRECTORY, READ_ATTRIBUTES};
 use super::smb_client::{READ_DATA, SmbClient, WRITER};
-use super::{BUCKET, HostKey, Mounts, loopback_tls, server_tls};
+use super::{BUCKET, HostKey, Mounts, answered, loopback_tls, server_tls};
 use crate::shared::{TestResult, WAIT_CAP, wait_until};
 
 #[tokio::test]
@@ -313,6 +314,59 @@ async fn ro_steps(mounts: &Mounts) -> TestResult<()> {
     assert!(
         mounts.exists("implicit/").await,
         "the final read-only NFS close preserved the implicit parent marker"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn revoked_nfs_deletes() -> TestResult<()> {
+    let mounts = Mounts::start(true, Some(loopback_tls())).await?;
+    let result = revoked_steps(&mounts).await;
+    mounts.shutdown().await;
+    result
+}
+
+/// An SMB delete-on-close waits for an NFS reader whose binding is then deleted, and the
+/// revoked reader's close completes the delete while preserving the implicit parent marker.
+async fn revoked_steps(mounts: &Mounts) -> TestResult<()> {
+    let smb_address = mounts.smb.ok_or("no SMB listener")?;
+    let nfs_address = mounts.nfs.ok_or("no NFS listener")?;
+    mounts
+        .put("implicit/revoked.txt", b"revoked close delete")
+        .await?;
+    let (_, mount) = mounts.bind_host(&HostKey::generate()?).await?;
+    let mut nfs = nfs_client::plain(nfs_address).await?;
+    let root = nfs.export_root(&mount.mount_id).await?;
+    let dir = nfs.lookup(&root, "implicit").await?;
+    let (reader, file) = nfs.open(&dir, "revoked.txt", READER).await?;
+    let mut smb = SmbClient::login(smb_address, &mounts.keys, BUCKET).await?;
+    let access = DELETE | READ_ATTRIBUTES;
+    let options = NOT_DIRECTORY | DELETE_ON_CLOSE;
+    let doomed = smb
+        .open("implicit\\revoked.txt", access, FILE_OPEN, options)
+        .await?;
+    smb.close(doomed).await?;
+    assert!(
+        mounts.exists("implicit/revoked.txt").await,
+        "the open NFS reader keeps the object"
+    );
+    // Deleting the binding revokes its open, which the server ends without publishing.
+    let route = mounts.nfs_route(&format!("mounts/{}", mount.mount_id));
+    let request = reqwest::Client::new()
+        .delete(route)
+        .bearer_auth(&mounts.token);
+    answered(request, StatusCode::NO_CONTENT).await?;
+    // The revocation cleanup may end the same open first, so this close may be refused.
+    let _ = nfs.close(&file, &reader).await;
+    wait_until(
+        "the revoked NFS reader's close completes the SMB delete",
+        WAIT_CAP,
+        || mounts.missing("implicit/revoked.txt"),
+    )
+    .await?;
+    assert!(
+        mounts.exists("implicit/").await,
+        "the revoked NFS close preserved the implicit parent marker"
     );
     Ok(())
 }

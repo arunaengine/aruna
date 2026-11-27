@@ -231,9 +231,14 @@ impl ArunaSmbBackend {
             mount_id: Ulid::nil(),
             stage_scope: stage_scope(&access_key),
         };
-        let opened = drive(VfsOpenOperation::new(input), &self.driver)
-            .await
-            .map_err(vfs_failure)?;
+        let bucket_scope = BucketScope::new(bucket.to_string(), incarnation);
+        let mut opened = drive(VfsOpenOperation::new(input.clone()), &self.driver).await;
+        // A close this backend still retries may hold the delete; finishing it frees the name.
+        let refused = matches!(opened, Err(VfsError::DeletePending));
+        if refused && self.drain_pending(&bucket_scope).await {
+            opened = drive(VfsOpenOperation::new(input), &self.driver).await;
+        }
+        let opened = opened.map_err(vfs_failure)?;
         let opened_ms = aruna_clock::unix_timestamp_millis();
         let open = FileOpen {
             access_key: access_key.clone(),

@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
 use ulid::Ulid;
 
+use crate::checkpoints::references;
 use crate::locks::open_owner;
 use crate::stages::{self, Stage};
 use crate::{Answer, State, VfsHandle};
@@ -59,6 +60,8 @@ pub(crate) struct Instance {
     pub(crate) draft: Option<(Ulid, u64)>,
     /// Its checkpoint moved to retained recovery; the last close gives up the reference.
     pub(crate) retained: bool,
+    /// A promoted generation that a newer retained draft replaced; reclaimed with the stage.
+    pub(crate) superseded: Option<(Ulid, u64)>,
 }
 
 impl Instance {
@@ -84,6 +87,7 @@ impl Instance {
             base_version: None,
             draft: None,
             retained: false,
+            superseded: None,
         }
     }
 
@@ -259,21 +263,42 @@ fn reclaim(state: &mut State, scope: &BucketScope, instance_id: u64) -> Option<S
     Some(stages::volatile_name(instance_id))
 }
 
+/// Removes the `superseded` generation and its charge once no instance references it, and
+/// returns it so the caller unlinks its files.
+pub(crate) fn drop_superseded(
+    state: &mut State,
+    superseded: Option<(Ulid, u64)>,
+) -> Option<(Ulid, u64)> {
+    let key = superseded?;
+    let mut instances = (state.buckets.values()).flat_map(|bucket| bucket.instances.values());
+    if instances.any(|other| references(other, key)) {
+        return None;
+    }
+    if let Some(checkpoint) = state.checkpoints.remove(&key) {
+        state.budget.release(checkpoint.group_id, checkpoint.bytes);
+    }
+    Some(key)
+}
+
 /// Drops the stage reference of a writerless detached instance and reclaims it once idle; the
-/// caller unlinks the returned volatile file.
+/// caller unlinks the returned volatile file and superseded generation.
 pub(crate) fn release_stage(
     state: &mut State,
     scope: &BucketScope,
     instance_id: u64,
-) -> Option<String> {
-    let instance = instance_mut(state, scope, instance_id).ok()?;
+) -> (Option<String>, Option<(Ulid, u64)>) {
+    let Ok(instance) = instance_mut(state, scope, instance_id) else {
+        return (None, None);
+    };
+    let superseded = instance.superseded.take();
     instance.stage_id = None;
     instance.generation = 0;
     instance.stage.sealed = None;
-    match instance.idle() {
+    let volatile = match instance.idle() {
         true => reclaim(state, scope, instance_id),
         false => None,
-    }
+    };
+    (volatile, drop_superseded(state, superseded))
 }
 
 impl VfsHandle {
@@ -365,7 +390,7 @@ impl VfsHandle {
         open_id: Ulid,
         detach_unstable: bool,
     ) -> Answer {
-        let (summary, unused) = {
+        let (summary, released) = {
             let mut state = self.shared.state.lock();
             let bucket = state.buckets.get_mut(scope).ok_or(VfsFailure::NotFound)?;
             let instance_id = bucket
@@ -393,7 +418,9 @@ impl VfsHandle {
                     instance.disposition_owner = open.owner;
                 }
             }
+            let mut superseded = None;
             if instance.retained && instance.opens.is_empty() {
+                superseded = instance.superseded.take();
                 instance.stage_id = None;
                 instance.generation = 0;
                 instance.stage.sealed = None;
@@ -418,16 +445,9 @@ impl VfsHandle {
                 true => reclaim(&mut state, scope, instance_id),
                 false => None,
             };
-            (summary, unused)
+            (summary, (unused, drop_superseded(&mut state, superseded)))
         };
-        if let Some(name) = unused {
-            let path = self.path(&name);
-            crate::blocking(move || {
-                crate::remove_quietly(&path);
-                Ok(())
-            })
-            .await?;
-        }
+        self.unlink_released(released).await?;
         Ok(VfsEvent::Closed(summary))
     }
 
@@ -650,7 +670,7 @@ impl VfsHandle {
     }
 
     /// Detaches the instance still naming `stage_id` at `generation` and, once no open holds
-    /// it, gives up its checkpoint reference; any other instance state is left alone.
+    /// it, gives up its checkpoint reference and delete disposition; other state is left alone.
     pub(crate) async fn retain_instance(
         &self,
         scope: &BucketScope,
@@ -659,7 +679,7 @@ impl VfsHandle {
         generation: u64,
         reason: DetachReason,
     ) -> Answer {
-        let unused = {
+        let released = {
             let mut state = self.shared.state.lock();
             let Some(bucket) = state.buckets.get_mut(scope) else {
                 return Ok(VfsEvent::Done);
@@ -678,19 +698,16 @@ impl VfsHandle {
                 .changes
                 .touch(&scope.bucket, &instance.key, true)?;
             let closed = instance.opens.is_empty();
+            if closed {
+                instance.delete_pending = false;
+                instance.disposition_owner = None;
+            }
             match closed {
                 true => release_stage(&mut state, scope, instance_id),
-                false => None,
+                false => (None, None),
             }
         };
-        if let Some(name) = unused {
-            let path = self.path(&name);
-            crate::blocking(move || {
-                crate::remove_quietly(&path);
-                Ok(())
-            })
-            .await?;
-        }
+        self.unlink_released(released).await?;
         Ok(VfsEvent::Done)
     }
 
@@ -763,6 +780,10 @@ impl VfsHandle {
             };
             if !instance.opens.is_empty() {
                 return Ok(VfsEvent::Done);
+            }
+            // A checkpointed instance leaves its name only through retained recovery.
+            if instance.stage_id.is_some() {
+                return Err(VfsFailure::Conflict);
             }
             instance.delete_pending = false;
             instance.disposition_owner = None;

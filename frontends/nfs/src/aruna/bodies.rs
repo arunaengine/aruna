@@ -152,4 +152,20 @@ impl ArunaNfsBackend {
         self.put_config(binding, &marker, BackendStream::empty(), (0, false))
             .await
     }
+
+    /// The zero-length parent marker write a close carries; the close sets its key and user
+    /// from the instance it ends. `None` when the bucket row is gone.
+    pub(super) async fn marker_template(
+        &self,
+        binding: &NfsMountBinding,
+    ) -> Result<Option<PutObjectConfig>, NfsStat4> {
+        match self
+            .put_config(binding, "", BackendStream::empty(), (0, false))
+            .await
+        {
+            Ok(put) => Ok(Some(put)),
+            Err(NfsStat4::Stale) => Ok(None),
+            Err(status) => Err(status),
+        }
+    }
 }

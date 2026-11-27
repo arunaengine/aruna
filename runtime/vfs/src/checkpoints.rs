@@ -120,7 +120,7 @@ fn end_claim(state: &mut State, scope: &BucketScope, instance_id: u64, key: (Uli
 }
 
 /// Whether `instance` reads, names or claims the generation `key`.
-fn references(instance: &Instance, key: (Ulid, u64)) -> bool {
+pub(crate) fn references(instance: &Instance, key: (Ulid, u64)) -> bool {
     let sealed = (instance.stage.sealed)
         .is_some_and(|sealed| sealed.stage_id == key.0 && sealed.generation == key.1);
     let named = instance.stage_id == Some(key.0) && instance.generation == key.1;
@@ -426,7 +426,7 @@ impl VfsHandle {
         stage_id: Ulid,
         generation: u64,
     ) -> Answer {
-        let unused = {
+        let released = {
             let mut state = self.shared.state.lock();
             let Some(bucket) = state.buckets.get_mut(scope) else {
                 return Ok(VfsEvent::Done);
@@ -440,6 +440,11 @@ impl VfsHandle {
             let reason = instance.detached.unwrap_or(DetachReason::LostLife);
             bucket.detach(instance_id, reason);
             let instance = (bucket.instances.get_mut(&instance_id)).ok_or(VfsFailure::NotFound)?;
+            if let Some(prior_id) = instance.stage_id
+                && (prior_id, instance.generation) != (stage_id, generation)
+            {
+                instance.superseded = Some((prior_id, instance.generation));
+            }
             instance.draft = None;
             instance.retained = true;
             instance.change = self
@@ -448,18 +453,19 @@ impl VfsHandle {
                 .touch(&scope.bucket, &instance.key, true)?;
             match instance.opens.is_empty() {
                 true => release_stage(&mut state, scope, instance_id),
-                false => None,
+                false => (None, None),
             }
         };
-        if let Some(name) = unused {
-            let path = self.path(&name);
-            crate::blocking(move || {
-                crate::remove_quietly(&path);
-                Ok(())
-            })
-            .await?;
-        }
+        self.unlink_released(released).await?;
         Ok(VfsEvent::Done)
+    }
+
+    /// Unlinks the volatile file and the superseded generation that a released stage gave up.
+    pub(crate) async fn unlink_released(
+        &self,
+        released: (Option<String>, Option<(Ulid, u64)>),
+    ) -> Answer {
+        remove_files(released_files(self, released)).await
     }
 
     /// Removes a generation no claim and no open or named instance references; a writerless
@@ -483,8 +489,8 @@ impl VfsHandle {
                 }
             }
             for (scope, instance_id) in held {
-                let volatile = release_stage(&mut state, &scope, instance_id);
-                names.extend(volatile.map(|name| self.path(&name)));
+                let released = release_stage(&mut state, &scope, instance_id);
+                names.extend(released_files(self, released));
             }
             if let Some(checkpoint) = state.checkpoints.remove(&key) {
                 state.budget.release(checkpoint.group_id, checkpoint.bytes);
@@ -591,6 +597,9 @@ impl VfsHandle {
 
 /// Unlinks files that may already be gone.
 async fn remove_files(names: Vec<PathBuf>) -> Answer {
+    if names.is_empty() {
+        return Ok(VfsEvent::Done);
+    }
     crate::blocking(move || {
         for name in names {
             crate::remove_quietly(&name);
@@ -608,6 +617,19 @@ fn generation_files(handle: &VfsHandle, stage_id: Ulid, generation: Option<u64>)
             handle.path(&draft_name(stage_id, generation)),
         ]
     })
+}
+
+/// The volatile file and both names of the superseded generation a released stage gave up.
+fn released_files(
+    handle: &VfsHandle,
+    released: (Option<String>, Option<(Ulid, u64)>),
+) -> Vec<PathBuf> {
+    let (volatile, stale) = released;
+    let mut names: Vec<PathBuf> = (volatile.iter()).map(|name| handle.path(name)).collect();
+    if let Some((stage_id, generation)) = stale {
+        names.extend(generation_files(handle, stage_id, Some(generation)));
+    }
+    names
 }
 
 /// Every checkpoint file in the stage folder; an unsealed draft counts as corrupt.

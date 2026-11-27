@@ -7,7 +7,6 @@ use aruna_core::structs::storage::vfs::{
     DetachReason, DirectoryWitness, FileIdentity, HandleIdentity, HandleKind, NfsMountBinding,
     NfsStageRecord, StageBase, StageDisposition, StageOwner,
 };
-use aruna_core::user::id::UserId;
 use aruna_core::vfs_effects::{
     ByteLock, ByteRange, InstanceSummary, ReadLockCheck, VfsFailure, VfsProtocol,
 };
@@ -407,9 +406,12 @@ impl ArunaNfsBackend {
         };
         // Unstable bytes without a checkpoint leave the name inside the close, under the same
         // state lock, so no writer of another mount joins them in between.
-        let close = VfsCloseOperation::new(input)
+        let mut close = VfsCloseOperation::new(input)
             .with_detach_unstable()
             .with_instance(slot.instance_id);
+        if let Some(put) = self.marker_template(binding).await.ok().flatten() {
+            close = close.with_parent_marker(put);
+        }
         let stage = match drive(close, &self.context).await {
             Ok(CloseOutcome::Pending) => stage,
             // An earlier attempt ended the open; a live checkpoint of this binding stays.
@@ -477,14 +479,7 @@ impl ArunaNfsBackend {
             .as_ref()
             .is_some_and(|found| found.detached.is_some());
         let dirty = summary.as_ref().is_some_and(|found| found.dirty);
-        let marker = match summary.as_ref() {
-            Some(found) if found.delete_pending => {
-                let owner = found.disposition_owner.as_ref();
-                let user = owner.map_or(binding.owner, |owner| owner.user);
-                self.parent_marker(binding, &found.key, user).await?
-            }
-            _ => None,
-        };
+        let marker = self.marker_template(binding).await?;
         let (publish, stage) = match slot.write || dirty {
             true => {
                 let read = LiveStageOperation::new(scope.clone(), object.object_id);
@@ -508,22 +503,6 @@ impl ArunaNfsBackend {
             close = close.with_parent_marker(put);
         }
         Ok((close, detached))
-    }
-
-    /// The zero-length marker write that keeps the parent of `key` when a final delete removes
-    /// its last child, written as `user`; `None` at the export root of the bucket.
-    async fn parent_marker(
-        &self,
-        binding: &NfsMountBinding,
-        key: &str,
-        user: UserId,
-    ) -> Result<Option<PutObjectConfig>, NfsStat4> {
-        let Some((parent, _)) = split_parent(key).filter(|(parent, _)| !parent.is_empty()) else {
-            return Ok(None);
-        };
-        let mut put = self.marker_put(binding, parent).await?;
-        put.user_id = user;
-        Ok(Some(put))
     }
 
     async fn release_quietly(&self, binding: &NfsMountBinding, object: ObjectRef, slot: OpenSlot) {

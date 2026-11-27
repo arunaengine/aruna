@@ -7,6 +7,7 @@ use super::super::handles_tests::{
     asked, child, context, denied, granted, id, instance, scope, user, vfs,
 };
 use super::super::mutate::tests::{prepared, put_done, stored};
+use super::super::path::marker_key;
 use super::super::recovery_tests::{binding, host};
 use super::*;
 use aruna_core::structs::execution::job::identity::JobId;
@@ -554,12 +555,14 @@ fn closing(context: VfsAccessContext, stage: Option<NfsStageRecord>) -> VfsClose
     operation
 }
 
-/// The last close of a delete-pending instance with `owner` as its disposition owner.
+/// The last close of a stageless delete-pending instance with `owner` as its disposition
+/// owner.
 fn pending(owner: Option<StageOwner>) -> CloseSummary {
     CloseSummary {
         remaining_opens: 0,
         delete_pending: true,
         disposition_owner: owner,
+        stage_id: None,
         ..summary(0)
     }
 }
@@ -674,10 +677,31 @@ fn nfs_owner_rechecked() {
     assert_eq!(asked(&gone.next(row(&host(Some(9))))), clear());
 }
 
+/// The release of instance 1 from the retained checkpoint `id(12)`.
+fn retention() -> VfsEffect {
+    VfsEffect::RetainInstance {
+        scope: scope(),
+        instance_id: 1,
+        stage_id: id(12),
+        generation: 2,
+        reason: DetachReason::LostLife,
+    }
+}
+
+/// Runs a retention's stage move and sync, and returns its outcome and instance release.
+fn kept(operation: &mut VfsCloseOperation, turn: CloseTurn) -> (CloseOutcome, Vec<IoCall>) {
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    assert_eq!(operation.next(child(())), Ok(Next::Call(IoCall::Sync)));
+    let Ok(Next::Then { output, calls }) = operation.next(IoResult::Done) else {
+        panic!("expected the retained outcome with the instance release");
+    };
+    (output, calls)
+}
+
 #[test]
 fn refused_delete_clears() {
-    // A definitive refusal clears the disposition: without a checkpoint it is the close's
-    // error, with one the checkpoint is retained.
+    // A definitive refusal without a checkpoint clears the disposition and is the close's
+    // error; with one the checkpoint is retained while the delete still blocks new opens.
     let mut bare = closing(context(), None);
     bare.next(vfs(VfsEvent::Closed(pending(Some(smb_owner())))))
         .unwrap();
@@ -685,17 +709,15 @@ fn refused_delete_clears() {
     assert_eq!(bare.next(vfs(VfsEvent::Done)), Err(VfsError::Denied));
 
     let mut staged = closing(context(), Some(stage()));
-    staged
-        .next(vfs(VfsEvent::Closed(pending(Some(smb_owner())))))
-        .unwrap();
-    assert_eq!(asked(&staged.next(refused(VfsError::Denied))), clear());
-    let turn = staged.next(vfs(VfsEvent::Done));
-    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
-    assert_eq!(staged.next(child(())), Ok(Next::Call(IoCall::Sync)));
-    let Ok(Next::Then { output, .. }) = staged.next(IoResult::Done) else {
-        panic!("expected the retained outcome");
+    let last = CloseSummary {
+        stage_id: Some(id(12)),
+        ..pending(Some(smb_owner()))
     };
+    staged.next(vfs(VfsEvent::Closed(last))).unwrap();
+    let turn = staged.next(refused(VfsError::Denied));
+    let (output, calls) = kept(&mut staged, turn);
     assert_eq!(output, CloseOutcome::Retained(id(12)));
+    assert_eq!(calls, vec![vfs_call(retention())]);
     // A missing disposition owner is a refusal too.
     let mut ownerless = closing(context(), None);
     let turn = ownerless.next(vfs(VfsEvent::Closed(pending(None))));
@@ -741,6 +763,138 @@ fn transient_delete_retries() {
         ..instance()
     };
     let turn = retry.next(vfs(VfsEvent::Instance(Some(found))));
+    assert_eq!(turn, Ok(Next::Call(settling())));
+    let turn = retry.next(child(ReceiptOutcome::RolledBack));
     assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
     assert_eq!(retry.next(child(())), Ok(Next::Done(CloseOutcome::Deleted)));
+}
+
+/// The settlement of the receipt open 22's earlier delete attempt may have left.
+fn settling() -> IoCall {
+    IoCall::child(VfsReceiptOperation::new(ReceiptInput {
+        scope: scope(),
+        attempt_id: id(22),
+        instance_id: Some(1),
+        updates: Vec::new(),
+        logical_size: None,
+        expected_edit: None,
+    }))
+}
+
+#[test]
+fn staged_delete_loads() {
+    // A refused delete of an instance whose checkpoint the close did not read loads the live
+    // stage row and retains it, never clearing the disposition first.
+    let mut operation = closing(context(), None);
+    let last = CloseSummary {
+        stage_id: Some(id(12)),
+        ..pending(Some(smb_owner()))
+    };
+    operation.next(vfs(VfsEvent::Closed(last))).unwrap();
+    let turn = operation.next(refused(VfsError::Denied));
+    let read = state_read(&[VfsKey::LiveStage(scope(), 4)]).unwrap();
+    assert_eq!(turn, Ok(Next::Call(read)));
+    let turn = operation.next(row(&stage()));
+    let (output, calls) = kept(&mut operation, turn);
+    assert_eq!(output, CloseOutcome::Retained(id(12)));
+    assert_eq!(calls, vec![vfs_call(retention())]);
+
+    // Without a live stage row the disposition is cleared and the refusal is the error.
+    let mut gone = closing(context(), None);
+    let last = CloseSummary {
+        stage_id: Some(id(12)),
+        ..pending(Some(smb_owner()))
+    };
+    gone.next(vfs(VfsEvent::Closed(last))).unwrap();
+    gone.next(refused(VfsError::Denied)).unwrap();
+    assert_eq!(asked(&gone.next(IoResult::Values(vec![None]))), clear());
+    assert_eq!(gone.next(vfs(VfsEvent::Done)), Err(VfsError::Denied));
+}
+
+#[test]
+fn retry_settles_receipt() {
+    // A retried close whose earlier removal committed before its sync failed only discards
+    // the stage, never removing again or clearing the disposition.
+    let input = CloseInput {
+        context: context(),
+        scope: scope(),
+        open_id: id(22),
+        publish: None,
+        stage: Some(stage()),
+    };
+    let mut retry = VfsCloseOperation::new(input).with_instance(1);
+    retry.first().unwrap();
+    retry
+        .next(vfs(VfsEvent::Failed(VfsFailure::NotFound)))
+        .unwrap();
+    let found = InstanceSummary {
+        open_count: 0,
+        delete_pending: true,
+        disposition_owner: Some(smb_owner()),
+        stage_id: Some(id(12)),
+        ..instance()
+    };
+    let turn = retry.next(vfs(VfsEvent::Instance(Some(found))));
+    assert_eq!(turn, Ok(Next::Call(settling())));
+    let turn = retry.next(child(ReceiptOutcome::Applied { life_id: None }));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    assert_eq!(retry.next(child(())), Ok(Next::Call(IoCall::Sync)));
+    let remove = VfsEffect::RemoveCheckpoint {
+        stage_id: id(12),
+        generation: 2,
+    };
+    assert_eq!(asked(&retry.next(IoResult::Done)), remove);
+    let turn = retry.next(vfs(VfsEvent::Done));
+    assert_eq!(turn, Ok(Next::Done(CloseOutcome::Deleted)));
+}
+
+#[test]
+fn marker_rewrites_owner() {
+    // The frontend's marker template is written as the disposition owner at the closed
+    // name's own parent, and a name at the bucket root passes no marker.
+    let share = VfsAccessContext {
+        access_key: "KEY2".to_string(),
+        protocol: VfsProtocol::Smb,
+        target: NfsMountTarget::for_bucket("bucket", 7).unwrap(),
+        read_only: false,
+        ..context()
+    };
+    let template = || {
+        let mut put = prepared("placeholder/");
+        put.user_id.user_ulid = id(9);
+        put
+    };
+    let mut expected = prepared(&marker_key("dir"));
+    expected.user_id = smb_owner().user;
+    let cases = [("dir/a.txt", Some(expected)), ("a.txt", None)];
+    for (key, marker) in cases {
+        let input = CloseInput {
+            context: context(),
+            scope: scope(),
+            open_id: id(22),
+            publish: None,
+            stage: None,
+        };
+        let mut operation = VfsCloseOperation::new(input).with_parent_marker(template());
+        operation.first().unwrap();
+        let last = CloseSummary {
+            key: key.to_string(),
+            ..pending(Some(smb_owner()))
+        };
+        let turn = operation.next(vfs(VfsEvent::Closed(last)));
+        let summary = summary(0);
+        let mut remove = VfsRemoveOperation::new(RemoveInput {
+            context: share.clone(),
+            key: key.to_string(),
+            kind: summary.kind,
+            handle_id: summary.handle_id,
+            identity: summary.identity,
+            instance_id: Some(1),
+            attempt_id: id(22),
+        });
+        if let Some(put) = marker {
+            remove = remove.with_parent_marker(put);
+        }
+        assert_eq!(turn, Ok(Next::Call(IoCall::child(remove))));
+    }
 }
