@@ -167,6 +167,7 @@ fn node_features(
     };
     let named = [
         ("workflows", Feature::Workflows),
+        ("automations", Feature::Automations),
         ("applets", Feature::Applets),
         ("builder", Feature::Applets),
         ("runs", Feature::Runs),
@@ -603,7 +604,7 @@ mod tests {
         let config: serde_json::Value = serde_json::from_slice(&body).unwrap();
         // Realm level feature flags only; no group's state reaches this unauthenticated file.
         let features = serde_json::json!({
-            "applets": false, "builder": false, "compute": true, "runs": true, "workflows": false
+            "applets": false, "automations": false, "builder": false, "compute": true, "runs": true, "workflows": false
         });
         assert_eq!(
             config,
@@ -660,8 +661,8 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&features).unwrap(),
             serde_json::json!({
-                "workflows": false, "applets": false, "builder": false, "runs": false,
-                "compute": false, "jobs": false, "tes": false
+                "workflows": false, "automations": false, "applets": false, "builder": false,
+                "runs": false, "compute": false, "jobs": false, "tes": false
             })
         );
     }

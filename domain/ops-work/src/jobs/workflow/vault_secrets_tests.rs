@@ -222,6 +222,9 @@ async fn releases_workflow_secrets() {
         directory_pins: Vec::new(),
         directory_roots: Vec::new(),
         used_tools: Vec::new(),
+        limits: None,
+        automation: None,
+        applet: None,
     };
     ctx.storage_handle
         .send_storage_effect(StorageEffect::Write {

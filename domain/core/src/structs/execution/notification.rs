@@ -141,6 +141,15 @@ pub enum NotificationKind {
         node_id: Option<NodeId>,
         actor_user_id: UserId,
     },
+    /// Fixed plain-text notice sent by an approved automation's notify stage.
+    AutomationNotice {
+        group_id: GroupId,
+        automation_id: Ulid,
+        firing_id: Ulid,
+        stage: String,
+        message: String,
+        run_link: String,
+    },
 }
 
 impl NotificationKind {
@@ -163,6 +172,7 @@ impl NotificationKind {
             NotificationKind::ShareUpload { .. } => "share.upload",
             NotificationKind::BucketDeleted { .. } => "bucket.deleted",
             NotificationKind::SecretUseWidened { .. } => "secret.use",
+            NotificationKind::AutomationNotice { .. } => "automation.notice",
         }
     }
 
@@ -184,6 +194,7 @@ impl NotificationKind {
             NotificationKind::ShareUpload { .. } => "share_upload",
             NotificationKind::BucketDeleted { .. } => "bucket_deleted",
             NotificationKind::SecretUseWidened { .. } => "secret_use_widened",
+            NotificationKind::AutomationNotice { .. } => "automation_notice",
         }
     }
 
@@ -696,6 +707,14 @@ mod tests {
                 relationship_id: Ulid::generate(),
                 error: "quota".to_string(),
                 actor_user_id: user(1, 6),
+            },
+            NotificationKind::AutomationNotice {
+                group_id: data_group_id,
+                automation_id: Ulid::generate(),
+                firing_id: Ulid::generate(),
+                stage: "notify".to_string(),
+                message: "Run succeeded".to_string(),
+                run_link: "/compute/automation-runs/01K".to_string(),
             },
         ] {
             let record = NotificationRecord::new(

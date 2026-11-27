@@ -87,10 +87,11 @@ pub struct FeatureState {
 **Authentication**: realm bearer token with READ on the realm configuration admin path.
 
 **Behavior**
-- A feature missing from the map uses its built-in default: on, except `applets`.
+- A feature missing from the map uses its built-in default: on, except `applets` and `automations`.
 - Feature keys: `runs`, `workflows`, `notebooks`, `applets`, `vault`, `assistant`, `plugins`,
   `connectors`, `shares`, `placement`, `profiles`, `repositories`, `s3-keys`, `watches`,
-  `federation`. `workflows` and `notebooks` also need `runs`."#,
+  `federation`, `automations`. `workflows` and `notebooks` need `runs`; `automations` needs
+  `workflows`."#,
     responses(
         (status = 200, description = "The stored feature policy", body = FeaturePolicy,
             example = json!({"features": {"runs": {"mode": "scoped", "default": true,

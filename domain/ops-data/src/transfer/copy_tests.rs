@@ -169,7 +169,7 @@ fn unbound_reference_fails() {
         fresh: Ulid::from_bytes([5; 16]),
         now_ms: 1,
     };
-    let mut keep = KeepReferenceOperation::new(input, step_head(), None, stamp);
+    let mut keep = KeepReferenceOperation::new(input, step_head(), None, stamp, false);
     assert!(matches!(keep.first(), Ok(Next::Call(IoCall::Child(_)))));
     let answer = keep.next(child::<(), CopyObjectError>(Ok(())));
     assert_eq!(
@@ -182,6 +182,9 @@ fn unbound_reference_fails() {
 fn plain_source_admitted() {
     let mut admit = AdmitSourceOperation {
         bucket: "source".to_string(),
+        dest_bucket: None,
+        allow_downgrade: false,
+        dest_encrypted: false,
         admitting: false,
     };
     assert!(matches!(admit.first(), Ok(Next::Call(IoCall::Read(_)))));
@@ -199,6 +202,9 @@ fn locked_source_refused() {
     };
     let mut admit = AdmitSourceOperation {
         bucket: "source".to_string(),
+        dest_bucket: None,
+        allow_downgrade: false,
+        dest_encrypted: false,
         admitting: false,
     };
     admit.first().unwrap();
@@ -1312,4 +1318,189 @@ async fn precondition_preserves_versions() {
         panic!("unexpected storage read result");
     };
     assert!(value.is_none());
+}
+
+async fn seal_bucket(
+    context: &DriverContext,
+    bucket: &str,
+    (realm_id, group_id, node_id, user_id): (RealmId, GroupId, aruna_core::id::NodeId, UserId),
+) -> aruna_core::structs::storage::encryption::BucketKeyRef {
+    use crate::s3::bucket::encryption::{EnableEncryptionOperation, EnableInput};
+    use crate::s3::bucket::key::install::{InstallInput, InstallKeyOperation};
+    use aruna_core::structs::storage::encryption::{BlockCipher, BlockKeys, EncryptionMode};
+    use aruna_core::structs::storage::holders::KeyLookup;
+    use std::collections::BTreeMap;
+
+    seed_bucket(context, bucket, group_id, user_id, Vec::new()).await;
+    let enabled = drive(
+        EnableEncryptionOperation::new(EnableInput {
+            bucket: bucket.to_string(),
+            group_id,
+            realm_id,
+            node_id,
+            caller: user_id,
+            mode: EncryptionMode::NodeManaged,
+            cipher: BlockCipher::ChaCha20Poly1305,
+            block_keys: BlockKeys::ContentDerived,
+            max_unlock_ms: None,
+            expected_generation: 0,
+            lookups: BTreeMap::from([(user_id, KeyLookup::Missing)]),
+            now_ms: 1,
+        }),
+        context,
+    )
+    .await
+    .unwrap();
+    let key = enabled.key.key;
+    drive(
+        InstallKeyOperation::new(InstallInput {
+            key,
+            public_key: enabled.key.public_key,
+            private_key: enabled.private_key,
+            duration: None,
+            max: None,
+        }),
+        context,
+    )
+    .await
+    .unwrap();
+    key
+}
+
+async fn read_bytes(
+    context: &DriverContext,
+    (bucket, key): (&str, &str),
+    (realm_id, group_id, node_id, user_id): (RealmId, GroupId, aruna_core::id::NodeId, UserId),
+) -> Vec<u8> {
+    let mut blob = drive(
+        GetObjectOperation::new(GetObjectInput {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            version_id: None,
+            range: None,
+            group_id,
+            user_identity: user_id,
+            realm_id,
+            node_id,
+        }),
+        context,
+    )
+    .await
+    .unwrap()
+    .blob;
+    let mut out = Vec::new();
+    while let Some(Ok(chunk)) = blob.next().await {
+        out.extend_from_slice(&chunk);
+    }
+    out
+}
+
+#[tokio::test]
+async fn cross_bucket_encryption() {
+    // Cross-bucket copy refuses encrypted->plain unless opted in and seals encrypted targets.
+    let (_temp, context) = full_context().await;
+    context
+        .storage_handle
+        .open_vault(aruna_core::node::vault::NodeVaultKey::random());
+    let realm_id = RealmId::from_bytes([9u8; 32]);
+    let group_id = Ulid::generate();
+    let node_id = context.net_handle.as_ref().unwrap().node_id();
+    let user_id = UserId::local(Ulid::generate(), realm_id);
+    let ids = (realm_id, group_id, node_id, user_id);
+    seed_authority(&context, realm_id, group_id, user_id).await;
+    let key_a = seal_bucket(&context, "enc-a", ids).await;
+    let key_b = seal_bucket(&context, "enc-b", ids).await;
+    seed_bucket(&context, "plain", group_id, user_id, Vec::new()).await;
+
+    drive(
+        PutObjectOperation::new(put_config(
+            realm_id,
+            group_id,
+            node_id,
+            "enc-a",
+            "secret.txt",
+            b"secret-data",
+        )),
+        &context,
+    )
+    .await
+    .unwrap();
+    drive(
+        PutObjectOperation::new(put_config(
+            realm_id,
+            group_id,
+            node_id,
+            "plain",
+            "open.txt",
+            b"open-data",
+        )),
+        &context,
+    )
+    .await
+    .unwrap();
+
+    let make = |src_b: &str, src_k: &str, dst_b: &str, dst_k: &str| CopyObjectInput {
+        source_bucket: src_b.to_string(),
+        source_key: src_k.to_string(),
+        source_version_id: None,
+        source_group_id: group_id,
+        source_auth_context: auth_context(user_id),
+        dest_bucket: dst_b.to_string(),
+        dest_key: dst_k.to_string(),
+        user_id,
+        group_id,
+        realm_id,
+        node_id,
+        quota_ceiling: None,
+        conditions: CopySourceConditions::default(),
+        metadata: None,
+        restrictions: None,
+        references: CopyReferences::Materialize,
+        job_id: None,
+    };
+
+    // Default encrypted -> plain is refused.
+    let refused = copy_object(&context, make("enc-a", "secret.txt", "plain", "leak.txt")).await;
+    assert_eq!(refused, Err(CopyObjectError::EncryptionDowngrade));
+
+    // Explicit opt-in allows encrypted -> plain and writes unencrypted bytes.
+    let op = CopyObjectOperation::new(
+        make("enc-a", "secret.txt", "plain", "opted.txt"),
+        node_routing(&context),
+    )
+    .allow_downgrade(true);
+    let downgraded = drive(op, &context).await.unwrap();
+    assert_eq!(
+        downgraded.location.as_ref().unwrap().format.bucket_key(),
+        None
+    );
+    assert_eq!(
+        read_bytes(&context, ("plain", "opted.txt"), ids).await,
+        b"secret-data"
+    );
+
+    // Encrypted -> encrypted seals cleanly with the destination bucket's key.
+    let sealed = copy_object(&context, make("enc-a", "secret.txt", "enc-b", "kept.txt"))
+        .await
+        .unwrap();
+    let sealed_key = sealed.location.as_ref().unwrap().format.bucket_key();
+    assert_eq!(sealed_key, Some(key_b));
+    assert_ne!(sealed_key, Some(key_a));
+    assert_eq!(
+        read_bytes(&context, ("enc-b", "kept.txt"), ids).await,
+        b"secret-data"
+    );
+
+    // Plain -> encrypted streams and seals cleanly instead of failing blob adoption.
+    let upgraded = copy_object(&context, make("plain", "open.txt", "enc-b", "sealed.txt"))
+        .await
+        .unwrap();
+    assert_eq!(
+        upgraded.location.as_ref().unwrap().format.bucket_key(),
+        Some(key_b)
+    );
+    assert_eq!(
+        read_bytes(&context, ("enc-b", "sealed.txt"), ids).await,
+        b"open-data"
+    );
 }

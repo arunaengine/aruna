@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::errors::StorageError;
 use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
@@ -515,7 +516,13 @@ pub struct DedupJobOperation {
 type DedupNext = Result<Next<Option<(JobId, [u8; 32])>>, SubmitJobError>;
 
 fn store_failed(error: JobMutationError) -> SubmitJobError {
-    SubmitJobError::UnexpectedEvent(error.to_string())
+    match error {
+        JobMutationError::Storage(detail) => {
+            SubmitJobError::Storage(StorageError::ReadError(detail))
+        }
+        JobMutationError::Conflict => SubmitJobError::Storage(StorageError::TransactionConflict),
+        other => SubmitJobError::UnexpectedEvent(other.to_string()),
+    }
 }
 
 impl DedupJobOperation {
@@ -604,7 +611,6 @@ mod tests {
     use super::*;
     use crate::tests::records::{Family, REALM, node, user};
     use aruna_core::calls::ChildOutcome;
-    use aruna_core::errors::StorageError;
 
     fn spec(owner: NodeId) -> SubmitJobSpec {
         SubmitJobSpec {
@@ -726,6 +732,33 @@ mod tests {
             SubmitJobError::JobPlanConflict {
                 existing_job_id: job_id
             }
+        );
+    }
+
+    // Storage failures during dedup index or job-record reads preserve SubmitJobError::Storage.
+    #[test]
+    fn dedup_keeps_storage() {
+        let mut find = DedupJobOperation::new(user(), b"key");
+        assert!(matches!(find.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let err = child(Err::<Option<(JobId, [u8; 32])>, _>(
+            JobMutationError::Storage("timeout".into()),
+        ));
+        assert_eq!(
+            find.next(err),
+            Err(SubmitJobError::Storage(StorageError::ReadError(
+                "timeout".into()
+            )))
+        );
+
+        let job_id = JobId::from_bytes([3u8; 16]);
+        let mut read = DedupJobOperation::new(user(), b"key");
+        assert!(matches!(read.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let plan = child(Ok::<_, JobMutationError>(Some((job_id, [1u8; 32]))));
+        assert!(matches!(read.next(plan), Ok(Next::Call(IoCall::Child(_)))));
+        let conflict = child(Err::<Option<JobRecord>, _>(JobMutationError::Conflict));
+        assert_eq!(
+            read.next(conflict),
+            Err(SubmitJobError::Storage(StorageError::TransactionConflict))
         );
     }
 }

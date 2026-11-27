@@ -791,6 +791,10 @@ impl IntoS3Error for CopyObjectError {
                 PreconditionFailed,
                 "At least one of the preconditions you specified did not hold."
             ),
+            CopyObjectError::EncryptionDowngrade => s3_error!(
+                AccessDenied,
+                "Copying from an encrypted bucket into an unencrypted bucket is not allowed."
+            ),
         }
     }
 }

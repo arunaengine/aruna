@@ -30,7 +30,6 @@ use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::rows::read_row;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
@@ -123,6 +122,8 @@ pub enum CopyObjectError {
     Reference(#[from] MaterializeReferenceError),
     #[error("At least one of the preconditions you specified did not hold.")]
     PreconditionFailed,
+    #[error("copying from an encrypted bucket into an unencrypted bucket is not allowed")]
+    EncryptionDowngrade,
 }
 
 impl From<IoError> for CopyObjectError {
@@ -349,6 +350,7 @@ pub struct CopyObjectOperation {
     routing: NodeRouting,
     progress: Option<PulledBytes>,
     token: Option<TokenRead>,
+    allow_downgrade: bool,
     stamp: CopyStamp,
     step: CopyStep,
 }
@@ -361,6 +363,7 @@ impl CopyObjectOperation {
             routing,
             progress: None,
             token: None,
+            allow_downgrade: false,
             stamp: CopyStamp {
                 version: None,
                 fresh: Ulid::nil(),
@@ -368,6 +371,12 @@ impl CopyObjectOperation {
             },
             step: CopyStep::Fence,
         }
+    }
+
+    /// Permits copying from an encrypted source bucket into an unencrypted destination bucket.
+    pub fn allow_downgrade(mut self, allow: bool) -> Self {
+        self.allow_downgrade = allow;
+        self
     }
 
     /// Publishes the bytes pulled so far, so a job can report a long source read.
@@ -441,7 +450,8 @@ impl CopyObjectOperation {
         // A record-only version of a distributed bucket is read through a holder, never kept.
         let record_only = (head.source_binding.as_ref()).is_some_and(record_only);
         if head.location.is_none() && input.references == CopyReferences::Preserve && !record_only {
-            let keep = KeepReferenceOperation::new(input, head, modified, stamp);
+            let keep =
+                KeepReferenceOperation::new(input, head, modified, stamp, self.allow_downgrade);
             return Ok(Next::Call(IoCall::child(keep)));
         }
         // A sealed source in the same bucket is aliased, never read, so it copies while locked.
@@ -460,13 +470,15 @@ impl CopyObjectOperation {
             routing: self.routing.clone(),
             progress: self.progress.take(),
             token: self.token.take(),
+            allow_downgrade: self.allow_downgrade,
+            dest_encrypted: false,
             modified,
             stamp,
             source: None,
             snapshot: None,
             gate: None,
             source_version: None,
-            step: BytesStep::Source,
+            step: BytesStep::Encryption,
         };
         Ok(Next::Call(IoCall::child(bytes)))
     }
@@ -530,6 +542,7 @@ impl Operation for CopyObjectOperation {
 
 #[derive(Debug, PartialEq)]
 enum BytesStep {
+    Encryption,
     Source,
     Routing,
     Gate,
@@ -545,6 +558,8 @@ struct CopyBytesOperation {
     routing: NodeRouting,
     progress: Option<PulledBytes>,
     token: Option<TokenRead>,
+    allow_downgrade: bool,
+    dest_encrypted: bool,
     modified: Option<SystemTime>,
     stamp: CopyStamp,
     source: Option<GetObjectResult>,
@@ -597,6 +612,8 @@ impl CopyBytesOperation {
         let plain = routing.plain_target(bucket, key, Ulid::nil()).is_some();
         let adopt = source.location.clone().filter(|location| {
             !plain
+                && !self.dest_encrypted
+                && location.format.bucket_key().is_none()
                 && resolve_backend(&routing, bucket, key).is_ok_and(|resolved| {
                     resolved.backend == location.backend
                         && EncodingClass::from(resolved.compression) == location.format.encoding()
@@ -651,24 +668,54 @@ impl Operation for CopyBytesOperation {
     type Error = CopyObjectError;
 
     fn first(&mut self) -> CopyTurn<CopyResultData> {
-        let input = &self.input;
-        let source = GetObjectInput {
-            bucket: input.source_bucket.clone(),
-            key: input.source_key.clone(),
-            version_id: input.source_version_id,
-            range: None,
-            group_id: input.source_group_id,
-            user_identity: input.source_auth_context.user_id,
-            realm_id: input.source_auth_context.realm_id,
-            node_id: input.node_id,
-        };
-        let restrictions = input.source_auth_context.path_restrictions.clone();
-        let read = ReadSourceOperation::new(source, restrictions, self.token.take());
-        Ok(Next::Call(IoCall::child(read)))
+        let mut reads = vec![(
+            BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+            self.input.dest_bucket.as_bytes().to_vec().into(),
+        )];
+        if self.input.source_bucket != self.input.dest_bucket {
+            reads.push((
+                BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+                self.input.source_bucket.as_bytes().to_vec().into(),
+            ));
+        }
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
     fn next(&mut self, result: IoResult) -> CopyTurn<CopyResultData> {
         match self.step {
+            BytesStep::Encryption => {
+                let mut rows = result.values()?.into_iter();
+                let dest_row = rows.next().flatten();
+                let dest = BucketEncryption::from_row(dest_row.as_deref()).map_err(|error| {
+                    CopyObjectError::Put(PutObjectError::ConversionError(error))
+                })?;
+                self.dest_encrypted = dest.is_encrypted();
+                if self.input.source_bucket != self.input.dest_bucket {
+                    let source_row = rows.next().flatten();
+                    let source =
+                        BucketEncryption::from_row(source_row.as_deref()).map_err(|error| {
+                            CopyObjectError::Get(GetObjectError::ConversionError(error))
+                        })?;
+                    if source.is_encrypted() && !self.dest_encrypted && !self.allow_downgrade {
+                        return Err(CopyObjectError::EncryptionDowngrade);
+                    }
+                }
+                let input = &self.input;
+                let source = GetObjectInput {
+                    bucket: input.source_bucket.clone(),
+                    key: input.source_key.clone(),
+                    version_id: input.source_version_id,
+                    range: None,
+                    group_id: input.source_group_id,
+                    user_identity: input.source_auth_context.user_id,
+                    realm_id: input.source_auth_context.realm_id,
+                    node_id: input.node_id,
+                };
+                let restrictions = input.source_auth_context.path_restrictions.clone();
+                let read = ReadSourceOperation::new(source, restrictions, self.token.take());
+                self.step = BytesStep::Source;
+                Ok(Next::Call(IoCall::child(read)))
+            }
             BytesStep::Source => {
                 let source = result.child::<GetObjectResult, GetObjectError>()??;
                 self.source_version = source.version_id;
@@ -798,6 +845,9 @@ impl Operation for AliasSealedOperation {
 #[derive(Debug, PartialEq)]
 struct AdmitSourceOperation {
     bucket: String,
+    dest_bucket: Option<String>,
+    allow_downgrade: bool,
+    dest_encrypted: bool,
     admitting: bool,
 }
 
@@ -806,23 +856,44 @@ impl Operation for AdmitSourceOperation {
     type Error = CopyObjectError;
 
     fn first(&mut self) -> CopyTurn<()> {
-        let key = self.bucket.as_bytes().to_vec();
-        Ok(Next::Call(read_row(BUCKET_ENCRYPTION_KEYSPACE, key)))
+        let mut reads = vec![(
+            BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+            self.bucket.as_bytes().to_vec().into(),
+        )];
+        if let Some(dest) = &self.dest_bucket {
+            reads.push((
+                BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+                dest.as_bytes().to_vec().into(),
+            ));
+        }
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
     fn next(&mut self, result: IoResult) -> CopyTurn<()> {
         if self.admitting {
             return match result.blob()? {
-                BlobEvent::ReadAdmitted { .. } => Ok(Next::Done(())),
+                BlobEvent::ReadAdmitted { .. } => {
+                    if self.dest_bucket.is_some() && !self.dest_encrypted && !self.allow_downgrade {
+                        return Err(CopyObjectError::EncryptionDowngrade);
+                    }
+                    Ok(Next::Done(()))
+                }
                 BlobEvent::Error(BlobError::BucketKey(error)) => Err(CopyObjectError::Get(
                     GetObjectError::ConversionError(ConversionError::BucketKey(error)),
                 )),
                 _ => Err(CopyObjectError::Get(GetObjectError::GetObjectFailed)),
             };
         }
-        let value = result.value()?;
+        let mut rows = result.values()?.into_iter();
+        let value = rows.next().flatten();
         let settings = BucketEncryption::from_row(value.as_deref())
             .map_err(|error| CopyObjectError::Get(GetObjectError::ConversionError(error)))?;
+        if self.dest_bucket.is_some() {
+            let dest_row = rows.next().flatten();
+            let dest = BucketEncryption::from_row(dest_row.as_deref())
+                .map_err(|error| CopyObjectError::Put(PutObjectError::ConversionError(error)))?;
+            self.dest_encrypted = dest.is_encrypted();
+        }
         let Some(key) = settings.active_key() else {
             return Ok(Next::Done(()));
         };
@@ -842,6 +913,7 @@ struct KeepReferenceOperation {
     head: Option<HeadObjectResult>,
     modified: Option<SystemTime>,
     stamp: CopyStamp,
+    allow_downgrade: bool,
     metadata: Option<SourceMetadata>,
     source_version_id: Option<Ulid>,
     admitting: bool,
@@ -853,6 +925,7 @@ impl KeepReferenceOperation {
         head: HeadObjectResult,
         modified: Option<SystemTime>,
         stamp: CopyStamp,
+        allow_downgrade: bool,
     ) -> Self {
         Self {
             input: Some(input),
@@ -860,6 +933,7 @@ impl KeepReferenceOperation {
             head: Some(head),
             modified,
             stamp,
+            allow_downgrade,
             metadata: None,
             admitting: false,
         }
@@ -910,6 +984,9 @@ impl Operation for KeepReferenceOperation {
         }
         let admit = AdmitSourceOperation {
             bucket: input.source_bucket.clone(),
+            dest_bucket: Some(input.dest_bucket.clone()),
+            allow_downgrade: self.allow_downgrade,
+            dest_encrypted: false,
             admitting: false,
         };
         self.admitting = true;

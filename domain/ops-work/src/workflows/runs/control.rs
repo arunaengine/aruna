@@ -3,13 +3,16 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::applet::record::{Access, Applet, applet_key};
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::compute::effect::{ComputeAnswer, ComputeEffect};
 use aruna_core::errors::AuthorizationError;
 use aruna_core::id::NodeId;
+use aruna_core::keyspaces::APPLETS_KEYSPACE;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::workflow_run::{
-    CacheScope, WorkflowRunRecord, WorkflowSecretScope,
+    AppletOrigin, CacheScope, WorkflowRunRecord, WorkflowSecretScope,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
@@ -23,6 +26,7 @@ use aruna_ops_identity::groups::admin_check::realm_groups_path;
 
 use super::admit::{AdmittedRun, Lineage, PinnedInput, RunRequest, StartRunOperation};
 use super::{RunAccessOperation, access_of};
+use crate::jobs::workflow::compute::{compute_answer, compute_call};
 use crate::workflows::{CatalogError, Need};
 
 /// What a new run of a lineage does with the run it follows.
@@ -51,6 +55,8 @@ enum FollowStep {
     Access,
     /// A copy of a run another node coordinates waits for the realm admin check.
     Admin(Box<WorkflowRunRecord>),
+    Applet(Box<WorkflowRunRecord>, Ulid, bool),
+    Sandbox(Box<WorkflowRunRecord>, Option<Ulid>),
     Start,
 }
 
@@ -74,9 +80,47 @@ impl FollowRunOperation {
 
     fn admit(
         &mut self,
-        source: &WorkflowRunRecord,
+        source: WorkflowRunRecord,
     ) -> Result<Next<WorkflowRunRecord>, CatalogError> {
-        let start = self.start(source)?;
+        let applet_id = source
+            .applet
+            .as_ref()
+            .map(|origin| origin.applet_id)
+            .or_else(|| {
+                source
+                    .automation
+                    .as_ref()
+                    .and_then(|origin| origin.applet_id)
+            });
+        let outside_input = source
+            .applet
+            .as_ref()
+            .is_some_and(|origin| origin.outside_input)
+            || source
+                .automation
+                .as_ref()
+                .is_some_and(|origin| origin.outside_input);
+        if let Some(id) = applet_id {
+            self.step = FollowStep::Applet(Box::new(source), id, outside_input);
+            return Ok(Next::Call(IoCall::Read(vec![(
+                APPLETS_KEYSPACE.to_string(),
+                applet_key(id),
+            )])));
+        }
+        if outside_input {
+            self.step = FollowStep::Sandbox(Box::new(source), None);
+            return Ok(Next::Call(compute_call(ComputeEffect::Offers)));
+        }
+        self.launch(&source, None, false)
+    }
+
+    fn launch(
+        &mut self,
+        source: &WorkflowRunRecord,
+        applet: Option<AppletOrigin>,
+        outside_input: bool,
+    ) -> Result<Next<WorkflowRunRecord>, CatalogError> {
+        let start = self.start(source, applet, outside_input)?;
         self.step = FollowStep::Start;
         Ok(Next::Call(IoCall::child(start)))
     }
@@ -94,7 +138,7 @@ impl FollowRunOperation {
             )));
         }
         if source.created_by == self.auth.user_id {
-            return self.admit(&source);
+            return self.admit(source);
         }
         let check = CheckPermissionsOperation::new(CheckPermissionsConfig {
             auth_context: self.auth.clone(),
@@ -105,7 +149,12 @@ impl FollowRunOperation {
         Ok(Next::Call(IoCall::child(check)))
     }
 
-    fn start(&self, source: &WorkflowRunRecord) -> Result<StartRunOperation, CatalogError> {
+    fn start(
+        &self,
+        source: &WorkflowRunRecord,
+        applet: Option<AppletOrigin>,
+        outside_input: bool,
+    ) -> Result<StartRunOperation, CatalogError> {
         let mut values: Value = crate::workflows::from_text(&source.values_json)?;
         if source.node_id != self.node.0 {
             values_held_by(&mut values, source.node_id);
@@ -154,7 +203,7 @@ impl FollowRunOperation {
             placement_site: source.placement_site.clone(),
             secrets: source.secrets.clone(),
         };
-        let lineage = match self.follow {
+        let mut lineage = match self.follow {
             Follow::Resume => Lineage {
                 first: Some(source.lineage),
                 resumes: Some(source.run_id),
@@ -172,6 +221,9 @@ impl FollowRunOperation {
                 used_tools: Vec::new(),
             },
         };
+        if outside_input {
+            lineage.cache_scope = CacheScope::Run;
+        }
         let mut start = StartRunOperation::new(&self.auth, self.node, request)
             .in_lineage(lineage)
             .with_token(self.token.clone());
@@ -197,6 +249,12 @@ impl FollowRunOperation {
         }
         if !directory_pins.is_empty() || !directory_roots.is_empty() {
             start = start.with_directories(directory_pins, directory_roots);
+        }
+        if let Some(limits) = source.limits {
+            start = start.with_limits(limits);
+        }
+        if let Some(applet) = applet {
+            start = start.with_applet(applet);
         }
         if source.created_by == self.auth.user_id && self.auth.path_restrictions.is_none() {
             start = start.with_captured(source.captured_remote.clone());
@@ -300,16 +358,59 @@ impl Operation for FollowRunOperation {
                 let (source, _) = access_of(result)?;
                 match source.state.is_active() {
                     true => self.active(source),
-                    false => self.admit(&source),
+                    false => self.admit(source),
                 }
             }
             FollowStep::Admin(source) => {
                 let allowed = result.child::<bool, AuthorizationError>()?;
                 match allowed {
-                    Ok(true) => self.admit(&source),
+                    Ok(true) => self.admit(*source),
                     Ok(false) => Err(CatalogError::Forbidden),
                     Err(error) => Err(CatalogError::Storage(error.to_string())),
                 }
+            }
+            FollowStep::Applet(source, applet_id, mut outside_input) => {
+                match result.value()? {
+                    Some(bytes) => {
+                        let applet = Applet::from_bytes(&bytes)
+                            .map_err(|err| CatalogError::Storage(err.to_string()))?;
+                        outside_input |= applet.access == Access::Public || applet.guests.is_some();
+                    }
+                    None => {
+                        outside_input = true;
+                    }
+                }
+                if outside_input {
+                    self.step = FollowStep::Sandbox(source, Some(applet_id));
+                    return Ok(Next::Call(compute_call(ComputeEffect::Offers)));
+                }
+                self.launch(
+                    &source,
+                    Some(AppletOrigin {
+                        applet_id,
+                        outside_input: false,
+                    }),
+                    false,
+                )
+            }
+            FollowStep::Sandbox(source, applet_id) => {
+                let ready = match compute_answer(result)? {
+                    ComputeAnswer::Offers(offers) => {
+                        !offers.is_empty()
+                            && offers
+                                .iter()
+                                .all(|o| o.caps().declared.sandbox && o.caps().declared.public_work)
+                    }
+                    _ => false,
+                };
+                if !ready {
+                    return Err(CatalogError::Forbidden);
+                }
+                let origin = applet_id.map(|id| AppletOrigin {
+                    applet_id: id,
+                    outside_input: true,
+                });
+                self.launch(&source, origin, true)
             }
             FollowStep::Start => {
                 let admitted = result.child::<AdmittedRun, CatalogError>()??;

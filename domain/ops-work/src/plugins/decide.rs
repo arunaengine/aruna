@@ -630,7 +630,8 @@ impl Judge {
             local: self.local,
             run: run.clone(),
         };
-        let needs = event_trigger(event.kind).needs();
+        let needs =
+            event_trigger(event.kind).and_then(aruna_plugin_contract::trigger::TriggerKind::needs);
         let target = needs.map(|permission| (permission, event.path.as_str()));
         let check = IoCall::child(CheckCall::new(&scope, target));
         self.phase = JudgePhase::Checking(Box::new(run));

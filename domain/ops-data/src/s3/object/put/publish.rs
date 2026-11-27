@@ -393,14 +393,17 @@ impl PutObjectOperation {
         )];
         // A tagged release crate commits its release row with the version.
         rows.extend(release_rows(&version_key, &version)?);
-        let config = &self.config;
-        let uploaded = SourceEvent::data_uploaded(
-            (config.realm_id, config.group_id, config.node_id),
-            (&config.request.bucket, &config.request.key),
-            version_id,
-            self.now_ms,
-        );
-        rows.extend(journal_entries(&uploaded)?);
+        if self.journal {
+            let config = &self.config;
+            let uploaded = SourceEvent::data_uploaded(
+                (config.realm_id, config.group_id, config.node_id),
+                (&config.request.bucket, &config.request.key),
+                version_id,
+                Some(config.user_id),
+                self.now_ms,
+            );
+            rows.extend(journal_entries(&uploaded)?);
+        }
         self.call(PutObjectState::CreateVersionRecord, IoCall::Write(rows))
     }
 

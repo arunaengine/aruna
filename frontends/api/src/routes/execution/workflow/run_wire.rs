@@ -140,6 +140,12 @@ pub struct WorkflowRunBody {
     /// computed for a caller.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub writable: Option<bool>,
+    /// Automation that started this run, when started automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automation_id: Option<String>,
+    /// Automation firing that started this run, when started automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firing_id: Option<String>,
 }
 
 /// One task of a step that lists its tasks.
@@ -222,6 +228,10 @@ pub struct WorkflowRunQuery {
     pub state: Option<String>,
     /// Only the runs of this workflow.
     pub workflow_id: Option<String>,
+    /// Only the runs started by this automation.
+    pub automation_id: Option<String>,
+    /// Only the runs started by this automation firing.
+    pub firing_id: Option<String>,
     /// The `next_cursor` of the page before.
     pub cursor: Option<String>,
     /// Runs per page, 50 when left out, at most 500.
@@ -375,6 +385,14 @@ impl From<&WorkflowRunRecord> for WorkflowRunBody {
             local_only: record.local_only,
             protected: record.protected,
             writable: None,
+            automation_id: record
+                .automation
+                .as_ref()
+                .map(|origin| origin.automation_id.to_string()),
+            firing_id: record
+                .automation
+                .as_ref()
+                .map(|origin| origin.firing_id.to_string()),
         }
     }
 }

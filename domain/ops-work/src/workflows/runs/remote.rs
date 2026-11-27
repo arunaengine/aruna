@@ -971,6 +971,9 @@ mod tests {
             directory_pins: Vec::new(),
             directory_roots: Vec::new(),
             used_tools: Vec::new(),
+            limits: None,
+            automation: None,
+            applet: None,
         };
         let link_target = Target {
             bucket: "data".into(),
@@ -1104,6 +1107,9 @@ mod tests {
             }],
             directory_roots: Vec::new(),
             used_tools: Vec::new(),
+            limits: None,
+            automation: None,
+            applet: None,
         };
         let child = Target {
             bucket: "data".into(),
@@ -1215,6 +1221,9 @@ mod tests {
             directory_pins: Vec::new(),
             directory_roots: Vec::new(),
             used_tools: Vec::new(),
+            limits: None,
+            automation: None,
+            applet: None,
         }
     }
 

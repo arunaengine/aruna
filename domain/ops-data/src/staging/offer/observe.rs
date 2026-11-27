@@ -242,6 +242,7 @@ impl ObserveFileOperation {
             (scope.realm_id, scope.group_id, scope.node_id),
             (&scope.bucket, &self.path),
             version_id,
+            Some(scope.user_id),
             self.now_ms,
         );
         let version = BlobVersion::reference(

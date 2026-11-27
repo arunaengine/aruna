@@ -15,6 +15,7 @@ pub mod vfs_effects;
 mod workload;
 
 pub mod applet;
+pub mod automation;
 pub mod calls;
 pub mod compute;
 pub mod effects;

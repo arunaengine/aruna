@@ -213,7 +213,8 @@ impl BeginAttempt {
         let RunTrigger::Event(event) = &self.scope.run.trigger else {
             return Ok(Next::Done(start));
         };
-        let needs = event_trigger(event.kind).needs();
+        let needs =
+            event_trigger(event.kind).and_then(aruna_plugin_contract::trigger::TriggerKind::needs);
         let target = needs.map(|permission| (permission, event.path.as_str()));
         let check = CheckCall::new(&self.scope, target);
         self.start = Some(start);

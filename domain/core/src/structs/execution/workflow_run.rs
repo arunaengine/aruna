@@ -320,6 +320,46 @@ impl StepRecord {
     }
 }
 
+/// Compute and active-run caps enforced at admission and on every task of the run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunLimits {
+    pub cpu_cores: Option<u32>,
+    pub ram_bytes: Option<u64>,
+    pub walltime_ms: Option<u64>,
+    /// Maximum concurrent active workflow runs for the submitting account.
+    pub active_cap: Option<u32>,
+}
+
+impl RunLimits {
+    pub fn is_empty(self) -> bool {
+        self.cpu_cores.is_none()
+            && self.ram_bytes.is_none()
+            && self.walltime_ms.is_none()
+            && self.active_cap.is_none()
+    }
+}
+
+/// Automation firing and stage that started a workflow run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutomationOrigin {
+    pub automation_id: Ulid,
+    pub firing_id: Ulid,
+    pub stage: String,
+    #[serde(default)]
+    pub applet_id: Option<Ulid>,
+    #[serde(default)]
+    pub outside_input: bool,
+    #[serde(default)]
+    pub depth: u8,
+}
+
+/// Direct applet start origin captured at admission for matching and sandbox propagation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppletOrigin {
+    pub applet_id: Ulid,
+    pub outside_input: bool,
+}
+
 /// One workflow run of a group on this node.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowRunRecord {
@@ -390,6 +430,131 @@ pub struct WorkflowRunRecord {
     /// Resolved `(tool_id, version)` pairs a composed workflow lowered against for this run.
     #[serde(default)]
     pub used_tools: Vec<(String, String)>,
+    /// Compute and concurrency caps captured at admission from an applet or automation.
+    #[serde(default)]
+    pub limits: Option<RunLimits>,
+    /// Automation firing that started this workflow run, when triggered automatically.
+    #[serde(default)]
+    pub automation: Option<AutomationOrigin>,
+    /// Direct applet start origin, when started by a visitor through an applet.
+    #[serde(default)]
+    pub applet: Option<AppletOrigin>,
+}
+
+/// Base-revision layout of [`WorkflowRunRecord`] ending after `used_tools`, for decoding existing
+/// postcard rows written before `limits`, `automation`, and `applet` were appended.
+#[cfg_attr(test, derive(Serialize))]
+#[derive(Deserialize)]
+struct LegacyRunRecord {
+    run_id: Ulid,
+    realm_id: RealmId,
+    group_id: GroupId,
+    workflow_id: Ulid,
+    workflow_name: String,
+    version: u32,
+    lineage: Ulid,
+    state: RunState,
+    node_id: NodeId,
+    created_by: UserId,
+    created_at_ms: u64,
+    finished_at_ms: Option<u64>,
+    error: Option<String>,
+    values_json: String,
+    inputs_json: Option<String>,
+    output: Option<RunOutput>,
+    outputs: Vec<RunFile>,
+    provenance_crate: bool,
+    provenance_document_id: Option<Ulid>,
+    provenance_status: Option<String>,
+    last_event_seq: u64,
+    local_only: bool,
+    origin: Option<RunOrigin>,
+    parent_job_id: Option<JobId>,
+    claim_token_digest: Option<String>,
+    attempts: u32,
+    steps: Vec<StepRecord>,
+    resumes_run_id: Option<Ulid>,
+    repeats_run_id: Option<Ulid>,
+    cache_scope: CacheScope,
+    placement_site: Option<String>,
+    protected: bool,
+    started_at_ms: Option<u64>,
+    secrets: BTreeMap<String, WorkflowSecretBinding>,
+    path_restrictions: Option<Vec<PathRestriction>>,
+    captured_remote: Vec<PrecapturedInput>,
+    directory_pins: Vec<DirectoryPin>,
+    directory_roots: Vec<DirectoryRoot>,
+    used_tools: Vec<(String, String)>,
+}
+
+impl From<LegacyRunRecord> for WorkflowRunRecord {
+    fn from(old: LegacyRunRecord) -> Self {
+        Self {
+            run_id: old.run_id,
+            realm_id: old.realm_id,
+            group_id: old.group_id,
+            workflow_id: old.workflow_id,
+            workflow_name: old.workflow_name,
+            version: old.version,
+            lineage: old.lineage,
+            state: old.state,
+            node_id: old.node_id,
+            created_by: old.created_by,
+            created_at_ms: old.created_at_ms,
+            finished_at_ms: old.finished_at_ms,
+            error: old.error,
+            values_json: old.values_json,
+            inputs_json: old.inputs_json,
+            output: old.output,
+            outputs: old.outputs,
+            provenance_crate: old.provenance_crate,
+            provenance_document_id: old.provenance_document_id,
+            provenance_status: old.provenance_status,
+            last_event_seq: old.last_event_seq,
+            local_only: old.local_only,
+            origin: old.origin,
+            parent_job_id: old.parent_job_id,
+            claim_token_digest: old.claim_token_digest,
+            attempts: old.attempts,
+            steps: old.steps,
+            resumes_run_id: old.resumes_run_id,
+            repeats_run_id: old.repeats_run_id,
+            cache_scope: old.cache_scope,
+            placement_site: old.placement_site,
+            protected: old.protected,
+            started_at_ms: old.started_at_ms,
+            secrets: old.secrets,
+            path_restrictions: old.path_restrictions,
+            captured_remote: old.captured_remote,
+            directory_pins: old.directory_pins,
+            directory_roots: old.directory_roots,
+            used_tools: old.used_tools,
+            limits: None,
+            automation: None,
+            applet: None,
+        }
+    }
+}
+
+impl WorkflowRunRecord {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    /// Decodes current postcard rows, falling back to the base-revision layout without trailing
+    /// `limits`/`automation`/`applet` fields so existing stored runs remain readable.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        match postcard::take_from_bytes::<Self>(bytes) {
+            Ok((record, [])) => Ok(record),
+            Ok(_) => Err(ConversionError::from(
+                postcard::Error::DeserializeBadEncoding,
+            )),
+            Err(err) => match postcard::take_from_bytes::<LegacyRunRecord>(bytes) {
+                Ok((legacy, [])) => Ok(Self::from(legacy)),
+                _ => Err(ConversionError::from(err)),
+            },
+        }
+    }
 }
 
 /// One task of a run, with the state of its newest attempt.
@@ -456,7 +621,6 @@ macro_rules! postcard_codec {
 }
 
 postcard_codec!(
-    WorkflowRunRecord,
     WorkflowTaskRecord,
     RunEventRecord,
     RunKeyRecord,
@@ -643,5 +807,64 @@ mod tests {
         assert_eq!(step.state(), RunState::Running);
         step.count(Some(RunState::Queued), Some(RunState::Failed));
         assert_eq!((step.total(), step.state()), (2, RunState::Failed));
+    }
+
+    #[test]
+    fn decodes_legacy_run() {
+        let run_id = Ulid::from_bytes([12; 16]);
+        let realm_id = RealmId([4; 32]);
+        let legacy = LegacyRunRecord {
+            run_id,
+            realm_id,
+            group_id: Ulid::from_bytes([13; 16]),
+            workflow_id: Ulid::from_bytes([14; 16]),
+            workflow_name: "legacy".into(),
+            version: 2,
+            lineage: run_id,
+            state: RunState::Succeeded,
+            node_id: iroh::SecretKey::from_bytes(&[5; 32]).public(),
+            created_by: UserId::default(),
+            created_at_ms: 100,
+            finished_at_ms: Some(200),
+            error: None,
+            values_json: "{}".into(),
+            inputs_json: None,
+            output: None,
+            outputs: Vec::new(),
+            provenance_crate: false,
+            provenance_document_id: None,
+            provenance_status: None,
+            last_event_seq: 3,
+            local_only: false,
+            origin: None,
+            parent_job_id: None,
+            claim_token_digest: None,
+            attempts: 1,
+            steps: Vec::new(),
+            resumes_run_id: None,
+            repeats_run_id: None,
+            cache_scope: CacheScope::Group,
+            placement_site: None,
+            protected: false,
+            started_at_ms: Some(110),
+            secrets: BTreeMap::new(),
+            path_restrictions: None,
+            captured_remote: Vec::new(),
+            directory_pins: Vec::new(),
+            directory_roots: Vec::new(),
+            used_tools: vec![("samtools".into(), "1.19".into())],
+        };
+        let mut bytes = postcard::to_allocvec(&legacy).unwrap();
+        let decoded = WorkflowRunRecord::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.run_id, run_id);
+        assert_eq!(decoded.used_tools, legacy.used_tools);
+        assert_eq!(
+            (decoded.limits, decoded.automation.as_ref(), decoded.applet),
+            (None, None, None)
+        );
+        let round = WorkflowRunRecord::from_bytes(&decoded.to_bytes().unwrap()).unwrap();
+        assert_eq!(round, decoded);
+        bytes.push(0xff);
+        assert!(WorkflowRunRecord::from_bytes(&bytes).is_err());
     }
 }

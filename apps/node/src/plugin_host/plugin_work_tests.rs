@@ -143,27 +143,58 @@ async fn locked_source_waits() {
     use aruna_core::compute::{SecretBytes, SharedSecret};
     use aruna_core::effects::{BlobEffect, StorageEffect};
     use aruna_core::events::BlobEvent;
-    use aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE;
+    use aruna_core::keyspaces::{BUCKET_ENCRYPTION_KEYSPACE, BUCKET_KEY_KEYSPACE};
     use aruna_core::structs::storage::encryption::{
-        BucketEncryption, BucketKeyRef, EncryptionMode, public_key_of,
+        BucketEncryption, BucketKeyRecord, BucketKeyRef, EncryptionMode, public_key_of,
     };
     let fixture = Fixture::new().await;
     let (_root, blob, _, spec) = ready_copy(&fixture).await;
     let ctx = job_context(&blob, &fixture);
     let key = BucketKeyRef::new(Ulid::from_bytes([115; 16]), 1);
-    let settings = BucketEncryption {
-        mode: EncryptionMode::VaultLocked,
-        bucket_id: Some(key.bucket_id),
-        key_generation: key.generation,
-        ..Default::default()
+    let out_key = BucketKeyRef::new(Ulid::from_bytes([116; 16]), 1);
+    for (bucket, bucket_key) in [("in", key), ("out", out_key)] {
+        let settings = BucketEncryption {
+            mode: EncryptionMode::VaultLocked,
+            bucket_id: Some(bucket_key.bucket_id),
+            key_generation: bucket_key.generation,
+            ..Default::default()
+        };
+        let write = StorageEffect::Write {
+            key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+            key: bucket.as_bytes().to_vec().into(),
+            value: settings.to_bytes().unwrap().into(),
+            txn_id: None,
+        };
+        blob.storage_handle.send_storage_effect(write).await;
+    }
+    let handle = blob.blob_handle.as_ref().unwrap();
+    let out_priv = || SecretBytes::new(vec![10; 32]);
+    let out_pub = public_key_of(&out_priv()).unwrap();
+    let out_rec = BucketKeyRecord::new(out_key, Ulid::from_bytes([117; 16]), out_pub, 1);
+    blob.storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: BUCKET_KEY_KEYSPACE.to_string(),
+            key: out_key.key().into(),
+            value: out_rec.to_bytes().unwrap().into(),
+            txn_id: None,
+        })
+        .await;
+    let Ok(BlobEvent::KeyPrepared { ticket }) = handle
+        .send_blob_effect(BlobEffect::PrepareKey {
+            key: out_key,
+            public_key: out_pub,
+            private_key: SharedSecret::new(out_priv()),
+            duration: None,
+            max: None,
+        })
+        .await
+        .into_blob()
+    else {
+        panic!("prepare destination key failed")
     };
-    let write = StorageEffect::Write {
-        key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
-        key: b"in".to_vec().into(),
-        value: settings.to_bytes().unwrap().into(),
-        txn_id: None,
-    };
-    blob.storage_handle.send_storage_effect(write).await;
+    handle
+        .send_blob_effect(BlobEffect::ActivateKey { ticket })
+        .await;
     let outcome = run_plugin_work(&ctx, &spec).await;
     let JobRunOutcome::AwaitingKey(waits) = outcome else {
         panic!("a locked source must wait, got {}", outcome_name(&outcome));
@@ -178,7 +209,6 @@ async fn locked_source_waits() {
         duration: None,
         max: None,
     };
-    let handle = blob.blob_handle.as_ref().unwrap();
     let Ok(BlobEvent::KeyPrepared { ticket }) = handle.send_blob_effect(prepare).await.into_blob()
     else {
         panic!("prepare failed")

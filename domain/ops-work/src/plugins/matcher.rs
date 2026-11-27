@@ -9,8 +9,8 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{EVENT_JOURNAL_KEYSPACE, PLUGIN_GAPS_KEYSPACE, PLUGIN_OUTBOX_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::plugin_runs::{
-    ForwardRow, GapReason, GapRow, JOURNAL_RETENTION_MS, JOURNAL_ROW, PENDING_ROW, SourceEvent,
-    SourceKind, gap_key, outbox_key, source_key,
+    AUTO_PENDING_ROW, ForwardRow, GapReason, GapRow, JOURNAL_RETENTION_MS, JOURNAL_ROW,
+    PENDING_ROW, SourceEvent, SourceKind, gap_key, outbox_key, source_key,
 };
 use aruna_core::types::GroupId;
 use aruna_core::user::id::UserId;
@@ -37,29 +37,33 @@ pub struct Target {
 
 impl Target {
     /// Whether the install's trigger of the event's kind covers the event's path, and the
-    /// event is not a dataset write of the install itself.
+    /// event is not a dataset or object write of the install itself.
     pub fn matches(&self, event: &SourceEvent) -> bool {
-        let dataset = matches!(
+        let Some(trigger) = event_trigger(event.kind) else {
+            return false;
+        };
+        let own = matches!(
             event.kind,
-            SourceKind::DatasetCreated | SourceKind::DatasetUpdated
+            SourceKind::DatasetCreated | SourceKind::DatasetUpdated | SourceKind::DataUploaded
         );
         self.group_id == event.group_id
-            && !(dataset && event.actor == Some(self.account))
-            && (self.coverage.get(&event_trigger(event.kind)))
+            && !(own && event.actor == Some(self.account))
+            && (self.coverage.get(&trigger))
                 .is_some_and(|patterns| patterns.iter().any(|pattern| covers(pattern, &event.path)))
     }
 }
 
-/// The manifest trigger a journaled event kind starts.
-pub(crate) fn event_trigger(kind: SourceKind) -> TriggerKind {
-    match kind {
+/// The manifest trigger a journaled event kind starts, when plugins subscribe to it.
+pub(crate) fn event_trigger(kind: SourceKind) -> Option<TriggerKind> {
+    Some(match kind {
         SourceKind::DatasetCreated => TriggerKind::DatasetCreated,
         SourceKind::DataUploaded => TriggerKind::DataUploaded,
         SourceKind::DatasetUpdated => TriggerKind::DatasetUpdated,
         SourceKind::SyncCompleted => TriggerKind::SyncCompleted,
         SourceKind::SyncFailed => TriggerKind::SyncFailed,
         SourceKind::JobFinished => TriggerKind::JobFinished,
-    }
+        SourceKind::AppletSubmission | SourceKind::RunFinished => return None,
+    })
 }
 
 /// The pending rows `keys` in one transaction, each queued for the installs it matches with at
@@ -148,9 +152,19 @@ impl MatchPage {
         {
             if !self.keep {
                 let kept = [&[JOURNAL_ROW][..], &key[1..]].concat();
+                let has_auto = event.as_ref().is_some_and(|e| {
+                    matches!(
+                        e.kind,
+                        SourceKind::DataUploaded
+                            | SourceKind::AppletSubmission
+                            | SourceKind::RunFinished
+                    )
+                });
+                let auto = has_auto.then(|| [&[AUTO_PENDING_ROW][..], &key[1..]].concat());
                 let source = event.map(|event| source_key(&event.source));
                 done.push((EVENT_JOURNAL_KEYSPACE, key));
                 done.push((EVENT_JOURNAL_KEYSPACE, kept));
+                done.extend(auto.map(|key| (EVENT_JOURNAL_KEYSPACE, key)));
                 done.extend(source.map(|key| (EVENT_JOURNAL_KEYSPACE, key)));
                 continue;
             }

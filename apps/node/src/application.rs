@@ -294,6 +294,7 @@ async fn run_node_owned(
             task_queues: resources.task_queues.clone(),
             usage_counters_rebuilt: resources.usage_counters_rebuilt,
             core_announcement,
+            disabled_features: resources.config.disabled_features.clone(),
         },
         &stop_token,
         || observed_listener_exit(&bindings),

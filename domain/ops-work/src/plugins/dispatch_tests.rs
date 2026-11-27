@@ -147,7 +147,7 @@ fn trigger_indexes_kept() {
         SourceKind::DataUploaded,
         SourceKind::DatasetUpdated,
     ] {
-        assert_eq!(event_trigger(kind).as_str(), kind.name());
+        assert_eq!(event_trigger(kind).unwrap().as_str(), kind.name());
     }
 }
 

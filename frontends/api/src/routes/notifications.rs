@@ -125,6 +125,16 @@ pub struct NotificationResponse {
     /// The secret a `secret_use_widened` notice is about; a node or group id names its scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firing_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_link: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -294,6 +304,11 @@ fn notification_response(record: &NotificationRecord) -> NotificationResponse {
         error: None,
         share_id: None,
         secret: None,
+        automation_id: None,
+        firing_id: None,
+        stage: None,
+        message: None,
+        run_link: None,
     };
     match &record.kind {
         NotificationKind::GroupJoinRequested {
@@ -446,6 +461,21 @@ fn notification_response(record: &NotificationRecord) -> NotificationResponse {
             response.group_id = group_id.map(|id| id.to_string());
             response.node_id = node_id.map(|id| id.to_string());
             response.actor_user_id = Some(actor_user_id.to_string());
+        }
+        NotificationKind::AutomationNotice {
+            group_id,
+            automation_id,
+            firing_id,
+            stage,
+            message,
+            run_link,
+        } => {
+            response.group_id = Some(group_id.to_string());
+            response.automation_id = Some(automation_id.to_string());
+            response.firing_id = Some(firing_id.to_string());
+            response.stage = Some(stage.clone());
+            response.message = Some(message.clone());
+            response.run_link = Some(run_link.clone());
         }
     }
     response

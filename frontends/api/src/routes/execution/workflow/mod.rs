@@ -64,7 +64,9 @@ fn catalog_error(error: CatalogError) -> ServerError {
         CatalogError::Forbidden => ServerError::Forbidden,
         CatalogError::Invalid(message) => ServerError::BadRequestReason(message),
         CatalogError::Unsupported(message) => ServerError::NotSupported(message),
-        CatalogError::Conflict(message) => ServerError::Conflict(message),
+        CatalogError::Conflict(message) | CatalogError::Capacity(message) => {
+            ServerError::Conflict(message)
+        }
         CatalogError::Coordinator(WorkflowError::Refused(refusal)) => {
             ServerError::BadRequestReason(refusal.to_string())
         }

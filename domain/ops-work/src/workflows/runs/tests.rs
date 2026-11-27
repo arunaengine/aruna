@@ -696,6 +696,9 @@ pub(super) fn sample_run() -> WorkflowRunRecord {
         directory_pins: Vec::new(),
         directory_roots: Vec::new(),
         used_tools: Vec::new(),
+        limits: None,
+        automation: None,
+        applet: None,
     }
 }
 
@@ -2526,6 +2529,53 @@ async fn delivers_empty_dir() {
     }
 }
 
+#[tokio::test]
+async fn run_area_untracked() {
+    // Internal `.uwe/runs/...` scratch writes skip journaling while delivered outputs journal.
+    let runs = runs().await;
+    let dir = tempfile::tempdir().unwrap();
+    let context = aruna_runner::testing::with_blob(&runs.fixture.context, dir.path()).await;
+    let record = runs.started().await;
+    let staging = resolve(&record, "aruna-staging://step/tmp.bin").unwrap();
+    assert!(staging.owned && super::data::is_run_area(&staging.key));
+    let op = super::data::WriteObjectOperation::new(
+        (record.clone(), runs.fixture.node),
+        NodeRouting::default(),
+        staging,
+        super::data::WriteBody::Bytes(b"scratch".to_vec()),
+    );
+    let ack = drive(op, &context).await.unwrap();
+    assert!(matches!(ack, HostRpcResult::UploadAck { .. }), "{ack:?}");
+
+    let delivered = super::data::Target {
+        bucket: "results".to_string(),
+        key: "out/final.bin".to_string(),
+        version: None,
+        owned: false,
+        node: None,
+    };
+    let op = super::data::WriteObjectOperation::new(
+        (record.clone(), runs.fixture.node),
+        NodeRouting::default(),
+        delivered,
+        super::data::WriteBody::Bytes(b"final".to_vec()),
+    )
+    .delivery("final.bin");
+    let res = drive(op, &context).await.unwrap();
+    assert!(matches!(res, HostRpcResult::Delivered { .. }), "{res:?}");
+
+    let rows = aruna_runner::testing::scan_prefix(
+        &context.storage_handle,
+        aruna_core::keyspaces::EVENT_JOURNAL_KEYSPACE,
+        &[aruna_core::plugin_runs::JOURNAL_ROW],
+    )
+    .await;
+    assert_eq!(rows.len(), 1);
+    let event = aruna_core::plugin_runs::SourceEvent::from_bytes(&rows[0].1).unwrap();
+    assert_eq!(event.actor, Some(record.created_by));
+    assert!(event.path.ends_with("/results/out/final.bin"));
+}
+
 // Local empty-file reads of a standalone precaptured link check the link pin and keep its version.
 #[test]
 fn keeps_empty_link() {
@@ -2610,6 +2660,9 @@ fn keeps_empty_link() {
         directory_pins: Vec::new(),
         directory_roots: Vec::new(),
         used_tools: Vec::new(),
+        limits: None,
+        automation: None,
+        applet: None,
     };
     let info = || BucketInfo {
         group_id: aruna_core::types::GroupId::from_bytes([1; 16]),
@@ -2738,4 +2791,165 @@ fn keeps_empty_link() {
             .unwrap(),
         Next::Done(HostRpcResult::Failed(ContractError::Denied { .. }))
     ));
+}
+
+#[tokio::test]
+async fn enforces_run_limits() {
+    // Admission enforces active_cap and rejects zero caps; task_spec clamps and enforces compute.
+    use aruna_core::structs::execution::workflow_run::RunLimits;
+
+    let mut run = sample_run();
+    run.limits = Some(RunLimits {
+        cpu_cores: Some(2),
+        ram_bytes: Some(1024),
+        walltime_ms: Some(30_000),
+        active_cap: Some(1),
+    });
+    let mut task = start_task();
+    task.resources = TaskResources::default();
+    let spec = task_spec(&run, &task, "k1").unwrap();
+    assert_eq!(spec.resources.cpu_cores, Some(2));
+    assert_eq!(spec.resources.ram_bytes, Some(1024));
+    assert_eq!(spec.resources.max_walltime_ms, Some(30_000));
+
+    task.resources.cpus = 4;
+    assert!(matches!(
+        task_spec(&run, &task, "k2"),
+        Err(aruna_workflow_contract::ContractError::Denied { .. })
+    ));
+    task.resources.cpus = 1;
+    task.resources.memory_bytes = Some(2048);
+    assert!(matches!(
+        task_spec(&run, &task, "k3"),
+        Err(aruna_workflow_contract::ContractError::Denied { .. })
+    ));
+    task.resources.memory_bytes = Some(512);
+    task.resources.time_seconds = Some(60);
+    assert!(matches!(
+        task_spec(&run, &task, "k4"),
+        Err(aruna_workflow_contract::ContractError::Denied { .. })
+    ));
+
+    let runs = runs().await;
+    let cap = RunLimits {
+        cpu_cores: Some(2),
+        ram_bytes: Some(1024),
+        walltime_ms: Some(30_000),
+        active_cap: Some(1),
+    };
+    let first = drive(
+        StartRunOperation::new(
+            &runs.fixture.alice,
+            runs.serving(),
+            runs.request(None, json!({})),
+        )
+        .with_limits(cap),
+        &runs.fixture.context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.record.limits, Some(cap));
+    let second = drive(
+        StartRunOperation::new(
+            &runs.fixture.alice,
+            runs.serving(),
+            runs.request(None, json!({})),
+        )
+        .with_limits(cap),
+        &runs.fixture.context,
+    )
+    .await;
+    assert!(
+        matches!(second, Err(CatalogError::Capacity(_))),
+        "{second:?}"
+    );
+    let stored = aruna_runner::testing::scan_prefix(
+        &runs.fixture.context.storage_handle,
+        aruna_core::keyspaces::WORKFLOW_RUN_KEYSPACE,
+        &[],
+    )
+    .await;
+    assert_eq!(stored.len(), 1, "capacity refusal leaves no failed run");
+
+    // Repeating an automation run with outside_input preserves applet origin and enforces sandbox.
+    use super::control::{Follow, FollowRunOperation};
+    use aruna_core::applet::record::{Access, applet_key};
+    use aruna_core::keyspaces::APPLETS_KEYSPACE;
+    use aruna_core::structs::execution::workflow_run::{AutomationOrigin, CacheScope};
+
+    let app_id = Ulid::from_bytes([79; 16]);
+    let mut applet = crate::applets::change::tests::applet();
+    applet.applet_id = app_id;
+    applet.group_id = runs.fixture.group_a;
+    applet.host_node = runs.fixture.node;
+    applet.access = Access::GroupMembers;
+    applet.guests = None;
+    aruna_runner::testing::write_value(
+        &runs.fixture.context.storage_handle,
+        APPLETS_KEYSPACE,
+        applet_key(app_id),
+        applet.to_bytes().unwrap(),
+    )
+    .await;
+
+    let mut ended = first.record.clone();
+    ended.state = RunState::Succeeded;
+    ended.finished_at_ms = Some(100);
+    ended.limits = None;
+    ended.automation = Some(AutomationOrigin {
+        automation_id: Ulid::from_bytes([78; 16]),
+        firing_id: Ulid::from_bytes([77; 16]),
+        stage: "run".into(),
+        applet_id: Some(app_id),
+        outside_input: true,
+        depth: 0,
+    });
+    aruna_runner::testing::write_value(
+        &runs.fixture.context.storage_handle,
+        aruna_core::keyspaces::WORKFLOW_RUN_KEYSPACE,
+        aruna_core::structs::execution::workflow_run::run_key(ended.run_id),
+        ended.to_bytes().unwrap(),
+    )
+    .await;
+    // Without a sandboxed backend, repeating an outside-input automation run is forbidden.
+    let denied = drive(
+        FollowRunOperation::new(
+            &runs.fixture.alice,
+            runs.serving(),
+            ended.run_id,
+            Follow::Repeat,
+        ),
+        &runs.fixture.context,
+    )
+    .await;
+    assert_eq!(denied, Err(CatalogError::Forbidden));
+
+    // When the automation run has a group-only applet and outside_input=false, follow preserves applet_id.
+    ended.automation.as_mut().unwrap().outside_input = false;
+    aruna_runner::testing::write_value(
+        &runs.fixture.context.storage_handle,
+        aruna_core::keyspaces::WORKFLOW_RUN_KEYSPACE,
+        aruna_core::structs::execution::workflow_run::run_key(ended.run_id),
+        ended.to_bytes().unwrap(),
+    )
+    .await;
+    let repeated = drive(
+        FollowRunOperation::new(
+            &runs.fixture.alice,
+            runs.serving(),
+            ended.run_id,
+            Follow::Repeat,
+        ),
+        &runs.fixture.context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        repeated.applet,
+        Some(aruna_core::structs::execution::workflow_run::AppletOrigin {
+            applet_id: app_id,
+            outside_input: false,
+        })
+    );
+    assert_eq!(repeated.cache_scope, CacheScope::Run);
 }

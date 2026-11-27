@@ -151,7 +151,9 @@ impl StartReplay {
                 SourceKind::SyncCompleted,
                 SourceKind::SyncFailed,
             ] {
-                let trigger = super::matcher::event_trigger(kind);
+                let Some(trigger) = super::matcher::event_trigger(kind) else {
+                    continue;
+                };
                 if target.coverage.contains_key(&trigger)
                     && old.get(&trigger) != target.coverage.get(&trigger)
                 {

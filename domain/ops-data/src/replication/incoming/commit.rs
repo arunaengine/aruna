@@ -499,6 +499,7 @@ impl IncomingVersionOperation {
                 (self.local_realm_id, group_id, self.local_node_id),
                 (&self.manifest.bucket, &self.manifest.key),
                 self.manifest.version_id,
+                Some(self.manifest.created_by),
                 self.now_ms,
             );
             rows.extend(journal_entries(&uploaded)?);

@@ -469,6 +469,8 @@ pub struct PutObjectOperation {
     marker_usage: Option<UsageCounterUpdate>,
     /// The marker bytes after a publish whose commit outcome is unknown.
     marker_reconcile: Option<BackendLocation>,
+    /// Whether this write journals a `data_uploaded` event; off for internal run areas.
+    journal: bool,
 }
 
 impl PutObjectOperation {
@@ -552,6 +554,7 @@ impl PutObjectOperation {
             marker_skipped: false,
             marker_usage: None,
             marker_reconcile: None,
+            journal: true,
         }
     }
 
@@ -571,6 +574,12 @@ impl PutObjectOperation {
     /// Creates the parent directory marker in the same transaction when it has no live head.
     pub fn with_parent_marker(mut self, marker: ParentMarker) -> Self {
         self.parent_marker = Some(marker);
+        self
+    }
+
+    /// Skips the `data_uploaded` journal entry for internal scratch or staging writes.
+    pub fn without_journal(mut self) -> Self {
+        self.journal = false;
         self
     }
 
@@ -1082,6 +1091,7 @@ impl PutObjectOperation {
         child.source_delete = self.source_delete.clone();
         child.parent_marker = self.parent_marker.clone();
         child.marker_location = self.marker_location.clone();
+        child.journal = self.journal;
         child
     }
 

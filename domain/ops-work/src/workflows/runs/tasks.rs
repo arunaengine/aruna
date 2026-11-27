@@ -227,6 +227,20 @@ pub(crate) fn site_tags(
     tags
 }
 
+fn cap_limit<T: Copy + Ord + std::fmt::Display>(
+    label: &str,
+    asked: Option<T>,
+    limit: Option<T>,
+) -> Result<Option<T>, ContractError> {
+    match (asked, limit) {
+        (Some(asked), Some(limit)) if asked > limit => Err(ContractError::Denied {
+            message: format!("task requests {asked} {label}, exceeding the run limit of {limit}"),
+        }),
+        (None, Some(limit)) => Ok(Some(limit)),
+        (asked, _) => Ok(asked),
+    }
+}
+
 /// The child job spec of one attempt: the wrapper as an inline file, the direct and staged
 /// inputs by their exact versions, and the control and work folders as outputs in the area.
 pub fn task_spec(
@@ -360,6 +374,16 @@ pub fn task_spec(
     }
     tags.extend(placement_tags(record, request));
     let resources = &request.resources;
+    let mut cpu_cores = (resources.cpus > 0).then_some(resources.cpus);
+    let mut ram_bytes = resources.memory_bytes;
+    let mut walltime_ms = resources
+        .time_seconds
+        .map(|seconds| seconds.saturating_mul(1000));
+    if let Some(limits) = record.limits {
+        cpu_cores = cap_limit("CPUs", cpu_cores, limits.cpu_cores)?;
+        ram_bytes = cap_limit("RAM bytes", ram_bytes, limits.ram_bytes)?;
+        walltime_ms = cap_limit("walltime ms", walltime_ms, limits.walltime_ms)?;
+    }
     let work = match record.protected || record.local_only {
         // Protected and local device runs keep work files in the output bucket, never in a realm
         // run area.
@@ -385,12 +409,10 @@ pub fn task_spec(
         workdir: Some(folders.work.clone()),
         env: BTreeMap::new(),
         resources: ComputeResources {
-            cpu_cores: (resources.cpus > 0).then_some(resources.cpus),
-            ram_bytes: resources.memory_bytes,
+            cpu_cores,
+            ram_bytes,
             disk_bytes: resources.disk_bytes,
-            max_walltime_ms: resources
-                .time_seconds
-                .map(|seconds| seconds.saturating_mul(1000)),
+            max_walltime_ms: walltime_ms,
             preemptible: false,
             gpus: (resources.gpus > 0).then_some(resources.gpus),
         },

@@ -1034,6 +1034,8 @@ pub enum ActiveJobKind {
     Execution,
     /// Unfinished native work of one plugin install, counted per install account.
     PluginWork,
+    /// Unfinished workflow runs of an account, bounded when a caller sets an active cap.
+    WorkflowRun,
 }
 
 impl ActiveJobKind {
@@ -1045,6 +1047,7 @@ impl ActiveJobKind {
         match payload {
             JobPayload::Execution(_) => Some(Self::Execution),
             JobPayload::PluginWork(_) => Some(Self::PluginWork),
+            JobPayload::WorkflowRun(_) => Some(Self::WorkflowRun),
             _ => None,
         }
     }
@@ -1054,6 +1057,7 @@ impl ActiveJobKind {
             Self::RoCrate => 0,
             Self::Execution => 1,
             Self::PluginWork => 2,
+            Self::WorkflowRun => 3,
         }
     }
 }

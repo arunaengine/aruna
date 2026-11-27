@@ -11,7 +11,7 @@ use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::job_request::{self, SubmissionScope, SubmitJobError, SubmitJobResult};
 use aruna_core::keyspaces::{
-    BUCKET_ENCRYPTION_KEYSPACE, RUN_IDEMPOTENCY_KEYSPACE, WORKFLOW_RUN_KEYSPACE,
+    BUCKET_ENCRYPTION_KEYSPACE, RUN_EVENT_KEYSPACE, RUN_IDEMPOTENCY_KEYSPACE, WORKFLOW_RUN_KEYSPACE,
 };
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::{Operation, TransactionMode};
@@ -22,9 +22,9 @@ use aruna_core::structs::execution::job::input::{
 };
 use aruna_core::structs::execution::job::local::{WorkspaceMode, user_dedup_key};
 use aruna_core::structs::execution::workflow_run::{
-    CacheScope, DirectoryPin, DirectoryRoot, PrecapturedInput, RunKeyRecord, RunOutput, RunState,
-    WorkflowRunRecord, WorkflowRunSpec, WorkflowSecretBinding, WorkflowSecretScope, run_key,
-    run_key_row,
+    AppletOrigin, AutomationOrigin, CacheScope, DirectoryPin, DirectoryRoot, PrecapturedInput,
+    RunKeyRecord, RunLimits, RunOutput, RunState, WorkflowRunRecord, WorkflowRunSpec,
+    WorkflowSecretBinding, WorkflowSecretScope, event_key, run_key, run_key_row,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -49,7 +49,7 @@ use super::data::ObjectAccessOperation;
 use super::{RunChange, change_call, changed, events};
 use crate::jobs::lifecycle::remote_inputs::{RemoteInputsOperation, ResolveCaller};
 use crate::jobs::submit::SubmitJobSpec;
-use crate::jobs::submit::local::SubmitLocalOperation;
+use crate::jobs::submit::local::{DedupJobOperation, SubmitLocalOperation};
 use crate::workflows::versions::{GetVersionOperation, VersionView};
 use crate::workflows::{CatalogError, GroupAccessOperation, access_answer};
 
@@ -249,7 +249,8 @@ enum AdmitStep {
     Record,
     Submit(Box<WorkflowRunRecord>),
     Job(Box<WorkflowRunRecord>),
-    Failed(String),
+    Failed(CatalogError),
+    Rollback(CatalogError),
 }
 
 /// Admits one run on this node; see the module comment for the checks, in that order.
@@ -260,6 +261,9 @@ pub struct StartRunOperation {
     node: (NodeId, RealmId),
     request: RunRequest,
     lineage: Lineage,
+    limits: Option<RunLimits>,
+    automation: Option<AutomationOrigin>,
+    applet: Option<AppletOrigin>,
     bad_address: Option<String>,
     pending: Vec<PinnedInput>,
     value_heads: Vec<(String, String)>,
@@ -321,6 +325,9 @@ impl StartRunOperation {
             resolved_values,
             request,
             lineage: Lineage::default(),
+            limits: None,
+            automation: None,
+            applet: None,
             bad_address,
             remote: BTreeMap::new(),
             asked: Vec::new(),
@@ -388,6 +395,24 @@ impl StartRunOperation {
     /// Starts the run in an existing lineage, as a resume or a repeat does.
     pub fn in_lineage(mut self, lineage: Lineage) -> Self {
         self.lineage = lineage;
+        self
+    }
+
+    /// Bounds compute resources and concurrent active runs for this run.
+    pub fn with_limits(mut self, limits: RunLimits) -> Self {
+        self.limits = (!limits.is_empty()).then_some(limits);
+        self
+    }
+
+    /// Marks this run as started by an automation firing and stage.
+    pub fn with_automation(mut self, origin: AutomationOrigin) -> Self {
+        self.automation = Some(origin);
+        self
+    }
+
+    /// Marks this run as started directly through an applet.
+    pub fn with_applet(mut self, origin: AppletOrigin) -> Self {
+        self.applet = Some(origin);
         self
     }
 
@@ -645,6 +670,9 @@ impl StartRunOperation {
             directory_pins: std::mem::take(&mut self.directory_pins),
             directory_roots: std::mem::take(&mut self.directory_roots),
             used_tools: self.lineage.used_tools.clone(),
+            limits: self.limits,
+            automation: self.automation.clone(),
+            applet: self.applet,
         };
         let key = request.idempotency_key.as_ref().map(|key| {
             let row = self.key_row(key);
@@ -799,28 +827,36 @@ impl StartRunOperation {
     }
 
     fn submit(&mut self, record: WorkflowRunRecord) -> AdmitNext {
-        let spec = WorkflowRunSpec {
-            run_id: record.run_id,
-            group_id: record.group_id,
-            created_by: record.created_by,
-            realm_id: record.realm_id,
-        };
-        let dedup = format!("workflow-run/{}", record.run_id);
-        let spec = SubmitJobSpec {
-            payload: JobPayload::WorkflowRun(Box::new(spec)),
-            created_by: record.created_by,
-            owner_node_id: self.node.0,
-            dedup_key: Some(user_dedup_key(record.created_by, &dedup)),
-            now_ms: self.now_ms,
-            retention_ms: RETENTION_MS,
-            workspace_mode: WorkspaceMode::None,
-            workspace_bucket: None,
-            active_cap: None,
-        };
+        let spec = run_job_spec(&record, self.node.0, self.now_ms);
         let serving = (!record.local_only).then_some(self.node);
         let submit = SubmitLocalOperation::new(spec, self.node.1, serving);
         self.step = AdmitStep::Submit(Box::new(record));
         Ok(Next::Call(IoCall::child(submit)))
+    }
+}
+
+fn run_job_dedup(record: &WorkflowRunRecord) -> Vec<u8> {
+    let dedup = format!("workflow-run/{}", record.run_id);
+    user_dedup_key(record.created_by, &dedup)
+}
+
+fn run_job_spec(record: &WorkflowRunRecord, owner: NodeId, now_ms: u64) -> SubmitJobSpec {
+    let spec = WorkflowRunSpec {
+        run_id: record.run_id,
+        group_id: record.group_id,
+        created_by: record.created_by,
+        realm_id: record.realm_id,
+    };
+    SubmitJobSpec {
+        payload: JobPayload::WorkflowRun(Box::new(spec)),
+        created_by: record.created_by,
+        owner_node_id: owner,
+        dedup_key: Some(run_job_dedup(record)),
+        now_ms,
+        retention_ms: RETENTION_MS,
+        workspace_mode: WorkspaceMode::None,
+        workspace_bucket: None,
+        active_cap: record.limits.and_then(|limits| limits.active_cap),
     }
 }
 
@@ -842,6 +878,21 @@ impl Operation for StartRunOperation {
         }
         if let Some(error) = self.bad_address.take() {
             return Err(CatalogError::Invalid(error));
+        }
+        if let Some(limits) = self.limits {
+            if limits.active_cap == Some(0) {
+                return Err(CatalogError::Capacity(
+                    "active workflow run limit reached".into(),
+                ));
+            }
+            if limits.cpu_cores == Some(0)
+                || limits.ram_bytes == Some(0)
+                || limits.walltime_ms == Some(0)
+            {
+                return Err(CatalogError::Invalid(
+                    "run compute limits must be greater than zero".into(),
+                ));
+            }
         }
         let Some(output) = &self.request.output else {
             return Err(CatalogError::Invalid(
@@ -1169,13 +1220,24 @@ impl Operation for StartRunOperation {
                     let change = RunChange::Job(submitted.job_id);
                     Ok(Next::Call(change_call(run_id, vec![change])))
                 }
+                Err(error @ SubmitJobError::ActiveJobLimit { .. }) => {
+                    let mut drops = vec![
+                        (WORKFLOW_RUN_KEYSPACE.to_string(), run_key(record.run_id)),
+                        (RUN_EVENT_KEYSPACE.to_string(), event_key(record.run_id, 1)),
+                    ];
+                    if let Some(key) = self.request.idempotency_key.as_deref() {
+                        drops.push((RUN_IDEMPOTENCY_KEYSPACE.to_string(), self.key_row(key)));
+                    }
+                    self.step = AdmitStep::Rollback(CatalogError::Capacity(error.to_string()));
+                    Ok(Next::Call(IoCall::Delete(drops)))
+                }
                 Err(error) => {
                     let message = format!("the run could not be queued: {error}");
                     let change = RunChange::State {
                         state: RunState::Failed,
                         error: Some(message.clone()),
                     };
-                    self.step = AdmitStep::Failed(message);
+                    self.step = AdmitStep::Failed(CatalogError::Storage(message));
                     Ok(Next::Call(change_call(record.run_id, vec![change])))
                 }
             },
@@ -1186,9 +1248,13 @@ impl Operation for StartRunOperation {
                     created: true,
                 }))
             }
-            AdmitStep::Failed(message) => {
+            AdmitStep::Failed(error) => {
                 changed(result)?;
-                Err(CatalogError::Storage(message))
+                Err(error)
+            }
+            AdmitStep::Rollback(error) => {
+                result.done()?;
+                Err(error)
             }
         }
     }
@@ -1196,7 +1262,11 @@ impl Operation for StartRunOperation {
     fn expected_error(error: &CatalogError) -> bool {
         matches!(
             error,
-            CatalogError::NotFound | CatalogError::Forbidden | CatalogError::Invalid(_)
+            CatalogError::NotFound
+                | CatalogError::Forbidden
+                | CatalogError::Invalid(_)
+                | CatalogError::Conflict(_)
+                | CatalogError::Capacity(_)
         )
     }
 }
@@ -1290,6 +1360,194 @@ impl Operation for RecordRunOperation {
                     record: self.record.clone(),
                     created: true,
                 }))
+            }
+        }
+    }
+}
+
+/// Outcome of reconciling a recovered workflow run's coordinator job before adoption.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReconciledRun {
+    Ready { run_id: Ulid, terminal: bool },
+    Missing(Ulid),
+    Capacity,
+    Deferred,
+}
+
+#[derive(Debug, PartialEq)]
+enum ReconcileStep {
+    ReadRun,
+    LookupDedup(Box<WorkflowRunRecord>),
+    SubmitJob(Box<WorkflowRunRecord>),
+    Attach,
+    Rollback,
+}
+
+/// Loads a recovered run and reconciles a missing `parent_job_id` through its `workflow-run/{id}`
+/// job deduplication key before a caller adopts or cancels it.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ReconcileRunOperation {
+    run_id: Ulid,
+    local: (NodeId, RealmId),
+    cancelling: bool,
+    idempotency_row: Option<Key>,
+    now_ms: u64,
+    step: ReconcileStep,
+}
+
+impl ReconcileRunOperation {
+    pub(crate) fn new(
+        run_id: Ulid,
+        local: (NodeId, RealmId),
+        cancelling: bool,
+        idempotency_row: Option<Key>,
+    ) -> Self {
+        Self {
+            run_id,
+            local,
+            cancelling,
+            idempotency_row,
+            now_ms: 0,
+            step: ReconcileStep::ReadRun,
+        }
+    }
+}
+
+impl Operation for ReconcileRunOperation {
+    type Output = ReconciledRun;
+    type Error = CatalogError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> Result<Next<ReconciledRun>, CatalogError> {
+        self.step = ReconcileStep::ReadRun;
+        Ok(Next::Call(super::read_run(self.run_id)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<ReconciledRun>, CatalogError> {
+        match std::mem::replace(&mut self.step, ReconcileStep::ReadRun) {
+            ReconcileStep::ReadRun => {
+                let Some(record) = super::run_answer(result)? else {
+                    return Ok(Next::Done(ReconciledRun::Missing(self.run_id)));
+                };
+                if record.state.is_terminal() {
+                    return Ok(Next::Done(ReconciledRun::Ready {
+                        run_id: record.run_id,
+                        terminal: true,
+                    }));
+                }
+                if record.parent_job_id.is_some() || record.node_id != self.local.0 {
+                    return Ok(Next::Done(ReconciledRun::Ready {
+                        run_id: record.run_id,
+                        terminal: false,
+                    }));
+                }
+                let dedup = run_job_dedup(&record);
+                let find = DedupJobOperation::new(record.created_by, &dedup);
+                self.step = ReconcileStep::LookupDedup(Box::new(record));
+                Ok(Next::Call(IoCall::child(find)))
+            }
+            ReconcileStep::LookupDedup(record) => {
+                let found = match result.child::<Option<(
+                    aruna_core::structs::execution::job::identity::JobId,
+                    [u8; 32],
+                )>, SubmitJobError>()?
+                {
+                    Ok(found) => found,
+                    Err(
+                        SubmitJobError::Storage(_)
+                        | SubmitJobError::PlacementUnavailable(_)
+                        | SubmitJobError::ClockHealth(_)
+                        | SubmitJobError::RangeMoving(_),
+                    ) => return Ok(Next::Done(ReconciledRun::Deferred)),
+                    Err(err) => return Err(CatalogError::Storage(err.to_string())),
+                };
+                if let Some((job_id, _)) = found {
+                    self.step = ReconcileStep::Attach;
+                    return Ok(Next::Call(change_call(
+                        record.run_id,
+                        vec![RunChange::Job(job_id)],
+                    )));
+                }
+                let never_started = record.attempts == 0
+                    && record.started_at_ms.is_none()
+                    && record.steps.is_empty();
+                if record.state == RunState::Cancelling && never_started {
+                    self.step = ReconcileStep::Attach;
+                    let change = RunChange::State {
+                        state: RunState::Cancelled,
+                        error: Some("cancelled before it started".into()),
+                    };
+                    return Ok(Next::Call(change_call(record.run_id, vec![change])));
+                }
+                if record.state != RunState::Queued {
+                    return Ok(Next::Done(ReconciledRun::Ready {
+                        run_id: record.run_id,
+                        terminal: false,
+                    }));
+                }
+                if self.cancelling {
+                    self.step = ReconcileStep::Attach;
+                    let change = RunChange::State {
+                        state: RunState::Cancelled,
+                        error: Some("cancelled before it started".into()),
+                    };
+                    return Ok(Next::Call(change_call(record.run_id, vec![change])));
+                }
+                let spec = run_job_spec(&record, self.local.0, self.now_ms);
+                let serving = (!record.local_only).then_some(self.local);
+                let submit = SubmitLocalOperation::new(spec, self.local.1, serving);
+                self.step = ReconcileStep::SubmitJob(record);
+                Ok(Next::Call(IoCall::child(submit)))
+            }
+            ReconcileStep::SubmitJob(record) => {
+                match result.child::<SubmitJobResult, SubmitJobError>()? {
+                    Ok(submitted) => {
+                        self.step = ReconcileStep::Attach;
+                        Ok(Next::Call(change_call(
+                            record.run_id,
+                            vec![RunChange::Job(submitted.job_id)],
+                        )))
+                    }
+                    Err(SubmitJobError::ActiveJobLimit { .. }) => {
+                        let mut drops = vec![
+                            (WORKFLOW_RUN_KEYSPACE.to_string(), run_key(record.run_id)),
+                            (RUN_EVENT_KEYSPACE.to_string(), event_key(record.run_id, 1)),
+                        ];
+                        if let Some(key) = self.idempotency_row.take() {
+                            drops.push((RUN_IDEMPOTENCY_KEYSPACE.to_string(), key));
+                        }
+                        self.step = ReconcileStep::Rollback;
+                        Ok(Next::Call(IoCall::Delete(drops)))
+                    }
+                    Err(
+                        SubmitJobError::Storage(_)
+                        | SubmitJobError::PlacementUnavailable(_)
+                        | SubmitJobError::ClockHealth(_)
+                        | SubmitJobError::RangeMoving(_),
+                    ) => Ok(Next::Done(ReconciledRun::Deferred)),
+                    Err(err) => {
+                        let change = RunChange::State {
+                            state: RunState::Failed,
+                            error: Some(format!("the run could not be queued: {err}")),
+                        };
+                        self.step = ReconcileStep::Attach;
+                        Ok(Next::Call(change_call(record.run_id, vec![change])))
+                    }
+                }
+            }
+            ReconcileStep::Attach => {
+                let record = changed(result)?;
+                Ok(Next::Done(ReconciledRun::Ready {
+                    run_id: record.run_id,
+                    terminal: record.state.is_terminal(),
+                }))
+            }
+            ReconcileStep::Rollback => {
+                result.done()?;
+                Ok(Next::Done(ReconciledRun::Capacity))
             }
         }
     }

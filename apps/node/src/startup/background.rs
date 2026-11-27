@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::tasks::runner::recover_until_stopped;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -79,6 +80,7 @@ pub(crate) struct Background {
     pub(crate) task_queues: TaskQueues,
     pub(crate) usage_counters_rebuilt: bool,
     pub(crate) core_announcement: CoreAnnouncement,
+    pub(crate) disabled_features: BTreeSet<aruna_core::structs::identity::features::Feature>,
 }
 
 /// One action in the durable background start. `start` runs every phase in
@@ -163,6 +165,7 @@ pub(crate) async fn start(
         task_queues,
         usage_counters_rebuilt,
         core_announcement,
+        disabled_features,
     } = background;
     let CoreAnnouncement {
         documents,
@@ -290,7 +293,15 @@ pub(crate) async fn start(
                 crate::applets::spawn_upkeep(driver_ctx.clone(), &shutdown)
             }
             StartupPhase::RunPlugins => {
-                spawn_worker(driver_ctx.clone(), realm_id, node_id, &shutdown)
+                spawn_worker(driver_ctx.clone(), realm_id, node_id, &shutdown);
+                crate::automations::spawn_worker(
+                    driver_ctx.clone(),
+                    jobs_runtime.clone(),
+                    realm_id,
+                    node_id,
+                    disabled_features.clone(),
+                    &shutdown,
+                );
             }
         }
     }
@@ -369,6 +380,7 @@ mod tests {
                 documents: Vec::new(),
                 allow_genesis: false,
             },
+            disabled_features: BTreeSet::new(),
         };
         (background, temp)
     }

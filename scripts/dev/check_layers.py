@@ -40,7 +40,7 @@ GROUPS = (
     (
         "work and integrations",
         frozenset(
-            "jobs plugins assistant notifications federation harvest node workflows applets".split()
+            "jobs plugins assistant notifications federation harvest node workflows applets automations".split()
         ),
     ),
 )

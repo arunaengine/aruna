@@ -8,6 +8,7 @@
 
 pub mod applets;
 pub mod assistant;
+pub mod automations;
 pub mod federation;
 pub mod harvest;
 pub mod jobs;
