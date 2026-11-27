@@ -250,7 +250,8 @@ async fn stages_and_edges() {
     )
     .await
     .unwrap();
-    assert_eq!(cancelling.state, FiringState::Cancelling);
+    assert_eq!(cancelling.firing.state, FiringState::Cancelling);
+    assert_eq!(cancelling.woken_runs, vec![child_id]);
     assert!(
         env.read_row(AUTOMATION_RUNS_KEYSPACE, &active_key(cf.firing_id))
             .await
@@ -520,6 +521,129 @@ async fn pinned_spec_cancel() {
     assert_eq!(after.firing.stages[0].receipt.copied.len(), 2);
     assert!(
         env.read_row(AUTOMATION_RUNS_KEYSPACE, &active_key(cf.firing_id))
+            .await
+            .is_none()
+    );
+
+    // A cancelling firing whose last child succeeds stays Cancelled across re-evaluation (#6).
+    let wf_id = Ulid::from_bytes([66; 16]);
+    let run_spec = Spec {
+        triggers: vec![Trigger::Manual { form_json: None }],
+        stages: vec![Stage {
+            name: "run".into(),
+            needs: Some(vec![]),
+            when: When::Passed,
+            kind: StageKind::Run {
+                workflow_id: wf_id,
+                version: 1,
+                values_json: "{}".into(),
+                inputs_json: None,
+                output_bucket: None,
+                output_prefix: None,
+                placement_site: None,
+                secrets: BTreeMap::new(),
+                provenance_crate: false,
+            },
+        }],
+        scope: Scope {
+            workflows: vec![(wf_id, 1)],
+            ..Scope::default()
+        },
+    };
+    let run_auto = env.create_active(run_spec.clone()).await;
+    let race_child_id = Ulid::from_bytes([103; 16]);
+    let mut race_child = env.sample_run(race_child_id, wf_id, RunState::Succeeded, None);
+    race_child.finished_at_ms = Some(50);
+    env.write_row(
+        WORKFLOW_RUN_KEYSPACE,
+        run_key(race_child_id),
+        race_child.to_bytes().unwrap(),
+    )
+    .await;
+    let mut rf = Firing::new(
+        Ulid::from_bytes([104; 16]),
+        run_auto.automation_id,
+        run_auto.group_id,
+        run_auto.revision,
+        &run_spec,
+        TriggerPayload::Manual {
+            values_json: "{}".into(),
+            actor: env.owner.user_id,
+        },
+        20,
+    );
+    rf.state = FiringState::Cancelling;
+    rf.stages[0].state = StageState::Cancelling;
+    rf.stages[0].receipt.workflow_run_id = Some(race_child_id);
+    rf.stages[0].receipt.cancel_sent = true;
+    for (ks, k, v) in new_firing_rows(&rf).unwrap() {
+        env.write_row(&ks, k, v).await;
+    }
+    drive(StepFiringsOperation::new((env.node, env.realm)), &env.ctx)
+        .await
+        .unwrap();
+    let (raced, _) = drive(
+        GetFiringOperation::new(&env.owner, rf.firing_id, env.node),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(raced.state, FiringState::Cancelled);
+    assert!(
+        env.read_row(AUTOMATION_RUNS_KEYSPACE, &active_key(rf.firing_id))
+            .await
+            .is_none()
+    );
+
+    // Resuming a failed firing respects max_active_firings (#7).
+    let mut cap_spec = spec_v1.clone();
+    cap_spec.scope.limits.max_active_firings = 1;
+    let cap_auto = env.create_active(cap_spec.clone()).await;
+    let mut failed_f = Firing::new(
+        Ulid::from_bytes([105; 16]),
+        cap_auto.automation_id,
+        cap_auto.group_id,
+        cap_auto.revision,
+        &cap_spec,
+        TriggerPayload::Manual {
+            values_json: "{}".into(),
+            actor: env.owner.user_id,
+        },
+        30,
+    );
+    failed_f.stages[0].state = StageState::Failed;
+    failed_f.evaluate(31);
+    assert_eq!(failed_f.state, FiringState::Failed);
+    let active_f = Firing::new(
+        Ulid::from_bytes([106; 16]),
+        cap_auto.automation_id,
+        cap_auto.group_id,
+        cap_auto.revision,
+        &cap_spec,
+        TriggerPayload::Manual {
+            values_json: "{}".into(),
+            actor: env.owner.user_id,
+        },
+        32,
+    );
+    for (ks, k, v) in new_firing_rows(&failed_f)
+        .unwrap()
+        .into_iter()
+        .chain(new_firing_rows(&active_f).unwrap())
+    {
+        env.write_row(&ks, k, v).await;
+    }
+    let capped_resume = drive(
+        ResumeFiringOperation::new(&env.owner, failed_f.firing_id, env.node),
+        &env.ctx,
+    )
+    .await;
+    assert!(
+        matches!(capped_resume, Err(AutoError::Limited(_))),
+        "{capped_resume:?}"
+    );
+    assert!(
+        env.read_row(AUTOMATION_RUNS_KEYSPACE, &active_key(failed_f.firing_id))
             .await
             .is_none()
     );

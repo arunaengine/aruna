@@ -286,6 +286,84 @@ async fn out_of_order() {
     assert_eq!(again.len(), 1);
     assert_eq!(again[0].firing_id, first[0].firing_id);
 
+    // Retry of an already-replayed event succeeds even after the automation is paused (#12).
+    use super::change::AutoChange;
+    use super::lifecycle::ChangeAutoOperation;
+    use aruna_core::automation::record::PauseReason;
+
+    drive(
+        ChangeAutoOperation::new(
+            &env.owner,
+            (auto.automation_id, None),
+            AutoChange::Pause(PauseReason::Owner),
+            env.node,
+        ),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    let paused_retry = drive(
+        StartEventsOperation::new(&env.owner, auto.automation_id, env.node, vec![eid]),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(paused_retry.len(), 1);
+    assert_eq!(paused_retry[0].firing_id, first[0].firing_id);
+    drive(
+        ChangeAutoOperation::new(
+            &env.owner,
+            (auto.automation_id, None),
+            AutoChange::Resume,
+            env.node,
+        ),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+
+    // Journal admission rejects events whose trigger was removed in a newer revision (#8).
+    let mut edited_spec = auto.spec.clone();
+    edited_spec
+        .triggers
+        .retain(|t| !matches!(t, Trigger::DataUploaded { .. }));
+    let edited = drive(
+        ChangeAutoOperation::new(
+            &env.owner,
+            (auto.automation_id, None),
+            AutoChange::Update {
+                name: None,
+                description: None,
+                spec: Some(edited_spec),
+            },
+            env.node,
+        ),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    assert!(edited.revision > auto.revision);
+    let stale = drive(
+        super::admit::AdmitFiringOp::journal(
+            auto.automation_id,
+            Ulid::from_bytes([87; 16]),
+            "data_uploaded/stale".into(),
+            auto.revision,
+            Some(env.owner.user_id),
+            TriggerPayload::DataUploaded {
+                bucket: "raw".into(),
+                key: "in/late.csv".into(),
+                version_id: Ulid::from_bytes([86; 16]),
+                path: "/p".into(),
+                size_bytes: 10,
+            },
+        ),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(stale, super::admit::AdmitOutcome::Unmatched);
+
     // Direct applet workflow run matches applet-filtered run_finished and propagates outside_input.
     let direct_id = Ulid::from_bytes([88; 16]);
     let mut direct_run = env.sample_run(direct_id, wf_id, RunState::Succeeded, None);

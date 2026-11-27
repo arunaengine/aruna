@@ -291,7 +291,7 @@ async fn copy_stage_checks() {
     let planned: CopiedFile = postcard::from_bytes(&rows[0].2).unwrap();
     assert_eq!(SetHint::of_version(planned.dest_version), dist.hint());
 
-    // Resolving file 1 of 2 as done recovers planned receipt and keeps stage Running.
+    // Resolving file 1 of 2 as done fails when the destination object is missing (#4).
     let stage_id = stage_intent_id(firing.firing_id, "copy");
     let intent = call_intent(
         0,
@@ -299,8 +299,12 @@ async fn copy_stage_checks() {
     );
     let (_, unk_key, unk_val) =
         unknown_row_in(AUTOMATION_INTENTS_KEYSPACE, stage_id, &intent, "timeout").unwrap();
-    env.write_row(AUTOMATION_INTENTS_KEYSPACE, unk_key, unk_val)
-        .await;
+    env.write_row(
+        AUTOMATION_INTENTS_KEYSPACE,
+        unk_key.clone(),
+        unk_val.clone(),
+    )
+    .await;
     env.write_row(
         AUTOMATION_RUNS_KEYSPACE,
         copy_plan_key(stage_id, 0),
@@ -312,7 +316,7 @@ async fn copy_stage_checks() {
     for (ks, k, v) in new_firing_rows(&firing).unwrap() {
         env.write_row(&ks, k, v).await;
     }
-    let resolved = drive(
+    let missing_dest = drive(
         ResolveStageOperation::new(
             &env.owner,
             firing.firing_id,
@@ -323,20 +327,93 @@ async fn copy_stage_checks() {
         ),
         &env.ctx,
     )
-    .await
+    .await;
+    assert!(matches!(missing_dest, Err(AutoError::Conflict(_))));
+    let still_open: IntentRecord = postcard::from_bytes(
+        &env.read_row(AUTOMATION_INTENTS_KEYSPACE, &intent_key(stage_id, 0))
+            .await
+            .unwrap(),
+    )
     .unwrap();
-    assert_eq!(resolved.stages[1].state, StageState::Running);
-    assert_eq!(resolved.state, FiringState::Running);
-    assert_eq!(resolved.stages[1].receipt.copied, vec![planned]);
+    assert!(matches!(still_open.state, IntentState::Unknown { .. }));
     assert!(
         env.read_row(AUTOMATION_RUNS_KEYSPACE, &copy_plan_key(stage_id, 0))
             .await
-            .is_none()
+            .is_some()
     );
-    let settled_raw = env
-        .read_row(AUTOMATION_INTENTS_KEYSPACE, &intent_key(stage_id, 0))
-        .await
+
+    // Verified HeadObjectResult with matching dest_version commits intent, plan drop and firing atomically.
+    let mut verified_head = ref_head(100);
+    verified_head.version_id = Some(planned.dest_version);
+    verified_head.resolved_version_id = Some(planned.dest_version);
+    let mut rop = ResolveStageOperation::new(
+        &env.owner,
+        firing.firing_id,
+        "copy".into(),
+        true,
+        Some("verified".into()),
+        env.node,
+    );
+    rop.first().unwrap();
+    rop.next(IoResult::Child(ChildOutcome::new(Ok::<_, AutoError>((
+        firing.clone(),
+        auto.clone(),
+    )))))
+    .unwrap();
+    rop.next(IoResult::Child(ChildOutcome::new(Ok::<_, AutoError>(
+        auto.clone(),
+    ))))
+    .unwrap();
+    rop.next(IoResult::Child(ChildOutcome::new(Ok::<
+        _,
+        crate::plugins::rows::StoreError,
+    >(vec![(
+        unk_key.to_vec(),
+        unk_val.to_vec(),
+    )]))))
+    .unwrap();
+    rop.next(IoResult::Values(vec![Some(
+        postcard::to_allocvec(&planned).unwrap().into(),
+    )]))
+    .unwrap();
+    let commit_call = rop
+        .next(IoResult::Child(ChildOutcome::new(
+            Ok::<_, HeadObjectError>(verified_head),
+        )))
         .unwrap();
-    let settled: IntentRecord = postcard::from_bytes(&settled_raw).unwrap();
-    assert!(matches!(settled.state, IntentState::Settled { .. }));
+    assert!(matches!(commit_call, Next::Call(IoCall::Child(_))));
+
+    // Cancelling a firing with NeedsAttention copy blocks resolution and keeps intent untouched (#5).
+    let cancelled = drive(
+        super::control::CancelFiringOperation::new(
+            &env.owner,
+            firing.firing_id,
+            (env.node, env.realm),
+        ),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(cancelled.firing.state, FiringState::Cancelled);
+    let after_cancel = drive(
+        ResolveStageOperation::new(
+            &env.owner,
+            firing.firing_id,
+            "copy".into(),
+            true,
+            None,
+            env.node,
+        ),
+        &env.ctx,
+    )
+    .await;
+    assert!(matches!(after_cancel, Err(AutoError::Conflict(_))));
+    assert!(
+        env.read_row(
+            AUTOMATION_RUNS_KEYSPACE,
+            &aruna_core::automation::keys::active_key(firing.firing_id)
+        )
+        .await
+        .is_none()
+    );
 }
