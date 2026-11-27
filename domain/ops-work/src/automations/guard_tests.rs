@@ -28,7 +28,7 @@ use serde_json::json;
 use ulid::Ulid;
 
 use super::AutoError;
-use super::check::{CheckAutoOperation, render_sample_stage};
+use super::check::{CheckAutoOperation, render_trigger_stage};
 use super::control::{AckCancelsOperation, CancelFiringOperation};
 use super::copy_stage::{call_intent, stage_intent_id};
 use super::firing_reads::GetFiringOperation;
@@ -191,15 +191,82 @@ async fn runner_guards_recovery() {
         *inputs_json = None;
     }
     let sample_obj = json!({"count": 7});
-    let checked_vals = render_sample_stage(
+    let (checked_vals, no_files) = render_trigger_stage(
         "{{trigger.values}}",
         None,
+        &tmpl_spec.triggers[0],
         &tmpl_spec,
         Some(&sample_obj),
+        env.owner.user_id,
         env.node,
     )
     .unwrap();
     assert_eq!(checked_vals, sample_obj);
+    assert!(!no_files);
+    // Manual sample containing key `values` still binds `trigger.values` to the whole object.
+    let shadow_obj = json!({"values": 7});
+    let (shadow_vals, _) = render_trigger_stage(
+        "{{trigger.values}}",
+        None,
+        &tmpl_spec.triggers[0],
+        &tmpl_spec,
+        Some(&shadow_obj),
+        env.owner.user_id,
+        env.node,
+    )
+    .unwrap();
+    assert_eq!(shadow_vals, shadow_obj);
+    // Upload-only trigger does not bind `trigger.values`, so bare `{{trigger.values}}` fails.
+    let upload_trig = Trigger::DataUploaded {
+        bucket: "raw".into(),
+        prefix: "in/".into(),
+        pattern: None,
+    };
+    assert!(matches!(
+        render_trigger_stage(
+            "{{trigger.values}}",
+            None,
+            &upload_trig,
+            &tmpl_spec,
+            Some(&shadow_obj),
+            env.owner.user_id,
+            env.node,
+        ),
+        Err(AutoError::Invalid(_))
+    ));
+    // Applet submission sample files flow into the same input merger; omitted files flag no_files.
+    let applet_trig = Trigger::AppletSubmission {
+        applet_id: Ulid::from_bytes([117; 16]),
+    };
+    let sub_sample = json!({
+        "files": [{"name": "reads", "bucket": "raw", "key": "sub/r1.fq", "version_id": ver.to_string()}]
+    });
+    let (sub_checked, sub_missing) = render_trigger_stage(
+        "{}",
+        None,
+        &applet_trig,
+        &tmpl_spec,
+        Some(&sub_sample),
+        env.owner.user_id,
+        env.node,
+    )
+    .unwrap();
+    assert!(!sub_missing);
+    assert_eq!(
+        sub_checked["reads"],
+        format!("aruna://raw/sub/r1.fq?version={ver}")
+    );
+    let (_, empty_sub) = render_trigger_stage(
+        "{}",
+        None,
+        &applet_trig,
+        &tmpl_spec,
+        None,
+        env.owner.user_id,
+        env.node,
+    )
+    .unwrap();
+    assert!(empty_sub);
     let mut bad_tmpl_spec = tmpl_spec.clone();
     if let StageKind::Run { values_json, .. } = &mut bad_tmpl_spec.stages[0].kind {
         *values_json = "{broken".into();
@@ -868,4 +935,247 @@ async fn runner_guards_recovery() {
     .unwrap();
     assert_eq!(missing.state, FiringState::NeedsAttention);
     assert_eq!(missing.stages[0].state, StageState::NeedsAttention);
+}
+
+#[tokio::test]
+async fn recovery_edge_cases() {
+    let env = Env::new().await;
+    let wf_id = Ulid::from_bytes([64; 16]);
+    let spec = Spec {
+        triggers: vec![Trigger::Manual { form_json: None }],
+        stages: vec![Stage {
+            name: "run".into(),
+            needs: Some(vec![]),
+            when: When::Passed,
+            kind: StageKind::Run {
+                workflow_id: wf_id,
+                version: 1,
+                values_json: "{}".into(),
+                inputs_json: None,
+                output_bucket: Some("out".into()),
+                output_prefix: Some("runs".into()),
+                placement_site: None,
+                secrets: BTreeMap::new(),
+                provenance_crate: false,
+            },
+        }],
+        scope: Scope {
+            workflows: vec![(wf_id, 1)],
+            ..Scope::default()
+        },
+    };
+    let auto = env.create_active(spec.clone()).await;
+    let acct = auto.account.unwrap();
+
+    // 1. Deleted child run still named by idempotency row preserves run_id (never re-runs).
+    let gone_id = Ulid::from_bytes([140; 16]);
+    let mut gone_run = Firing::new(
+        Ulid::from_bytes([141; 16]),
+        auto.automation_id,
+        auto.group_id,
+        auto.revision,
+        &spec,
+        TriggerPayload::Manual {
+            values_json: "{}".into(),
+            actor: env.owner.user_id,
+        },
+        10,
+    );
+    gone_run.stages[0].state = StageState::Running;
+    let gone_idem = run_idempotency_key(gone_run.firing_id, "run", gone_run.attempt);
+    env.write_row(
+        RUN_IDEMPOTENCY_KEYSPACE,
+        run_key_row(auto.group_id, acct, &gone_idem),
+        RunKeyRecord {
+            run_id: gone_id,
+            request_digest: [0; 32],
+        }
+        .to_bytes()
+        .unwrap(),
+    )
+    .await;
+    let gone_cid = Ulid::from_bytes([142; 16]);
+    let mut gone_can = Firing::new(
+        Ulid::from_bytes([143; 16]),
+        auto.automation_id,
+        auto.group_id,
+        auto.revision,
+        &spec,
+        TriggerPayload::Manual {
+            values_json: "{}".into(),
+            actor: env.owner.user_id,
+        },
+        11,
+    );
+    gone_can.state = FiringState::Cancelling;
+    gone_can.stages[0].state = StageState::Cancelling;
+    let gcan_idem = run_idempotency_key(gone_can.firing_id, "run", gone_can.attempt);
+    env.write_row(
+        RUN_IDEMPOTENCY_KEYSPACE,
+        run_key_row(auto.group_id, acct, &gcan_idem),
+        RunKeyRecord {
+            run_id: gone_cid,
+            request_digest: [0; 32],
+        }
+        .to_bytes()
+        .unwrap(),
+    )
+    .await;
+
+    // 2. Directly cancelled never-started run (Cancelling, attempts=0, no job) finishes Cancelled.
+    let direct_id = Ulid::from_bytes([144; 16]);
+    let mut direct_rec = env.sample_run(direct_id, wf_id, RunState::Cancelling, None);
+    direct_rec.created_by = acct;
+    direct_rec.attempts = 0;
+    env.write_row(
+        WORKFLOW_RUN_KEYSPACE,
+        run_key(direct_id),
+        direct_rec.to_bytes().unwrap(),
+    )
+    .await;
+    let mut direct_f = Firing::new(
+        Ulid::from_bytes([145; 16]),
+        auto.automation_id,
+        auto.group_id,
+        auto.revision,
+        &spec,
+        TriggerPayload::Manual {
+            values_json: "{}".into(),
+            actor: env.owner.user_id,
+        },
+        12,
+    );
+    direct_f.stages[0].state = StageState::Running;
+    let dir_idem = run_idempotency_key(direct_f.firing_id, "run", direct_f.attempt);
+    env.write_row(
+        RUN_IDEMPOTENCY_KEYSPACE,
+        run_key_row(auto.group_id, acct, &dir_idem),
+        RunKeyRecord {
+            run_id: direct_id,
+            request_digest: [0; 32],
+        }
+        .to_bytes()
+        .unwrap(),
+    )
+    .await;
+
+    // 3. Unavailable placement during recovery defers cleanly without dropping other cancel signals.
+    let defer_id = Ulid::from_bytes([146; 16]);
+    let mut defer_rec = env.sample_run(defer_id, wf_id, RunState::Queued, None);
+    defer_rec.created_by = acct;
+    defer_rec.attempts = 0;
+    env.write_row(
+        WORKFLOW_RUN_KEYSPACE,
+        run_key(defer_id),
+        defer_rec.to_bytes().unwrap(),
+    )
+    .await;
+    let mut defer_f = Firing::new(
+        Ulid::from_bytes([147; 16]),
+        auto.automation_id,
+        auto.group_id,
+        auto.revision,
+        &spec,
+        TriggerPayload::Manual {
+            values_json: "{}".into(),
+            actor: env.owner.user_id,
+        },
+        13,
+    );
+    defer_f.stages[0].state = StageState::Running;
+    let def_idem = run_idempotency_key(defer_f.firing_id, "run", defer_f.attempt);
+    env.write_row(
+        RUN_IDEMPOTENCY_KEYSPACE,
+        run_key_row(auto.group_id, acct, &def_idem),
+        RunKeyRecord {
+            run_id: defer_id,
+            request_digest: [0; 32],
+        }
+        .to_bytes()
+        .unwrap(),
+    )
+    .await;
+    let live_id = Ulid::from_bytes([148; 16]);
+    let live_rec = env.sample_run(live_id, wf_id, RunState::Running, None);
+    env.write_row(
+        WORKFLOW_RUN_KEYSPACE,
+        run_key(live_id),
+        live_rec.to_bytes().unwrap(),
+    )
+    .await;
+    let mut live_f = Firing::new(
+        Ulid::from_bytes([149; 16]),
+        auto.automation_id,
+        auto.group_id,
+        auto.revision,
+        &spec,
+        TriggerPayload::Manual {
+            values_json: "{}".into(),
+            actor: env.owner.user_id,
+        },
+        14,
+    );
+    live_f.state = FiringState::Cancelling;
+    live_f.stages[0].state = StageState::Cancelling;
+    live_f.stages[0].receipt.workflow_run_id = Some(live_id);
+    for (ks, k, v) in new_firing_rows(&gone_run)
+        .unwrap()
+        .into_iter()
+        .chain(new_firing_rows(&gone_can).unwrap())
+        .chain(new_firing_rows(&direct_f).unwrap())
+        .chain(new_firing_rows(&defer_f).unwrap())
+        .chain(new_firing_rows(&live_f).unwrap())
+    {
+        env.write_row(&ks, k, v).await;
+    }
+
+    // Without job-control placement seeded, defer_f defers while all other firings and cancel acks complete.
+    let rep = drive(StepFiringsOperation::new((env.node, env.realm)), &env.ctx)
+        .await
+        .unwrap();
+    assert!(rep.wake_runs.contains(&live_id));
+    assert!(
+        rep.cancel_acks
+            .iter()
+            .any(|a| a.firing_id == live_f.firing_id && a.run_id == live_id)
+    );
+    let (gone_after, _) = drive(
+        GetFiringOperation::new(&env.owner, gone_run.firing_id, env.node),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(gone_after.state, FiringState::NeedsAttention);
+    assert_eq!(gone_after.stages[0].receipt.workflow_run_id, Some(gone_id));
+    let (gcan_after, _) = drive(
+        GetFiringOperation::new(&env.owner, gone_can.firing_id, env.node),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(gcan_after.state, FiringState::Cancelled);
+    assert_eq!(gcan_after.stages[0].receipt.workflow_run_id, Some(gone_cid));
+    let (dir_after, _) = drive(
+        GetFiringOperation::new(&env.owner, direct_f.firing_id, env.node),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(dir_after.state, FiringState::Cancelled);
+    assert_eq!(dir_after.stages[0].receipt.workflow_run_id, Some(direct_id));
+    let dir_rec = WorkflowRunRecord::from_bytes(
+        &env.read_row(WORKFLOW_RUN_KEYSPACE, &run_key(direct_id))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(dir_rec.state, RunState::Cancelled);
+    let (def_after, _) = drive(
+        GetFiringOperation::new(&env.owner, defer_f.firing_id, env.node),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(def_after.stages[0].state, StageState::Running);
+    assert_eq!(def_after.stages[0].receipt.workflow_run_id, None);
 }
