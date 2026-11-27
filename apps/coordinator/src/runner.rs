@@ -196,33 +196,95 @@ struct ReceiptKey {
     path: String,
 }
 
+fn trim_slash(path: &str) -> &str {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() { path } else { trimmed }
+}
+
+/// Exact-keyed table with an unambiguous canonical-path fallback for symlinks.
+#[derive(Default)]
+struct ReceiptTable {
+    exact: HashMap<ReceiptKey, String>,
+    fallback: HashMap<ReceiptKey, Option<String>>,
+}
+
+impl ReceiptTable {
+    fn insert(&mut self, mut key: ReceiptKey, value: String) {
+        key.path = trim_slash(&key.path).to_owned();
+        self.exact.insert(key, value);
+    }
+
+    fn insert_fallback(&mut self, mut key: ReceiptKey, value: String) {
+        key.path = trim_slash(&key.path).to_owned();
+        self.fallback
+            .entry(key)
+            .and_modify(|slot| {
+                if slot.as_deref() != Some(value.as_str()) {
+                    *slot = None;
+                }
+            })
+            .or_insert(Some(value));
+    }
+
+    fn lookup(&self, scope: Option<&str>, basename: Option<&str>, raw: &str) -> Option<String> {
+        let norm = trim_slash(raw);
+        let try_exact = |base: Option<&str>| {
+            self.exact
+                .get(&ReceiptKey {
+                    scope: scope.map(str::to_owned),
+                    basename: base.map(str::to_owned),
+                    path: norm.to_owned(),
+                })
+                .cloned()
+        };
+        if let Some(hit) = try_exact(basename) {
+            return Some(hit);
+        }
+        if basename.is_some()
+            && let Some(hit) = try_exact(None)
+        {
+            return Some(hit);
+        }
+        let canon = std::fs::canonicalize(raw)
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())?;
+        let canon_norm = trim_slash(&canon);
+        let try_fb = |base: Option<&str>| {
+            self.fallback
+                .get(&ReceiptKey {
+                    scope: scope.map(str::to_owned),
+                    basename: base.map(str::to_owned),
+                    path: canon_norm.to_owned(),
+                })
+                .and_then(|slot| slot.clone())
+        };
+        try_fb(basename).or_else(|| basename.and_then(|_| try_fb(None)))
+    }
+}
+
 /// Delivered URIs and directory scopes used to rewrite workflow output locations.
 #[derive(Default)]
 struct Receipts {
-    scoped: HashMap<ReceiptKey, String>,
-    fallback: HashMap<ReceiptKey, Option<String>>,
-    scopes: HashMap<ReceiptKey, String>,
+    locations: ReceiptTable,
+    scopes: ReceiptTable,
     walked: HashSet<String>,
 }
 
 impl Receipts {
     fn insert(&mut self, key: ReceiptKey, location: String) {
-        self.scoped.insert(key, location);
+        self.locations.insert(key, location);
     }
 
     fn insert_fallback(&mut self, key: ReceiptKey, location: String) {
-        self.fallback
-            .entry(key)
-            .and_modify(|slot| {
-                if slot.as_deref() != Some(location.as_str()) {
-                    *slot = None;
-                }
-            })
-            .or_insert(Some(location));
+        self.locations.insert_fallback(key, location);
     }
 
     fn insert_scope(&mut self, key: ReceiptKey, target_path: String) {
         self.scopes.insert(key, target_path);
+    }
+
+    fn scope_fallback(&mut self, key: ReceiptKey, target_path: String) {
+        self.scopes.insert_fallback(key, target_path);
     }
 
     fn mark_walked(&mut self, scope: String) {
@@ -233,56 +295,13 @@ impl Receipts {
         self.walked.contains(scope)
     }
 
-    fn lookup(
-        &self,
-        map: &HashMap<ReceiptKey, String>,
-        fallback: Option<&HashMap<ReceiptKey, Option<String>>>,
-        scope: Option<&str>,
-        basename: Option<&str>,
-        raw: &str,
-    ) -> Option<String> {
-        let try_key = |base: Option<&str>, path: &str| {
-            map.get(&ReceiptKey {
-                scope: scope.map(str::to_owned),
-                basename: base.map(str::to_owned),
-                path: path.to_owned(),
-            })
-            .cloned()
-        };
-        if let Some(hit) = try_key(basename, raw) {
-            return Some(hit);
-        }
-        if basename.is_some()
-            && let Some(hit) = try_key(None, raw)
-        {
-            return Some(hit);
-        }
-        let canon = std::fs::canonicalize(raw)
-            .ok()
-            .map(|p| p.to_string_lossy().into_owned())?;
-        if let Some(hit) = try_key(basename, &canon) {
-            return Some(hit);
-        }
-        if basename.is_some()
-            && let Some(hit) = try_key(None, &canon)
-        {
-            return Some(hit);
-        }
-        let fb = fallback?;
-        let try_fb = |base: Option<&str>| {
-            fb.get(&ReceiptKey {
-                scope: scope.map(str::to_owned),
-                basename: base.map(str::to_owned),
-                path: canon.clone(),
-            })
-            .and_then(|slot| slot.clone())
-        };
-        try_fb(basename).or_else(|| basename.and_then(|_| try_fb(None)))
-    }
-
     fn get(&self, scope: Option<&str>, basename: Option<&str>, loc: &str) -> Option<String> {
         let raw = local_location(loc)?;
-        self.lookup(&self.scoped, Some(&self.fallback), scope, basename, &raw)
+        self.locations.lookup(scope, basename, &raw)
+    }
+
+    fn get_raw(&self, scope: Option<&str>, basename: Option<&str>, raw: &str) -> Option<String> {
+        self.locations.lookup(scope, basename, raw)
     }
 
     fn child_scope(
@@ -291,7 +310,7 @@ impl Receipts {
         basename: Option<&str>,
         raw: &str,
     ) -> Option<String> {
-        self.lookup(&self.scopes, None, scope, basename, raw)
+        self.scopes.lookup(scope, basename, raw)
     }
 }
 
@@ -307,7 +326,7 @@ struct PendingFile {
 
 /// One declared output directory tracked so its summary location gets the output prefix.
 struct OutputDir {
-    raw_target: String,
+    raw_targets: Vec<String>,
     canonical: PathBuf,
     parent_scope: Option<String>,
     listing_scope: Option<String>,
@@ -432,14 +451,11 @@ fn plan_outputs(
                         raw_targets.push(joined);
                     }
                 }
-                let mut fallback_targets = Vec::new();
-                if canonical != logical {
-                    fallback_targets.push(ReceiptKey {
-                        scope: copy_scope.clone(),
-                        basename: None,
-                        path: canonical.to_string_lossy().into_owned(),
-                    });
-                }
+                let fallback_targets = vec![ReceiptKey {
+                    scope: copy_scope.clone(),
+                    basename: None,
+                    path: canonical.to_string_lossy().into_owned(),
+                }];
                 add_pending(
                     &mut by_target,
                     PendingFile {
@@ -454,13 +470,16 @@ fn plan_outputs(
             }
             for (sub_logical, sub_canon, sub_rel) in sub_dirs {
                 check_path(&sub_rel)?;
-                let raw_sub = sub_logical
-                    .strip_prefix(&source)
-                    .map(|inner| target_base.join(inner).to_string_lossy().into_owned())
-                    .unwrap_or_else(|_| sub_logical.to_string_lossy().into_owned());
+                let mut raw_targets = vec![sub_logical.to_string_lossy().into_owned()];
+                if let Ok(inner) = sub_logical.strip_prefix(&source) {
+                    let joined = target_base.join(inner).to_string_lossy().into_owned();
+                    if !raw_targets.contains(&joined) {
+                        raw_targets.push(joined);
+                    }
+                }
                 let leaf_empty = is_empty_dir(&sub_canon);
                 dirs.push(OutputDir {
-                    raw_target: raw_sub,
+                    raw_targets,
                     canonical: sub_canon,
                     parent_scope: copy_scope.clone(),
                     listing_scope: None,
@@ -471,7 +490,7 @@ fn plan_outputs(
             }
             let leaf_empty = is_empty_dir(&source);
             dirs.push(OutputDir {
-                raw_target: item.source,
+                raw_targets: vec![item.source],
                 canonical: source,
                 parent_scope: item.parent_dir,
                 listing_scope: copy_scope,
@@ -481,25 +500,23 @@ fn plan_outputs(
             });
         } else if meta.is_file() {
             check_path(&target_path)?;
-            let mut raw_targets = vec![ReceiptKey {
+            let raw_key = ReceiptKey {
                 scope: item.parent_dir.clone(),
                 basename: item.basename.clone(),
                 path: item.source,
-            }];
-            let canon = ReceiptKey {
+            };
+            let canon_key = ReceiptKey {
                 scope: item.parent_dir.clone(),
                 basename: item.basename,
                 path: source.to_string_lossy().into_owned(),
             };
-            if !raw_targets.contains(&canon) {
-                raw_targets.push(canon);
-            }
+            let fallback_targets = vec![canon_key];
             add_pending(
                 &mut by_target,
                 PendingFile {
                     local: source,
-                    raw_targets,
-                    fallback_targets: Vec::new(),
+                    raw_targets: vec![raw_key],
+                    fallback_targets,
                     parent_dir: item.parent_dir,
                     target_path,
                     remote_hint,
@@ -567,21 +584,25 @@ fn record_sample(
 
 /// Registers one delivered directory receipt and its listing scope for descendant lookups.
 fn register_dir(dir: OutputDir, prefix: String, receipts: &mut Receipts) {
-    let raw_key = ReceiptKey {
-        scope: dir.parent_scope.clone(),
-        basename: dir.basename.clone(),
-        path: dir.raw_target,
-    };
+    for raw in dir.raw_targets {
+        let raw_key = ReceiptKey {
+            scope: dir.parent_scope.clone(),
+            basename: dir.basename.clone(),
+            path: raw,
+        };
+        receipts.insert(raw_key.clone(), prefix.clone());
+        if let Some(scope) = &dir.listing_scope {
+            receipts.insert_scope(raw_key, scope.clone());
+        }
+    }
     let canon_key = ReceiptKey {
         scope: dir.parent_scope,
         basename: dir.basename,
         path: dir.canonical.to_string_lossy().into_owned(),
     };
-    receipts.insert(raw_key.clone(), prefix.clone());
     receipts.insert_fallback(canon_key.clone(), prefix);
     if let Some(scope) = dir.listing_scope {
-        receipts.insert_scope(raw_key, scope.clone());
-        receipts.insert_scope(canon_key, scope.clone());
+        receipts.scope_fallback(canon_key, scope.clone());
         receipts.mark_walked(scope);
     }
 }
@@ -921,22 +942,25 @@ fn rewrite_locations(value: &mut Value, receipts: &Receipts, scope: Option<&str>
             let is_dir = class == Some("Directory");
             let is_entry = matches!(class, Some("File" | "Directory"));
             let basename = is_entry.then(|| entry_basename(map)).flatten();
+            let entry_raw = is_entry
+                .then(|| usable_path(map, "location").or_else(|| usable_path(map, "path")))
+                .flatten();
+            let entry_uri = entry_raw
+                .as_deref()
+                .and_then(|raw| receipts.get_raw(scope, basename.as_deref(), raw));
             let list_scope = match is_dir {
-                true => {
-                    let raw = usable_path(map, "location").or_else(|| usable_path(map, "path"));
-                    match raw {
-                        Some(raw) => receipts
-                            .child_scope(scope, basename.as_deref(), &raw)
-                            .or_else(|| scope.map(str::to_owned)),
-                        None => match (scope, basename.as_deref()) {
-                            (Some(parent), Some(_)) if receipts.is_walked(parent) => {
-                                Some(parent.to_owned())
-                            }
-                            (Some(parent), Some(base)) => Some(format!("{parent}/{base}")),
-                            _ => scope.map(str::to_owned),
-                        },
-                    }
-                }
+                true => match entry_raw.as_deref() {
+                    Some(raw) => receipts
+                        .child_scope(scope, basename.as_deref(), raw)
+                        .or_else(|| scope.map(str::to_owned)),
+                    None => match (scope, basename.as_deref()) {
+                        (Some(parent), Some(_)) if receipts.is_walked(parent) => {
+                            Some(parent.to_owned())
+                        }
+                        (Some(parent), Some(base)) => Some(format!("{parent}/{base}")),
+                        _ => scope.map(str::to_owned),
+                    },
+                },
                 false => scope.map(str::to_owned),
             };
             for (key, item) in map.iter_mut() {
@@ -944,7 +968,12 @@ fn rewrite_locations(value: &mut Value, receipts: &Receipts, scope: Option<&str>
                     && matches!(key.as_str(), "location" | "path")
                     && let Value::String(text) = item
                 {
-                    if let Some(delivered) = receipts.get(scope, basename.as_deref(), text) {
+                    let usable = !text.is_empty() && !text.starts_with("_:") && !served(text);
+                    if usable
+                        && let Some(delivered) = entry_uri
+                            .clone()
+                            .or_else(|| receipts.get(scope, basename.as_deref(), text))
+                    {
                         *text = delivered;
                     }
                     continue;
@@ -1521,6 +1550,9 @@ mod tests {
             for key in item.raw_targets {
                 receipts.insert(key, loc.clone());
             }
+            for key in item.fallback_targets {
+                receipts.insert_fallback(key, loc.clone());
+            }
         }
         finish_missing(plan.missing_dirs, &dir_sample, None, &mut receipts);
         let mut rewritten = outputs;
@@ -1700,6 +1732,9 @@ mod tests {
             for key in item.raw_targets {
                 receipts.insert(key, loc.clone());
             }
+            for key in item.fallback_targets {
+                receipts.insert_fallback(key, loc.clone());
+            }
         }
         for d in plan.dirs {
             let (rel, loc) = dir_sample.get(&d.target_path).expect("sample");
@@ -1836,6 +1871,124 @@ mod tests {
         assert_eq!(
             rewritten["bundle"]["listing"][1]["listing"][0]["location"],
             "aruna://results/run/bundle/b/data?version=v1"
+        );
+
+        // Symlinked top-level dirs (`outputs/a` and `outputs/z -> a`) keep separate scopes, and
+        // symlinked subdirs under a symlinked bundle (`outputs/tree_link -> workflow/tree`) keep
+        // exact logical receipts for both `workflow/tree/{a,b}` and `outputs/tree_link/{a,b}`.
+        let wf_tree = dir.path().join("workflow").join("tree");
+        let shared_sub = dir.path().join("workflow").join("shared_sub");
+        std::fs::create_dir_all(&wf_tree).unwrap();
+        std::fs::create_dir_all(&shared_sub).unwrap();
+        std::fs::write(shared_sub.join("item.txt"), b"item").unwrap();
+        let sub_a = wf_tree.join("a");
+        let sub_b = wf_tree.join("b");
+        std::os::unix::fs::symlink(&shared_sub, &sub_a).unwrap();
+        std::os::unix::fs::symlink(&shared_sub, &sub_b).unwrap();
+        let tree_link = out_dir.join("tree_link");
+        std::os::unix::fs::symlink(&wf_tree, &tree_link).unwrap();
+
+        let dir_orig = out_dir.join("orig");
+        std::fs::create_dir_all(&dir_orig).unwrap();
+        let orig_file = dir_orig.join("f.txt");
+        std::fs::write(&orig_file, b"orig").unwrap();
+        let dir_alias = out_dir.join("z_alias");
+        std::os::unix::fs::symlink(&dir_orig, &dir_alias).unwrap();
+        let other_alias = dir.path().join("workflow").join("other_alias");
+        std::os::unix::fs::symlink(&dir_orig, &other_alias).unwrap();
+
+        let dir_outputs = json!({
+            "orig": {
+                "class": "Directory",
+                "location": format!("file://{}", dir_orig.display()),
+                "listing": [{"class": "File", "location": format!("file://{}", orig_file.display())}],
+            },
+            "alias": {
+                "class": "Directory",
+                "location": format!("file://{}/", dir_alias.display()),
+                "path": dir_orig.to_string_lossy(),
+                "listing": [{"class": "File", "location": format!("file://{}", dir_alias.join("f.txt").display())}],
+            },
+            "linked_tree": {
+                "class": "Directory",
+                "location": format!("file://{}", tree_link.display()),
+                "listing": [
+                    {
+                        "class": "Directory",
+                        "location": format!("file://{}", sub_a.display()),
+                        "listing": [{"class": "File", "location": format!("file://{}", sub_a.join("item.txt").display())}],
+                    },
+                    {
+                        "class": "Directory",
+                        "location": format!("file://{}", sub_b.display()),
+                        "listing": [{"class": "File", "location": format!("file://{}", sub_b.join("item.txt").display())}],
+                    },
+                ],
+            },
+        });
+        let plan2 = plan_outputs(root, &canon, &[], Some(&dir_outputs)).unwrap();
+        let mut receipts2 = Receipts::default();
+        let mut samples2 = HashMap::new();
+        for (i, item) in plan2.files.into_values().enumerate() {
+            let loc = format!("aruna://results/run/{}?version=v{i}", item.target_path);
+            record_sample(
+                &mut samples2,
+                item.parent_dir.as_deref(),
+                &item.target_path,
+                &loc,
+            );
+            for key in item.raw_targets {
+                receipts2.insert(key, loc.clone());
+            }
+            for key in item.fallback_targets {
+                receipts2.insert_fallback(key, loc.clone());
+            }
+        }
+        for d in plan2.dirs {
+            let (rel, loc) = samples2.get(&d.target_path).expect("sample");
+            let prefix = output_prefix(loc, rel, &d.target_path).expect("prefix");
+            register_dir(d, prefix, &mut receipts2);
+        }
+        assert_eq!(
+            receipts2.get(None, None, &format!("file://{}", other_alias.display())),
+            None
+        );
+        assert_eq!(
+            receipts2.child_scope(None, None, &other_alias.to_string_lossy()),
+            None
+        );
+        let mut out2 = dir_outputs;
+        rewrite_locations(&mut out2, &receipts2, None);
+        assert_eq!(out2["orig"]["location"], "aruna://results/run/orig/");
+        assert_eq!(
+            out2["orig"]["listing"][0]["location"],
+            "aruna://results/run/orig/f.txt?version=v0"
+        );
+        assert_eq!(out2["alias"]["location"], "aruna://results/run/z_alias/");
+        assert_eq!(out2["alias"]["path"], "aruna://results/run/z_alias/");
+        assert_eq!(
+            out2["alias"]["listing"][0]["location"],
+            "aruna://results/run/z_alias/f.txt?version=v3"
+        );
+        assert_eq!(
+            out2["linked_tree"]["location"],
+            "aruna://results/run/tree_link/"
+        );
+        assert_eq!(
+            out2["linked_tree"]["listing"][0]["location"],
+            "aruna://results/run/tree_link/a/"
+        );
+        assert_eq!(
+            out2["linked_tree"]["listing"][0]["listing"][0]["location"],
+            "aruna://results/run/tree_link/a/item.txt?version=v1"
+        );
+        assert_eq!(
+            out2["linked_tree"]["listing"][1]["location"],
+            "aruna://results/run/tree_link/b/"
+        );
+        assert_eq!(
+            out2["linked_tree"]["listing"][1]["listing"][0]["location"],
+            "aruna://results/run/tree_link/b/item.txt?version=v2"
         );
     }
 }
