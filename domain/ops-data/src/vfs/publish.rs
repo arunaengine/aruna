@@ -799,6 +799,7 @@ enum CloseStep {
     Close,
     Lookup,
     Receipt,
+    CheckRetained,
     Successor,
     Publish,
     OwnerMount,
@@ -970,7 +971,8 @@ impl VfsCloseOperation {
     }
 
     /// An instance with no opens left and its delete still pending is finished again, once
-    /// the receipt an earlier attempt may have left is settled; a writerless dirty one publishes.
+    /// the receipt an earlier attempt may have left is settled; a detached staged one finishes
+    /// its discard or retention, and a writerless dirty one publishes.
     fn looked_up(&mut self, result: IoResult) -> CloseTurn {
         let found = match vfs_event(result)? {
             VfsEvent::Instance(Some(found)) => found,
@@ -978,15 +980,20 @@ impl VfsCloseOperation {
             other => return Err(unexpected(&other)),
         };
         let pending = found.open_count == 0 && found.delete_pending;
+        let detached_stage = found.open_count == 0
+            && !found.delete_pending
+            && found.stage_id.is_some()
+            && found.detached.is_some();
         let dirty = found.writer_count == 0
             && found.dirty
             && found.detached.is_none()
             && !found.delete_pending
             && self.input.publish.is_some();
-        if !pending && !dirty {
+        if !pending && !detached_stage && !dirty {
             return Err(VfsError::Vfs(VfsFailure::NotFound));
         }
-        let instance_id = found.instance_id;
+        let (instance_id, detached, stage_id) = (found.instance_id, found.detached, found.stage_id);
+        let handle_id = found.handle_id;
         self.summary = Some(CloseSummary {
             instance_id,
             key: found.key,
@@ -1006,6 +1013,18 @@ impl VfsCloseOperation {
             edit_generation: found.edit_generation,
             successor_owner: None,
         });
+        if detached_stage {
+            return match (detached, stage_id) {
+                (Some(DetachReason::Unlinked), _) => self.discard(),
+                (Some(reason), _) if self.input.stage.is_some() => self.retain(reason),
+                (Some(reason), Some(stage_id)) => {
+                    let read = state_read(&self.stage_keys(stage_id, handle_id))?;
+                    self.reason = Some(reason);
+                    self.call(CloseStep::LiveStage, read)
+                }
+                _ => Err(VfsError::Conflict),
+            };
+        }
         if dirty {
             return self.publish();
         }
@@ -1024,7 +1043,7 @@ impl VfsCloseOperation {
     }
 
     /// A committed earlier removal or a proven unlink only discards the stage; a rolled back
-    /// one runs the delete again.
+    /// one runs the delete again unless an earlier refusal already retained its checkpoint.
     fn receipt_settled(&mut self, result: IoResult) -> CloseTurn {
         match result.child::<ReceiptOutcome, VfsError>()? {
             Ok(ReceiptOutcome::Applied { .. }) => self.discard_as(CloseOutcome::Deleted),
@@ -1033,13 +1052,37 @@ impl VfsCloseOperation {
                     .summary
                     .as_ref()
                     .is_some_and(|summary| summary.detached == Some(DetachReason::Unlinked));
-                match unlinked {
-                    true => self.discard_as(CloseOutcome::Deleted),
-                    false => self.final_delete(),
+                let stage_id = self.summary.as_ref().and_then(|summary| summary.stage_id);
+                match (unlinked, stage_id) {
+                    (true, _) => self.discard_as(CloseOutcome::Deleted),
+                    (false, Some(stage_id)) => {
+                        let key = VfsKey::RetainedStage(self.input.scope.clone(), stage_id);
+                        let read = state_read(&[key])?;
+                        self.call(CloseStep::CheckRetained, read)
+                    }
+                    (false, None) => self.final_delete(),
                 }
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// A checkpoint an earlier refusal already moved to retention finishes that retention
+    /// instead of deleting again, so its file is never removed while the row names it.
+    fn retained_checked(&mut self, result: IoResult) -> CloseTurn {
+        let [row] = aruna_core::rows::values::<1>(result)?;
+        let summary = self.summary.as_ref().ok_or(VfsError::Conflict)?;
+        let (stage_id, generation) = (summary.stage_id, summary.generation);
+        let stage_id = stage_id.ok_or(VfsError::Conflict)?;
+        let kept = record_of::<NfsStageRecord>(row.as_ref())?
+            .filter(|row| row.stage_id == stage_id && row.generation == generation);
+        let Some(row) = kept else {
+            return self.final_delete();
+        };
+        self.input.stage = Some(row);
+        self.outcome = Some(CloseOutcome::Retained(stage_id));
+        self.reason = Some(DetachReason::LostLife);
+        self.call(CloseStep::Synced, IoCall::Sync)
     }
 
     /// The fenced delete runs as the disposition owner through that owner's own export, never
@@ -1152,15 +1195,19 @@ impl VfsCloseOperation {
         let Some(stage_id) = summary.stage_id else {
             return self.clear_disposition(error);
         };
-        let scope = self.input.scope.clone();
-        let retained = VfsKey::RetainedStage(scope.clone(), stage_id);
-        let keys = match summary.handle_id {
-            Some(handle_id) => vec![VfsKey::LiveStage(scope, handle_id), retained],
-            None => vec![retained],
-        };
-        let read = state_read(&keys)?;
+        let read = state_read(&self.stage_keys(stage_id, summary.handle_id))?;
         self.failure = Some(error);
         self.call(CloseStep::LiveStage, read)
+    }
+
+    /// The live row of the handle, when it has one, and the retained row of the checkpoint.
+    fn stage_keys(&self, stage_id: Ulid, handle_id: Option<u64>) -> Vec<VfsKey> {
+        let scope = self.input.scope.clone();
+        let retained = VfsKey::RetainedStage(scope.clone(), stage_id);
+        match handle_id {
+            Some(handle_id) => vec![VfsKey::LiveStage(scope, handle_id), retained],
+            None => vec![retained],
+        }
     }
 
     /// The live checkpoint is retained once read, and one an earlier attempt already moved
@@ -1175,17 +1222,18 @@ impl VfsCloseOperation {
             None => None,
         };
         let kept = rows.next().flatten();
+        let reason = self.reason.unwrap_or(DetachReason::LostLife);
         if let Some(stage) = record_of::<NfsStageRecord>(live.as_ref())? {
             self.input.stage = Some(stage);
             self.failure = None;
-            return self.retain(DetachReason::LostLife);
+            return self.retain(reason);
         }
         let kept = record_of::<NfsStageRecord>(kept.as_ref())?
             .filter(|row| row.stage_id == stage_id && row.generation == generation);
         if let Some(row) = kept {
             self.outcome = Some(CloseOutcome::Retained(row.stage_id));
             self.input.stage = Some(row);
-            self.reason = Some(DetachReason::LostLife);
+            self.reason = Some(reason);
             self.failure = None;
             return self.call(CloseStep::Synced, IoCall::Sync);
         }
@@ -1204,7 +1252,7 @@ impl VfsCloseOperation {
             instance_id,
             stage_id,
             generation,
-            reason: DetachReason::LostLife,
+            reason: self.reason.unwrap_or(DetachReason::LostLife),
         };
         self.call(CloseStep::Cleared, vfs_call(retain))
     }
@@ -1217,10 +1265,14 @@ impl VfsCloseOperation {
         self.call(CloseStep::Cleared, vfs_call(effect))
     }
 
-    /// Without a checkpoint to keep, the refusal is the close's error.
+    /// Without a checkpoint to keep, the refusal is the close's error; a retried detached
+    /// close without one only lets go of it.
     fn cleared(&mut self, result: IoResult) -> CloseTurn {
         vfs_event(result)?;
-        Err(self.failure.take().unwrap_or(VfsError::Conflict))
+        match self.failure.take() {
+            Some(error) => Err(error),
+            None => Ok(Next::Done(CloseOutcome::Closed)),
+        }
     }
 
     fn publish(&mut self) -> CloseTurn {
@@ -1287,7 +1339,8 @@ impl VfsCloseOperation {
     }
 
     /// Only a proven unlink or final delete discards the stage row and its file; a checkpoint
-    /// whose row an earlier attempt already deleted is still reclaimed after a sync.
+    /// whose row an earlier attempt already deleted is still reclaimed after a sync, unless a
+    /// retained row still names it.
     fn discard_as(&mut self, outcome: CloseOutcome) -> CloseTurn {
         if self.input.stage.is_some() {
             return self.change_stage(None, outcome);
@@ -1297,29 +1350,36 @@ impl VfsCloseOperation {
         let Some((stage_id, generation, handle_id)) = named else {
             return Ok(Next::Done(outcome));
         };
+        let read = state_read(&self.stage_keys(stage_id, handle_id))?;
         self.outcome = Some(outcome);
         self.checkpoint = Some((stage_id, generation));
-        match handle_id {
-            Some(handle_id) => {
-                let key = VfsKey::LiveStage(self.input.scope.clone(), handle_id);
-                let read = state_read(&[key])?;
-                self.call(CloseStep::DiscardStage, read)
-            }
-            None => self.call(CloseStep::Synced, IoCall::Sync),
-        }
+        self.call(CloseStep::DiscardStage, read)
     }
 
     fn discard_read(&mut self, result: IoResult) -> CloseTurn {
-        let [row] = aruna_core::rows::values::<1>(result)?;
-        match record_of::<NfsStageRecord>(row.as_ref())? {
-            Some(stage) => {
-                self.input.stage = Some(stage);
-                self.checkpoint = None;
-                let outcome = self.outcome.take().ok_or(VfsError::Conflict)?;
-                self.change_stage(None, outcome)
-            }
-            None => self.call(CloseStep::Synced, IoCall::Sync),
+        let summary = self.summary.as_ref().ok_or(VfsError::Conflict)?;
+        let mut rows = result.values()?.into_iter();
+        let live = match summary.handle_id {
+            Some(_) => rows.next().flatten(),
+            None => None,
+        };
+        let kept = rows.next().flatten();
+        if let Some(stage) = record_of::<NfsStageRecord>(live.as_ref())? {
+            self.input.stage = Some(stage);
+            self.checkpoint = None;
+            let outcome = self.outcome.take().ok_or(VfsError::Conflict)?;
+            return self.change_stage(None, outcome);
         }
+        let (stage_id, generation) = self.checkpoint.ok_or(VfsError::Conflict)?;
+        let kept = record_of::<NfsStageRecord>(kept.as_ref())?
+            .filter(|row| row.stage_id == stage_id && row.generation == generation);
+        if let Some(row) = kept {
+            self.input.stage = Some(row);
+            self.checkpoint = None;
+            self.outcome = Some(CloseOutcome::Retained(stage_id));
+            self.reason = Some(DetachReason::LostLife);
+        }
+        self.call(CloseStep::Synced, IoCall::Sync)
     }
 
     fn stage_changed(&mut self, result: IoResult) -> CloseTurn {
@@ -1385,6 +1445,7 @@ impl Operation for VfsCloseOperation {
             CloseStep::Close => self.closed(result),
             CloseStep::Lookup => self.looked_up(result),
             CloseStep::Receipt => self.receipt_settled(result),
+            CloseStep::CheckRetained => self.retained_checked(result),
             CloseStep::Successor => self.successor_admitted(result),
             CloseStep::Publish => self.published(result),
             CloseStep::OwnerMount => self.owner_mount(result),

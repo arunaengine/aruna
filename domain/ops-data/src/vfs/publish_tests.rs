@@ -859,9 +859,12 @@ fn discard_reclaims_stage() {
     let turn = retry.next(vfs(VfsEvent::Instance(Some(found))));
     assert_eq!(turn, Ok(Next::Call(settling())));
     let turn = retry.next(child(ReceiptOutcome::RolledBack));
-    let read = state_read(&[VfsKey::LiveStage(scope(), 9)]).unwrap();
-    assert_eq!(turn, Ok(Next::Call(read)));
-    let turn = retry.next(IoResult::Values(vec![None]));
+    let keys = [
+        VfsKey::LiveStage(scope(), 9),
+        VfsKey::RetainedStage(scope(), id(12)),
+    ];
+    assert_eq!(turn, Ok(Next::Call(state_read(&keys).unwrap())));
+    let turn = retry.next(IoResult::Values(vec![None, None]));
     assert_eq!(turn, Ok(Next::Call(IoCall::Sync)));
     let remove = VfsEffect::RemoveCheckpoint {
         stage_id: id(12),
@@ -870,6 +873,168 @@ fn discard_reclaims_stage() {
     assert_eq!(asked(&retry.next(IoResult::Done)), remove);
     let turn = retry.next(vfs(VfsEvent::Done));
     assert_eq!(turn, Ok(Next::Done(CloseOutcome::Deleted)));
+}
+
+/// A retried close of instance 1 whose open is gone, up to its answer to finding `found`.
+fn retry_found(found: InstanceSummary) -> (VfsCloseOperation, CloseTurn) {
+    let input = CloseInput {
+        context: context(),
+        scope: scope(),
+        open_id: id(22),
+        publish: None,
+        stage: None,
+    };
+    let mut retry = VfsCloseOperation::new(input).with_instance(1);
+    retry.first().unwrap();
+    retry
+        .next(vfs(VfsEvent::Failed(VfsFailure::NotFound)))
+        .unwrap();
+    let turn = retry.next(vfs(VfsEvent::Instance(Some(found))));
+    (retry, turn)
+}
+
+/// The retained row of checkpoint `id(12)` at generation 1, detached for `reason`.
+fn held(reason: DetachReason) -> NfsStageRecord {
+    let row = NfsStageRecord {
+        generation: 1,
+        ..stage()
+    };
+    retained(&row, reason, 0)
+}
+
+/// The release of instance 1 from checkpoint `id(12)` at generation 1 for `reason`.
+fn released(reason: DetachReason) -> IoCall {
+    vfs_call(VfsEffect::RetainInstance {
+        scope: scope(),
+        instance_id: 1,
+        stage_id: id(12),
+        generation: 1,
+        reason,
+    })
+}
+
+#[test]
+fn retry_keeps_retained() {
+    // A retried delete whose earlier refusal already moved the checkpoint to retention
+    // finishes that retention, never deleting again or removing the checkpoint file.
+    let found = InstanceSummary {
+        open_count: 0,
+        delete_pending: true,
+        disposition_owner: Some(smb_owner()),
+        stage_id: Some(id(12)),
+        generation: 1,
+        ..instance()
+    };
+    let check = state_read(&[VfsKey::RetainedStage(scope(), id(12))]).unwrap();
+    let (mut retry, turn) = retry_found(found.clone());
+    assert_eq!(turn, Ok(Next::Call(settling())));
+    let turn = retry.next(child(ReceiptOutcome::RolledBack));
+    assert_eq!(turn, Ok(Next::Call(check)));
+    let kept = encoded(&held(DetachReason::LostLife));
+    let turn = retry.next(IoResult::Values(vec![kept]));
+    assert_eq!(turn, Ok(Next::Call(IoCall::Sync)));
+    let Ok(Next::Then { output, calls }) = retry.next(IoResult::Done) else {
+        panic!("expected the retained outcome with the instance release");
+    };
+    assert_eq!(output, CloseOutcome::Retained(id(12)));
+    assert_eq!(calls, vec![released(DetachReason::LostLife)]);
+
+    // Without a retained row the delete runs again through the owner's share.
+    let (mut retry, _) = retry_found(found.clone());
+    retry.next(child(ReceiptOutcome::RolledBack)).unwrap();
+    let turn = retry.next(IoResult::Values(vec![None]));
+    let share = VfsAccessContext {
+        access_key: "KEY2".to_string(),
+        protocol: VfsProtocol::Smb,
+        target: NfsMountTarget::for_bucket("bucket", 7).unwrap(),
+        read_only: false,
+        ..context()
+    };
+    let remove = VfsRemoveOperation::new(RemoveInput {
+        context: share,
+        key: found.key,
+        kind: found.kind,
+        handle_id: found.handle_id,
+        identity: found.identity,
+        instance_id: Some(1),
+        attempt_id: id(22),
+    });
+    assert_eq!(turn, Ok(Next::Call(IoCall::child(remove))));
+
+    // A proven unlink keeps a checkpoint a retained row still names instead of removing it.
+    let unlinked = InstanceSummary {
+        open_count: 0,
+        delete_pending: true,
+        detached: Some(DetachReason::Unlinked),
+        stage_id: Some(id(12)),
+        generation: 1,
+        handle_id: Some(9),
+        ..instance()
+    };
+    let (mut retry, _) = retry_found(unlinked);
+    retry.next(child(ReceiptOutcome::RolledBack)).unwrap();
+    let kept = encoded(&held(DetachReason::LostLife));
+    let turn = retry.next(IoResult::Values(vec![None, kept]));
+    assert_eq!(turn, Ok(Next::Call(IoCall::Sync)));
+    let Ok(Next::Then { output, calls }) = retry.next(IoResult::Done) else {
+        panic!("expected the retained outcome with the instance release");
+    };
+    assert_eq!(output, CloseOutcome::Retained(id(12)));
+    assert_eq!(calls, vec![released(DetachReason::LostLife)]);
+}
+
+/// A closed detached instance without a pending delete that names checkpoint `id(12)`.
+fn detached(reason: DetachReason) -> InstanceSummary {
+    InstanceSummary {
+        open_count: 0,
+        delete_pending: false,
+        detached: Some(reason),
+        stage_id: Some(id(12)),
+        generation: 1,
+        handle_id: Some(9),
+        ..instance()
+    }
+}
+
+#[test]
+fn unlinked_retry_discards() {
+    // A retried close of an unlinked instance whose live row an earlier attempt deleted
+    // before its sync failed still syncs and reclaims the checkpoint.
+    let (mut retry, turn) = retry_found(detached(DetachReason::Unlinked));
+    let keys = [
+        VfsKey::LiveStage(scope(), 9),
+        VfsKey::RetainedStage(scope(), id(12)),
+    ];
+    assert_eq!(turn, Ok(Next::Call(state_read(&keys).unwrap())));
+    let turn = retry.next(IoResult::Values(vec![None, None]));
+    assert_eq!(turn, Ok(Next::Call(IoCall::Sync)));
+    let remove = VfsEffect::RemoveCheckpoint {
+        stage_id: id(12),
+        generation: 1,
+    };
+    assert_eq!(asked(&retry.next(IoResult::Done)), remove);
+    let turn = retry.next(vfs(VfsEvent::Done));
+    assert_eq!(turn, Ok(Next::Done(CloseOutcome::Discarded)));
+}
+
+#[test]
+fn detached_retry_retains() {
+    // A retried close of a displaced instance whose checkpoint already moved to retention
+    // finishes the release with its own reason.
+    let (mut retry, turn) = retry_found(detached(DetachReason::Displaced));
+    let keys = [
+        VfsKey::LiveStage(scope(), 9),
+        VfsKey::RetainedStage(scope(), id(12)),
+    ];
+    assert_eq!(turn, Ok(Next::Call(state_read(&keys).unwrap())));
+    let kept = encoded(&held(DetachReason::Displaced));
+    let turn = retry.next(IoResult::Values(vec![None, kept]));
+    assert_eq!(turn, Ok(Next::Call(IoCall::Sync)));
+    let Ok(Next::Then { output, calls }) = retry.next(IoResult::Done) else {
+        panic!("expected the retained outcome with the instance release");
+    };
+    assert_eq!(output, CloseOutcome::Retained(id(12)));
+    assert_eq!(calls, vec![released(DetachReason::Displaced)]);
 }
 
 #[test]

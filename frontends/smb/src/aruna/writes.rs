@@ -12,7 +12,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::vfs::{
     BucketScope, DirectoryWitness, FileIdentity, HandleIdentity, HandleKind, NfsStageRecord,
-    StageBase,
+    StageBase, StageDisposition,
 };
 use aruna_core::user::id::UserId;
 use aruna_core::vfs_effects::{InstanceSummary, ReadLockCheck, VfsFailure, VfsProtocol};
@@ -23,10 +23,11 @@ use aruna_ops_data::vfs::mutate::{MkdirInput, RenameInput};
 use aruna_ops_data::vfs::path::{NameUse, check_component, child_key, marker_key, split_parent};
 use aruna_ops_data::vfs::policy::{VfsAccess, VfsRequest};
 use aruna_ops_data::vfs::publish::{CloseInput, CloseOutcome, PublishInput, Published};
+use aruna_ops_data::vfs::recovery::ReceiptInput;
 use aruna_ops_data::vfs::{
     AuthorizeVfsOperation, InstanceTarget, LiveStageOperation, LookupInstanceOperation,
     VfsAccessContext, VfsCloseOperation, VfsDispositionOperation, VfsError, VfsMkdirOperation,
-    VfsPublishOperation, VfsReadOperation, VfsRenameOperation,
+    VfsPublishOperation, VfsReadOperation, VfsReceiptOperation, VfsRenameOperation,
 };
 use aruna_ops_identity::document_repository::GetConfigOperation;
 use aruna_ops_identity::groups::routing::{BucketRules, SnapshotOperation};
@@ -40,8 +41,8 @@ use super::bodies::chunked_body;
 use super::files::current_open;
 use super::names::Resolution;
 use super::{
-    ArunaSmbBackend, FileOpen, PendingDelete, PendingMap, file_info, object_kind, share_context,
-    vfs_failure,
+    ArunaSmbBackend, FileOpen, PendingDelete, PendingMap, PublishRetry, file_info, object_kind,
+    share_context, vfs_failure,
 };
 use crate::backend::{BackendError, FileInfo};
 
@@ -249,23 +250,44 @@ impl CloseRunner {
         Ok((input, put))
     }
 
+    /// Settles the publication attempt an earlier try of `entry` left, so a write whose
+    /// outcome stayed unknown releases its attempt before another one starts.
+    async fn settle_publish(&self, entry: &PendingDelete) -> Result<(), VfsError> {
+        let prior = *entry.publish.lock();
+        let Some(prior) = prior else {
+            return Ok(());
+        };
+        let open = &entry.open;
+        let receipt = ReceiptInput {
+            scope: BucketScope::new(open.bucket.clone(), open.incarnation),
+            attempt_id: prior.attempt_id,
+            instance_id: Some(open.instance_id),
+            updates: Vec::new(),
+            logical_size: Some(prior.logical_size),
+            expected_edit: prior.expected_edit,
+        };
+        drive(VfsReceiptOperation::new(receipt), &self.driver).await?;
+        *entry.publish.lock() = None;
+        Ok(())
+    }
+
     /// Closes the open of `entry` again with the instance's live checkpoint row, the rebuilt
-    /// publication of a dirty last writer and a fresh copy of its marker write; a pending
-    /// delete is never published. Also tells whether the instance was detached.
+    /// publication of its dirty last writer and a fresh copy of its marker write; a pending
+    /// delete is never published. Also tells whether this open still owns publication.
     async fn retry_close(&self, entry: &PendingDelete) -> Result<(CloseOutcome, bool), VfsError> {
+        self.settle_publish(entry).await?;
         let open = &entry.open;
         let scope = BucketScope::new(open.bucket.clone(), open.incarnation);
         let lookup =
             LookupInstanceOperation::new(scope, InstanceTarget::Instance(open.instance_id));
         let found = drive(lookup, &self.driver).await?;
         let mut parts = CloseParts::default();
-        let mut detached = false;
+        let mut owner = false;
         if let Some(summary) = found.filter(|summary| summary.instance_id == open.instance_id) {
-            detached = summary.detached.is_some();
             parts.stage = self.live_stage(open, &summary).await?;
-            let deleting = summary.delete_pending || open.delete_on_close;
-            let last = summary.writer_count == 0 || (open.write && summary.writer_count <= 1);
-            if summary.dirty && last && !deleting && !detached {
+            let stage = parts.stage.as_ref();
+            owner = open.write && summary.detached.is_none() && !is_quota_blocked(stage);
+            if owns_publish(open, &summary, stage) {
                 let live = current_open(open, Some(&summary));
                 let stage = parts.stage.clone();
                 let publish = self.prepare(&live, &summary, stage).await;
@@ -285,9 +307,41 @@ impl CloseRunner {
                 Some(put)
             }
         };
+        // A write whose outcome stays unknown after a failure is settled by the next retry.
+        *entry.publish.lock() = parts.publish.as_ref().map(retry_of);
         let outcome = self.run_close(open, parts).await?;
-        Ok((outcome, detached))
+        *entry.publish.lock() = None;
+        Ok((outcome, owner))
     }
+}
+
+/// The attempt of a prepared publication that a later retry may have to settle.
+fn retry_of(publish: &(PublishInput, PutObjectConfig)) -> PublishRetry {
+    let (input, _) = publish;
+    PublishRetry {
+        attempt_id: input.attempt_id,
+        logical_size: input.logical_size,
+        expected_edit: input.expected_edit,
+    }
+}
+
+/// True when the node's quota retry owns the live checkpoint `stage`.
+pub(super) fn is_quota_blocked(stage: Option<&NfsStageRecord>) -> bool {
+    stage.is_some_and(|stage| {
+        stage.disposition == StageDisposition::Live && stage.quota_retry.is_some()
+    })
+}
+
+/// True when the close of `open` publishes the dirty bytes itself: it is the last writer,
+/// with no pending delete, a name left and no quota retry owning the checkpoint.
+pub(super) fn owns_publish(
+    open: &FileOpen,
+    summary: &InstanceSummary,
+    stage: Option<&NfsStageRecord>,
+) -> bool {
+    let deleting = summary.delete_pending || open.delete_on_close;
+    let last = summary.writer_count <= 1 && !deleting && summary.detached.is_none();
+    open.write && summary.dirty && last && !is_quota_blocked(stage)
 }
 
 /// A close failure a later retry may still get past; any other one ended the close for good.
@@ -310,11 +364,11 @@ pub(super) fn retry_prepare_error(error: BackendError) -> VfsError {
     }
 }
 
-/// True once a retry ended the close. An attached instance whose dirty bytes stay unpublished
-/// keeps it, as does a failure a later retry may still get past.
+/// True once a retry ended the close. Dirty bytes whose own writer still owns publication
+/// keep it, as does a failure a later retry may still get past.
 pub(super) fn retry_done(result: Result<(CloseOutcome, bool), VfsError>) -> bool {
     match result {
-        Ok((CloseOutcome::Pending, false)) => false,
+        Ok((CloseOutcome::Pending, true)) => false,
         Ok(_) => true,
         Err(error) => !is_transient_close(&error),
     }
@@ -395,8 +449,13 @@ impl ArunaSmbBackend {
     }
 
     /// Hands a transiently failed close to one background retry, so a pending delete it left
-    /// never wedges the name once the SMB handle is gone.
-    pub(super) fn queue_pending(&self, open: FileOpen, marker: Option<PutObjectConfig>) {
+    /// never wedges the name once the SMB handle is gone. `publish` is the attempt it settles.
+    pub(super) fn queue_pending(
+        &self,
+        open: FileOpen,
+        marker: Option<PutObjectConfig>,
+        publish: Option<PublishRetry>,
+    ) {
         let key = (
             BucketScope::new(open.bucket.clone(), open.incarnation),
             open.open_id,
@@ -405,6 +464,7 @@ impl ArunaSmbBackend {
             open,
             marker: Mutex::new(marker),
             gate: tokio::sync::Mutex::new(()),
+            publish: Mutex::new(publish),
         });
         {
             let mut pending = self.pending.lock();
@@ -596,10 +656,7 @@ impl ArunaSmbBackend {
         parts: &mut CloseParts,
     ) -> Result<(), BackendError> {
         parts.stage = self.live_stage(open, summary).await?;
-        let deleting = summary.delete_pending || open.delete_on_close;
-        let detached = summary.detached.is_some();
-        let last = summary.writer_count <= 1 && !deleting && !detached;
-        if open.write && summary.dirty && last {
+        if owns_publish(open, summary, parts.stage.as_ref()) {
             let stage = parts.stage.clone();
             parts.publish = Some(self.prepare(open, summary, stage).await?);
         }
@@ -624,11 +681,13 @@ impl ArunaSmbBackend {
             Ok(None) => {}
             Err(error) => failure = Some(error),
         }
+        let quota_blocked = is_quota_blocked(parts.stage.as_ref());
+        let publish = parts.publish.as_ref().map(retry_of);
         // Retry in the background if the marker template fails so a final delete never lacks it.
         let put = match self.close_runner().marker_template(&open).await {
             Ok(put) => put,
             Err(error) => {
-                self.queue_pending(open, None);
+                self.queue_pending(open, None, None);
                 return Err(error);
             }
         };
@@ -640,7 +699,7 @@ impl ArunaSmbBackend {
             Err(error) => {
                 // The SMB handle is gone already; the backend finishes the close itself.
                 if is_transient_close(&error) {
-                    self.queue_pending(open, marker);
+                    self.queue_pending(open, marker, publish);
                 }
                 return Err(vfs_failure(error));
             }
@@ -651,13 +710,14 @@ impl ArunaSmbBackend {
                 time = Some(published.version_id);
             }
             CloseOutcome::Closed | CloseOutcome::Deleted | CloseOutcome::Discarded => {}
-            // A detached instance has no name left to publish to.
-            CloseOutcome::Pending if detached => {}
+            // A detached instance has no name left to publish to; a read-only open or a
+            // quota-blocked checkpoint leaves publication to its writer or the quota retry.
+            CloseOutcome::Pending if detached || !open.write || quota_blocked => {}
             CloseOutcome::QuotaBlocked => return Err(BackendError::DiskFull),
             CloseOutcome::Retained(_) => return Err(BackendError::Denied),
             // The backend keeps the close and publishes the dirty bytes on a later retry.
             CloseOutcome::Pending => {
-                self.queue_pending(open, marker);
+                self.queue_pending(open, marker, None);
                 let unpublished = BackendError::Internal("dirty bytes stay unpublished".into());
                 return Err(failure.unwrap_or(unpublished));
             }

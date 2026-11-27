@@ -10,7 +10,9 @@ use aruna_core::keyspaces::{S3_BUCKET_KEYSPACE, USER_ACCESS_KEYSPACE};
 use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::structs::storage::distribution::{DistributionBinding, DistributionRevision};
-use aruna_core::structs::storage::vfs::{FileIdentity, StageScope};
+use aruna_core::structs::storage::vfs::{
+    DetachReason, FileIdentity, NfsStageRecord, QuotaRetry, StageBase, StageDisposition, StageScope,
+};
 use aruna_core::user::id::UserId;
 use aruna_core::vfs_effects::InstanceSummary;
 use aruna_ops_data::vfs::CHUNK_BYTES;
@@ -440,7 +442,7 @@ async fn pending_delete_retries() {
         "{closed:?}"
     );
     assert!(server.pending.lock().contains_key(&key));
-    server.queue_pending(open.clone(), None);
+    server.queue_pending(open.clone(), None, None);
     assert_eq!(server.pending.lock().len(), 1, "one retry per failed close");
 
     tokio::time::advance(Duration::from_secs(10)).await;
@@ -461,20 +463,21 @@ async fn pending_delete_retries() {
     }
 }
 
-/// A retried close keeps going while an attached instance still holds unpublished dirty bytes
-/// or the failure may pass, and ends on any finished close or a definitive refusal.
+/// A retried close keeps going while its own writer still owns unpublished dirty bytes or the
+/// failure may pass, and ends on any finished close or a definitive refusal.
 #[test]
 fn retry_keeps_unpublished() {
     let published = Published {
         version_id: Ulid::from_parts(1, 1),
         life_id: None,
     };
-    assert!(!writes::retry_done(Ok((CloseOutcome::Pending, false))));
-    assert!(writes::retry_done(Ok((CloseOutcome::Pending, true))));
-    assert!(writes::retry_done(Ok((CloseOutcome::Closed, false))));
+    assert!(!writes::retry_done(Ok((CloseOutcome::Pending, true))));
+    // A read-only open, a detached instance or a quota-blocked checkpoint leaves the bytes.
+    assert!(writes::retry_done(Ok((CloseOutcome::Pending, false))));
+    assert!(writes::retry_done(Ok((CloseOutcome::Closed, true))));
     assert!(writes::retry_done(Ok((
         CloseOutcome::Published(published),
-        false
+        true
     ))));
     let unavailable = VfsError::Unavailable("store offline".into());
     assert!(!writes::retry_done(Err(unavailable)));
@@ -500,4 +503,95 @@ fn prepare_errors_retry() {
     let directory = writes::retry_prepare_error(BackendError::IsDirectory);
     assert!(matches!(directory, VfsError::IsDirectory), "{directory:?}");
     assert!(writes::retry_done(Err(directory)));
+}
+
+/// A live checkpoint row of `open`, waiting for quota when `retry` is set.
+fn stage_row(open: &FileOpen, retry: Option<QuotaRetry>) -> NfsStageRecord {
+    NfsStageRecord {
+        stage_id: Ulid::from_parts(2, 2),
+        handle_id: 4,
+        owner: open.owner.clone(),
+        key: open.key.clone(),
+        generation: 1,
+        checkpoint: "c-1".into(),
+        logical_size: 12,
+        base: StageBase::Unpublished {
+            token: Ulid::from_parts(3, 3),
+            predecessor: None,
+        },
+        source_copies: Vec::new(),
+        source_policies: Vec::new(),
+        destination_copies: Vec::new(),
+        destination_policies: Vec::new(),
+        disposition: StageDisposition::Live,
+        quota_retry: retry,
+        foreign_life: None,
+        updated_at_ms: 0,
+    }
+}
+
+/// Only the last writer publishes dirty bytes at close; a read-only open and a checkpoint the
+/// quota retry owns leave them to their owner.
+#[test]
+fn reader_skips_publish() {
+    let writer = joined_open(None);
+    let mut reader = writer.clone();
+    reader.write = false;
+    let mut summary = renamed_instance(None, Ulid::from_parts(1, 1));
+    summary.dirty = true;
+    summary.writer_count = 0;
+    let live = stage_row(&writer, None);
+    let retry = QuotaRetry {
+        attempts: 1,
+        next_at_ms: 10,
+    };
+    let waiting = stage_row(&writer, Some(retry));
+    let mut kept = waiting.clone();
+    kept.disposition = StageDisposition::Retained {
+        reason: DetachReason::LostLife,
+    };
+    assert!(writes::is_quota_blocked(Some(&waiting)));
+    assert!(!writes::is_quota_blocked(Some(&live)));
+    assert!(!writes::is_quota_blocked(Some(&kept)));
+    assert!(!writes::is_quota_blocked(None));
+
+    assert!(!writes::owns_publish(&reader, &summary, None));
+    assert!(!writes::owns_publish(&reader, &summary, Some(&live)));
+    assert!(!writes::owns_publish(&writer, &summary, Some(&waiting)));
+    assert!(writes::owns_publish(&writer, &summary, None));
+    assert!(writes::owns_publish(&writer, &summary, Some(&live)));
+    summary.writer_count = 2;
+    assert!(!writes::owns_publish(&writer, &summary, None));
+}
+
+/// A queued close keeps the publication attempt it left until a retry settles it, and the
+/// retry settles it first and once, before a later step fails.
+#[tokio::test(start_paused = true)]
+async fn publish_retry_tracked() {
+    let server = backend(MemoryStorage::open());
+    let open = joined_open(None);
+    let scope = BucketScope::new(open.bucket.clone(), open.incarnation);
+    let key = (scope.clone(), open.open_id);
+    let attempt = PublishRetry {
+        attempt_id: Ulid::from_parts(5, 5),
+        logical_size: 12,
+        expected_edit: Some(3),
+    };
+    server.queue_pending(open.clone(), None, Some(attempt));
+    let entry = server.pending.lock().get(&key).cloned();
+    let entry = entry.expect("the failed close is queued");
+    assert_eq!(*entry.publish.lock(), Some(attempt));
+    // Another failed close of the same open never replaces the attempt still to settle.
+    let other = PublishRetry {
+        attempt_id: Ulid::from_parts(6, 6),
+        ..attempt
+    };
+    server.queue_pending(open.clone(), None, Some(other));
+    assert_eq!(*entry.publish.lock(), Some(attempt));
+
+    // Without a receipt the attempt settles as rolled back; the instance lookup after it
+    // still fails on a node without file servers, so the close stays queued.
+    assert!(!server.drain_pending(&scope).await);
+    assert!(server.pending.lock().contains_key(&key));
+    assert_eq!(*entry.publish.lock(), None);
 }

@@ -80,6 +80,16 @@ struct PendingDelete {
     marker: Mutex<Option<PutObjectConfig>>,
     /// Lets one retry run at a time, in the background or before a refused open.
     gate: tokio::sync::Mutex<()>,
+    /// The publication attempt a retry settles before it starts another write.
+    publish: Mutex<Option<PublishRetry>>,
+}
+
+/// One publication attempt whose uncertain outcome must be settled before another write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PublishRetry {
+    attempt_id: Ulid,
+    logical_size: u64,
+    expected_edit: Option<u64>,
 }
 
 /// Transiently failed closes by bucket scope and open.
