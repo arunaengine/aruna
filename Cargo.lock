@@ -692,6 +692,7 @@ dependencies = [
  "ipnet",
  "iroh",
  "irokle",
+ "jiff 1.0.3",
  "md5",
  "opentelemetry",
  "oxrdf",
@@ -5467,6 +5468,7 @@ checksum = "107f2e89536b6818514025f6787b0d94d819e54fe3b40365275fc753de485b3f"
 dependencies = [
  "jiff-core 1.0.2",
  "jiff-static 1.0.3",
+ "jiff-tzdb 1.0.0",
  "jiff-tzdb-platform 1.0.0",
  "log",
  "portable-atomic",

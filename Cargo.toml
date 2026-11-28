@@ -188,6 +188,7 @@ irokle = { git = "https://github.com/arunaengine/irokle.git", rev = "063d8be559f
     "iroh",
 ] }
 iroh-io = "0.6.2"
+jiff = { version = "1.0.3", default-features = false, features = ["std", "tzdb-bundle-always"] }
 jsonwebtoken = { version = "12.0.0", features = ["rust_crypto"] }
 json-patch = "4.2.0"
 keyring-core = "1.1.0"
