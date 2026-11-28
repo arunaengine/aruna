@@ -769,57 +769,85 @@ pub struct StoreVersionOperation {
     stored: Option<Created>,
 }
 
+pub(crate) type WriteRow = (
+    aruna_core::types::KeySpace,
+    aruna_core::types::Key,
+    aruna_core::types::Value,
+);
+
+/// Builds the workflow, version and source write rows for a prepared version and updates `record`.
+pub(crate) fn version_write_rows(
+    workflow_id: Ulid,
+    record: &mut WorkflowRecord,
+    prepared: Prepared,
+    created_by: aruna_core::user::id::UserId,
+    message: Option<String>,
+    now_ms: u64,
+) -> Result<(Created, Vec<WriteRow>), CatalogError> {
+    let version = record.version_count + 1;
+    record.version_count = version;
+    record.updated_at_ms = now_ms;
+    let files = WorkflowFiles {
+        files: prepared.files,
+    };
+    let digest = source_digest(&files.source());
+    let mut paths: Vec<String> = files.files.iter().map(|file| file.path.clone()).collect();
+    paths.sort();
+    let row = WorkflowVersionRecord {
+        workflow_id,
+        version,
+        language: record.language,
+        entrypoint: prepared.entrypoint,
+        files: paths,
+        commit: prepared.commit.clone(),
+        digest: digest.clone(),
+        created_by,
+        created_at_ms: now_ms,
+        message,
+        uwe_yaml: prepared.uwe_yaml,
+        images: prepared.images,
+        inspection: prepared.inspection,
+    };
+    let key = version_key(workflow_id, version);
+    let created = Created {
+        workflow_id,
+        version,
+        commit: prepared.commit,
+        digest,
+    };
+    let rows = vec![
+        (
+            WORKFLOW_KEYSPACE.into(),
+            workflow_key(workflow_id),
+            record.to_bytes()?.into(),
+        ),
+        (
+            WORKFLOW_VERSION_KEYSPACE.into(),
+            key.clone(),
+            row.to_bytes()?.into(),
+        ),
+        (
+            WORKFLOW_SOURCE_KEYSPACE.into(),
+            key,
+            files.to_bytes()?.into(),
+        ),
+    ];
+    Ok((created, rows))
+}
+
 impl StoreVersionOperation {
     fn write(&mut self, mut record: WorkflowRecord) -> Result<Next<Created>, CatalogError> {
-        let version = record.version_count + 1;
-        record.version_count = version;
-        record.updated_at_ms = self.now_ms;
         let prepared = std::mem::take(&mut self.prepared);
-        let files = WorkflowFiles {
-            files: prepared.files,
-        };
-        let digest = source_digest(&files.source());
-        let mut paths: Vec<String> = files.files.iter().map(|file| file.path.clone()).collect();
-        paths.sort();
-        let row = WorkflowVersionRecord {
-            workflow_id: self.workflow_id,
-            version,
-            language: record.language,
-            entrypoint: prepared.entrypoint,
-            files: paths,
-            commit: prepared.commit.clone(),
-            digest: digest.clone(),
-            created_by: self.created_by,
-            created_at_ms: self.now_ms,
-            message: self.message.take(),
-            uwe_yaml: prepared.uwe_yaml,
-            images: prepared.images,
-            inspection: prepared.inspection,
-        };
-        let key = version_key(self.workflow_id, version);
-        self.stored = Some(Created {
-            workflow_id: self.workflow_id,
-            version,
-            commit: prepared.commit,
-            digest,
-        });
-        Ok(Next::Call(IoCall::Write(vec![
-            (
-                WORKFLOW_KEYSPACE.into(),
-                workflow_key(self.workflow_id),
-                record.to_bytes()?.into(),
-            ),
-            (
-                WORKFLOW_VERSION_KEYSPACE.into(),
-                key.clone(),
-                row.to_bytes()?.into(),
-            ),
-            (
-                WORKFLOW_SOURCE_KEYSPACE.into(),
-                key,
-                files.to_bytes()?.into(),
-            ),
-        ])))
+        let (created, rows) = version_write_rows(
+            self.workflow_id,
+            &mut record,
+            prepared,
+            self.created_by,
+            self.message.take(),
+            self.now_ms,
+        )?;
+        self.stored = Some(created);
+        Ok(Next::Call(IoCall::Write(rows)))
     }
 }
 
@@ -959,6 +987,7 @@ impl Operation for CreateWorkflowOperation {
                     created_by: self.auth.user_id,
                     created_at_ms: self.now_ms,
                     updated_at_ms: self.now_ms,
+                    automation_id: None,
                 });
                 self.stage = CreateStage::Prepare;
                 Ok(Next::Call(IoCall::child(prepare)))
