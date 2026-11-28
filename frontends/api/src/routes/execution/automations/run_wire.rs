@@ -286,12 +286,12 @@ impl FiringBody {
             resolutions: firing
                 .resolutions
                 .iter()
-                .map(|resolution: &Resolution| ResolutionBody {
-                    stage: resolution.stage.clone(),
-                    done: resolution.done,
-                    actor: resolution.actor.to_string(),
-                    note: resolution.note.clone(),
-                    at: rfc3339(resolution.at_ms),
+                .map(|r: &Resolution| ResolutionBody {
+                    stage: r.stage.clone(),
+                    done: r.done,
+                    actor: r.actor.to_string(),
+                    note: r.note.clone(),
+                    at: rfc3339(r.at_ms),
                 })
                 .collect(),
             created_at: rfc3339(firing.created_at_ms),

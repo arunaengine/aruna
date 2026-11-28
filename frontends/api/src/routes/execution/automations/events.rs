@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use aruna_ops_work::automations::AutoError;
 use aruna_ops_work::automations::firing_reads::ListEventsOperation;
 use aruna_ops_work::automations::start::{ManualStart, StartEventsOperation, StartManualOperation};
 use aruna_runner::driver::drive;
@@ -124,7 +125,7 @@ pub async fn start_automation(
             }));
             Ok((StatusCode::CONFLICT, Json(body)).into_response())
         }
-        Err(aruna_ops_work::automations::AutoError::Conflict(message)) => {
+        Err(AutoError::Conflict(message)) => {
             let body = StartConflictBody::Conflict(StateConflictBody {
                 error: message,
                 code: Some("Conflict".into()),
