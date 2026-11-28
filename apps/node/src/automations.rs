@@ -22,7 +22,7 @@ use tracing::{debug, warn};
 const WORKER_IDLE: Duration = Duration::from_secs(2);
 const WORKER_BUSY: Duration = Duration::from_millis(200);
 
-/// Runs automation journal matching, schedule trigger ticks and DAG firing advancement until shutdown.
+/// Runs automation journal matching, schedule ticks and DAG firing advancement until shutdown.
 pub fn spawn_worker(
     context: Arc<DriverContext>,
     jobs_runtime: Arc<JobsRuntime>,

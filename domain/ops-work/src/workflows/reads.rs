@@ -436,11 +436,7 @@ impl Operation for DeleteRowsOperation {
                     return Ok(Next::Call(version_rows(self.workflow_id, next)));
                 }
                 if let Some(automation) = self.unlink.take() {
-                    let row = (
-                        AUTOMATIONS_KEYSPACE.to_string(),
-                        automation_key(automation.automation_id),
-                        automation.to_bytes()?.into(),
-                    );
+                    let row = crate::automation_row(&automation)?;
                     self.step = DeleteStep::UnlinkAutomation;
                     return Ok(Next::Call(IoCall::Write(vec![row])));
                 }

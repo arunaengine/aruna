@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use crate::rfc3339;
 use aruna_core::errors::AuthorizationError;
 use aruna_core::id::NodeId;
 use aruna_core::metadata::CRATE_PROFILE_IRI;
@@ -1347,10 +1348,6 @@ fn image_url(registry: &str, name: &str) -> Option<String> {
         "ghcr.io" => Some(format!("https://ghcr.io/{name}")),
         _ => None,
     }
-}
-
-fn rfc3339(ms: u64) -> String {
-    crate::rfc3339(ms)
 }
 
 #[cfg(test)]

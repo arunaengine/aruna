@@ -10,7 +10,7 @@ use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::types::{Key, Value};
 use ulid::Ulid;
 
-use super::AutoError;
+use super::{AutoError, window_retry_after};
 
 /// Atomically checks and increments one or more usage counter rows in `AUTOMATIONS_KEYSPACE`.
 #[derive(Clone, Debug, PartialEq)]
@@ -18,7 +18,7 @@ pub struct CountUsageOperation {
     id: Ulid,
     checks: Vec<(CounterKind, Window, u64, u64)>,
     now_ms: u64,
-    rows: Vec<(Key, u64, u64)>,
+    rows: Vec<(Key, Window, u64, u64)>,
 }
 
 impl CountUsageOperation {
@@ -79,13 +79,13 @@ impl Operation for CountUsageOperation {
             .iter()
             .map(|&(kind, window, add, cap)| {
                 let key = counter_key(self.id, kind, (window, window.start(self.now_ms)));
-                (key, add, cap)
+                (key, window, add, cap)
             })
             .collect();
         let reads = self
             .rows
             .iter()
-            .map(|(key, _, _)| (AUTOMATIONS_KEYSPACE.to_string(), key.clone()))
+            .map(|(key, _, _, _)| (AUTOMATIONS_KEYSPACE.to_string(), key.clone()))
             .collect();
         Ok(Next::Call(IoCall::Read(reads)))
     }
@@ -97,11 +97,14 @@ impl Operation for CountUsageOperation {
         }
         let values = result.values()?;
         let mut writes = Vec::with_capacity(self.rows.len());
-        for ((key, add, cap), stored) in std::mem::take(&mut self.rows).into_iter().zip(values) {
+        for ((key, window, add, cap), stored) in
+            std::mem::take(&mut self.rows).into_iter().zip(values)
+        {
             let next = count_u64(stored.as_deref()).saturating_add(add);
             if next > cap {
-                return Err(AutoError::Limited(
-                    "automation rate or byte cap reached".into(),
+                return Err(AutoError::limited(
+                    "automation rate or byte cap reached",
+                    window_retry_after(window, self.now_ms),
                 ));
             }
             writes.push((
@@ -114,6 +117,6 @@ impl Operation for CountUsageOperation {
     }
 
     fn expected_error(error: &AutoError) -> bool {
-        matches!(error, AutoError::Limited(_))
+        matches!(error, AutoError::Limited { .. })
     }
 }

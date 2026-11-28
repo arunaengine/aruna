@@ -530,9 +530,7 @@ impl Operation for FiringTxOp {
                     return Ok(Next::Call(active_page(Some(after))));
                 }
                 if active_count >= limit {
-                    return Err(AutoError::Limited(
-                        "max_active_firings limit reached".into(),
-                    ));
+                    return Err(AutoError::limited("max_active_firings limit reached", 30));
                 }
                 self.commit_out(*out)
             }

@@ -6,7 +6,6 @@ use std::collections::BTreeSet;
 
 use aruna_core::automation::firing::TriggerPayload;
 use aruna_core::automation::keys::parse_due_key;
-use aruna_core::automation::record::Lifecycle;
 use aruna_core::automation::schedule::next_start;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id_mint::IdMint;
@@ -18,7 +17,8 @@ use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation
 use ulid::Ulid;
 
 use super::admit::{AdmitFiringOp, AdmitOutcome};
-use super::{AutoError, auto_answer, read_auto, schedule_due_page};
+use super::firing_reads::decode_ulid;
+use super::{AutoError, schedule_due_page};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TimerReport {
@@ -31,7 +31,6 @@ pub struct TimerReport {
 enum TimerStep {
     Config,
     Index,
-    LoadAutomation(Ulid),
     AdmitSlot {
         automation_id: Ulid,
         previous_at_ms: Option<u64>,
@@ -39,7 +38,7 @@ enum TimerStep {
 }
 
 /// Evaluates due scheduled automations via the due-time-ordered `SCHEDULE_DUE_ROW` index,
-/// stopping at the first future key and validating schedules inside each admission transaction.
+/// stopping at the first future key and skipping disabled groups without reading records.
 #[derive(Debug, PartialEq)]
 pub struct TickTimersOperation {
     realm_id: RealmId,
@@ -90,8 +89,7 @@ impl TickTimersOperation {
             return Next::Done(self.report);
         };
         self.report.checked += 1;
-        self.step = TimerStep::LoadAutomation(automation_id);
-        Next::Call(read_auto(automation_id))
+        self.admit_slot(automation_id, None)
     }
 
     fn admit_slot(
@@ -100,7 +98,7 @@ impl TickTimersOperation {
         previous_at_ms: Option<u64>,
     ) -> Next<TimerReport> {
         let firing_id = self.ids.mint(self.now_ms);
-        let admit = AdmitFiringOp::schedule(automation_id, firing_id);
+        let admit = AdmitFiringOp::schedule(automation_id, firing_id, self.now_ms);
         self.step = TimerStep::AdmitSlot {
             automation_id,
             previous_at_ms,
@@ -138,16 +136,19 @@ impl Operation for TickTimersOperation {
             TimerStep::Index => {
                 let (rows, next) = result.page()?;
                 let mut reached_future = false;
-                for (key, _) in rows {
-                    let Some((due_ms, automation_id)) = parse_due_key(&key) else {
+                for (key, value) in rows {
+                    let Some(entry) = parse_due_key(&key) else {
                         continue;
                     };
-                    if due_ms > self.now_ms {
+                    if entry.due_ms > self.now_ms {
                         reached_future = true;
                         break;
                     }
-                    if self.seen_ids.insert(automation_id) {
-                        self.due_ids.push(automation_id);
+                    if decode_ulid(&value).is_some_and(|group| !self.feature_on(group)) {
+                        continue;
+                    }
+                    if self.seen_ids.insert(entry.automation_id) {
+                        self.due_ids.push(entry.automation_id);
                     }
                 }
                 if !reached_future && let Some(after) = next {
@@ -156,18 +157,6 @@ impl Operation for TickTimersOperation {
                 }
                 self.due_ids.reverse();
                 Ok(self.next_entry())
-            }
-            TimerStep::LoadAutomation(automation_id) => {
-                let Some(automation) = auto_answer(result)? else {
-                    return Ok(self.admit_slot(automation_id, None));
-                };
-                if automation.lifecycle == Lifecycle::Active
-                    && automation.spec.has_schedules()
-                    && !self.feature_on(automation.group_id)
-                {
-                    return Ok(self.next_entry());
-                }
-                Ok(self.admit_slot(automation_id, None))
             }
             TimerStep::AdmitSlot {
                 automation_id,

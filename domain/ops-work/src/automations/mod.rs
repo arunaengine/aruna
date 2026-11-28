@@ -39,11 +39,11 @@ pub mod upkeep;
 
 use aruna_core::automation::firing::Firing;
 use aruna_core::automation::keys::{
-    active_prefix, firing_key, record_key, record_prefix, schedule_cursor_key, schedule_due_key,
-    schedule_due_prefix,
+    active_prefix, firing_key, group_auto_key, group_prefix, record_key, record_prefix,
+    schedule_cursor_key, schedule_due_key, schedule_due_prefix,
 };
 use aruna_core::automation::record::{Automation, Lifecycle, Spec};
-use aruna_core::automation::schedule::ScheduleCursor;
+use aruna_core::automation::schedule::{CursorMode, ScheduleCursor};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::ConversionError;
 use aruna_core::id::NodeId;
@@ -57,6 +57,7 @@ use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_core::types::{GroupId, Key, KeySpace, Value};
 use aruna_ops_identity::auth::error::AuthorizeError;
 use aruna_ops_identity::auth::request_authorization::AuthorizeOperation;
+use aruna_ops_identity::document_repository::GetConfigError;
 use byteview::ByteView;
 use std::collections::BTreeSet;
 use thiserror::Error;
@@ -76,12 +77,31 @@ pub enum AutoError {
     Conflict(String),
     #[error("{0}")]
     Capacity(String),
-    #[error("{0}")]
-    Limited(String),
+    #[error("{reason}")]
+    Limited { reason: String, retry_after: u64 },
     #[error("{0}")]
     Unavailable(String),
     #[error("storage failed: {0}")]
     Storage(String),
+}
+
+impl AutoError {
+    pub fn limited(reason: impl Into<String>, retry_after: u64) -> Self {
+        Self::Limited {
+            reason: reason.into(),
+            retry_after: retry_after.max(1),
+        }
+    }
+}
+
+pub(crate) fn window_retry_after(
+    window: aruna_core::automation::usage::Window,
+    now_ms: u64,
+) -> u64 {
+    let span = window.span_ms();
+    let elapsed = now_ms % span;
+    let remaining_ms = span.saturating_sub(elapsed);
+    remaining_ms.div_ceil(1_000).max(1)
 }
 
 impl From<IoError> for AutoError {
@@ -160,11 +180,32 @@ pub(crate) fn auto_answer(result: IoResult) -> Result<Option<Automation>, AutoEr
 }
 
 pub(crate) fn auto_row(auto: &Automation) -> Result<(KeySpace, Key, Value), AutoError> {
-    Ok((
+    Ok(crate::automation_row(auto)?)
+}
+
+pub(crate) fn group_auto_row(auto: &Automation) -> (KeySpace, Key, Value) {
+    (
         AUTOMATIONS_KEYSPACE.to_string(),
-        record_key(auto.automation_id),
-        ByteView::from(auto.to_bytes()?),
-    ))
+        group_auto_key(auto.group_id, auto.automation_id),
+        ByteView::from(Vec::new()),
+    )
+}
+
+pub(crate) fn auto_rows(auto: &Automation) -> Result<Vec<(KeySpace, Key, Value)>, AutoError> {
+    let mut rows = vec![auto_row(auto)?];
+    if auto.lifecycle != Lifecycle::Removed {
+        rows.push(group_auto_row(auto));
+    }
+    Ok(rows)
+}
+
+pub(crate) fn group_autos_page(group_id: GroupId, after: Option<Key>) -> IoCall {
+    IoCall::Page {
+        space: AUTOMATIONS_KEYSPACE.to_string(),
+        prefix: group_prefix(group_id),
+        after,
+        limit: 256,
+    }
 }
 
 pub(crate) fn schedule_due_page(after: Option<Key>) -> IoCall {
@@ -189,11 +230,31 @@ pub(crate) fn check_feature(
     }
 }
 
-pub(crate) fn schedule_due_row(due_ms: u64, automation_id: Ulid) -> (KeySpace, Key, Value) {
+/// Decodes a `GetConfigOperation` result and verifies that every listed feature is enabled.
+pub(crate) fn check_features(
+    result: IoResult,
+    disabled: &BTreeSet<Feature>,
+    group_id: GroupId,
+    features: &[Feature],
+) -> Result<(), AutoError> {
+    let config = result
+        .child::<RealmConfigDocument, GetConfigError>()?
+        .map_err(|_| AutoError::Unavailable("the realm feature policy cannot be read".into()))?;
+    for &feature in features {
+        check_feature(&config, disabled, feature, group_id)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn schedule_due_row(
+    due_ms: u64,
+    automation_id: Ulid,
+    group_id: GroupId,
+) -> (KeySpace, Key, Value) {
     (
         AUTOMATIONS_KEYSPACE.to_string(),
         schedule_due_key(due_ms, automation_id),
-        ByteView::from(Vec::new()),
+        ByteView::from(group_id.to_bytes().to_vec()),
     )
 }
 
@@ -218,20 +279,21 @@ pub(crate) struct ScheduleSync {
 pub(crate) fn plan_schedule_sync(
     auto: &Automation,
     previous: Option<&ScheduleCursor>,
-    was_active: bool,
+    mode: CursorMode,
     now_ms: u64,
 ) -> Result<ScheduleSync, AutoError> {
     let next = if auto.lifecycle == Lifecycle::Active {
-        ScheduleCursor::for_spec(&auto.spec, previous, was_active, now_ms)
+        ScheduleCursor::for_spec(&auto.spec, previous, mode, now_ms)
     } else {
         None
     };
-    plan_cursor_transition(auto.automation_id, previous, next.as_ref())
+    plan_cursor_transition(auto.automation_id, auto.group_id, previous, next.as_ref())
 }
 
 /// Computes the due-index and cursor row writes/deletes to move from `previous` to `next`.
 pub(crate) fn plan_cursor_transition(
     automation_id: Ulid,
+    group_id: GroupId,
     previous: Option<&ScheduleCursor>,
     next: Option<&ScheduleCursor>,
 ) -> Result<ScheduleSync, AutoError> {
@@ -252,7 +314,7 @@ pub(crate) fn plan_cursor_transition(
             }
             if previous.map(|old| old.due_ms) != Some(cursor.due_ms) {
                 sync.writes
-                    .push(schedule_due_row(cursor.due_ms, automation_id));
+                    .push(schedule_due_row(cursor.due_ms, automation_id, group_id));
             }
         }
         None => {

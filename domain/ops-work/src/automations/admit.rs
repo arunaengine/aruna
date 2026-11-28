@@ -12,7 +12,7 @@ use aruna_core::automation::keys::{
 };
 use aruna_core::automation::record::{Automation, KeptEvent, Lifecycle, Trigger};
 use aruna_core::automation::rules::{ConditionCheck, ConditionCheckKind, evaluate_conditions};
-use aruna_core::automation::schedule::{ScheduleCursor, schedule_due};
+use aruna_core::automation::schedule::{CursorMode, ScheduleCursor, schedule_due};
 use aruna_core::automation::usage::{CounterKind, Window, count_u64, counter_key};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::{APPLETS_KEYSPACE, AUTOMATION_RUNS_KEYSPACE, AUTOMATIONS_KEYSPACE};
@@ -23,7 +23,9 @@ use byteview::ByteView;
 use ulid::Ulid;
 
 use super::firing_reads::decode_ulid;
-use super::{AutoError, ScheduleSync, active_page, firing_row, plan_cursor_transition};
+use super::{
+    AutoError, ScheduleSync, active_page, firing_row, plan_cursor_transition, window_retry_after,
+};
 
 /// Writes a newly created firing along with its active-set (when active) and firing-id index rows.
 pub(crate) fn new_firing_rows(firing: &Firing) -> Result<Vec<(KeySpace, Key, Value)>, AutoError> {
@@ -224,13 +226,41 @@ pub(crate) struct AdmitFiringOp {
     payload: TriggerPayload,
     source: AdmitSource,
     now_ms: u64,
-    rate_keys: Option<(Key, Key)>,
+    rate_keys: (Key, Key),
     step: AdmitStep,
 }
 
+fn require_active(auto: &Automation) -> Result<(), AutoError> {
+    if auto.lifecycle != Lifecycle::Active {
+        return Err(AutoError::Conflict(
+            "automation must be active to start".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn rate_keys_for(auto_id: Ulid, window_ms: u64) -> (Key, Key) {
+    let hour = counter_key(
+        auto_id,
+        CounterKind::Firings,
+        (Window::Hour, Window::Hour.start(window_ms)),
+    );
+    let day = counter_key(
+        auto_id,
+        CounterKind::Firings,
+        (Window::Day, Window::Day.start(window_ms)),
+    );
+    (hour, day)
+}
+
 impl AdmitFiringOp {
-    pub(crate) fn manual(auto_id: Ulid, firing_id: Ulid, payload: TriggerPayload) -> Self {
-        Self::new(auto_id, firing_id, payload, AdmitSource::Manual)
+    pub(crate) fn manual(
+        auto_id: Ulid,
+        firing_id: Ulid,
+        payload: TriggerPayload,
+        window_ms: u64,
+    ) -> Self {
+        Self::new(auto_id, firing_id, payload, AdmitSource::Manual, window_ms)
     }
 
     pub(crate) fn journal(
@@ -239,12 +269,14 @@ impl AdmitFiringOp {
         source: String,
         actor: Option<UserId>,
         payload: TriggerPayload,
+        window_ms: u64,
     ) -> Self {
         Self::new(
             auto_id,
             firing_id,
             payload,
             AdmitSource::Journal { source, actor },
+            window_ms,
         )
     }
 
@@ -253,48 +285,43 @@ impl AdmitFiringOp {
         event_id: Ulid,
         firing_id: Ulid,
         payload: TriggerPayload,
+        window_ms: u64,
     ) -> Self {
         Self::new(
             auto_id,
             firing_id,
             payload,
             AdmitSource::Replay { event_id },
+            window_ms,
         )
     }
 
-    pub(crate) fn schedule(auto_id: Ulid, firing_id: Ulid) -> Self {
+    pub(crate) fn schedule(auto_id: Ulid, firing_id: Ulid, window_ms: u64) -> Self {
         Self::new(
             auto_id,
             firing_id,
             TriggerPayload::Schedule { at_ms: 0 },
             AdmitSource::Schedule,
+            window_ms,
         )
     }
 
-    fn new(auto_id: Ulid, firing_id: Ulid, payload: TriggerPayload, source: AdmitSource) -> Self {
+    fn new(
+        auto_id: Ulid,
+        firing_id: Ulid,
+        payload: TriggerPayload,
+        source: AdmitSource,
+        window_ms: u64,
+    ) -> Self {
         Self {
             auto_id,
             firing_id,
             payload,
             source,
-            now_ms: 0,
-            rate_keys: None,
+            now_ms: window_ms,
+            rate_keys: rate_keys_for(auto_id, window_ms),
             step: AdmitStep::Read,
         }
-    }
-
-    fn compute_rate_keys(&self) -> (Key, Key) {
-        let hour = counter_key(
-            self.auto_id,
-            CounterKind::Firings,
-            (Window::Hour, Window::Hour.start(self.now_ms)),
-        );
-        let day = counter_key(
-            self.auto_id,
-            CounterKind::Firings,
-            (Window::Day, Window::Day.start(self.now_ms)),
-        );
-        (hour, day)
     }
 
     fn finish_write(
@@ -396,8 +423,7 @@ impl Operation for AdmitFiringOp {
 
     fn first(&mut self) -> Result<Next<AdmitOutcome>, AutoError> {
         self.step = AdmitStep::Read;
-        let (hour_key, day_key) = self.compute_rate_keys();
-        self.rate_keys = Some((hour_key.clone(), day_key.clone()));
+        let (hour_key, day_key) = self.rate_keys.clone();
         let mut reads = vec![
             (AUTOMATIONS_KEYSPACE.to_string(), record_key(self.auto_id)),
             (AUTOMATIONS_KEYSPACE.to_string(), hour_key),
@@ -446,7 +472,8 @@ impl Operation for AdmitFiringOp {
                         && let Some(cursor_bytes) = values.get(3).and_then(Option::as_deref)
                     {
                         let cursor = ScheduleCursor::from_bytes(cursor_bytes)?;
-                        let sync = plan_cursor_transition(self.auto_id, Some(&cursor), None)?;
+                        let sync =
+                            plan_cursor_transition(self.auto_id, Ulid::nil(), Some(&cursor), None)?;
                         return self.apply_idle_sync(sync, IdleOutcome::Unmatched);
                     }
                     return Err(AutoError::NotFound);
@@ -462,62 +489,68 @@ impl Operation for AdmitFiringOp {
                         firing_key(self.auto_id, existing_id),
                     )])));
                 }
-                if matches!(self.source, AdmitSource::Schedule) {
-                    let stored_cursor = values
-                        .get(3)
-                        .and_then(Option::as_deref)
-                        .map(ScheduleCursor::from_bytes)
-                        .transpose()?;
-                    if auto.lifecycle != Lifecycle::Active || !auto.spec.has_schedules() {
-                        let sync =
-                            plan_cursor_transition(self.auto_id, stored_cursor.as_ref(), None)?;
-                        return self.apply_idle_sync(sync, IdleOutcome::Unmatched);
-                    }
-                    let Some(cursor) = stored_cursor else {
-                        return Ok(Next::Done(AdmitOutcome::AlreadySeen));
-                    };
-                    let due = schedule_due(&auto.spec, &cursor, self.now_ms);
-                    if due.missed_count > 0
-                        && let (Some(first_ms), Some(last_ms)) =
-                            (due.first_missed_ms, due.last_missed_ms)
-                    {
-                        self.payload = TriggerPayload::Schedule { at_ms: last_ms };
-                        let next_cursor = cursor.advance(&auto.spec, last_ms, self.now_ms);
-                        let sync = plan_cursor_transition(
+                match &self.source {
+                    AdmitSource::Schedule => {
+                        let stored_cursor = values
+                            .get(3)
+                            .and_then(Option::as_deref)
+                            .map(ScheduleCursor::from_bytes)
+                            .transpose()?;
+                        if auto.lifecycle != Lifecycle::Active || !auto.spec.has_schedules() {
+                            let sync = plan_cursor_transition(
+                                self.auto_id,
+                                auto.group_id,
+                                stored_cursor.as_ref(),
+                                None,
+                            )?;
+                            return self.apply_idle_sync(sync, IdleOutcome::Unmatched);
+                        }
+                        let Some(cursor) = stored_cursor else {
+                            return Ok(Next::Done(AdmitOutcome::AlreadySeen));
+                        };
+                        let due = schedule_due(&auto.spec, &cursor, self.now_ms);
+                        if due.missed_count > 0
+                            && let (Some(first_ms), Some(last_ms)) =
+                                (due.first_missed_ms, due.last_missed_ms)
+                        {
+                            self.payload = TriggerPayload::Schedule { at_ms: last_ms };
+                            let next_cursor = cursor.advance(&auto.spec, last_ms, self.now_ms);
+                            let sync = plan_cursor_transition(
+                                auto.automation_id,
+                                auto.group_id,
+                                Some(&cursor),
+                                next_cursor.as_ref(),
+                            )?;
+                            let reason = missed_reason(due.missed_count, first_ms, last_ms);
+                            return self.write_skipped(&auto, reason, Vec::new(), Some(sync));
+                        }
+                        let Some(slot_ms) = due.live_slot_ms else {
+                            let refreshed = ScheduleCursor::for_spec(
+                                &auto.spec,
+                                Some(&cursor),
+                                CursorMode::Preserve,
+                                self.now_ms,
+                            );
+                            let sync = plan_cursor_transition(
+                                auto.automation_id,
+                                auto.group_id,
+                                Some(&cursor),
+                                refreshed.as_ref(),
+                            )?;
+                            return self.apply_idle_sync(sync, IdleOutcome::AlreadySeen);
+                        };
+                        self.payload = TriggerPayload::Schedule { at_ms: slot_ms };
+                        let next_cursor = cursor.advance(&auto.spec, slot_ms, self.now_ms);
+                        let schedule_sync = plan_cursor_transition(
                             auto.automation_id,
+                            auto.group_id,
                             Some(&cursor),
                             next_cursor.as_ref(),
                         )?;
-                        let reason = missed_reason(due.missed_count, first_ms, last_ms);
-                        return self.write_skipped(&auto, reason, Vec::new(), Some(sync));
+                        return self.evaluate_and_check(auto, values, Some(schedule_sync));
                     }
-                    let Some(slot_ms) = due.live_slot_ms else {
-                        let refreshed =
-                            ScheduleCursor::for_spec(&auto.spec, Some(&cursor), true, self.now_ms);
-                        let sync = plan_cursor_transition(
-                            auto.automation_id,
-                            Some(&cursor),
-                            refreshed.as_ref(),
-                        )?;
-                        return self.apply_idle_sync(sync, IdleOutcome::AlreadySeen);
-                    };
-                    self.payload = TriggerPayload::Schedule { at_ms: slot_ms };
-                    let next_cursor = cursor.advance(&auto.spec, slot_ms, self.now_ms);
-                    let schedule_sync = plan_cursor_transition(
-                        auto.automation_id,
-                        Some(&cursor),
-                        next_cursor.as_ref(),
-                    )?;
-                    return self.evaluate_and_check(auto, values, Some(schedule_sync));
-                }
-
-                if auto.lifecycle != Lifecycle::Active {
-                    return Err(AutoError::Conflict(
-                        "automation must be active to start".into(),
-                    ));
-                }
-                match &self.source {
                     AdmitSource::Manual => {
+                        require_active(&auto)?;
                         if !matches_trigger(&auto, &self.payload, None, None) {
                             return Err(AutoError::Invalid(
                                 "automation has no manual trigger".into(),
@@ -525,6 +558,7 @@ impl Operation for AdmitFiringOp {
                         }
                     }
                     AdmitSource::Journal { actor, .. } => {
+                        require_active(&auto)?;
                         if values.get(3).and_then(Option::as_ref).is_some() {
                             return Ok(Next::Done(AdmitOutcome::AlreadySeen));
                         }
@@ -548,6 +582,7 @@ impl Operation for AdmitFiringOp {
                         }
                     }
                     AdmitSource::Replay { .. } => {
+                        require_active(&auto)?;
                         let kept_bytes = values
                             .get(4)
                             .and_then(Option::as_deref)
@@ -571,7 +606,6 @@ impl Operation for AdmitFiringOp {
                             ));
                         }
                     }
-                    AdmitSource::Schedule => unreachable!(),
                 }
                 self.evaluate_and_check(auto, values, None)
             }
@@ -620,9 +654,7 @@ impl Operation for AdmitFiringOp {
                         checks.push(limit_check(ConditionCheckKind::ActiveLimit, text, why));
                         return self.write_skipped(&auto, reason, checks, schedule_sync);
                     }
-                    return Err(AutoError::Limited(
-                        "max_active_firings limit reached".into(),
-                    ));
+                    return Err(AutoError::limited("max_active_firings limit reached", 30));
                 }
                 let firing = Firing::new(
                     self.firing_id,
@@ -720,10 +752,7 @@ impl AdmitFiringOp {
         {
             return Ok(Next::Done(AdmitOutcome::ChainDepth));
         }
-        let (hour_key, day_key) = self
-            .rate_keys
-            .clone()
-            .unwrap_or_else(|| self.compute_rate_keys());
+        let (hour_key, day_key) = self.rate_keys.clone();
         let limits = &auto.spec.scope.limits;
         let hour_cap = limits.hour_limit();
         let day_cap = limits.day_limit();
@@ -732,8 +761,9 @@ impl AdmitFiringOp {
         let hour_next = hour_count.saturating_add(1);
         let day_next = day_count.saturating_add(1);
         if hour_next > u64::from(hour_cap) || day_next > u64::from(day_cap) {
+            let over_hour = hour_next > u64::from(hour_cap);
             if matches!(self.source, AdmitSource::Schedule) {
-                let (text, why) = if hour_next > u64::from(hour_cap) {
+                let (text, why) = if over_hour {
                     (
                         format!("At most {hour_cap} starts per hour"),
                         format!("{hour_count} starts in this hour already."),
@@ -749,8 +779,14 @@ impl AdmitFiringOp {
                 checks.push(limit_check(ConditionCheckKind::Starts, text, why));
                 return self.write_skipped(&auto, reason, checks, schedule_sync);
             }
-            return Err(AutoError::Limited(
-                "automation rate or byte cap reached".into(),
+            let retry_after = if over_hour {
+                window_retry_after(Window::Hour, self.now_ms)
+            } else {
+                window_retry_after(Window::Day, self.now_ms)
+            };
+            return Err(AutoError::limited(
+                "automation rate or byte cap reached",
+                retry_after,
             ));
         }
         self.step = AdmitStep::Active {
