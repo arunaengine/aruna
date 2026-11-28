@@ -86,7 +86,7 @@ async fn runner_guards_recovery() {
         key: "dir/a\"b\\c\nd.csv".into(),
         version_id: ver,
         path: "/p".into(),
-        size_bytes: 5,
+        size_bytes: Some(5),
     };
     let qf = Firing::new(
         Ulid::from_bytes([104; 16]),

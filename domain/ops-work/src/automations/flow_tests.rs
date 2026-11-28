@@ -557,7 +557,7 @@ async fn paused_widening_staged() {
 #[tokio::test]
 async fn delete_blocked_active() {
     use super::control::CancelFiringOperation;
-    use super::start::StartManualOperation;
+    use super::start::{ManualStart, StartManualOperation};
 
     let env = Env::new().await;
     let mut spec = env.base_spec();
@@ -565,12 +565,14 @@ async fn delete_blocked_active() {
     let active = env.create_active(spec).await;
     let id = active.automation_id;
 
-    let first = drive(
+    let ManualStart::Started(first) = drive(
         StartManualOperation::new(&env.owner, id, env.node, "{}".into()),
         &env.ctx,
     )
     .await
-    .unwrap();
+    .unwrap() else {
+        panic!("expected started firing");
+    };
     let second = drive(
         StartManualOperation::new(&env.owner, id, env.node, "{}".into()),
         &env.ctx,

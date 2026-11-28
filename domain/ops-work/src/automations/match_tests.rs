@@ -40,10 +40,12 @@ async fn matcher_and_replay() {
             applet_id: None,
         },
     ];
+    spec.scope.allow_outside_input = true;
     spec.scope.limits = Limits {
         max_chain_depth: Some(1),
         ..Limits::default()
     };
+    spec.scope.allow_outside_input = true;
     let auto = env.create_active(spec).await;
 
     // Self-upload is skipped; matching user upload fires once; cursor prevents duplicates.
@@ -215,6 +217,7 @@ async fn out_of_order() {
             applet_id: Some(applet_id),
         },
     ];
+    spec.scope.allow_outside_input = true;
     let auto = env.create_active(spec).await;
     let loc = (env.realm, env.group, env.node);
 
@@ -351,14 +354,13 @@ async fn out_of_order() {
             auto.automation_id,
             Ulid::from_bytes([87; 16]),
             "data_uploaded/stale".into(),
-            auto.revision,
             Some(env.owner.user_id),
             TriggerPayload::DataUploaded {
                 bucket: "raw".into(),
                 key: "in/late.csv".into(),
                 version_id: Ulid::from_bytes([86; 16]),
                 path: "/p".into(),
-                size_bytes: 10,
+                size_bytes: Some(10),
             },
         ),
         &env.ctx,
@@ -392,7 +394,6 @@ async fn out_of_order() {
             auto.automation_id,
             Ulid::from_bytes([85; 16]),
             "run_finished/depth-hit".into(),
-            edited.revision,
             Some(env.owner.user_id),
             TriggerPayload::RunFinished {
                 workflow_id: wf_id,

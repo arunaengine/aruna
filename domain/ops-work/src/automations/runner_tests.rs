@@ -24,7 +24,7 @@ use super::control::{
 use super::firing_reads::GetFiringOperation;
 use super::flow_tests::Env;
 use super::runner::StepFiringsOperation;
-use super::start::{StartManualOperation, new_firing_rows};
+use super::start::{ManualStart, StartManualOperation, new_firing_rows};
 use super::upkeep::AutoUpkeepOperation;
 
 #[tokio::test]
@@ -60,12 +60,14 @@ async fn stages_and_edges() {
         },
     };
     let auto = env.create_active(spec).await;
-    let started = drive(
+    let ManualStart::Started(started) = drive(
         StartManualOperation::new(&env.owner, auto.automation_id, env.node, "{}".into()),
         &env.ctx,
     )
     .await
-    .unwrap();
+    .unwrap() else {
+        panic!("expected started firing");
+    };
     drive(StepFiringsOperation::new((env.node, env.realm)), &env.ctx)
         .await
         .unwrap();
@@ -295,7 +297,13 @@ async fn stages_and_edges() {
         ),
         reason: "paused".into(),
         kept_at_ms: 1,
-        payload: None,
+        payload: TriggerPayload::DataUploaded {
+            bucket: "raw".into(),
+            key: "in/old.csv".into(),
+            version_id: Ulid::from_bytes([99; 16]),
+            path: "/r/g/raw/in/old.csv".into(),
+            size_bytes: Some(10),
+        },
     };
     env.write_row(
         AUTOMATIONS_KEYSPACE,
@@ -351,12 +359,14 @@ async fn pinned_spec_cancel() {
         },
     };
     let auto = env.create_active(spec_v1.clone()).await;
-    let started = drive(
+    let ManualStart::Started(started) = drive(
         StartManualOperation::new(&env.owner, auto.automation_id, env.node, "{}".into()),
         &env.ctx,
     )
     .await
-    .unwrap();
+    .unwrap() else {
+        panic!("expected started firing");
+    };
     drive(StepFiringsOperation::new((env.node, env.realm)), &env.ctx)
         .await
         .unwrap();
