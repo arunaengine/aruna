@@ -106,10 +106,6 @@ pub(crate) fn pinned_retry_after(window: Window, pinned_ms: u64, now_ms: u64) ->
     expiry_ms.saturating_sub(now_ms).div_ceil(1_000).max(1)
 }
 
-pub(crate) fn window_retry_after(window: Window, now_ms: u64) -> u64 {
-    pinned_retry_after(window, now_ms, now_ms)
-}
-
 impl From<IoError> for AutoError {
     fn from(error: IoError) -> Self {
         Self::Storage(error.to_string())
