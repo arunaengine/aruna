@@ -4,30 +4,25 @@
 
 use std::collections::BTreeSet;
 
-use aruna_core::applet::record::{SubmissionReceipt, submission_key};
 use aruna_core::automation::firing::{Firing, TriggerPayload};
 use aruna_core::automation::keys::{firing_key, kept_key, replay_key};
-use aruna_core::automation::record::{Automation, KeptEvent, RunStatus};
+use aruna_core::automation::record::{Automation, KeptEvent};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
-use aruna_core::keyspaces::{
-    APPLETS_KEYSPACE, AUTOMATION_RUNS_KEYSPACE, AUTOMATIONS_KEYSPACE, WORKFLOW_RUN_KEYSPACE,
-};
+use aruna_core::keyspaces::{AUTOMATION_RUNS_KEYSPACE, AUTOMATIONS_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::plugin_runs::{SourceEvent, SourceKind};
-use aruna_core::structs::execution::workflow_run::{RunState, WorkflowRunRecord, run_key};
+use aruna_core::plugin_runs::SourceEvent;
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_ops_data::s3::object::head::{
-    HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
-};
+use aruna_core::structs::identity::features::Feature;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 use ulid::Ulid;
 
 #[cfg(test)]
 pub(crate) use super::admit::new_firing_rows;
 pub(crate) use super::admit::{AdmitFiringOp, AdmitOutcome, parse_replay};
-use super::copy_stage::source_length;
-use super::{AutoAccessOperation, AutoError, Need};
+use super::{AutoAccessOperation, AutoError, Need, check_feature};
 
 /// Parses a `DataUploaded` source event into `(bucket, version_id, key)`.
 pub(crate) fn parse_upload(event: &SourceEvent) -> Option<(String, Ulid, String)> {
@@ -42,9 +37,17 @@ pub(crate) fn parse_upload(event: &SourceEvent) -> Option<(String, Ulid, String)
     Some((bucket, version_id, key))
 }
 
+/// Outcome of a manual automation start request.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ManualStart {
+    Started(Firing),
+    Skipped(Firing),
+}
+
 #[derive(Debug, PartialEq)]
 enum ManualStep {
     Access,
+    Config(Box<Automation>),
     Admit,
 }
 
@@ -55,6 +58,7 @@ pub struct StartManualOperation {
     id: Ulid,
     local: NodeId,
     values_json: String,
+    disabled_features: BTreeSet<Feature>,
     ids: IdMint,
     now_ms: u64,
     step: ManualStep,
@@ -67,15 +71,21 @@ impl StartManualOperation {
             id,
             local,
             values_json,
+            disabled_features: BTreeSet::new(),
             ids: IdMint::default(),
             now_ms: 0,
             step: ManualStep::Access,
         }
     }
+
+    pub fn with_disabled_features(mut self, disabled: BTreeSet<Feature>) -> Self {
+        self.disabled_features = disabled;
+        self
+    }
 }
 
 impl Operation for StartManualOperation {
-    type Output = Firing;
+    type Output = ManualStart;
     type Error = AutoError;
 
     fn stamp(&mut self, now_ms: u64) {
@@ -86,21 +96,40 @@ impl Operation for StartManualOperation {
         self.ids = IdMint::new(seed);
     }
 
-    fn first(&mut self) -> Result<Next<Firing>, AutoError> {
+    fn first(&mut self) -> Result<Next<ManualStart>, AutoError> {
+        self.step = ManualStep::Access;
         let access = AutoAccessOperation::new(&self.auth, self.id, self.local, Need::Write);
         Ok(Next::Call(IoCall::child(access)))
     }
 
-    fn next(&mut self, result: IoResult) -> Result<Next<Firing>, AutoError> {
+    fn next(&mut self, result: IoResult) -> Result<Next<ManualStart>, AutoError> {
         match std::mem::replace(&mut self.step, ManualStep::Admit) {
             ManualStep::Access => {
                 let auto = result.child::<Automation, AutoError>()??;
+                self.step = ManualStep::Config(Box::new(auto));
+                Ok(Next::Call(IoCall::child(GetConfigOperation::new(
+                    self.auth.realm_id,
+                ))))
+            }
+            ManualStep::Config(auto) => {
+                let config = result
+                    .child::<RealmConfigDocument, GetConfigError>()?
+                    .map_err(|_| {
+                        AutoError::Unavailable("the realm feature policy cannot be read".into())
+                    })?;
+                check_feature(
+                    &config,
+                    &self.disabled_features,
+                    Feature::Automations,
+                    auto.group_id,
+                )?;
                 let firing_id = self.ids.mint(self.now_ms);
                 let payload = TriggerPayload::Manual {
                     values_json: self.values_json.clone(),
                     actor: self.auth.user_id,
                 };
                 let admit = AdmitFiringOp::manual(auto.automation_id, firing_id, payload);
+                self.step = ManualStep::Admit;
                 Ok(Next::Call(IoCall::retry(
                     admit,
                     &auto.automation_id.to_bytes(),
@@ -108,9 +137,9 @@ impl Operation for StartManualOperation {
             }
             ManualStep::Admit => match result.child::<AdmitOutcome, AutoError>()?? {
                 AdmitOutcome::Created(firing) | AdmitOutcome::Existing(firing) => {
-                    Ok(Next::Done(firing))
+                    Ok(Next::Done(ManualStart::Started(firing)))
                 }
-                AdmitOutcome::Skipped(firing) => Err(AutoError::ConditionsNotMet(Box::new(firing))),
+                AdmitOutcome::Skipped(firing) => Ok(Next::Done(ManualStart::Skipped(firing))),
                 AdmitOutcome::AlreadySeen | AdmitOutcome::Unmatched | AdmitOutcome::ChainDepth => {
                     Err(IoError::Unfinished.into())
                 }
@@ -132,10 +161,9 @@ enum ReplayItem {
 #[derive(Debug, PartialEq)]
 enum ReplayStep {
     Access,
+    Config(Box<Automation>),
     ReadKept,
     LoadReplayed,
-    EnrichUpload(Box<KeptEvent>, String, Ulid, String),
-    Enrich(Box<KeptEvent>),
     Admit,
 }
 
@@ -147,6 +175,7 @@ pub struct StartEventsOperation {
     id: Ulid,
     local: NodeId,
     event_ids: Vec<Ulid>,
+    disabled_features: BTreeSet<Feature>,
     ids: IdMint,
     now_ms: u64,
     pending: Vec<ReplayItem>,
@@ -157,12 +186,13 @@ pub struct StartEventsOperation {
 impl StartEventsOperation {
     pub fn new(auth: &AuthContext, id: Ulid, local: NodeId, mut event_ids: Vec<Ulid>) -> Self {
         let mut seen = BTreeSet::new();
-        event_ids.retain(|eid| seen.insert(*eid));
+        event_ids.retain(|event_id| seen.insert(*event_id));
         Self {
             auth: auth.clone(),
             id,
             local,
             event_ids,
+            disabled_features: BTreeSet::new(),
             ids: IdMint::default(),
             now_ms: 0,
             pending: Vec::new(),
@@ -171,68 +201,30 @@ impl StartEventsOperation {
         }
     }
 
+    pub fn with_disabled_features(mut self, disabled: BTreeSet<Feature>) -> Self {
+        self.disabled_features = disabled;
+        self
+    }
+
     fn next_item(&mut self) -> Result<Next<Vec<Firing>>, AutoError> {
         let Some(item) = self.pending.pop() else {
             return Ok(Next::Done(std::mem::take(&mut self.started)));
         };
-        let kept = match item {
+        match item {
             ReplayItem::Replayed(firing_id) => {
                 self.step = ReplayStep::LoadReplayed;
-                return Ok(Next::Call(IoCall::Read(vec![(
+                Ok(Next::Call(IoCall::Read(vec![(
                     AUTOMATION_RUNS_KEYSPACE.to_string(),
                     firing_key(self.id, firing_id),
-                )])));
-            }
-            ReplayItem::Kept(kept) => *kept,
-        };
-        if let Some(payload) = kept.payload {
-            return self.begin_admit(kept.event_id, payload);
-        }
-        match kept.event.kind {
-            SourceKind::DataUploaded => {
-                let (bucket, version_id, key) = parse_upload(&kept.event)
-                    .ok_or_else(|| AutoError::Invalid("malformed upload event".into()))?;
-                let head = HeadObjectOperation::new(HeadObjectInput {
-                    bucket: bucket.clone(),
-                    key: key.clone(),
-                    version_id: Some(version_id),
-                });
-                self.step = ReplayStep::EnrichUpload(Box::new(kept), bucket, version_id, key);
-                Ok(Next::Call(IoCall::child(head)))
-            }
-            SourceKind::AppletSubmission => {
-                let applet_id = Ulid::from_string(&kept.event.resource)
-                    .map_err(|_| AutoError::Invalid("bad applet_id in event".into()))?;
-                let ver_id = Ulid::from_string(&kept.event.revision)
-                    .map_err(|_| AutoError::Invalid("bad version_id in event".into()))?;
-                self.step = ReplayStep::Enrich(Box::new(kept));
-                Ok(Next::Call(IoCall::Read(vec![(
-                    APPLETS_KEYSPACE.to_string(),
-                    submission_key(applet_id, ver_id),
                 )])))
             }
-            SourceKind::RunFinished => {
-                let run_id = Ulid::from_string(&kept.event.revision)
-                    .map_err(|_| AutoError::Invalid("bad run_id in event".into()))?;
-                self.step = ReplayStep::Enrich(Box::new(kept));
-                Ok(Next::Call(IoCall::Read(vec![(
-                    WORKFLOW_RUN_KEYSPACE.to_string(),
-                    run_key(run_id),
-                )])))
+            ReplayItem::Kept(kept) => {
+                let firing_id = self.ids.mint(self.now_ms);
+                let admit = AdmitFiringOp::replay(self.id, kept.event_id, firing_id, kept.payload);
+                self.step = ReplayStep::Admit;
+                Ok(Next::Call(IoCall::retry(admit, &self.id.to_bytes())))
             }
-            _ => self.next_item(),
         }
-    }
-
-    fn begin_admit(
-        &mut self,
-        event_id: Ulid,
-        payload: TriggerPayload,
-    ) -> Result<Next<Vec<Firing>>, AutoError> {
-        let firing_id = self.ids.mint(self.now_ms);
-        let admit = AdmitFiringOp::replay(self.id, event_id, firing_id, payload);
-        self.step = ReplayStep::Admit;
-        Ok(Next::Call(IoCall::retry(admit, &self.id.to_bytes())))
     }
 }
 
@@ -252,6 +244,7 @@ impl Operation for StartEventsOperation {
         if self.event_ids.is_empty() {
             return Err(AutoError::Invalid("select at least one event_id".into()));
         }
+        self.step = ReplayStep::Access;
         let access = AutoAccessOperation::new(&self.auth, self.id, self.local, Need::Write);
         Ok(Next::Call(IoCall::child(access)))
     }
@@ -260,15 +253,40 @@ impl Operation for StartEventsOperation {
         match std::mem::replace(&mut self.step, ReplayStep::Admit) {
             ReplayStep::Access => {
                 let auto = result.child::<Automation, AutoError>()??;
+                self.step = ReplayStep::Config(Box::new(auto));
+                Ok(Next::Call(IoCall::child(GetConfigOperation::new(
+                    self.auth.realm_id,
+                ))))
+            }
+            ReplayStep::Config(auto) => {
+                let config = result
+                    .child::<RealmConfigDocument, GetConfigError>()?
+                    .map_err(|_| {
+                        AutoError::Unavailable("the realm feature policy cannot be read".into())
+                    })?;
+                check_feature(
+                    &config,
+                    &self.disabled_features,
+                    Feature::Automations,
+                    auto.group_id,
+                )?;
+                if auto.spec.uses_applets() {
+                    check_feature(
+                        &config,
+                        &self.disabled_features,
+                        Feature::Applets,
+                        auto.group_id,
+                    )?;
+                }
                 let mut reads = Vec::with_capacity(self.event_ids.len() * 2);
-                for eid in &self.event_ids {
+                for event_id in &self.event_ids {
                     reads.push((
                         AUTOMATIONS_KEYSPACE.to_string(),
-                        kept_key(auto.automation_id, *eid),
+                        kept_key(auto.automation_id, *event_id),
                     ));
                     reads.push((
                         AUTOMATIONS_KEYSPACE.to_string(),
-                        replay_key(auto.automation_id, *eid),
+                        replay_key(auto.automation_id, *event_id),
                     ));
                 }
                 self.step = ReplayStep::ReadKept;
@@ -298,71 +316,6 @@ impl Operation for StartEventsOperation {
                 }
                 self.next_item()
             }
-            ReplayStep::EnrichUpload(kept, bucket, version_id, key) => {
-                let size_bytes = match result.child::<HeadObjectResult, HeadObjectError>()? {
-                    Ok(head) => source_length(&head).unwrap_or(0),
-                    Err(_) => 0,
-                };
-                let payload = TriggerPayload::DataUploaded {
-                    bucket,
-                    key,
-                    version_id,
-                    path: kept.event.path.clone(),
-                    size_bytes,
-                };
-                self.begin_admit(kept.event_id, payload)
-            }
-            ReplayStep::Enrich(kept) => {
-                let Some(bytes) = result.value()? else {
-                    return self.next_item();
-                };
-                let payload = match kept.event.kind {
-                    SourceKind::AppletSubmission => {
-                        let rec = SubmissionReceipt::from_bytes(&bytes)?;
-                        TriggerPayload::AppletSubmission {
-                            applet_id: rec.applet_id,
-                            version_id: rec.version_id,
-                            pseudonym: rec.pseudonym,
-                            guest: rec.guest,
-                            outside_input: rec.outside_input || rec.guest,
-                            bucket: rec.bucket,
-                            key: rec.key,
-                            files: rec.files,
-                        }
-                    }
-                    SourceKind::RunFinished => {
-                        let rec = WorkflowRunRecord::from_bytes(&bytes)?;
-                        let status = match rec.state {
-                            RunState::Succeeded => RunStatus::Succeeded,
-                            _ => RunStatus::Failed,
-                        };
-                        let depth = rec
-                            .automation
-                            .as_ref()
-                            .map_or(0, |o| o.depth)
-                            .saturating_add(1);
-                        let applet_id = rec
-                            .automation
-                            .as_ref()
-                            .and_then(|o| o.applet_id)
-                            .or_else(|| rec.applet.as_ref().map(|a| a.applet_id));
-                        let outside_input =
-                            rec.automation.as_ref().is_some_and(|o| o.outside_input)
-                                || rec.applet.as_ref().is_some_and(|a| a.outside_input);
-                        TriggerPayload::RunFinished {
-                            workflow_id: rec.workflow_id,
-                            run_id: rec.run_id,
-                            status,
-                            outputs: rec.outputs,
-                            applet_id,
-                            outside_input,
-                            depth,
-                        }
-                    }
-                    _ => return self.next_item(),
-                };
-                self.begin_admit(kept.event_id, payload)
-            }
             ReplayStep::Admit => {
                 match result.child::<AdmitOutcome, AutoError>()?? {
                     AdmitOutcome::Created(firing)
@@ -370,9 +323,17 @@ impl Operation for StartEventsOperation {
                     | AdmitOutcome::Skipped(firing) => {
                         self.started.push(firing);
                     }
-                    AdmitOutcome::AlreadySeen
-                    | AdmitOutcome::Unmatched
-                    | AdmitOutcome::ChainDepth => {}
+                    AdmitOutcome::Unmatched => {
+                        return Err(AutoError::Conflict(
+                            "kept event no longer matches this automation's triggers".into(),
+                        ));
+                    }
+                    AdmitOutcome::ChainDepth => {
+                        return Err(AutoError::Conflict(
+                            "kept event exceeds max_chain_depth".into(),
+                        ));
+                    }
+                    AdmitOutcome::AlreadySeen => {}
                 }
                 self.next_item()
             }

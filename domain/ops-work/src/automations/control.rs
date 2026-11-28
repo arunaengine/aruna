@@ -2,6 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeSet;
+
 use aruna_core::automation::firing::{CopiedFile, Firing, FiringState, StageState};
 use aruna_core::automation::keys::copy_plan_key;
 use aruna_core::automation::record::{Automation, StageKind};
@@ -12,18 +14,20 @@ use aruna_core::keyspaces::{AUTOMATION_INTENTS_KEYSPACE, AUTOMATION_RUNS_KEYSPAC
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::identity::features::Feature;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{Key, KeySpace, Value};
 use aruna_ops_data::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 use aruna_ops_identity::groups::admin_check::AdminCheckOperation;
 use ulid::Ulid;
 
 use super::copy_stage::{source_count, source_length, stage_intent_id};
 use super::firing_reads::GetFiringOperation;
 pub(crate) use super::firing_tx::{FiringDelta, FiringTxOp, FiringTxResult};
-use super::{AutoAccessOperation, AutoError, Need, automation_auth_for};
+use super::{AutoAccessOperation, AutoError, Need, automation_auth_for, check_feature};
 use crate::plugins::intents::{IntentRecord, IntentState, intent_scan_in, resolved_rows_in};
 use crate::plugins::rows::{Rows, StoreError, decode, encode, row, scan_rows};
 use crate::workflows::CatalogError;
@@ -533,6 +537,7 @@ impl Operation for ResolveStageOperation {
 enum ResumeStep {
     Load,
     Access,
+    Config(Box<Automation>),
     Commit,
 }
 
@@ -543,6 +548,7 @@ pub struct ResumeFiringOperation {
     auth: AuthContext,
     firing_id: Ulid,
     local: NodeId,
+    disabled_features: BTreeSet<Feature>,
     step: ResumeStep,
 }
 
@@ -552,8 +558,14 @@ impl ResumeFiringOperation {
             auth: auth.clone(),
             firing_id,
             local,
+            disabled_features: BTreeSet::new(),
             step: ResumeStep::Load,
         }
+    }
+
+    pub fn with_disabled_features(mut self, disabled: BTreeSet<Feature>) -> Self {
+        self.disabled_features = disabled;
+        self
     }
 }
 
@@ -579,6 +591,23 @@ impl Operation for ResumeFiringOperation {
             }
             ResumeStep::Access => {
                 let auto = result.child::<Automation, AutoError>()??;
+                self.step = ResumeStep::Config(Box::new(auto));
+                Ok(Next::Call(IoCall::child(GetConfigOperation::new(
+                    self.auth.realm_id,
+                ))))
+            }
+            ResumeStep::Config(auto) => {
+                let config = result
+                    .child::<RealmConfigDocument, GetConfigError>()?
+                    .map_err(|_| {
+                        AutoError::Unavailable("the realm feature policy cannot be read".into())
+                    })?;
+                check_feature(
+                    &config,
+                    &self.disabled_features,
+                    Feature::Automations,
+                    auto.group_id,
+                )?;
                 let tx = FiringTxOp::new(auto.automation_id, self.firing_id, FiringDelta::Resume);
                 self.step = ResumeStep::Commit;
                 Ok(Next::Call(IoCall::retry(
@@ -601,7 +630,8 @@ impl Operation for ResumeFiringOperation {
 #[derive(Debug, PartialEq)]
 enum DecideStep {
     Load,
-    Admin(Ulid),
+    Admin(Box<Automation>),
+    Config(Box<Automation>),
     Commit,
 }
 
@@ -615,6 +645,7 @@ pub struct DecideStageOperation {
     approve: bool,
     note: Option<String>,
     local: NodeId,
+    disabled_features: BTreeSet<Feature>,
     step: DecideStep,
 }
 
@@ -634,8 +665,29 @@ impl DecideStageOperation {
             approve,
             note,
             local,
+            disabled_features: BTreeSet::new(),
             step: DecideStep::Load,
         }
+    }
+
+    pub fn with_disabled_features(mut self, disabled: BTreeSet<Feature>) -> Self {
+        self.disabled_features = disabled;
+        self
+    }
+
+    fn commit_decision(&mut self, auto_id: Ulid) -> Next<Firing> {
+        let tx = FiringTxOp::new(
+            auto_id,
+            self.firing_id,
+            FiringDelta::Decide {
+                stage: self.stage.clone(),
+                approve: self.approve,
+                actor: self.auth.user_id,
+                note: self.note.clone(),
+            },
+        );
+        self.step = DecideStep::Commit;
+        Next::Call(IoCall::retry(tx, &self.firing_id.to_bytes()))
     }
 }
 
@@ -653,28 +705,37 @@ impl Operation for DecideStageOperation {
             DecideStep::Load => {
                 let (_, auto) = result.child::<(Firing, Automation), AutoError>()??;
                 let check = AdminCheckOperation::new(self.auth.clone(), auto.group_id);
-                self.step = DecideStep::Admin(auto.automation_id);
+                self.step = DecideStep::Admin(Box::new(auto));
                 Ok(Next::Call(IoCall::child(check)))
             }
-            DecideStep::Admin(auto_id) => {
+            DecideStep::Admin(auto) => {
                 let is_admin = result
                     .child::<bool, AuthorizationError>()?
                     .map_err(|e| AutoError::Storage(e.to_string()))?;
                 if !is_admin {
                     return Err(AutoError::Forbidden);
                 }
-                let tx = FiringTxOp::new(
-                    auto_id,
-                    self.firing_id,
-                    FiringDelta::Decide {
-                        stage: self.stage.clone(),
-                        approve: self.approve,
-                        actor: self.auth.user_id,
-                        note: self.note.clone(),
-                    },
-                );
-                self.step = DecideStep::Commit;
-                Ok(Next::Call(IoCall::retry(tx, &self.firing_id.to_bytes())))
+                if self.approve {
+                    self.step = DecideStep::Config(auto);
+                    return Ok(Next::Call(IoCall::child(GetConfigOperation::new(
+                        self.auth.realm_id,
+                    ))));
+                }
+                Ok(self.commit_decision(auto.automation_id))
+            }
+            DecideStep::Config(auto) => {
+                let config = result
+                    .child::<RealmConfigDocument, GetConfigError>()?
+                    .map_err(|_| {
+                        AutoError::Unavailable("the realm feature policy cannot be read".into())
+                    })?;
+                check_feature(
+                    &config,
+                    &self.disabled_features,
+                    Feature::Automations,
+                    auto.group_id,
+                )?;
+                Ok(self.commit_decision(auto.automation_id))
             }
             DecideStep::Commit => {
                 let tx = result.child::<FiringTxResult, AutoError>()??;
