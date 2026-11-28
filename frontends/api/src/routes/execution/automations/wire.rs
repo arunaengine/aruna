@@ -2,17 +2,20 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::automation::diff::ApprovalDiff;
+use aruna_core::automation::diff::{ApprovalDiff, LinkedApplet};
 use aruna_core::automation::graph::{AutoGraph, AutoNodeKind};
 use aruna_core::automation::record::{Automation, Lifecycle, PauseReason, PendingChange};
 use aruna_ops_work::automations::check::{AutoCheckReport, CopyPreview};
 use aruna_ops_work::automations::diff::AutoDiffResult;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use ulid::Ulid;
 use utoipa::{IntoParams, ToSchema};
 
-pub use super::spec_wire::{LimitsBody, SpecBody, TriggerBody, WorkflowRefBody};
+pub use super::spec_wire::{
+    ConditionBody, ConditionsBody, EffectiveLimitsBody, LimitsBody, SpecBody, TriggerBody,
+    WorkflowRefBody,
+};
 use crate::error::{ServerError, ServerResult};
 use crate::jobs::rfc3339;
 use crate::routes::execution::workflow::wire::{
@@ -81,6 +84,8 @@ pub struct AutomationBody {
     pub created_at: String,
     pub updated_at: String,
     pub revision: u64,
+    /// Optional primary workflow linked to this automation.
+    pub workflow_id: Option<String>,
 }
 
 impl AutomationBody {
@@ -102,6 +107,7 @@ impl AutomationBody {
             created_at: rfc3339(auto.created_at_ms),
             updated_at: rfc3339(auto.updated_at_ms),
             revision: auto.revision,
+            workflow_id: auto.workflow_id.map(|id| id.to_string()),
         }
     }
 }
@@ -148,6 +154,8 @@ pub struct ListAutoQuery {
     pub group_id: String,
     /// Optional lifecycle filter (`draft`, `waiting_for_approval`, `active`, `paused`, `removed`).
     pub lifecycle: Option<String>,
+    /// Optional workflow ULID filter (matches linked primary workflow or any `run` stage).
+    pub workflow_id: Option<String>,
     /// Pagination cursor returned by the previous page.
     pub cursor: Option<String>,
     /// Maximum items to return (1 to 500).
@@ -175,6 +183,14 @@ pub struct CreateAutoRequest {
     #[serde(default)]
     pub description: String,
     pub spec: SpecBody,
+    #[serde(default)]
+    pub workflow_id: Option<String>,
+}
+
+fn present_option<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Clone, Debug, Deserialize, ToSchema)]
@@ -191,6 +207,18 @@ pub struct UpdateAutoRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub spec: Option<SpecBody>,
+    #[serde(default, deserialize_with = "present_option")]
+    #[schema(value_type = Option<String>)]
+    pub workflow_id: Option<Option<String>>,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[schema(as = AutomationLinkedApplet)]
+pub struct LinkedAppletBody {
+    pub applet_id: String,
+    pub name: String,
+    pub slug: String,
+    pub outside_input: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, ToSchema)]
@@ -206,6 +234,10 @@ pub struct RevisionBody {
     "revision": 2,
     "triggers_added": [{"kind": "manual"}],
     "triggers_removed": [],
+    "conditions_added": [],
+    "conditions_removed": [],
+    "conditions_mode_before": null,
+    "conditions_mode_after": "all",
     "read_added": [],
     "read_removed": [],
     "write_added": [],
@@ -228,13 +260,18 @@ pub struct RevisionBody {
     "outside_input": false,
     "unsandboxed": false,
     "loop_warnings": [],
-    "applet_warnings": []
+    "applet_warnings": [],
+    "linked_applets": []
 }))]
 pub struct DiffBody {
     pub pending: bool,
     pub revision: u64,
     pub triggers_added: Vec<TriggerBody>,
     pub triggers_removed: Vec<TriggerBody>,
+    pub conditions_added: Vec<ConditionBody>,
+    pub conditions_removed: Vec<ConditionBody>,
+    pub conditions_mode_before: Option<String>,
+    pub conditions_mode_after: String,
     pub read_added: Vec<String>,
     pub read_removed: Vec<String>,
     pub write_added: Vec<String>,
@@ -258,6 +295,7 @@ pub struct DiffBody {
     pub unsandboxed: bool,
     pub loop_warnings: Vec<String>,
     pub applet_warnings: Vec<String>,
+    pub linked_applets: Vec<LinkedAppletBody>,
 }
 
 impl DiffBody {
@@ -284,6 +322,18 @@ impl DiffBody {
                 .iter()
                 .map(TriggerBody::from_domain)
                 .collect(),
+            conditions_added: d
+                .conditions_added
+                .iter()
+                .map(ConditionBody::from_domain)
+                .collect(),
+            conditions_removed: d
+                .conditions_removed
+                .iter()
+                .map(ConditionBody::from_domain)
+                .collect(),
+            conditions_mode_before: d.conditions_mode.0.map(|m| m.as_str().into()),
+            conditions_mode_after: d.conditions_mode.1.as_str().into(),
             read_added: d.read_added,
             read_removed: d.read_removed,
             write_added: d.write_added,
@@ -315,6 +365,16 @@ impl DiffBody {
             unsandboxed: d.unsandboxed,
             loop_warnings: d.loop_warnings,
             applet_warnings: d.applet_warnings,
+            linked_applets: d
+                .linked_applets
+                .into_iter()
+                .map(|item: LinkedApplet| LinkedAppletBody {
+                    applet_id: item.applet_id.to_string(),
+                    name: item.name,
+                    slug: item.slug,
+                    outside_input: item.outside_input,
+                })
+                .collect(),
         }
     }
 }
