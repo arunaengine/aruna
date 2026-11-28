@@ -190,7 +190,9 @@ pub struct WorkflowPatchBody {
     pub visibility: Option<Visibility>,
 }
 
-fn present<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Option<String>>, D::Error> {
+pub(crate) fn present<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error> {
     Option::<String>::deserialize(deserializer).map(Some)
 }
 

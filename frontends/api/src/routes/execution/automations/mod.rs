@@ -18,8 +18,6 @@ pub mod wire;
 
 use std::sync::Arc;
 
-use aruna_core::structs::identity::features::Feature;
-use aruna_core::types::GroupId;
 use aruna_ops_work::automations::AutoError;
 use ulid::Ulid;
 use utoipa_axum::router::OpenApiRouter;
@@ -63,26 +61,7 @@ pub(crate) fn auto_error(error: AutoError) -> ServerError {
             "automation_limited",
             msg,
         ),
-        AutoError::ConditionsNotMet(firing) => ServerError::Refused(
-            axum::http::StatusCode::CONFLICT,
-            "conditions_not_met",
-            firing
-                .reason
-                .unwrap_or_else(|| "Conditions were not met.".into()),
-        ),
         AutoError::Unavailable(msg) => ServerError::ServiceUnavailableReason(msg),
         AutoError::Storage(msg) => ServerError::InternalError(msg.into()),
     }
-}
-
-pub(crate) async fn require_switches(
-    state: &ServerState,
-    group_id: GroupId,
-    uses_applets: bool,
-) -> ServerResult<()> {
-    crate::features::require(state, Feature::Automations, Some(group_id)).await?;
-    if uses_applets {
-        crate::features::require(state, Feature::Applets, Some(group_id)).await?;
-    }
-    Ok(())
 }

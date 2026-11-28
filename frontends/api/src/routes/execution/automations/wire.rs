@@ -7,7 +7,7 @@ use aruna_core::automation::graph::{AutoGraph, AutoNodeKind};
 use aruna_core::automation::record::{Automation, Lifecycle, PauseReason, PendingChange};
 use aruna_ops_work::automations::check::{AutoCheckReport, CopyPreview};
 use aruna_ops_work::automations::diff::AutoDiffResult;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ulid::Ulid;
 use utoipa::{IntoParams, ToSchema};
@@ -19,7 +19,7 @@ pub use super::spec_wire::{
 use crate::error::{ServerError, ServerResult};
 use crate::jobs::rfc3339;
 use crate::routes::execution::workflow::wire::{
-    GraphEnd, GraphNodeKind, WorkflowGraphBody, WorkflowGraphEdge, WorkflowGraphNode,
+    GraphEnd, GraphNodeKind, WorkflowGraphBody, WorkflowGraphEdge, WorkflowGraphNode, present,
 };
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
@@ -187,12 +187,6 @@ pub struct CreateAutoRequest {
     pub workflow_id: Option<String>,
 }
 
-fn present_option<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<Option<String>>, D::Error> {
-    Option::<String>::deserialize(deserializer).map(Some)
-}
-
 #[derive(Clone, Debug, Deserialize, ToSchema)]
 #[schema(as = UpdateAutomationRequest, example = json!({
     "expected_revision": 1,
@@ -207,7 +201,7 @@ pub struct UpdateAutoRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub spec: Option<SpecBody>,
-    #[serde(default, deserialize_with = "present_option")]
+    #[serde(default, deserialize_with = "present")]
     #[schema(value_type = Option<String>)]
     pub workflow_id: Option<Option<String>>,
 }
@@ -252,6 +246,8 @@ pub struct RevisionBody {
     "secrets_removed": [],
     "allow_downgrade_before": false,
     "allow_downgrade_after": false,
+    "outside_input_before": false,
+    "outside_input_after": false,
     "stages_added": ["alert"],
     "stages_removed": [],
     "stages_changed": [],
@@ -286,6 +282,8 @@ pub struct DiffBody {
     pub secrets_removed: Vec<String>,
     pub allow_downgrade_before: bool,
     pub allow_downgrade_after: bool,
+    pub outside_input_before: bool,
+    pub outside_input_after: bool,
     pub stages_added: Vec<String>,
     pub stages_removed: Vec<String>,
     pub stages_changed: Vec<String>,
@@ -299,9 +297,9 @@ pub struct DiffBody {
 }
 
 impl DiffBody {
-    pub fn from_result(res: AutoDiffResult) -> Self {
-        let d: ApprovalDiff = res.diff;
-        let wf = |list: Vec<(Ulid, u32)>| {
+    pub fn from_result(result: AutoDiffResult) -> Self {
+        let diff: ApprovalDiff = result.diff;
+        let map_workflows = |list: Vec<(Ulid, u32)>| {
             list.into_iter()
                 .map(|(id, version)| WorkflowRefBody {
                     workflow_id: id.to_string(),
@@ -310,62 +308,64 @@ impl DiffBody {
                 .collect()
         };
         Self {
-            pending: res.pending,
-            revision: res.revision,
-            triggers_added: d
+            pending: result.pending,
+            revision: result.revision,
+            triggers_added: diff
                 .triggers_added
                 .iter()
                 .map(TriggerBody::from_domain)
                 .collect(),
-            triggers_removed: d
+            triggers_removed: diff
                 .triggers_removed
                 .iter()
                 .map(TriggerBody::from_domain)
                 .collect(),
-            conditions_added: d
+            conditions_added: diff
                 .conditions_added
                 .iter()
                 .map(ConditionBody::from_domain)
                 .collect(),
-            conditions_removed: d
+            conditions_removed: diff
                 .conditions_removed
                 .iter()
                 .map(ConditionBody::from_domain)
                 .collect(),
-            conditions_mode_before: d.conditions_mode.0.map(|m| m.as_str().into()),
-            conditions_mode_after: d.conditions_mode.1.as_str().into(),
-            read_added: d.read_added,
-            read_removed: d.read_removed,
-            write_added: d.write_added,
-            write_removed: d.write_removed,
-            metadata_added: d.metadata_added,
-            metadata_removed: d.metadata_removed,
-            workflows_added: wf(d.workflows_added),
-            workflows_removed: wf(d.workflows_removed),
-            audiences_added: d
+            conditions_mode_before: diff.conditions_mode.0.map(|mode| mode.as_str().into()),
+            conditions_mode_after: diff.conditions_mode.1.as_str().into(),
+            read_added: diff.read_added,
+            read_removed: diff.read_removed,
+            write_added: diff.write_added,
+            write_removed: diff.write_removed,
+            metadata_added: diff.metadata_added,
+            metadata_removed: diff.metadata_removed,
+            workflows_added: map_workflows(diff.workflows_added),
+            workflows_removed: map_workflows(diff.workflows_removed),
+            audiences_added: diff
                 .audiences_added
                 .iter()
-                .map(|a| a.as_str().into())
+                .map(|audience| audience.as_str().into())
                 .collect(),
-            audiences_removed: d
+            audiences_removed: diff
                 .audiences_removed
                 .iter()
-                .map(|a| a.as_str().into())
+                .map(|audience| audience.as_str().into())
                 .collect(),
-            secrets_added: d.secrets_added,
-            secrets_removed: d.secrets_removed,
-            allow_downgrade_before: d.allow_downgrade.0,
-            allow_downgrade_after: d.allow_downgrade.1,
-            stages_added: d.stages_added,
-            stages_removed: d.stages_removed,
-            stages_changed: d.stages_changed,
-            limits_before: d.limits_before.as_ref().map(LimitsBody::from_domain),
-            limits_after: LimitsBody::from_domain(&d.limits_after),
-            outside_input: d.outside_input,
-            unsandboxed: d.unsandboxed,
-            loop_warnings: d.loop_warnings,
-            applet_warnings: d.applet_warnings,
-            linked_applets: d
+            secrets_added: diff.secrets_added,
+            secrets_removed: diff.secrets_removed,
+            allow_downgrade_before: diff.allow_downgrade.0,
+            allow_downgrade_after: diff.allow_downgrade.1,
+            outside_input_before: diff.allow_outside_input.0,
+            outside_input_after: diff.allow_outside_input.1,
+            stages_added: diff.stages_added,
+            stages_removed: diff.stages_removed,
+            stages_changed: diff.stages_changed,
+            limits_before: diff.limits_before.as_ref().map(LimitsBody::from_domain),
+            limits_after: LimitsBody::from_domain(&diff.limits_after),
+            outside_input: diff.outside_input,
+            unsandboxed: diff.unsandboxed,
+            loop_warnings: diff.loop_warnings,
+            applet_warnings: diff.applet_warnings,
+            linked_applets: diff
                 .linked_applets
                 .into_iter()
                 .map(|item: LinkedApplet| LinkedAppletBody {

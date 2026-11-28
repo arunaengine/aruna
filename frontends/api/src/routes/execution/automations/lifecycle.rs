@@ -18,7 +18,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use super::wire::{AutomationBody, CheckBody, CheckRequest, DiffBody, RevisionBody, graph_body};
-use super::{auto_error, path_id, require_switches};
+use super::{auto_error, path_id};
 use crate::auth::{RealmAuth, UnrestrictedAuth};
 use crate::error::{ErrorResponse, ServerResult};
 use crate::routes::execution::workflow::wire::WorkflowGraphBody;
@@ -42,21 +42,13 @@ async fn apply_change(
     id: &str,
     expected: Option<u64>,
     change: AutoChange,
-    gate: bool,
 ) -> ServerResult<Json<AutomationBody>> {
     let id = path_id(id)?;
-    if gate {
-        let auto = drive(
-            AutoAccessOperation::new(auth, id, state.get_node_id(), Need::Write),
-            &state.get_ctx(),
-        )
+    let operation = ChangeAutoOperation::new(auth, (id, expected), change, state.get_node_id())
+        .with_disabled_features(state.disabled_features());
+    let updated = drive(operation, &state.get_ctx())
         .await
         .map_err(auto_error)?;
-        let target = auto.pending.as_ref().map(|p| &p.spec).unwrap_or(&auto.spec);
-        require_switches(state, auto.group_id, target.uses_applets()).await?;
-    }
-    let op = ChangeAutoOperation::new(auth, (id, expected), change, state.get_node_id());
-    let updated = drive(op, &state.get_ctx()).await.map_err(auto_error)?;
     Ok(Json(AutomationBody::from_domain(&updated)))
 }
 
@@ -72,9 +64,9 @@ async fn apply_change(
     request_body = RevisionBody,
     responses(
         (status = 200, description = "Automation waiting for approval", body = AutomationBody),
-        (status = 403, description = "Permission denied", body = ErrorResponse),
+        (status = 403, description = "Permission denied or feature disabled", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "Revision conflict or feature disabled", body = ErrorResponse)
+        (status = 409, description = "Revision conflict", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -90,7 +82,6 @@ pub async fn request_approval(
         &id,
         body.expected_revision,
         AutoChange::RequestApproval,
-        true,
     )
     .await
 }
@@ -107,9 +98,9 @@ pub async fn request_approval(
     request_body = RevisionBody,
     responses(
         (status = 200, description = "Approved active automation", body = AutomationBody),
-        (status = 403, description = "Human group admin required", body = ErrorResponse),
+        (status = 403, description = "Human group admin required or feature disabled", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "Revision conflict or feature disabled", body = ErrorResponse)
+        (status = 409, description = "Revision conflict", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -125,7 +116,6 @@ pub async fn approve_automation(
         &id,
         body.expected_revision,
         AutoChange::Approve,
-        true,
     )
     .await
 }
@@ -159,7 +149,6 @@ pub async fn reject_automation(
         &id,
         body.expected_revision,
         AutoChange::Reject,
-        false,
     )
     .await
 }
@@ -194,7 +183,6 @@ pub async fn pause_automation(
         &id,
         body.expected_revision,
         AutoChange::Pause(PauseReason::Owner),
-        false,
     )
     .await
 }
@@ -211,9 +199,9 @@ pub async fn pause_automation(
     request_body = RevisionBody,
     responses(
         (status = 200, description = "Active automation", body = AutomationBody),
-        (status = 403, description = "Permission denied", body = ErrorResponse),
+        (status = 403, description = "Permission denied or feature disabled", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "Not paused or feature disabled", body = ErrorResponse)
+        (status = 409, description = "Not paused or revision conflict", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -229,7 +217,6 @@ pub async fn resume_automation(
         &id,
         body.expected_revision,
         AutoChange::Resume,
-        true,
     )
     .await
 }

@@ -8,7 +8,7 @@ use aruna_core::applet::hosts::embedding_origins;
 use aruna_core::applet::record::Applet;
 use aruna_ops_work::applets::change::{AppletChange, ChangeAppletOperation};
 use aruna_ops_work::applets::{AppletAccessOperation, Need};
-use aruna_ops_work::automations::applet_link::LinkAppletOperation;
+use aruna_ops_work::automations::applet_link::{AppletLinkTarget, LinkAppletOperation};
 use aruna_runner::driver::drive;
 use axum::Json;
 use axum::extract::{Path, State};
@@ -462,7 +462,7 @@ pub async fn set_guests(
         (status = 400, description = "Invalid automation id or automation belongs to another group", body = ErrorResponse),
         (status = 403, description = "Permission denied or feature disabled", body = ErrorResponse),
         (status = 404, description = "No such applet or automation", body = ErrorResponse),
-        (status = 409, description = "Stale revision or applet taken down", body = ErrorResponse)
+        (status = 409, description = "Stale revision, applet taken down or outside input not approved", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -484,7 +484,10 @@ pub async fn set_automations(
         .collect::<ServerResult<Vec<_>>>()?;
     let operation = LinkAppletOperation::new(
         &auth,
-        (target, body.expected_revision),
+        AppletLinkTarget {
+            applet_id: target,
+            expected_revision: body.expected_revision,
+        },
         ids,
         state.get_node_id(),
     )

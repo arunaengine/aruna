@@ -3,9 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::automation::record::{RunStatus, Spec, Trigger};
-use aruna_core::automation::rules::{
-    Condition, ConditionMode, Conditions, ScheduleEvery, ScheduleSpec, Weekday,
-};
+use aruna_core::automation::rules::{Condition, ConditionMode, Conditions};
+use aruna_core::automation::schedule::{ClockTime, ScheduleEvery, ScheduleSpec, Weekday};
 use aruna_core::automation::scope::{Audience, Limits, Scope};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -69,8 +68,7 @@ pub enum TriggerBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hours: Option<u8>,
         /// Required IANA time zone name (e.g. `"Europe/Berlin"`).
-        #[serde(default)]
-        zone: Option<String>,
+        zone: String,
     },
 }
 
@@ -95,18 +93,22 @@ impl TriggerBody {
                 applet_id,
             } => Self::RunFinished {
                 workflow_id: workflow_id.to_string(),
-                status: status.map(|s| s.as_str().into()),
+                status: status.map(|value| value.as_str().into()),
                 applet_id: applet_id.map(|id| id.to_string()),
             },
             Trigger::AppletSubmission { applet_id } => Self::AppletSubmission {
                 applet_id: applet_id.map(|id| id.to_string()),
             },
-            Trigger::Schedule(sched) => Self::Schedule {
-                every: sched.every.as_str().into(),
-                at: sched.at.clone(),
-                days: sched.days.iter().map(|d| d.as_str().into()).collect(),
-                hours: sched.hours,
-                zone: Some(sched.zone.clone()),
+            Trigger::Schedule(schedule) => Self::Schedule {
+                every: schedule.every.as_str().into(),
+                at: schedule.at.to_string(),
+                days: schedule
+                    .days
+                    .iter()
+                    .map(|day| day.as_str().into())
+                    .collect(),
+                hours: schedule.hours,
+                zone: schedule.zone.clone(),
             },
         }
     }
@@ -155,14 +157,15 @@ impl TriggerBody {
                         "unknown schedule `every` value `{every}` (expected day, week or hours)"
                     ))
                 })?;
+                let parsed_at = parse_clock_time(at, "schedule trigger `at`")?;
                 let parsed_days = days
                     .iter()
-                    .map(|d| parse_weekday(d))
+                    .map(|day| parse_weekday(day))
                     .collect::<ServerResult<Vec<_>>>()?;
-                let zone = require_zone(zone.as_deref(), "schedule trigger")?;
+                let zone = require_zone(zone, "schedule trigger")?;
                 Trigger::Schedule(ScheduleSpec {
                     every,
-                    at: at.clone(),
+                    at: parsed_at,
                     days: parsed_days,
                     hours: *hours,
                     zone,
@@ -179,13 +182,13 @@ pub enum ConditionBody {
     TimeOfDay {
         from: String,
         to: String,
-        #[serde(default)]
-        zone: Option<String>,
+        /// Required IANA time zone name (e.g. `"Europe/Berlin"`).
+        zone: String,
     },
     Weekdays {
         days: Vec<String>,
-        #[serde(default)]
-        zone: Option<String>,
+        /// Required IANA time zone name (e.g. `"Europe/Berlin"`).
+        zone: String,
     },
     File {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -198,16 +201,16 @@ pub enum ConditionBody {
 }
 
 impl ConditionBody {
-    pub fn from_domain(cond: &Condition) -> Self {
-        match cond {
+    pub fn from_domain(condition: &Condition) -> Self {
+        match condition {
             Condition::TimeOfDay { from, to, zone } => Self::TimeOfDay {
-                from: from.clone(),
-                to: to.clone(),
-                zone: Some(zone.clone()),
+                from: from.to_string(),
+                to: to.to_string(),
+                zone: zone.clone(),
             },
             Condition::Weekdays { days, zone } => Self::Weekdays {
-                days: days.iter().map(|d| d.as_str().into()).collect(),
-                zone: Some(zone.clone()),
+                days: days.iter().map(|day| day.as_str().into()).collect(),
+                zone: zone.clone(),
             },
             Condition::File {
                 pattern,
@@ -224,16 +227,16 @@ impl ConditionBody {
     pub fn to_domain(&self) -> ServerResult<Condition> {
         Ok(match self {
             Self::TimeOfDay { from, to, zone } => Condition::TimeOfDay {
-                from: from.clone(),
-                to: to.clone(),
-                zone: require_zone(zone.as_deref(), "time_of_day condition")?,
+                from: parse_clock_time(from, "time_of_day `from`")?,
+                to: parse_clock_time(to, "time_of_day `to`")?,
+                zone: require_zone(zone, "time_of_day condition")?,
             },
             Self::Weekdays { days, zone } => Condition::Weekdays {
                 days: days
                     .iter()
-                    .map(|d| parse_weekday(d))
+                    .map(|day| parse_weekday(day))
                     .collect::<ServerResult<Vec<_>>>()?,
-                zone: require_zone(zone.as_deref(), "weekdays condition")?,
+                zone: require_zone(zone, "weekdays condition")?,
             },
             Self::File {
                 pattern,
@@ -271,10 +274,14 @@ impl Default for ConditionsBody {
 }
 
 impl ConditionsBody {
-    pub fn from_domain(conds: &Conditions) -> Self {
+    pub fn from_domain(conditions: &Conditions) -> Self {
         Self {
-            mode: conds.mode.as_str().into(),
-            items: conds.items.iter().map(ConditionBody::from_domain).collect(),
+            mode: conditions.mode.as_str().into(),
+            items: conditions
+                .items
+                .iter()
+                .map(ConditionBody::from_domain)
+                .collect(),
         }
     }
 
@@ -321,6 +328,7 @@ pub struct LimitsBody {
     pub max_chain_depth: Option<u8>,
     /// Read-only effective limits after applying node defaults; ignored on write requests.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(read_only)]
     pub effective: Option<EffectiveLimitsBody>,
 }
 
@@ -373,6 +381,8 @@ pub struct ScopeBody {
     pub audiences: Vec<String>,
     pub secrets: Vec<String>,
     pub allow_downgrade: bool,
+    /// Must be approved before public or guest applets can trigger this automation.
+    pub allow_outside_input: bool,
     pub limits: LimitsBody,
 }
 
@@ -409,10 +419,11 @@ impl SpecBody {
                     .scope
                     .audiences
                     .iter()
-                    .map(|a| a.as_str().into())
+                    .map(|audience| audience.as_str().into())
                     .collect(),
                 secrets: spec.scope.secrets.clone(),
                 allow_downgrade: spec.scope.allow_downgrade,
+                allow_outside_input: spec.scope.allow_outside_input,
                 limits: LimitsBody::from_domain(&spec.scope.limits),
             },
         }
@@ -434,13 +445,18 @@ impl SpecBody {
             .scope
             .workflows
             .iter()
-            .map(|w| Ok((parse_ulid(&w.workflow_id, "workflow_id")?, w.version)))
+            .map(|entry| {
+                Ok((
+                    parse_ulid(&entry.workflow_id, "workflow_id")?,
+                    entry.version,
+                ))
+            })
             .collect::<ServerResult<Vec<_>>>()?;
         let audiences = self
             .scope
             .audiences
             .iter()
-            .map(|a| parse_audience(a))
+            .map(|audience| parse_audience(audience))
             .collect::<ServerResult<Vec<_>>>()?;
         Ok(Spec {
             triggers,
@@ -454,6 +470,7 @@ impl SpecBody {
                 audiences,
                 secrets: self.scope.secrets.clone(),
                 allow_downgrade: self.scope.allow_downgrade,
+                allow_outside_input: self.scope.allow_outside_input,
                 limits: self.scope.limits.to_domain(),
             },
         })
@@ -465,8 +482,14 @@ pub(crate) fn parse_ulid(text: &str, name: &str) -> ServerResult<Ulid> {
         .map_err(|_| ServerError::BadRequestReason(format!("{name} is not a ULID")))
 }
 
-fn require_zone(zone: Option<&str>, label: &str) -> ServerResult<String> {
-    let trimmed = zone.map(str::trim).unwrap_or_default();
+fn parse_clock_time(text: &str, label: &str) -> ServerResult<ClockTime> {
+    ClockTime::parse(text).ok_or_else(|| {
+        ServerError::BadRequestReason(format!("{label} must be HH:MM (00:00..23:59)"))
+    })
+}
+
+fn require_zone(zone: &str, label: &str) -> ServerResult<String> {
+    let trimmed = zone.trim();
     if trimmed.is_empty() {
         return Err(ServerError::BadRequestReason(format!(
             "{label} needs an IANA time zone in `zone`"

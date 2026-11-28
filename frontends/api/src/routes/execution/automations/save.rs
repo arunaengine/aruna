@@ -11,7 +11,7 @@ use aruna_ops_work::workflows::reads::WorkflowView;
 use aruna_runner::driver::drive;
 use axum::Json;
 use axum::extract::State;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
@@ -23,18 +23,12 @@ use crate::error::{ErrorResponse, ServerResult};
 use crate::routes::execution::workflow::registry::created_body;
 use crate::routes::execution::workflow::source_input;
 use crate::routes::execution::workflow::wire::{
-    Visibility, WorkflowCreated, WorkflowLanguage, WorkflowSourceBody, WorkflowSummary,
+    Visibility, WorkflowCreated, WorkflowLanguage, WorkflowSourceBody, WorkflowSummary, present,
 };
 use crate::server::state::ServerState;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new().routes(routes!(save_bundle))
-}
-
-fn present_option<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<Option<String>>, D::Error> {
-    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 fn default_true() -> bool {
@@ -47,7 +41,7 @@ fn default_true() -> bool {
 pub struct SaveWorkflowRequest {
     pub workflow_id: Option<String>,
     pub name: Option<String>,
-    #[serde(default, deserialize_with = "present_option")]
+    #[serde(default, deserialize_with = "present")]
     #[schema(value_type = Option<String>)]
     pub description: Option<Option<String>>,
     pub language: Option<WorkflowLanguage>,
@@ -147,12 +141,15 @@ pub struct SaveBundleRequest {
         "updated_at": "2026-11-26T12:00:00+00:00",
         "revision": 1,
         "workflow_id": "01K8W2A0000000000000000000"
-    }
+    },
+    "identity_synced": true
 }))]
 pub struct SaveBundleResponse {
     pub workflow: WorkflowSummary,
     pub version: Option<WorkflowCreated>,
     pub automation: AutomationBody,
+    /// Whether the automation's service account role already matches the saved revision.
+    pub identity_synced: bool,
 }
 
 #[utoipa::path(
@@ -228,5 +225,6 @@ pub async fn save_bundle(
         workflow,
         version: saved.created.map(created_body),
         automation: AutomationBody::from_domain(&saved.automation),
+        identity_synced: saved.identity_synced,
     }))
 }
