@@ -48,6 +48,13 @@ pub struct MatchReport {
     pub skipped: usize,
     pub kept: usize,
     pub paused: usize,
+    pub deferred: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowDisposition {
+    Drop,
+    Retain,
 }
 
 #[derive(Debug, PartialEq)]
@@ -100,8 +107,9 @@ pub struct MatchEventsOperation {
     now_ms: u64,
     config: Option<RealmConfigDocument>,
     autos: Vec<Automation>,
+    next_page: Option<Vec<u8>>,
     rows: Vec<JournalRow>,
-    current_key: Option<Vec<u8>>,
+    current_row: Option<(Vec<u8>, RowDisposition)>,
     matches: Vec<PendingMatch>,
     report: MatchReport,
     step: MatchStep,
@@ -116,11 +124,18 @@ impl MatchEventsOperation {
             now_ms: 0,
             config: None,
             autos: Vec::new(),
+            next_page: None,
             rows: Vec::new(),
-            current_key: None,
+            current_row: None,
             matches: Vec::new(),
             report: MatchReport::default(),
             step: MatchStep::Config,
+        }
+    }
+
+    fn retain_current(&mut self) {
+        if let Some((_, disposition)) = &mut self.current_row {
+            *disposition = RowDisposition::Retain;
         }
     }
 
@@ -207,21 +222,36 @@ impl MatchEventsOperation {
                 key,
             )])));
         }
-        if let Some(row_key) = self.current_key.take() {
-            self.step = MatchStep::DropPending;
-            return Ok(Next::Call(IoCall::Delete(vec![(
-                EVENT_JOURNAL_KEYSPACE.to_string(),
-                Key::from(row_key),
-            )])));
+        if let Some((row_key, disposition)) = self.current_row.take() {
+            match disposition {
+                RowDisposition::Drop => {
+                    self.step = MatchStep::DropPending;
+                    return Ok(Next::Call(IoCall::Delete(vec![(
+                        EVENT_JOURNAL_KEYSPACE.to_string(),
+                        Key::from(row_key),
+                    )])));
+                }
+                RowDisposition::Retain => {
+                    self.report.deferred += 1;
+                }
+            }
         }
         self.next_row()
     }
 
     fn next_row(&mut self) -> Result<Next<MatchReport>, AutoError> {
         let Some((row_key, event)) = self.rows.pop() else {
+            if let Some(after) = self.next_page.take() {
+                self.step = MatchStep::Journal;
+                return Ok(Next::Call(IoCall::child(journal_page(
+                    AUTO_PENDING_ROW,
+                    Some(after),
+                    MATCH_BATCH,
+                ))));
+            }
             return Ok(Next::Done(self.report));
         };
-        self.current_key = Some(row_key);
+        self.current_row = Some((row_key, RowDisposition::Drop));
         for automation_index in 0..self.autos.len() {
             if Self::coarse_matches(&self.autos[automation_index], &event) {
                 self.matches.push(PendingMatch {
@@ -380,10 +410,11 @@ impl Operation for MatchEventsOperation {
                 ))))
             }
             MatchStep::Journal => {
-                let (mut rows, _) = result
+                let (mut rows, next) = result
                     .child::<(Vec<JournalRow>, Option<Vec<u8>>), StoreError>()?
                     .map_err(|error| AutoError::Storage(error.detail()))?;
-                self.report.scanned = rows.len();
+                self.next_page = next;
+                self.report.scanned += rows.len();
                 rows.reverse();
                 self.rows = rows;
                 self.next_row()
@@ -466,7 +497,10 @@ impl Operation for MatchEventsOperation {
                             StagingSourceError::NotFound | StagingSourceError::AccessDenied,
                         ),
                     ) => None,
-                    Err(error) => return Err(AutoError::Storage(error.to_string())),
+                    Err(_) => {
+                        self.retain_current();
+                        return self.next_match();
+                    }
                 };
                 let payload = TriggerPayload::DataUploaded {
                     bucket,
@@ -738,6 +772,14 @@ mod tests {
 
     #[test]
     fn handles_upload_head() {
+        use std::collections::HashMap;
+
+        use aruna_core::automation::firing::Firing;
+        use aruna_core::errors::StorageError;
+        use aruna_core::managed_copy::ManagedCopyError;
+        use aruna_core::structs::storage::blob::ManagedCopyState;
+        use aruna_core::structs::storage::multipart::MultipartChecksumType;
+
         let realm = RealmId([9; 32]);
         let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
         let group = Ulid::from_bytes([11; 16]);
@@ -756,6 +798,22 @@ mod tests {
             Some(owner),
             10,
         );
+        let second_version = Ulid::from_bytes([66; 16]);
+        let second_event = SourceEvent::data_uploaded(
+            (realm, group, node),
+            ("raw", "in/second.csv"),
+            second_version,
+            None,
+            11,
+        );
+        let third_version = Ulid::from_bytes([67; 16]);
+        let third_event = SourceEvent::data_uploaded(
+            (realm, group, node),
+            ("raw", "in/third.csv"),
+            third_version,
+            None,
+            12,
+        );
         let mut config = RealmConfigDocument::default_for_realm(realm, Vec::new());
         config.features.insert(
             Feature::Automations,
@@ -764,69 +822,150 @@ mod tests {
                 groups: Default::default(),
             },
         );
-
-        // StorageError propagates so the pending journal row is retried rather than skipped.
-        let mut retry_op = MatchEventsOperation::new(realm);
-        retry_op.config = Some(config.clone());
-        retry_op.autos.push(auto.clone());
-        retry_op.step = MatchStep::EnrichUpload {
-            automation_index: 0,
-            event: Box::new(event.clone()),
-            bucket: "raw".into(),
-            version_id,
-            key: "in/file.csv".into(),
+        let healthy_head = HeadObjectResult {
+            location: None,
+            metadata: HashMap::new(),
+            source_metadata: None,
+            last_refresh: None,
+            version_created_at: None,
+            version_id: None,
+            resolved_version_id: None,
+            checksum_type: MultipartChecksumType::FullObject,
+            composite_hashes: HashMap::new(),
+            part_count: None,
+            source_policies: Vec::new(),
+            source_binding: None,
         };
-        let storage_err = retry_op.next(IoResult::Child(ChildOutcome::new(Err::<
-            HeadObjectResult,
-            HeadObjectError,
-        >(
-            HeadObjectError::StorageError(aruna_core::errors::StorageError::CommitFailed),
-        ))));
-        assert!(matches!(storage_err, Err(AutoError::Storage(_))));
-
-        // NoSuchKey and missing native-reference sources yield size_bytes = None so the journal
-        // never stalls and subsequent pending events still progress.
-        let mut missing_op = MatchEventsOperation::new(realm);
-        missing_op.config = Some(config.clone());
-        missing_op.autos.push(auto.clone());
-        missing_op.step = MatchStep::EnrichUpload {
-            automation_index: 0,
-            event: Box::new(event.clone()),
-            bucket: "raw".into(),
-            version_id,
-            key: "in/file.csv".into(),
+        let created = |id_byte: u8| {
+            AdmitOutcome::Created(Firing::new(
+                Ulid::from_bytes([id_byte; 16]),
+                auto.automation_id,
+                group,
+                1,
+                &auto.spec,
+                TriggerPayload::Manual {
+                    values_json: "{}".into(),
+                    actor: owner,
+                },
+                10,
+            ))
         };
-        let next = missing_op
-            .next(IoResult::Child(ChildOutcome::new(Err::<
-                HeadObjectResult,
-                HeadObjectError,
-            >(
-                HeadObjectError::NoSuchKey,
-            ))))
-            .unwrap();
-        assert!(matches!(next, Next::Call(IoCall::Child(_))));
-        assert!(matches!(
-            missing_op.step,
-            MatchStep::Admit { ref payload, .. }
-                if matches!(payload.as_ref(), TriggerPayload::DataUploaded { size_bytes: None, .. })
-        ));
 
-        let second_version = Ulid::from_bytes([66; 16]);
-        let second_event = SourceEvent::data_uploaded(
-            (realm, group, node),
-            ("raw", "in/second.csv"),
-            second_version,
-            None,
-            2,
-        );
+        // Unavailable uploads stay pending for retry while healthy rows across pages proceed.
         for head_error in [
-            StagingSourceError::NotFound,
-            StagingSourceError::AccessDenied,
+            HeadObjectError::ManagedCopyError(ManagedCopyError::NotServeable(
+                ManagedCopyState::UnresolvedDeparted,
+            )),
+            HeadObjectError::StorageError(StorageError::CommitFailed),
+        ] {
+            let mut scan_op = MatchEventsOperation::new(realm);
+            scan_op.config = Some(config.clone());
+            scan_op.autos.push(auto.clone());
+            scan_op.step = MatchStep::Journal;
+            let page_one = vec![
+                (vec![AUTO_PENDING_ROW, 1], event.clone()),
+                (vec![AUTO_PENDING_ROW, 2], second_event.clone()),
+            ];
+            let seen_first = scan_op
+                .next(IoResult::Child(ChildOutcome::new(Ok::<_, StoreError>((
+                    page_one,
+                    Some(vec![AUTO_PENDING_ROW, 2]),
+                )))))
+                .unwrap();
+            assert!(matches!(seen_first, Next::Call(IoCall::Read(_))));
+            let head_first = scan_op.next(IoResult::Values(vec![None])).unwrap();
+            assert!(matches!(head_first, Next::Call(IoCall::Child(_))));
+
+            // Non-definitive HEAD error retains row 1 and moves directly to row 2 (no Delete).
+            let seen_second = scan_op
+                .next(IoResult::Child(ChildOutcome::new(Err::<
+                    HeadObjectResult,
+                    HeadObjectError,
+                >(
+                    head_error
+                ))))
+                .unwrap();
+            assert_eq!(scan_op.report.deferred, 1);
+            assert!(matches!(seen_second, Next::Call(IoCall::Read(_))));
+
+            let head_second = scan_op.next(IoResult::Values(vec![None])).unwrap();
+            assert!(matches!(head_second, Next::Call(IoCall::Child(_))));
+            assert!(
+                matches!(scan_op.step, MatchStep::EnrichUpload { ref key, .. } if key == "in/second.csv")
+            );
+            let admit_second = scan_op
+                .next(IoResult::Child(ChildOutcome::new(
+                    Ok::<_, HeadObjectError>(healthy_head.clone()),
+                )))
+                .unwrap();
+            assert!(matches!(admit_second, Next::Call(IoCall::Child(_))));
+            let drop_second = scan_op
+                .next(IoResult::Child(ChildOutcome::new(Ok::<_, AutoError>(
+                    created(81),
+                ))))
+                .unwrap();
+            assert!(matches!(
+                drop_second,
+                Next::Call(IoCall::Delete(ref keys)) if keys[0].1.as_ref() == [AUTO_PENDING_ROW, 2]
+            ));
+
+            // Draining page 1 requests page 2 using the stored continuation cursor.
+            let next_page_call = scan_op.next(IoResult::Done).unwrap();
+            assert!(matches!(next_page_call, Next::Call(IoCall::Child(_))));
+            assert_eq!(scan_op.step, MatchStep::Journal);
+
+            let page_two = vec![(vec![AUTO_PENDING_ROW, 3], third_event.clone())];
+            let seen_third = scan_op
+                .next(IoResult::Child(ChildOutcome::new(Ok::<_, StoreError>((
+                    page_two,
+                    None::<Vec<u8>>,
+                )))))
+                .unwrap();
+            assert!(matches!(seen_third, Next::Call(IoCall::Read(_))));
+            let head_third = scan_op.next(IoResult::Values(vec![None])).unwrap();
+            assert!(matches!(head_third, Next::Call(IoCall::Child(_))));
+            assert!(
+                matches!(scan_op.step, MatchStep::EnrichUpload { ref key, .. } if key == "in/third.csv")
+            );
+            let admit_third = scan_op
+                .next(IoResult::Child(ChildOutcome::new(
+                    Ok::<_, HeadObjectError>(healthy_head.clone()),
+                )))
+                .unwrap();
+            assert!(matches!(admit_third, Next::Call(IoCall::Child(_))));
+            let drop_third = scan_op
+                .next(IoResult::Child(ChildOutcome::new(Ok::<_, AutoError>(
+                    created(82),
+                ))))
+                .unwrap();
+            assert!(matches!(
+                drop_third,
+                Next::Call(IoCall::Delete(ref keys)) if keys[0].1.as_ref() == [AUTO_PENDING_ROW, 3]
+            ));
+            let finished = scan_op.next(IoResult::Done).unwrap();
+            assert_eq!(
+                finished,
+                Next::Done(MatchReport {
+                    scanned: 3,
+                    fired: 2,
+                    skipped: 0,
+                    kept: 0,
+                    paused: 0,
+                    deferred: 1,
+                })
+            );
+        }
+
+        // Definitive absence/denial yields size_bytes = None and removes the processed row.
+        for head_error in [
+            HeadObjectError::NoSuchKey,
+            HeadObjectError::StagingSourceError(StagingSourceError::NotFound),
+            HeadObjectError::StagingSourceError(StagingSourceError::AccessDenied),
         ] {
             let mut ref_op = MatchEventsOperation::new(realm);
             ref_op.config = Some(config.clone());
             ref_op.autos.push(auto.clone());
-            ref_op.current_key = Some(vec![AUTO_PENDING_ROW, 1]);
+            ref_op.current_row = Some((vec![AUTO_PENDING_ROW, 1], RowDisposition::Drop));
             ref_op
                 .rows
                 .push((vec![AUTO_PENDING_ROW, 2], second_event.clone()));
@@ -842,7 +981,7 @@ mod tests {
                     HeadObjectResult,
                     HeadObjectError,
                 >(
-                    HeadObjectError::StagingSourceError(head_error),
+                    head_error
                 ))))
                 .unwrap();
             assert!(matches!(to_admit, Next::Call(IoCall::Child(_))));
@@ -851,7 +990,6 @@ mod tests {
                 MatchStep::Admit { ref payload, .. }
                     if matches!(payload.as_ref(), TriggerPayload::DataUploaded { size_bytes: None, .. })
             ));
-            // Completing admission deletes the first pending row and advances to the second event.
             let drop_first = ref_op
                 .next(IoResult::Child(ChildOutcome::new(Ok::<
                     AdmitOutcome,
@@ -861,6 +999,7 @@ mod tests {
                 ))))
                 .unwrap();
             assert!(matches!(drop_first, Next::Call(IoCall::Delete(_))));
+            assert_eq!(ref_op.report.deferred, 0);
             let read_second = ref_op.next(IoResult::Done).unwrap();
             assert!(matches!(read_second, Next::Call(IoCall::Read(_))));
             let head_second = ref_op.next(IoResult::Values(vec![None])).unwrap();

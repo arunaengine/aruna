@@ -39,7 +39,7 @@ pub fn spawn_worker(
                 .with_disabled_features(disabled_features.clone());
             match drive(matcher, context.as_ref()).await {
                 Ok(report) => {
-                    if report.scanned > 0 || report.fired > 0 || report.skipped > 0 {
+                    if report.scanned > report.deferred || report.fired > 0 || report.skipped > 0 {
                         busy = true;
                         debug!(?report, "Matched automation journal events");
                     }
