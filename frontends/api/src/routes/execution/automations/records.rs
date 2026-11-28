@@ -61,6 +61,11 @@ pub async fn list_automations(
         .as_deref()
         .map(parse_lifecycle)
         .transpose()?;
+    let workflow_id = query
+        .workflow_id
+        .as_deref()
+        .map(|id| param_id(id, "workflow_id"))
+        .transpose()?;
     let after = query
         .cursor
         .as_deref()
@@ -72,7 +77,8 @@ pub async fn list_automations(
         lifecycle,
         after,
         limit(query.limit),
-    );
+    )
+    .with_workflow(workflow_id);
     let page = drive(op, &state.get_ctx()).await.map_err(auto_error)?;
     Ok(Json(AutomationPage {
         items: page.items.iter().map(AutomationBody::from_domain).collect(),
@@ -103,6 +109,11 @@ pub async fn create_automation(
     Json(body): Json<CreateAutoRequest>,
 ) -> ServerResult<(StatusCode, Json<AutomationBody>)> {
     let group_id = param_id(&body.group_id, "group_id")?;
+    let workflow_id = body
+        .workflow_id
+        .as_deref()
+        .map(|id| param_id(id, "workflow_id"))
+        .transpose()?;
     let spec = body.spec.to_domain()?;
     require_switches(&state, group_id, spec.uses_applets()).await?;
     let input = NewAuto {
@@ -110,6 +121,7 @@ pub async fn create_automation(
         name: body.name,
         description: body.description,
         spec,
+        workflow_id,
     };
     let op = CreateAutoOperation::new(&auth, state.get_node_id(), input);
     let auto = drive(op, &state.get_ctx()).await.map_err(auto_error)?;
@@ -182,10 +194,19 @@ pub async fn update_automation(
         .as_ref()
         .map_or(existing.spec.uses_applets(), |s| s.uses_applets());
     require_switches(&state, existing.group_id, applets).await?;
+    let workflow_id = body
+        .workflow_id
+        .map(|opt| {
+            opt.as_deref()
+                .map(|s| param_id(s, "workflow_id"))
+                .transpose()
+        })
+        .transpose()?;
     let change = AutoChange::Update {
         name: body.name,
         description: body.description,
         spec,
+        workflow_id,
     };
     let op = ChangeAutoOperation::new(
         &auth,

@@ -11,6 +11,7 @@ mod route_tests;
 mod run_tests;
 pub mod run_wire;
 pub mod runs;
+pub mod save;
 pub mod spec_wire;
 pub mod stage_wire;
 pub mod wire;
@@ -31,6 +32,7 @@ const MAX_LIMIT: usize = 500;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     records::router()
+        .merge(save::router())
         .merge(lifecycle::router())
         .merge(events::router())
         .merge(runs::router())
@@ -53,6 +55,7 @@ pub(crate) fn auto_error(error: AutoError) -> ServerError {
     match error {
         AutoError::NotFound => ServerError::NotFound,
         AutoError::Forbidden => ServerError::Forbidden,
+        AutoError::FeatureOff(feature, state) => ServerError::FeatureOff(feature, state),
         AutoError::Invalid(msg) => ServerError::BadRequestReason(msg),
         AutoError::Conflict(msg) | AutoError::Capacity(msg) => ServerError::Conflict(msg),
         AutoError::Limited(msg) => ServerError::Refused(
@@ -60,6 +63,14 @@ pub(crate) fn auto_error(error: AutoError) -> ServerError {
             "automation_limited",
             msg,
         ),
+        AutoError::ConditionsNotMet(firing) => ServerError::Refused(
+            axum::http::StatusCode::CONFLICT,
+            "conditions_not_met",
+            firing
+                .reason
+                .unwrap_or_else(|| "Conditions were not met.".into()),
+        ),
+        AutoError::Unavailable(msg) => ServerError::ServiceUnavailableReason(msg),
         AutoError::Storage(msg) => ServerError::InternalError(msg.into()),
     }
 }

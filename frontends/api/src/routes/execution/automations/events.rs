@@ -6,15 +6,18 @@ use std::sync::Arc;
 
 use aruna_ops_work::automations::firing_reads::ListEventsOperation;
 use aruna_ops_work::automations::start::{StartEventsOperation, StartManualOperation};
-use aruna_ops_work::automations::{AutoAccessOperation, Need};
+use aruna_ops_work::automations::{AutoAccessOperation, AutoError, Need};
 use aruna_runner::driver::drive;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use super::run_wire::{FiringBody, KeptEventBody, StartEventsRequest, StartRequest};
+use super::run_wire::{
+    ConditionsRefusalBody, FiringBody, KeptEventBody, StartEventsRequest, StartRequest,
+};
 use super::{auto_error, param_id, path_id, require_switches};
 use crate::auth::{RealmAuth, UnrestrictedAuth};
 use crate::error::{ErrorResponse, ServerResult};
@@ -44,7 +47,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         (status = 400, description = "Automation has no manual trigger", body = ErrorResponse),
         (status = 403, description = "Permission denied", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "Automation not active or feature disabled", body = ErrorResponse)
+        (status = 409, description = "Conditions not met, automation not active or feature disabled", body = ConditionsRefusalBody)
     ),
     security(("bearer_auth" = []))
 )]
@@ -53,7 +56,7 @@ pub async fn start_automation(
     UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(id): Path<String>,
     Json(body): Json<StartRequest>,
-) -> ServerResult<(StatusCode, Json<FiringBody>)> {
+) -> ServerResult<Response> {
     let id = path_id(&id)?;
     let auto = drive(
         AutoAccessOperation::new(&auth, id, state.get_node_id(), Need::Write),
@@ -67,8 +70,25 @@ pub async fn start_automation(
         .map(|v| v.to_string())
         .unwrap_or_else(|| "{}".into());
     let op = StartManualOperation::new(&auth, id, state.get_node_id(), values);
-    let firing = drive(op, &state.get_ctx()).await.map_err(auto_error)?;
-    Ok((StatusCode::ACCEPTED, Json(FiringBody::from_domain(&firing))))
+    match drive(op, &state.get_ctx()).await {
+        Ok(firing) => {
+            Ok((StatusCode::ACCEPTED, Json(FiringBody::from_domain(&firing))).into_response())
+        }
+        Err(AutoError::ConditionsNotMet(firing)) => {
+            let message = firing
+                .reason
+                .clone()
+                .unwrap_or_else(|| "Conditions were not met.".into());
+            let body = ConditionsRefusalBody {
+                error: "conditions_not_met".into(),
+                code: "conditions_not_met".into(),
+                message,
+                firing: FiringBody::from_domain(&firing),
+            };
+            Ok((StatusCode::CONFLICT, Json(body)).into_response())
+        }
+        Err(err) => Err(auto_error(err)),
+    }
 }
 
 #[utoipa::path(
@@ -127,12 +147,22 @@ pub async fn list_events(
             "attempt": 1,
             "state": "running",
             "trigger_kind": "data_uploaded",
+            "trigger_event": {
+                "kind": "data_uploaded",
+                "bucket": "reads",
+                "key": "run1/a.fastq",
+                "version_id": "01K8W1C0000000000000000000",
+                "path": "/realm/g/01JABCDEF0123456789ABCDEFG/data/node/reads/run1/a.fastq",
+                "size_bytes": 1024
+            },
             "stages": [],
             "resolutions": [],
             "created_at": "2026-11-26T12:05:00+00:00",
             "updated_at": "2026-11-26T12:05:00+00:00",
             "finished_at": null,
-            "error": null
+            "error": null,
+            "reason": null,
+            "conditions_checked": []
         }])),
         (status = 400, description = "Invalid event ids", body = ErrorResponse),
         (status = 403, description = "Permission denied", body = ErrorResponse),
