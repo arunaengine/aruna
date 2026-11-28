@@ -12,6 +12,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_ops_work::automations::control::AckCancelsOperation;
 use aruna_ops_work::automations::matcher::MatchEventsOperation;
 use aruna_ops_work::automations::runner::StepFiringsOperation;
+use aruna_ops_work::automations::timer::TickTimersOperation;
 use aruna_runner::driver::{DriverContext, drive};
 use aruna_runner::jobs::runtime::JobsRuntime;
 use aruna_scheduler::shutdown::Shutdown;
@@ -37,12 +38,23 @@ pub fn spawn_worker(
                 .with_disabled_features(disabled_features.clone());
             match drive(matcher, context.as_ref()).await {
                 Ok(report) => {
-                    if report.scanned > 0 || report.fired > 0 {
+                    if report.scanned > 0 || report.fired > 0 || report.skipped > 0 {
                         busy = true;
                         debug!(?report, "Matched automation journal events");
                     }
                 }
                 Err(error) => warn!(%error, "Automation event matching failed"),
+            }
+            let timers = TickTimersOperation::new(realm_id)
+                .with_disabled_features(disabled_features.clone());
+            match drive(timers, context.as_ref()).await {
+                Ok(report) => {
+                    if report.fired > 0 || report.skipped > 0 {
+                        busy = true;
+                        debug!(?report, "Processed scheduled automation triggers");
+                    }
+                }
+                Err(error) => warn!(%error, "Automation schedule tick failed"),
             }
             let stepper = StepFiringsOperation::new((node_id, realm_id))
                 .with_disabled_features(disabled_features.clone());
