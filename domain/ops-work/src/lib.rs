@@ -21,3 +21,12 @@ pub mod workflows;
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod tests;
+
+/// Formats a millisecond UNIX timestamp as an RFC 3339 string.
+pub(crate) fn rfc3339(ms: u64) -> String {
+    i64::try_from(ms)
+        .ok()
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map(|timestamp| timestamp.to_rfc3339())
+        .unwrap_or_else(|| ms.to_string())
+}

@@ -39,9 +39,11 @@ pub mod upkeep;
 
 use aruna_core::automation::firing::Firing;
 use aruna_core::automation::keys::{
-    active_prefix, firing_key, record_key, record_prefix, schedule_key, schedule_prefix,
+    active_prefix, firing_key, record_key, record_prefix, schedule_cursor_key, schedule_due_key,
+    schedule_due_prefix,
 };
 use aruna_core::automation::record::{Automation, Lifecycle, Spec};
+use aruna_core::automation::schedule::ScheduleCursor;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::ConversionError;
 use aruna_core::id::NodeId;
@@ -76,8 +78,6 @@ pub enum AutoError {
     Capacity(String),
     #[error("{0}")]
     Limited(String),
-    #[error("{}", .0.reason.as_deref().unwrap_or("conditions were not met"))]
-    ConditionsNotMet(Box<Firing>),
     #[error("{0}")]
     Unavailable(String),
     #[error("storage failed: {0}")]
@@ -167,10 +167,10 @@ pub(crate) fn auto_row(auto: &Automation) -> Result<(KeySpace, Key, Value), Auto
     ))
 }
 
-pub(crate) fn schedule_page(after: Option<Key>) -> IoCall {
+pub(crate) fn schedule_due_page(after: Option<Key>) -> IoCall {
     IoCall::Page {
         space: AUTOMATIONS_KEYSPACE.to_string(),
-        prefix: schedule_prefix(),
+        prefix: schedule_due_prefix(),
         after,
         limit: 256,
     }
@@ -189,12 +189,82 @@ pub(crate) fn check_feature(
     }
 }
 
-pub(crate) fn schedule_row(automation_id: Ulid, ms: u64) -> (KeySpace, Key, Value) {
+pub(crate) fn schedule_due_row(due_ms: u64, automation_id: Ulid) -> (KeySpace, Key, Value) {
     (
         AUTOMATIONS_KEYSPACE.to_string(),
-        schedule_key(automation_id),
-        ByteView::from(ms.to_be_bytes().to_vec()),
+        schedule_due_key(due_ms, automation_id),
+        ByteView::from(Vec::new()),
     )
+}
+
+pub(crate) fn schedule_cursor_row(
+    automation_id: Ulid,
+    cursor: &ScheduleCursor,
+) -> Result<(KeySpace, Key, Value), AutoError> {
+    Ok((
+        AUTOMATIONS_KEYSPACE.to_string(),
+        schedule_cursor_key(automation_id),
+        ByteView::from(cursor.to_bytes()?),
+    ))
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ScheduleSync {
+    pub writes: Vec<(KeySpace, Key, Value)>,
+    pub deletes: Vec<(KeySpace, Key)>,
+}
+
+/// Computes the due-index and cursor row writes/deletes needed after mutating `auto`.
+pub(crate) fn plan_schedule_sync(
+    auto: &Automation,
+    previous: Option<&ScheduleCursor>,
+    was_active: bool,
+    now_ms: u64,
+) -> Result<ScheduleSync, AutoError> {
+    let next = if auto.lifecycle == Lifecycle::Active {
+        ScheduleCursor::for_spec(&auto.spec, previous, was_active, now_ms)
+    } else {
+        None
+    };
+    plan_cursor_transition(auto.automation_id, previous, next.as_ref())
+}
+
+/// Computes the due-index and cursor row writes/deletes to move from `previous` to `next`.
+pub(crate) fn plan_cursor_transition(
+    automation_id: Ulid,
+    previous: Option<&ScheduleCursor>,
+    next: Option<&ScheduleCursor>,
+) -> Result<ScheduleSync, AutoError> {
+    let mut sync = ScheduleSync::default();
+    if let Some(old) = previous
+        && next.map(|cursor| cursor.due_ms) != Some(old.due_ms)
+    {
+        sync.deletes.push((
+            AUTOMATIONS_KEYSPACE.to_string(),
+            schedule_due_key(old.due_ms, automation_id),
+        ));
+    }
+    match next {
+        Some(cursor) => {
+            if previous != Some(cursor) {
+                sync.writes
+                    .push(schedule_cursor_row(automation_id, cursor)?);
+            }
+            if previous.map(|old| old.due_ms) != Some(cursor.due_ms) {
+                sync.writes
+                    .push(schedule_due_row(cursor.due_ms, automation_id));
+            }
+        }
+        None => {
+            if previous.is_some() {
+                sync.deletes.push((
+                    AUTOMATIONS_KEYSPACE.to_string(),
+                    schedule_cursor_key(automation_id),
+                ));
+            }
+        }
+    }
+    Ok(sync)
 }
 
 pub(crate) fn firing_row(firing: &Firing) -> Result<(KeySpace, Key, Value), AutoError> {

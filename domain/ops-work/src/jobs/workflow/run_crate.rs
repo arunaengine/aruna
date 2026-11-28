@@ -1350,9 +1350,7 @@ fn image_url(registry: &str, name: &str) -> Option<String> {
 }
 
 fn rfc3339(ms: u64) -> String {
-    chrono::DateTime::from_timestamp_millis(ms as i64)
-        .map(|timestamp| timestamp.to_rfc3339())
-        .unwrap_or_default()
+    crate::rfc3339(ms)
 }
 
 #[cfg(test)]
