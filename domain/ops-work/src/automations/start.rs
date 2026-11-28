@@ -18,11 +18,15 @@ use aruna_core::operation::Operation;
 use aruna_core::plugin_runs::{SourceEvent, SourceKind};
 use aruna_core::structs::execution::workflow_run::{RunState, WorkflowRunRecord, run_key};
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_ops_data::s3::object::head::{
+    HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
+};
 use ulid::Ulid;
 
 #[cfg(test)]
 pub(crate) use super::admit::new_firing_rows;
 pub(crate) use super::admit::{AdmitFiringOp, AdmitOutcome, parse_replay};
+use super::copy_stage::source_length;
 use super::{AutoAccessOperation, AutoError, Need};
 
 /// Parses a `DataUploaded` source event into `(bucket, version_id, key)`.
@@ -106,6 +110,7 @@ impl Operation for StartManualOperation {
                 AdmitOutcome::Created(firing) | AdmitOutcome::Existing(firing) => {
                     Ok(Next::Done(firing))
                 }
+                AdmitOutcome::Skipped(firing) => Err(AutoError::ConditionsNotMet(Box::new(firing))),
                 AdmitOutcome::AlreadySeen | AdmitOutcome::Unmatched | AdmitOutcome::ChainDepth => {
                     Err(IoError::Unfinished.into())
                 }
@@ -129,6 +134,7 @@ enum ReplayStep {
     Access,
     ReadKept,
     LoadReplayed,
+    EnrichUpload(Box<KeptEvent>, String, Ulid, String),
     Enrich(Box<KeptEvent>),
     Admit,
 }
@@ -179,18 +185,20 @@ impl StartEventsOperation {
             }
             ReplayItem::Kept(kept) => *kept,
         };
+        if let Some(payload) = kept.payload {
+            return self.begin_admit(kept.event_id, payload);
+        }
         match kept.event.kind {
             SourceKind::DataUploaded => {
                 let (bucket, version_id, key) = parse_upload(&kept.event)
                     .ok_or_else(|| AutoError::Invalid("malformed upload event".into()))?;
-                let payload = TriggerPayload::DataUploaded {
-                    bucket,
-                    key,
-                    version_id,
-                    path: kept.event.path.clone(),
-                    size_bytes: 0,
-                };
-                self.begin_admit(kept.event_id, payload)
+                let head = HeadObjectOperation::new(HeadObjectInput {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    version_id: Some(version_id),
+                });
+                self.step = ReplayStep::EnrichUpload(Box::new(kept), bucket, version_id, key);
+                Ok(Next::Call(IoCall::child(head)))
             }
             SourceKind::AppletSubmission => {
                 let applet_id = Ulid::from_string(&kept.event.resource)
@@ -290,6 +298,20 @@ impl Operation for StartEventsOperation {
                 }
                 self.next_item()
             }
+            ReplayStep::EnrichUpload(kept, bucket, version_id, key) => {
+                let size_bytes = match result.child::<HeadObjectResult, HeadObjectError>()? {
+                    Ok(head) => source_length(&head).unwrap_or(0),
+                    Err(_) => 0,
+                };
+                let payload = TriggerPayload::DataUploaded {
+                    bucket,
+                    key,
+                    version_id,
+                    path: kept.event.path.clone(),
+                    size_bytes,
+                };
+                self.begin_admit(kept.event_id, payload)
+            }
             ReplayStep::Enrich(kept) => {
                 let Some(bytes) = result.value()? else {
                     return self.next_item();
@@ -343,7 +365,9 @@ impl Operation for StartEventsOperation {
             }
             ReplayStep::Admit => {
                 match result.child::<AdmitOutcome, AutoError>()?? {
-                    AdmitOutcome::Created(firing) | AdmitOutcome::Existing(firing) => {
+                    AdmitOutcome::Created(firing)
+                    | AdmitOutcome::Existing(firing)
+                    | AdmitOutcome::Skipped(firing) => {
                         self.started.push(firing);
                     }
                     AdmitOutcome::AlreadySeen

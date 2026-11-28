@@ -4,7 +4,9 @@
 
 use std::collections::BTreeSet;
 
-use aruna_core::applet::record::{SubmissionReceipt, submission_key};
+use aruna_core::applet::record::{
+    Applet, Lifecycle as AppletLifecycle, SubmissionReceipt, applet_key, submission_key,
+};
 use aruna_core::automation::firing::TriggerPayload;
 use aruna_core::automation::glob::glob_match;
 use aruna_core::automation::keys::{kept_key, seen_key};
@@ -22,11 +24,15 @@ use aruna_core::structs::execution::workflow_run::{RunState, WorkflowRunRecord, 
 use aruna_core::structs::identity::features::{Feature, resolve};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{GroupId, Key};
+use aruna_ops_data::s3::object::head::{
+    HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
+};
 use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 use byteview::ByteView;
 use ulid::Ulid;
 
 use super::change::{AutoChange, WriteAutoOperation};
+use super::copy_stage::source_length;
 use super::start::{AdmitFiringOp, AdmitOutcome, parse_upload};
 use super::{AutoError, autos_page};
 use crate::plugins::journal::{JournalRow, journal_page};
@@ -38,6 +44,7 @@ const MATCH_BATCH: usize = 128;
 pub struct MatchReport {
     pub scanned: usize,
     pub fired: usize,
+    pub skipped: usize,
     pub kept: usize,
     pub paused: usize,
 }
@@ -48,15 +55,16 @@ enum MatchStep {
     Autos,
     Journal,
     Seen(usize, Box<SourceEvent>),
+    EnrichUpload(usize, Box<SourceEvent>, String, Ulid, String),
     Enrich(usize, Box<SourceEvent>),
-    PauseChain(usize, Box<SourceEvent>),
-    Admit(usize, Box<SourceEvent>),
+    PauseChain(usize, Box<SourceEvent>, Option<Box<TriggerPayload>>),
+    Admit(usize, Box<SourceEvent>, Box<TriggerPayload>),
     Write,
     DropPending,
 }
 
 /// Scans `EVENT_JOURNAL_KEYSPACE` `AUTO_PENDING_ROW` rows and fires or keeps matched events while
-/// enforcing self-loop guards, node/group feature switches, chain depth and atomic limits.
+/// enforcing self-loop guards, node/group feature switches, chain depth, conditions and limits.
 #[derive(Debug, PartialEq)]
 pub struct MatchEventsOperation {
     realm_id: RealmId,
@@ -131,9 +139,11 @@ impl MatchEventsOperation {
                 let Ok(applet_id) = Ulid::from_string(&event.resource) else {
                     return false;
                 };
-                auto.spec.triggers.iter().any(
-                    |t| matches!(t, Trigger::AppletSubmission { applet_id: a } if *a == applet_id),
-                )
+                auto.spec.triggers.iter().any(|t| match t {
+                    Trigger::AppletSubmission { applet_id: Some(a) } => *a == applet_id,
+                    Trigger::AppletSubmission { applet_id: None } => true,
+                    _ => false,
+                })
             }
             SourceKind::RunFinished => {
                 let Ok(wf_id) = Ulid::from_string(&event.resource) else {
@@ -184,6 +194,7 @@ impl MatchEventsOperation {
         &mut self,
         idx: usize,
         event: SourceEvent,
+        payload: Option<TriggerPayload>,
         reason: &str,
     ) -> Result<Next<MatchReport>, AutoError> {
         let auto_id = self.autos[idx].automation_id;
@@ -195,6 +206,7 @@ impl MatchEventsOperation {
             event,
             reason: reason.to_string(),
             kept_at_ms: self.now_ms,
+            payload,
         };
         let rows = vec![
             (
@@ -217,6 +229,7 @@ impl MatchEventsOperation {
         &mut self,
         idx: usize,
         event: SourceEvent,
+        payload: Option<TriggerPayload>,
     ) -> Result<Next<MatchReport>, AutoError> {
         let auto = &self.autos[idx];
         if auto.lifecycle == Lifecycle::Active {
@@ -227,13 +240,13 @@ impl MatchEventsOperation {
                 actor,
                 self.realm_id,
             );
-            self.step = MatchStep::PauseChain(idx, Box::new(event));
+            self.step = MatchStep::PauseChain(idx, Box::new(event), payload.map(Box::new));
             return Ok(Next::Call(IoCall::retry(
                 pause,
                 &auto.automation_id.to_bytes(),
             )));
         }
-        self.write_kept(idx, event, "chain_depth")
+        self.write_kept(idx, event, payload, "chain_depth")
     }
 
     fn decide(
@@ -244,15 +257,15 @@ impl MatchEventsOperation {
     ) -> Result<Next<MatchReport>, AutoError> {
         let auto = &self.autos[idx];
         if auto.lifecycle != Lifecycle::Active {
-            return self.write_kept(idx, event, auto.lifecycle.as_str());
+            return self.write_kept(idx, event, Some(payload), auto.lifecycle.as_str());
         }
         if !self.feature_on(Feature::Automations, auto.group_id) {
-            return self.write_kept(idx, event, "feature_disabled");
+            return self.write_kept(idx, event, Some(payload), "feature_disabled");
         }
         if matches!(payload, TriggerPayload::AppletSubmission { .. })
             && !self.feature_on(Feature::Applets, auto.group_id)
         {
-            return self.write_kept(idx, event, "applets_disabled");
+            return self.write_kept(idx, event, Some(payload), "applets_disabled");
         }
         let auto_id = auto.automation_id;
         let matched_revision = auto.revision;
@@ -263,9 +276,9 @@ impl MatchEventsOperation {
             event.source.clone(),
             matched_revision,
             event.actor,
-            payload,
+            payload.clone(),
         );
-        self.step = MatchStep::Admit(idx, Box::new(event));
+        self.step = MatchStep::Admit(idx, Box::new(event), Box::new(payload));
         Ok(Next::Call(IoCall::retry(admit, &auto_id.to_bytes())))
     }
 }
@@ -331,14 +344,13 @@ impl Operation for MatchEventsOperation {
                         let Some((bucket, version_id, key)) = parse_upload(&event) else {
                             return self.next_match();
                         };
-                        let payload = TriggerPayload::DataUploaded {
-                            bucket,
-                            key,
-                            version_id,
-                            path: event.path.clone(),
-                            size_bytes: 0,
-                        };
-                        self.decide(idx, *event, payload)
+                        let head = HeadObjectOperation::new(HeadObjectInput {
+                            bucket: bucket.clone(),
+                            key: key.clone(),
+                            version_id: Some(version_id),
+                        });
+                        self.step = MatchStep::EnrichUpload(idx, event, bucket, version_id, key);
+                        Ok(Next::Call(IoCall::child(head)))
                     }
                     SourceKind::AppletSubmission => {
                         let (Ok(applet_id), Ok(ver)) = (
@@ -348,10 +360,10 @@ impl Operation for MatchEventsOperation {
                             return self.next_match();
                         };
                         self.step = MatchStep::Enrich(idx, event);
-                        Ok(Next::Call(IoCall::Read(vec![(
-                            APPLETS_KEYSPACE.to_string(),
-                            submission_key(applet_id, ver),
-                        )])))
+                        Ok(Next::Call(IoCall::Read(vec![
+                            (APPLETS_KEYSPACE.to_string(), submission_key(applet_id, ver)),
+                            (APPLETS_KEYSPACE.to_string(), applet_key(applet_id)),
+                        ])))
                     }
                     SourceKind::RunFinished => {
                         let Ok(run_id) = Ulid::from_string(&event.revision) else {
@@ -366,113 +378,158 @@ impl Operation for MatchEventsOperation {
                     _ => self.next_match(),
                 }
             }
-            MatchStep::Enrich(idx, event) => {
-                let Some(bytes) = result.value()? else {
-                    return self.next_match();
+            MatchStep::EnrichUpload(idx, event, bucket, version_id, key) => {
+                let size_bytes = match result.child::<HeadObjectResult, HeadObjectError>()? {
+                    Ok(head) => source_length(&head).unwrap_or(0),
+                    Err(_) => 0,
                 };
-                match event.kind {
-                    SourceKind::AppletSubmission => {
-                        let rec = SubmissionReceipt::from_bytes(&bytes)?;
-                        let payload = TriggerPayload::AppletSubmission {
-                            applet_id: rec.applet_id,
-                            version_id: rec.version_id,
-                            pseudonym: rec.pseudonym,
-                            guest: rec.guest,
-                            outside_input: rec.outside_input || rec.guest,
-                            bucket: rec.bucket,
-                            key: rec.key,
-                            files: rec.files,
-                        };
-                        self.decide(idx, *event, payload)
-                    }
-                    SourceKind::RunFinished => {
-                        let rec = WorkflowRunRecord::from_bytes(&bytes)?;
-                        let auto = &self.autos[idx];
-                        if rec
-                            .automation
-                            .as_ref()
-                            .is_some_and(|o| o.automation_id == auto.automation_id)
-                        {
-                            return self.next_match();
-                        }
-                        let status = match rec.state {
-                            RunState::Succeeded => RunStatus::Succeeded,
-                            RunState::Failed => RunStatus::Failed,
-                            _ => return self.next_match(),
-                        };
-                        let rec_applet = rec
-                            .automation
-                            .as_ref()
-                            .and_then(|o| o.applet_id)
-                            .or_else(|| rec.applet.as_ref().map(|a| a.applet_id));
-                        let matched = auto.spec.triggers.iter().any(|t| match t {
-                            Trigger::RunFinished {
-                                workflow_id,
-                                status: want_status,
-                                applet_id: want_applet,
-                            } => {
-                                *workflow_id == rec.workflow_id
-                                    && want_status.is_none_or(|s| s == status)
-                                    && want_applet.is_none_or(|a| Some(a) == rec_applet)
-                            }
-                            _ => false,
-                        });
-                        if !matched {
-                            return self.next_match();
-                        }
-                        let depth = rec
-                            .automation
-                            .as_ref()
-                            .map_or(0, |o| o.depth)
-                            .saturating_add(1);
-                        if depth >= auto.spec.scope.limits.max_chain_depth {
-                            return self.pause_chain_depth(idx, *event);
-                        }
-                        let outside_input =
-                            rec.automation.as_ref().is_some_and(|o| o.outside_input)
-                                || rec.applet.as_ref().is_some_and(|a| a.outside_input);
-                        let payload = TriggerPayload::RunFinished {
-                            workflow_id: rec.workflow_id,
-                            run_id: rec.run_id,
-                            status,
-                            outputs: rec.outputs,
-                            applet_id: rec_applet,
-                            outside_input,
-                            depth,
-                        };
-                        self.decide(idx, *event, payload)
-                    }
-                    _ => self.next_match(),
-                }
+                let payload = TriggerPayload::DataUploaded {
+                    bucket,
+                    key,
+                    version_id,
+                    path: event.path.clone(),
+                    size_bytes,
+                };
+                self.decide(idx, *event, payload)
             }
-            MatchStep::PauseChain(idx, event) => {
+            MatchStep::Enrich(idx, event) => match event.kind {
+                SourceKind::AppletSubmission => {
+                    let values = result.values()?;
+                    let Some(bytes) = values.first().and_then(Option::as_ref) else {
+                        return self.next_match();
+                    };
+                    let rec = SubmissionReceipt::from_bytes(bytes)?;
+                    let auto = &self.autos[idx];
+                    let explicit = auto.spec.triggers.iter().any(|t| {
+                        matches!(t, Trigger::AppletSubmission { applet_id: Some(a) } if *a == rec.applet_id)
+                    });
+                    if !explicit {
+                        let linked = values
+                            .get(1)
+                            .and_then(Option::as_deref)
+                            .and_then(|raw| Applet::from_bytes(raw).ok())
+                            .is_some_and(|applet| {
+                                applet.lifecycle != AppletLifecycle::TakenDown
+                                    && applet.group_id == auto.group_id
+                                    && applet.automations.contains(&auto.automation_id)
+                            });
+                        if !linked {
+                            return self.next_match();
+                        }
+                    }
+                    let payload = TriggerPayload::AppletSubmission {
+                        applet_id: rec.applet_id,
+                        version_id: rec.version_id,
+                        pseudonym: rec.pseudonym,
+                        guest: rec.guest,
+                        outside_input: rec.outside_input || rec.guest,
+                        bucket: rec.bucket,
+                        key: rec.key,
+                        files: rec.files,
+                    };
+                    self.decide(idx, *event, payload)
+                }
+                SourceKind::RunFinished => {
+                    let Some(bytes) = result.value()? else {
+                        return self.next_match();
+                    };
+                    let rec = WorkflowRunRecord::from_bytes(&bytes)?;
+                    let auto = &self.autos[idx];
+                    if rec
+                        .automation
+                        .as_ref()
+                        .is_some_and(|o| o.automation_id == auto.automation_id)
+                    {
+                        return self.next_match();
+                    }
+                    let status = match rec.state {
+                        RunState::Succeeded => RunStatus::Succeeded,
+                        RunState::Failed => RunStatus::Failed,
+                        _ => return self.next_match(),
+                    };
+                    let rec_applet = rec
+                        .automation
+                        .as_ref()
+                        .and_then(|o| o.applet_id)
+                        .or_else(|| rec.applet.as_ref().map(|a| a.applet_id));
+                    let matched = auto.spec.triggers.iter().any(|t| match t {
+                        Trigger::RunFinished {
+                            workflow_id,
+                            status: want_status,
+                            applet_id: want_applet,
+                        } => {
+                            *workflow_id == rec.workflow_id
+                                && want_status.is_none_or(|s| s == status)
+                                && want_applet.is_none_or(|a| Some(a) == rec_applet)
+                        }
+                        _ => false,
+                    });
+                    if !matched {
+                        return self.next_match();
+                    }
+                    let depth = rec
+                        .automation
+                        .as_ref()
+                        .map_or(0, |o| o.depth)
+                        .saturating_add(1);
+                    let outside_input = rec.automation.as_ref().is_some_and(|o| o.outside_input)
+                        || rec.applet.as_ref().is_some_and(|a| a.outside_input);
+                    let payload = TriggerPayload::RunFinished {
+                        workflow_id: rec.workflow_id,
+                        run_id: rec.run_id,
+                        status,
+                        outputs: rec.outputs,
+                        applet_id: rec_applet,
+                        outside_input,
+                        depth,
+                    };
+                    if depth >= auto.spec.scope.limits.chain_depth() {
+                        return self.pause_chain_depth(idx, *event, Some(payload));
+                    }
+                    self.decide(idx, *event, payload)
+                }
+                _ => self.next_match(),
+            },
+            MatchStep::PauseChain(idx, event, payload) => {
                 if let Ok(updated) = result.child::<Automation, AutoError>()? {
                     self.autos[idx] = updated;
                     self.report.paused += 1;
                 }
-                self.write_kept(idx, *event, "chain_depth")
+                self.write_kept(idx, *event, payload.map(|p| *p), "chain_depth")
             }
-            MatchStep::Admit(idx, event) => match result.child::<AdmitOutcome, AutoError>()? {
-                Ok(AdmitOutcome::Created(_)) => {
-                    self.report.fired += 1;
-                    self.next_match()
+            MatchStep::Admit(idx, event, payload) => {
+                match result.child::<AdmitOutcome, AutoError>()? {
+                    Ok(AdmitOutcome::Created(_)) => {
+                        self.report.fired += 1;
+                        self.next_match()
+                    }
+                    Ok(AdmitOutcome::Skipped(_)) => {
+                        self.report.skipped += 1;
+                        self.next_match()
+                    }
+                    Ok(AdmitOutcome::ChainDepth) => {
+                        self.pause_chain_depth(idx, *event, Some(*payload))
+                    }
+                    Ok(
+                        AdmitOutcome::AlreadySeen
+                        | AdmitOutcome::Existing(_)
+                        | AdmitOutcome::Unmatched,
+                    ) => self.next_match(),
+                    Err(AutoError::Limited(msg)) => {
+                        let reason = if msg.contains("active") {
+                            "max_active_firings"
+                        } else {
+                            "rate_limited"
+                        };
+                        self.write_kept(idx, *event, Some(*payload), reason)
+                    }
+                    Err(AutoError::Conflict(_)) => {
+                        self.write_kept(idx, *event, Some(*payload), "paused")
+                    }
+                    Err(AutoError::NotFound) => self.next_match(),
+                    Err(err) => Err(err),
                 }
-                Ok(AdmitOutcome::ChainDepth) => self.pause_chain_depth(idx, *event),
-                Ok(
-                    AdmitOutcome::AlreadySeen | AdmitOutcome::Existing(_) | AdmitOutcome::Unmatched,
-                ) => self.next_match(),
-                Err(AutoError::Limited(msg)) => {
-                    let reason = if msg.contains("active") {
-                        "max_active_firings"
-                    } else {
-                        "rate_limited"
-                    };
-                    self.write_kept(idx, *event, reason)
-                }
-                Err(AutoError::Conflict(_)) => self.write_kept(idx, *event, "paused"),
-                Err(AutoError::NotFound) => self.next_match(),
-                Err(err) => Err(err),
-            },
+            }
             MatchStep::Write => {
                 result.done()?;
                 self.next_match()
@@ -517,6 +574,7 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 1,
             revision: 1,
+            workflow_id: None,
         };
         let path = group_permission_path(realm, group, node);
         let event = SourceEvent::run_finished(
@@ -526,16 +584,25 @@ mod tests {
             owner,
             10,
         );
+        let payload = TriggerPayload::RunFinished {
+            workflow_id: Ulid::from_bytes([60; 16]),
+            run_id: Ulid::from_bytes([61; 16]),
+            status: RunStatus::Succeeded,
+            outputs: vec![],
+            applet_id: None,
+            outside_input: false,
+            depth: 3,
+        };
         let mut op = MatchEventsOperation::new(realm);
         op.autos.push(auto.clone());
-        op.step = MatchStep::Admit(0, Box::new(event));
+        op.step = MatchStep::Admit(0, Box::new(event), Box::new(payload));
         let next = op
             .next(IoResult::Child(ChildOutcome::new(Ok::<_, AutoError>(
                 AdmitOutcome::ChainDepth,
             ))))
             .unwrap();
         assert!(matches!(next, Next::Call(IoCall::Child(_))));
-        assert!(matches!(op.step, MatchStep::PauseChain(0, _)));
+        assert!(matches!(op.step, MatchStep::PauseChain(0, _, _)));
         let mut paused = auto;
         paused.lifecycle = Lifecycle::Paused;
         paused.pause_reason = Some(PauseReason::ChainDepth);

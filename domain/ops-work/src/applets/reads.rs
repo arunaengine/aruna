@@ -185,3 +185,74 @@ impl Operation for LoadAppletOperation {
         Ok(Next::Done(applet_answer(result)?))
     }
 }
+
+/// Loads every applet of `group_id` without caller auth checks (for internal automation checks).
+#[derive(Debug, PartialEq)]
+pub struct GroupAppletsOperation {
+    group_id: GroupId,
+    ids: Vec<Ulid>,
+    applets: Vec<Applet>,
+    reading: bool,
+}
+
+impl GroupAppletsOperation {
+    pub fn new(group_id: GroupId) -> Self {
+        Self {
+            group_id,
+            ids: Vec::new(),
+            applets: Vec::new(),
+            reading: false,
+        }
+    }
+
+    fn page(&self, after: Option<aruna_core::types::Key>) -> Next<Vec<Applet>> {
+        Next::Call(IoCall::Page {
+            space: APPLETS_KEYSPACE.to_string(),
+            prefix: group_prefix(self.group_id),
+            after,
+            limit: 256,
+        })
+    }
+
+    fn next_batch(&mut self) -> Next<Vec<Applet>> {
+        if self.ids.is_empty() {
+            return Next::Done(std::mem::take(&mut self.applets));
+        }
+        let take = self.ids.len().min(128);
+        let reads = self
+            .ids
+            .drain(..take)
+            .map(|id| (APPLETS_KEYSPACE.to_string(), applet_key(id)))
+            .collect();
+        self.reading = true;
+        Next::Call(IoCall::Read(reads))
+    }
+}
+
+impl Operation for GroupAppletsOperation {
+    type Output = Vec<Applet>;
+    type Error = AppletError;
+
+    fn first(&mut self) -> Result<Next<Vec<Applet>>, AppletError> {
+        Ok(self.page(None))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Vec<Applet>>, AppletError> {
+        if !self.reading {
+            let (rows, more) = result.page()?;
+            for (key, _) in rows {
+                if let Some(bytes) = key.get(17..33).and_then(|s| <[u8; 16]>::try_from(s).ok()) {
+                    self.ids.push(Ulid::from_bytes(bytes));
+                }
+            }
+            if let Some(after) = more {
+                return Ok(self.page(Some(after)));
+            }
+            return Ok(self.next_batch());
+        }
+        for value in result.values()?.into_iter().flatten() {
+            self.applets.push(Applet::from_bytes(&value)?);
+        }
+        Ok(self.next_batch())
+    }
+}

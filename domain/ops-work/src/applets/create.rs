@@ -98,6 +98,7 @@ impl CreateAppletOperation {
             created_by: self.auth.user_id,
             created_at_ms: self.now_ms,
             revision: 1,
+            automations: Vec::new(),
         })
     }
 }
