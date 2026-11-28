@@ -33,6 +33,7 @@ async fn stages_and_edges() {
     let wf_id = Ulid::from_bytes([61; 16]);
     let spec = Spec {
         triggers: vec![Trigger::Manual { form_json: None }],
+        conditions: Default::default(),
         stages: vec![
             Stage {
                 name: "gate".into(),
@@ -205,6 +206,7 @@ async fn stages_and_edges() {
     .await;
     let cancel_spec = Spec {
         triggers: vec![Trigger::Manual { form_json: None }],
+        conditions: Default::default(),
         stages: vec![Stage {
             name: "run".into(),
             needs: Some(vec![]),
@@ -293,6 +295,7 @@ async fn stages_and_edges() {
         ),
         reason: "paused".into(),
         kept_at_ms: 1,
+        payload: None,
     };
     env.write_row(
         AUTOMATIONS_KEYSPACE,
@@ -321,6 +324,7 @@ async fn pinned_spec_cancel() {
     let env = Env::new().await;
     let spec_v1 = Spec {
         triggers: vec![Trigger::Manual { form_json: None }],
+        conditions: Default::default(),
         stages: vec![
             Stage {
                 name: "gate".into(),
@@ -377,6 +381,7 @@ async fn pinned_spec_cancel() {
                 name: None,
                 description: None,
                 spec: Some(spec_v2),
+                workflow_id: None,
             },
             env.node,
         ),
@@ -458,6 +463,7 @@ async fn pinned_spec_cancel() {
     // Concurrent cancel during copy preserves committed file receipt and ends Cancelled.
     let copy_spec = Spec {
         triggers: vec![Trigger::Manual { form_json: None }],
+        conditions: Default::default(),
         stages: vec![Stage {
             name: "copy".into(),
             needs: Some(vec![]),
@@ -529,6 +535,7 @@ async fn pinned_spec_cancel() {
     let wf_id = Ulid::from_bytes([66; 16]);
     let run_spec = Spec {
         triggers: vec![Trigger::Manual { form_json: None }],
+        conditions: Default::default(),
         stages: vec![Stage {
             name: "run".into(),
             needs: Some(vec![]),
@@ -597,7 +604,7 @@ async fn pinned_spec_cancel() {
 
     // Resuming a failed firing respects max_active_firings (#7).
     let mut cap_spec = spec_v1.clone();
-    cap_spec.scope.limits.max_active_firings = 1;
+    cap_spec.scope.limits.max_active_firings = Some(1);
     let cap_auto = env.create_active(cap_spec.clone()).await;
     let mut failed_f = Firing::new(
         Ulid::from_bytes([105; 16]),

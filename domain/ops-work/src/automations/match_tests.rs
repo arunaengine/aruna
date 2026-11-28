@@ -31,7 +31,9 @@ async fn matcher_and_replay() {
             prefix: "in/".into(),
             pattern: Some("*.csv".into()),
         },
-        Trigger::AppletSubmission { applet_id },
+        Trigger::AppletSubmission {
+            applet_id: Some(applet_id),
+        },
         Trigger::RunFinished {
             workflow_id: wf_id,
             status: None,
@@ -39,7 +41,7 @@ async fn matcher_and_replay() {
         },
     ];
     spec.scope.limits = Limits {
-        max_chain_depth: 1,
+        max_chain_depth: Some(1),
         ..Limits::default()
     };
     let auto = env.create_active(spec).await;
@@ -335,6 +337,7 @@ async fn out_of_order() {
                 name: None,
                 description: None,
                 spec: Some(edited_spec),
+                workflow_id: None,
             },
             env.node,
         ),
@@ -366,7 +369,7 @@ async fn out_of_order() {
 
     // Lowering max_chain_depth in a newer revision returns ChainDepth (not Unmatched) and pauses.
     let mut lowered_spec = edited.spec.clone();
-    lowered_spec.scope.limits.max_chain_depth = 1;
+    lowered_spec.scope.limits.max_chain_depth = Some(1);
     let lowered = drive(
         ChangeAutoOperation::new(
             &env.owner,
@@ -375,6 +378,7 @@ async fn out_of_order() {
                 name: None,
                 description: None,
                 spec: Some(lowered_spec),
+                workflow_id: None,
             },
             env.node,
         ),
@@ -407,7 +411,7 @@ async fn out_of_order() {
     assert_eq!(depth_hit, super::admit::AdmitOutcome::ChainDepth);
     // Restore higher chain depth for the direct applet run_finished check below.
     let mut restored_spec = lowered.spec.clone();
-    restored_spec.scope.limits.max_chain_depth = 3;
+    restored_spec.scope.limits.max_chain_depth = Some(3);
     let staged_up = drive(
         ChangeAutoOperation::new(
             &env.owner,
@@ -416,6 +420,7 @@ async fn out_of_order() {
                 name: None,
                 description: None,
                 spec: Some(restored_spec),
+                workflow_id: None,
             },
             env.node,
         ),
