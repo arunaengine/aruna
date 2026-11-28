@@ -1,4 +1,4 @@
-//! Pure state-machine tests for `CommitBundleOperation` covering pairing, revision and schedule rows.
+//! Pure state-machine tests for `CommitBundleOperation` covering pairing and schedule rows.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -7,7 +7,9 @@ use std::collections::BTreeMap;
 use aruna_core::automation::record::{
     Automation, Lifecycle, Spec, Stage, StageKind, Trigger, When,
 };
-use aruna_core::automation::schedule::{ClockTime, ScheduleCursor, ScheduleEvery, ScheduleSpec};
+use aruna_core::automation::schedule::{
+    ClockTime, CursorMode, ScheduleCursor, ScheduleEvery, ScheduleSpec,
+};
 use aruna_core::automation::scope::{Audience, Scope};
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::operation::Operation;
@@ -19,7 +21,7 @@ use aruna_core::user::id::UserId;
 use serde_json::json;
 use ulid::Ulid;
 
-use super::{CommitBundleInput, CommitBundleOperation, SaveAutomation, SaveWorkflow};
+use super::{CommitBundleInput, CommitBundleOperation, SaveAutomation, SaveTarget, SaveWorkflow};
 use crate::automations::AutoError;
 use crate::workflows::import::Prepared;
 
@@ -65,8 +67,8 @@ fn base_spec(workflow_id: Ulid, version: u32) -> Spec {
 }
 
 fn sample_input(
-    workflow_new: bool,
-    automation_new: bool,
+    workflow_target: SaveTarget,
+    automation_target: SaveTarget,
     spec: Spec,
     prepared: Option<Prepared>,
 ) -> CommitBundleInput {
@@ -76,12 +78,10 @@ fn sample_input(
         local: iroh::SecretKey::from_bytes(&[3; 32]).public(),
         realm_id,
         actor: UserId::local(Ulid::from_bytes([1; 16]), realm_id),
-        workflow_id: Ulid::from_bytes([20; 16]),
-        workflow_new,
-        automation_id: Ulid::from_bytes([30; 16]),
-        automation_new,
+        workflow_target,
+        automation_target,
         workflow: SaveWorkflow {
-            workflow_id: (!workflow_new).then(|| Ulid::from_bytes([20; 16])),
+            workflow_id: (!workflow_target.is_create()).then_some(workflow_target.id()),
             name: Some("qc".into()),
             description: None,
             language: Some(StoredWorkflowLanguage::Wir),
@@ -90,8 +90,8 @@ fn sample_input(
             source: None,
         },
         automation: SaveAutomation {
-            automation_id: (!automation_new).then(|| Ulid::from_bytes([30; 16])),
-            expected_revision: (!automation_new).then_some(1),
+            automation_id: (!automation_target.is_create()).then_some(automation_target.id()),
+            expected_revision: (!automation_target.is_create()).then_some(1),
             name: Some("qc-auto".into()),
             description: None,
             spec,
@@ -104,9 +104,14 @@ fn sample_input(
 
 #[test]
 fn commits_new_pair() {
-    let input = sample_input(true, true, base_spec(Ulid::nil(), 0), Some(prepared_wir()));
-    let workflow_id = input.workflow_id;
-    let automation_id = input.automation_id;
+    let workflow_id = Ulid::from_bytes([20; 16]);
+    let automation_id = Ulid::from_bytes([30; 16]);
+    let input = sample_input(
+        SaveTarget::Create(workflow_id),
+        SaveTarget::Create(automation_id),
+        base_spec(Ulid::nil(), 0),
+        Some(prepared_wir()),
+    );
     let mut operation = CommitBundleOperation::new(input);
 
     let first = operation.first().unwrap();
@@ -116,7 +121,7 @@ fn commits_new_pair() {
     assert!(matches!(check_version, Next::Call(IoCall::Read(ref keys)) if keys.len() == 1));
 
     let write = operation.next(IoResult::Values(vec![None])).unwrap();
-    assert!(matches!(write, Next::Call(IoCall::Write(ref rows)) if rows.len() >= 4));
+    assert!(matches!(write, Next::Call(IoCall::Write(ref rows)) if rows.len() >= 5));
 
     let Next::Done(saved) = operation.next(IoResult::Done).unwrap() else {
         panic!("expected Done");
@@ -132,9 +137,16 @@ fn commits_new_pair() {
 
 #[test]
 fn rejects_bundle_conflicts() {
-    let input = sample_input(false, true, base_spec(Ulid::from_bytes([20; 16]), 1), None);
+    let workflow_id = Ulid::from_bytes([20; 16]);
+    let automation_id = Ulid::from_bytes([30; 16]);
+    let input = sample_input(
+        SaveTarget::Update(workflow_id),
+        SaveTarget::Create(automation_id),
+        base_spec(workflow_id, 1),
+        None,
+    );
     let workflow_conflict = WorkflowRecord {
-        workflow_id: input.workflow_id,
+        workflow_id,
         group_id: input.group_id,
         name: "qc".into(),
         description: None,
@@ -147,7 +159,7 @@ fn rejects_bundle_conflicts() {
         updated_at_ms: 1,
         automation_id: Some(Ulid::from_bytes([99; 16])),
     };
-    let mut conflict_op = CommitBundleOperation::new(input.clone());
+    let mut conflict_op = CommitBundleOperation::new(input);
     conflict_op.first().unwrap();
     let result = conflict_op.next(IoResult::Values(vec![Some(
         workflow_conflict.to_bytes().unwrap().into(),
@@ -156,15 +168,15 @@ fn rejects_bundle_conflicts() {
 
     // Existing automation linked to another workflow also conflicts.
     let both_existing = sample_input(
-        false,
-        false,
-        base_spec(Ulid::from_bytes([20; 16]), 1),
+        SaveTarget::Update(workflow_id),
+        SaveTarget::Update(automation_id),
+        base_spec(workflow_id, 1),
         Some(prepared_wir()),
     );
-    let mut wf = workflow_conflict.clone();
-    wf.automation_id = None;
+    let mut workflow = workflow_conflict.clone();
+    workflow.automation_id = None;
     let mut foreign_link_auto = Automation {
-        automation_id: both_existing.automation_id,
+        automation_id,
         group_id: both_existing.group_id,
         name: "qc-auto".into(),
         description: String::new(),
@@ -186,20 +198,20 @@ fn rejects_bundle_conflicts() {
     };
     let mut auto_conflict = CommitBundleOperation::new(both_existing.clone());
     auto_conflict.first().unwrap();
-    let err = auto_conflict.next(IoResult::Values(vec![
-        Some(wf.to_bytes().unwrap().into()),
+    let error = auto_conflict.next(IoResult::Values(vec![
+        Some(workflow.to_bytes().unwrap().into()),
         Some(foreign_link_auto.to_bytes().unwrap().into()),
         None,
     ]));
-    assert!(matches!(err, Err(AutoError::Conflict(_))));
+    assert!(matches!(error, Err(AutoError::Conflict(_))));
 
     // Existing version collision at CheckVersion conflicts cleanly.
-    foreign_link_auto.workflow_id = Some(both_existing.workflow_id);
+    foreign_link_auto.workflow_id = Some(workflow_id);
     let mut version_collision = CommitBundleOperation::new(both_existing);
     version_collision.first().unwrap();
     let check = version_collision
         .next(IoResult::Values(vec![
-            Some(wf.to_bytes().unwrap().into()),
+            Some(workflow.to_bytes().unwrap().into()),
             Some(foreign_link_auto.to_bytes().unwrap().into()),
             None,
         ]))
@@ -211,7 +223,9 @@ fn rejects_bundle_conflicts() {
 
 #[test]
 fn drops_removed_schedules() {
-    let mut spec_without_schedule = base_spec(Ulid::from_bytes([20; 16]), 1);
+    let workflow_id = Ulid::from_bytes([20; 16]);
+    let automation_id = Ulid::from_bytes([30; 16]);
+    let mut spec_without_schedule = base_spec(workflow_id, 1);
     spec_without_schedule.stages = vec![Stage {
         name: "alert".into(),
         needs: Some(Vec::new()),
@@ -234,9 +248,14 @@ fn drops_removed_schedules() {
             zone: "UTC".into(),
         }));
 
-    let input = sample_input(false, false, spec_without_schedule, None);
+    let input = sample_input(
+        SaveTarget::Update(workflow_id),
+        SaveTarget::Update(automation_id),
+        spec_without_schedule,
+        None,
+    );
     let workflow = WorkflowRecord {
-        workflow_id: input.workflow_id,
+        workflow_id,
         group_id: input.group_id,
         name: "qc".into(),
         description: None,
@@ -247,10 +266,10 @@ fn drops_removed_schedules() {
         created_by: input.actor,
         created_at_ms: 1,
         updated_at_ms: 1,
-        automation_id: Some(input.automation_id),
+        automation_id: Some(automation_id),
     };
     let active_auto = Automation {
-        automation_id: input.automation_id,
+        automation_id,
         group_id: input.group_id,
         name: "qc-auto".into(),
         description: String::new(),
@@ -260,7 +279,7 @@ fn drops_removed_schedules() {
         spec: spec_with_schedule.clone(),
         pending: None,
         account: Some(input.actor),
-        role_id: Some(input.automation_id),
+        role_id: Some(automation_id),
         approved_by: Some(input.actor),
         approved_at_ms: Some(1),
         created_by: input.actor,
@@ -268,9 +287,11 @@ fn drops_removed_schedules() {
         updated_at_ms: 1,
         revision: 1,
         identity_synced_revision: 1,
-        workflow_id: Some(input.workflow_id),
+        workflow_id: Some(workflow_id),
     };
-    let cursor = ScheduleCursor::for_spec(&spec_with_schedule, None, false, input.now_ms).unwrap();
+    let cursor =
+        ScheduleCursor::for_spec(&spec_with_schedule, None, CursorMode::Reset, input.now_ms)
+            .unwrap();
 
     let mut operation = CommitBundleOperation::new(input);
     let first = operation.first().unwrap();

@@ -5,7 +5,7 @@
 use aruna_core::automation::dag::{validate_scope, validate_spec};
 use aruna_core::automation::keys::{record_key, schedule_cursor_key};
 use aruna_core::automation::record::{Automation, Lifecycle, Spec, StageKind};
-use aruna_core::automation::schedule::ScheduleCursor;
+use aruna_core::automation::schedule::{CursorMode, ScheduleCursor};
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{AUTOMATIONS_KEYSPACE, WORKFLOW_KEYSPACE, WORKFLOW_VERSION_KEYSPACE};
@@ -21,7 +21,7 @@ use aruna_core::workflow::WorkflowError;
 use ulid::Ulid;
 
 use super::change::{AutoChange, DraftAutoInput, apply_change, draft_automation, validate_name};
-use super::{AutoError, auto_row, plan_schedule_sync};
+use super::{AutoError, auto_rows, plan_schedule_sync};
 use crate::workflows::CatalogError;
 use crate::workflows::import::{Created, Prepared, SourceInput, version_write_rows};
 
@@ -67,6 +67,25 @@ pub struct SavedBundle {
     pub identity_synced: bool,
 }
 
+/// Whether a bundle save creates a new entity or updates an existing one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SaveTarget {
+    Create(Ulid),
+    Update(Ulid),
+}
+
+impl SaveTarget {
+    pub(crate) fn id(self) -> Ulid {
+        match self {
+            Self::Create(id) | Self::Update(id) => id,
+        }
+    }
+
+    pub(crate) fn is_create(self) -> bool {
+        matches!(self, Self::Create(_))
+    }
+}
+
 /// Named parameters for [`CommitBundleOperation`].
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CommitBundleInput {
@@ -74,10 +93,8 @@ pub(crate) struct CommitBundleInput {
     pub local: NodeId,
     pub realm_id: RealmId,
     pub actor: UserId,
-    pub workflow_id: Ulid,
-    pub workflow_new: bool,
-    pub automation_id: Ulid,
-    pub automation_new: bool,
+    pub workflow_target: SaveTarget,
+    pub automation_target: SaveTarget,
     pub workflow: SaveWorkflow,
     pub automation: SaveAutomation,
     pub prepared: Option<Prepared>,
@@ -196,13 +213,15 @@ impl CommitBundleOperation {
         if let Some(visibility) = self.input.workflow.visibility {
             workflow.visibility = visibility;
         }
-        workflow.automation_id = Some(self.input.automation_id);
+        let workflow_id = self.input.workflow_target.id();
+        let automation_id = self.input.automation_target.id();
+        workflow.automation_id = Some(automation_id);
 
         let mut spec = self.input.automation.spec.clone();
         if target_version > 0 {
             pin_spec(
                 &mut spec,
-                self.input.workflow_id,
+                workflow_id,
                 target_version,
                 self.input.automation.pin_version && has_prepared,
             );
@@ -216,9 +235,14 @@ impl CommitBundleOperation {
         )
         .map_err(AutoError::Invalid)?;
 
-        let was_active = existing_automation
+        let mode = if existing_automation
             .as_ref()
-            .is_some_and(|item| item.lifecycle == Lifecycle::Active);
+            .is_some_and(|item| item.lifecycle == Lifecycle::Active)
+        {
+            CursorMode::Preserve
+        } else {
+            CursorMode::Reset
+        };
         let automation = match existing_automation {
             Some(mut automation) => {
                 if self
@@ -237,7 +261,7 @@ impl CommitBundleOperation {
                         name: self.input.automation.name.clone(),
                         description: self.input.automation.description.clone(),
                         spec: Some(spec),
-                        workflow_id: Some(Some(self.input.workflow_id)),
+                        workflow_id: Some(Some(workflow_id)),
                     },
                     self.input.actor,
                     self.input.realm_id,
@@ -254,7 +278,7 @@ impl CommitBundleOperation {
                     .unwrap_or(&workflow.name);
                 let name = validate_name(raw_name)?;
                 draft_automation(DraftAutoInput {
-                    automation_id: self.input.automation_id,
+                    automation_id,
                     group_id: self.input.group_id,
                     name,
                     description: self
@@ -269,14 +293,14 @@ impl CommitBundleOperation {
                     spec,
                     created_by: self.input.actor,
                     now_ms: self.input.now_ms,
-                    workflow_id: Some(self.input.workflow_id),
+                    workflow_id: Some(workflow_id),
                 })
             }
         };
 
         let (created, mut writes) = if let Some(prepared) = self.input.prepared.clone() {
             let (created, rows) = version_write_rows(
-                self.input.workflow_id,
+                workflow_id,
                 &mut workflow,
                 prepared,
                 self.input.actor,
@@ -289,14 +313,14 @@ impl CommitBundleOperation {
             workflow.updated_at_ms = self.input.now_ms;
             let row = (
                 WORKFLOW_KEYSPACE.into(),
-                workflow_key(self.input.workflow_id),
+                workflow_key(workflow_id),
                 workflow.to_bytes()?.into(),
             );
             (None, vec![row])
         };
-        writes.push(auto_row(&automation)?);
+        writes.extend(auto_rows(&automation)?);
         let schedule_sync =
-            plan_schedule_sync(&automation, cursor.as_ref(), was_active, self.input.now_ms)?;
+            plan_schedule_sync(&automation, cursor.as_ref(), mode, self.input.now_ms)?;
         writes.extend(schedule_sync.writes);
         let identity_synced = !automation.needs_identity_sync();
         let saved = SavedBundle {
@@ -326,31 +350,29 @@ impl Operation for CommitBundleOperation {
     }
 
     fn first(&mut self) -> Result<Next<SavedBundle>, AutoError> {
+        let workflow_id = self.input.workflow_target.id();
+        let automation_id = self.input.automation_target.id();
         self.step = CommitStep::Read;
-        let mut reads = vec![(
-            WORKFLOW_KEYSPACE.to_string(),
-            workflow_key(self.input.workflow_id),
-        )];
-        if !self.input.automation_new {
+        let mut reads = vec![(WORKFLOW_KEYSPACE.to_string(), workflow_key(workflow_id))];
+        if !self.input.automation_target.is_create() {
+            reads.push((AUTOMATIONS_KEYSPACE.to_string(), record_key(automation_id)));
             reads.push((
                 AUTOMATIONS_KEYSPACE.to_string(),
-                record_key(self.input.automation_id),
-            ));
-            reads.push((
-                AUTOMATIONS_KEYSPACE.to_string(),
-                schedule_cursor_key(self.input.automation_id),
+                schedule_cursor_key(automation_id),
             ));
         }
         Ok(Next::Call(IoCall::Read(reads)))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<SavedBundle>, AutoError> {
+        let workflow_id = self.input.workflow_target.id();
+        let automation_id = self.input.automation_target.id();
         match std::mem::replace(&mut self.step, CommitStep::Read) {
             CommitStep::Read => {
                 let values = result.values()?;
                 let stored_workflow = values.first().and_then(Option::as_deref);
-                let workflow = match (stored_workflow, self.input.workflow_new) {
-                    (None, true) => {
+                let workflow = match (stored_workflow, self.input.workflow_target) {
+                    (None, SaveTarget::Create(_)) => {
                         let prepared_language =
                             self.input.prepared.as_ref().and_then(|item| item.language);
                         let language = prepared_language
@@ -369,7 +391,7 @@ impl Operation for CommitBundleOperation {
                             .filter(|text| !text.is_empty())
                             .ok_or_else(|| AutoError::Invalid("a workflow needs a name".into()))?;
                         WorkflowRecord {
-                            workflow_id: self.input.workflow_id,
+                            workflow_id,
                             group_id: self.input.group_id,
                             name: name.to_string(),
                             description: self.input.workflow.description.clone().flatten(),
@@ -380,10 +402,10 @@ impl Operation for CommitBundleOperation {
                             created_by: self.input.actor,
                             created_at_ms: self.input.now_ms,
                             updated_at_ms: self.input.now_ms,
-                            automation_id: Some(self.input.automation_id),
+                            automation_id: Some(automation_id),
                         }
                     }
-                    (Some(bytes), false) => {
+                    (Some(bytes), SaveTarget::Update(_)) => {
                         let record = WorkflowRecord::from_bytes(bytes)?;
                         if record.group_id != self.input.group_id {
                             return Err(AutoError::Invalid(
@@ -392,7 +414,7 @@ impl Operation for CommitBundleOperation {
                         }
                         if record
                             .automation_id
-                            .is_some_and(|existing| existing != self.input.automation_id)
+                            .is_some_and(|existing| existing != automation_id)
                         {
                             return Err(AutoError::Conflict(
                                 "workflow is already linked to another automation".into(),
@@ -410,41 +432,42 @@ impl Operation for CommitBundleOperation {
                         }
                         record
                     }
-                    (None, false) => return Err(AutoError::NotFound),
-                    (Some(_), true) => {
+                    (None, SaveTarget::Update(_)) => return Err(AutoError::NotFound),
+                    (Some(_), SaveTarget::Create(_)) => {
                         return Err(AutoError::Conflict("the workflow exists".into()));
                     }
                 };
-                let (existing_automation, cursor) = if self.input.automation_new {
-                    (None, None)
-                } else {
-                    let bytes = values
-                        .get(1)
-                        .and_then(Option::as_deref)
-                        .ok_or(AutoError::NotFound)?;
-                    let automation = Automation::from_bytes(bytes)?;
-                    if automation.lifecycle == Lifecycle::Removed {
-                        return Err(AutoError::NotFound);
+                let (existing_automation, cursor) = match self.input.automation_target {
+                    SaveTarget::Create(_) => (None, None),
+                    SaveTarget::Update(_) => {
+                        let bytes = values
+                            .get(1)
+                            .and_then(Option::as_deref)
+                            .ok_or(AutoError::NotFound)?;
+                        let automation = Automation::from_bytes(bytes)?;
+                        if automation.lifecycle == Lifecycle::Removed {
+                            return Err(AutoError::NotFound);
+                        }
+                        if automation.group_id != self.input.group_id {
+                            return Err(AutoError::Invalid(
+                                "automation belongs to a different group".into(),
+                            ));
+                        }
+                        if automation
+                            .workflow_id
+                            .is_some_and(|existing| existing != workflow_id)
+                        {
+                            return Err(AutoError::Conflict(
+                                "automation is already linked to another workflow".into(),
+                            ));
+                        }
+                        let cursor = values
+                            .get(2)
+                            .and_then(Option::as_deref)
+                            .map(ScheduleCursor::from_bytes)
+                            .transpose()?;
+                        (Some(automation), cursor)
                     }
-                    if automation.group_id != self.input.group_id {
-                        return Err(AutoError::Invalid(
-                            "automation belongs to a different group".into(),
-                        ));
-                    }
-                    if automation
-                        .workflow_id
-                        .is_some_and(|existing| existing != self.input.workflow_id)
-                    {
-                        return Err(AutoError::Conflict(
-                            "automation is already linked to another workflow".into(),
-                        ));
-                    }
-                    let cursor = values
-                        .get(2)
-                        .and_then(Option::as_deref)
-                        .map(ScheduleCursor::from_bytes)
-                        .transpose()?;
-                    (Some(automation), cursor)
                 };
                 if self.input.prepared.is_some() {
                     let next_version = workflow.version_count + 1;
@@ -455,7 +478,7 @@ impl Operation for CommitBundleOperation {
                     };
                     return Ok(Next::Call(read_row(
                         WORKFLOW_VERSION_KEYSPACE,
-                        version_key(self.input.workflow_id, next_version),
+                        version_key(workflow_id, next_version),
                     )));
                 }
                 self.write_all(workflow, existing_automation, cursor)

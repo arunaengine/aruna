@@ -1,4 +1,4 @@
-//! Tests atomic single-transaction workflow + automation saves, bidirectional links and identity sync.
+//! Tests atomic workflow + automation saves, bidirectional links and identity sync recovery.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -624,11 +624,162 @@ async fn commits_bundle_atomically() {
     )
     .await
     .unwrap();
-    let cleared_wf = WorkflowRecord::from_bytes(
+    let cleared_workflow = WorkflowRecord::from_bytes(
         &env.read_row(WORKFLOW_KEYSPACE, &workflow_key(pair.workflow.workflow_id))
             .await
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(cleared_wf.automation_id, None);
+    assert_eq!(cleared_workflow.automation_id, None);
+}
+
+#[test]
+fn reports_unsynced_edit() {
+    let realm = aruna_core::structs::identity::realm::RealmId([6; 32]);
+    let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
+    let group_id = Ulid::from_bytes([8; 16]);
+    let workflow_id = Ulid::from_bytes([9; 16]);
+    let automation_id = Ulid::from_bytes([10; 16]);
+    let auth = aruna_core::structs::identity::auth::AuthContext::new(
+        aruna_core::user::id::UserId::local(Ulid::from_bytes([1; 16]), realm),
+        realm,
+    );
+    let mut spec = Spec::default();
+    spec.triggers.push(Trigger::Manual { form_json: None });
+    spec.stages.push(Stage {
+        name: "alert".into(),
+        needs: Some(Vec::new()),
+        when: When::Passed,
+        kind: StageKind::Notify {
+            audience: Audience::GroupAdmins,
+            message: "ok".into(),
+        },
+    });
+    spec.scope.audiences = vec![Audience::GroupAdmins];
+
+    let committed_auto = Automation {
+        automation_id,
+        group_id,
+        name: "qc".into(),
+        description: String::new(),
+        host_node: node,
+        lifecycle: Lifecycle::Active,
+        pause_reason: None,
+        spec: spec.clone(),
+        pending: None,
+        account: Some(auth.user_id),
+        role_id: Some(automation_id),
+        approved_by: Some(auth.user_id),
+        approved_at_ms: Some(1),
+        created_by: auth.user_id,
+        created_at_ms: 1,
+        updated_at_ms: 2,
+        revision: 2,
+        identity_synced_revision: 1,
+        workflow_id: Some(workflow_id),
+    };
+    let workflow = WorkflowRecord {
+        workflow_id,
+        group_id,
+        name: "qc".into(),
+        description: None,
+        language: StoredWorkflowLanguage::Wir,
+        visibility: WorkflowVisibility::Group,
+        version_count: 1,
+        edam_formats: Vec::new(),
+        created_by: auth.user_id,
+        created_at_ms: 1,
+        updated_at_ms: 2,
+        automation_id: Some(automation_id),
+    };
+    let bundle = SaveBundle {
+        group_id,
+        workflow: SaveWorkflow {
+            workflow_id: Some(workflow_id),
+            name: None,
+            description: None,
+            language: None,
+            visibility: None,
+            message: None,
+            source: None,
+        },
+        automation: SaveAutomation {
+            automation_id: Some(automation_id),
+            expected_revision: Some(1),
+            name: None,
+            description: None,
+            spec,
+            pin_version: true,
+        },
+    };
+
+    let mut operation = SaveBundleOperation::new(&auth, node, bundle);
+    operation.first().unwrap();
+    let mut config = RealmConfigDocument::default_for_realm(realm, Vec::new());
+    for feature in [Feature::Workflows, Feature::Automations] {
+        config.features.insert(
+            feature,
+            FeatureMode::Scoped {
+                default: true,
+                groups: Default::default(),
+            },
+        );
+    }
+    operation
+        .next(IoResult::Child(ChildOutcome::new(Ok::<_, GetConfigError>(
+            config,
+        ))))
+        .unwrap();
+    operation
+        .next(IoResult::Child(ChildOutcome::new(Ok::<_, AuthorizeError>(
+            (),
+        ))))
+        .unwrap();
+    operation
+        .next(IoResult::Child(ChildOutcome::new(Ok::<_, AuthorizeError>(
+            (),
+        ))))
+        .unwrap();
+    operation
+        .next(IoResult::Values(vec![Some(
+            workflow.to_bytes().unwrap().into(),
+        )]))
+        .unwrap();
+    let mut existing = committed_auto.clone();
+    existing.revision = 1;
+    operation
+        .next(IoResult::Values(vec![Some(
+            existing.to_bytes().unwrap().into(),
+        )]))
+        .unwrap();
+
+    // Commit returns revision 2 needing sync; SyncIdentity returns revision 3 (concurrent edit)
+    // whose identity_synced_revision is still 2, so identity_synced must be false.
+    let saved_commit = SavedBundle {
+        workflow,
+        created: None,
+        automation: committed_auto.clone(),
+        identity_synced: false,
+    };
+    let sync_call = operation
+        .next(IoResult::Child(ChildOutcome::new(Ok::<_, AutoError>(
+            saved_commit,
+        ))))
+        .unwrap();
+    assert!(matches!(sync_call, Next::Call(IoCall::Child(_))));
+
+    let mut concurrent = committed_auto;
+    concurrent.revision = 3;
+    concurrent.identity_synced_revision = 2;
+    assert!(concurrent.needs_identity_sync());
+    let Next::Done(done) = operation
+        .next(IoResult::Child(ChildOutcome::new(Ok::<_, AutoError>(
+            concurrent,
+        ))))
+        .unwrap()
+    else {
+        panic!("expected Done");
+    };
+    assert_eq!(done.automation.revision, 3);
+    assert!(!done.identity_synced);
 }
