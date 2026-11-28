@@ -8,20 +8,23 @@ use aruna_core::applet::hosts::embedding_origins;
 use aruna_core::applet::record::Applet;
 use aruna_ops_work::applets::change::{AppletChange, ChangeAppletOperation};
 use aruna_ops_work::applets::{AppletAccessOperation, Need};
+use aruna_ops_work::automations::applet_link::LinkAppletOperation;
 use aruna_runner::driver::drive;
 use axum::Json;
 use axum::extract::{Path, State};
+use ulid::Ulid;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use super::wire::{
-    AppletBody, ApprovalRequestBody, EmbeddingRequest, GuestsRequest, RevisionBody,
-    TakedownRequest, VersionAction,
+    AppletAutomationsRequest, AppletBody, ApprovalRequestBody, EmbeddingRequest, GuestsRequest,
+    RevisionBody, TakedownRequest, VersionAction,
 };
 use super::{applet_error, applet_id, effective_hosting, require_feature, serving};
 use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::access::groups::ensure_group_admin;
+use crate::routes::execution::automations::auto_error;
 use crate::server::state::ServerState;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
@@ -35,6 +38,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(takedown))
         .routes(routes!(set_embedding))
         .routes(routes!(set_guests))
+        .routes(routes!(set_automations))
 }
 
 /// Applies `change` as `auth` and answers the changed applet.
@@ -441,4 +445,55 @@ pub async fn set_guests(
     let policy = body.guests.map(|guests| guests.policy(auth.user_id));
     let key = (applet.applet_id, body.expected_revision);
     change(&state, &auth, key, AppletChange::Guests(policy)).await
+}
+
+#[utoipa::path(
+    put,
+    path = "/applets/{applet_id}/automations",
+    tag = "applets",
+    summary = "Set the automations started by an applet",
+    description = r#"Sets which workflow automations in the applet's group are started when visitors submit this applet.
+
+**Authentication**: realm bearer token without path restrictions, with WRITE on the group's data on the applet's host node."#,
+    params(("applet_id" = String, Path, description = "Applet id; an unparseable id is 404")),
+    request_body = AppletAutomationsRequest,
+    responses(
+        (status = 200, description = "The changed applet", body = AppletBody),
+        (status = 400, description = "Invalid automation id or automation belongs to another group", body = ErrorResponse),
+        (status = 403, description = "Permission denied or feature disabled", body = ErrorResponse),
+        (status = 404, description = "No such applet or automation", body = ErrorResponse),
+        (status = 409, description = "Stale revision or applet taken down", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn set_automations(
+    State(state): State<Arc<ServerState>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
+    Path(id): Path<String>,
+    Json(body): Json<AppletAutomationsRequest>,
+) -> ServerResult<Json<AppletBody>> {
+    let target = applet_id(&id)?;
+    let ids = body
+        .automation_ids
+        .iter()
+        .map(|raw| {
+            Ulid::from_string(raw).map_err(|_| {
+                ServerError::BadRequestReason(format!("automation_id `{raw}` is not a ULID"))
+            })
+        })
+        .collect::<ServerResult<Vec<_>>>()?;
+    let operation = LinkAppletOperation::new(
+        &auth,
+        (target, body.expected_revision),
+        ids,
+        state.get_node_id(),
+    )
+    .with_disabled_features(state.disabled_features());
+    let applet = drive(operation, &state.get_ctx())
+        .await
+        .map_err(auto_error)?;
+    Ok(Json(AppletBody::new(
+        &applet,
+        serving(&state, &applet).await?,
+    )))
 }

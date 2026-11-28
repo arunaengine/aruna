@@ -87,7 +87,7 @@ fn git_input(git: GitSourceBody) -> GitInput {
 }
 
 /// The domain source of a request body, with file contents decoded.
-fn source_input(source: WorkflowSourceBody) -> Result<SourceInput, ServerError> {
+pub(crate) fn source_input(source: WorkflowSourceBody) -> Result<SourceInput, ServerError> {
     Ok(match source {
         WorkflowSourceBody::UweYaml(text) => SourceInput::UweYaml(text),
         WorkflowSourceBody::Wir(document) => SourceInput::Wir(document),
