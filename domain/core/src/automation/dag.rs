@@ -8,6 +8,7 @@ use ulid::Ulid;
 
 use super::glob::expand_copy;
 use super::record::{Spec, Stage, StageKind, Trigger};
+use super::rules::{validate_conditions, validate_schedule};
 use super::scope::{Limits, MAX_CHAIN_DEPTH};
 use crate::id::NodeId;
 use crate::permission_path::{path_within, permission_pattern_matches, role_path_confined};
@@ -84,13 +85,15 @@ fn check_text(label: &str, text: &str) -> Result<(), String> {
 }
 
 fn check_limits(limits: &Limits) -> Result<(), String> {
-    if limits.max_active_firings == 0 || limits.max_concurrent_workflows == 0 {
+    if limits.max_active_firings == Some(0) || limits.max_concurrent_workflows == Some(0) {
         return Err("concurrency limits must be at least 1".into());
     }
-    if limits.per_hour == 0 || limits.per_day == 0 {
+    if limits.per_hour == Some(0) || limits.per_day == Some(0) {
         return Err("rate limits must be at least 1".into());
     }
-    if limits.max_chain_depth == 0 || limits.max_chain_depth > MAX_CHAIN_DEPTH {
+    if let Some(depth) = limits.max_chain_depth
+        && (depth == 0 || depth > MAX_CHAIN_DEPTH)
+    {
         return Err(format!("max_chain_depth must be in 1..={MAX_CHAIN_DEPTH}"));
     }
     if limits.cpu_cores == Some(0) || limits.ram_bytes == Some(0) || limits.walltime_ms == Some(0) {
@@ -104,23 +107,26 @@ fn check_triggers(triggers: &[Trigger]) -> Result<(), String> {
         return Err(format!("automations need 1..={MAX_STAGES} triggers"));
     }
     for trigger in triggers {
-        if let Trigger::DataUploaded {
-            bucket,
-            prefix,
-            pattern,
-        } = trigger
-        {
-            if bucket.is_empty() {
-                return Err("data_uploaded trigger needs a bucket".into());
+        match trigger {
+            Trigger::DataUploaded {
+                bucket,
+                prefix,
+                pattern,
+            } => {
+                if bucket.is_empty() {
+                    return Err("data_uploaded trigger needs a bucket".into());
+                }
+                if prefix.starts_with('/') || prefix.contains("..") {
+                    return Err("data_uploaded prefix must be relative without `..`".into());
+                }
+                if let Some(pat) = pattern
+                    && (pat.is_empty() || pat.contains('/'))
+                {
+                    return Err("data_uploaded filename pattern must not contain `/`".into());
+                }
             }
-            if prefix.starts_with('/') || prefix.contains("..") {
-                return Err("data_uploaded prefix must be relative without `..`".into());
-            }
-            if let Some(pat) = pattern
-                && (pat.is_empty() || pat.contains('/'))
-            {
-                return Err("data_uploaded filename pattern must not contain `/`".into());
-            }
+            Trigger::Schedule(sched) => validate_schedule(sched)?,
+            _ => {}
         }
     }
     Ok(())
@@ -218,9 +224,10 @@ fn check_stage(stage: &Stage, needs: &BTreeSet<&str>, spec: &Spec) -> Result<(),
     Ok(())
 }
 
-/// Validates triggers, limits, stage names, references and DAG acyclicity.
+/// Validates triggers, conditions, limits, stage names, references and DAG acyclicity.
 pub fn validate_spec(spec: &Spec) -> Result<DagPlan, String> {
     check_triggers(&spec.triggers)?;
+    validate_conditions(&spec.conditions)?;
     check_limits(&spec.scope.limits)?;
     if spec.stages.is_empty() || spec.stages.len() > MAX_STAGES {
         return Err(format!("automations need 1..={MAX_STAGES} stages"));

@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+use super::firing::TriggerPayload;
+use super::rules::{Conditions, ScheduleSpec};
 use super::scope::{Audience, Scope};
 use crate::errors::ConversionError;
 use crate::id::NodeId;
@@ -102,8 +104,10 @@ pub enum Trigger {
         applet_id: Option<Ulid>,
     },
     AppletSubmission {
-        applet_id: Ulid,
+        /// `None` matches any applet in the group naming this automation in its own settings.
+        applet_id: Option<Ulid>,
     },
+    Schedule(ScheduleSpec),
 }
 
 /// What one stage in an automation DAG does when its upstream needs satisfy `when`.
@@ -167,10 +171,12 @@ pub struct Stage {
     pub kind: StageKind,
 }
 
-/// Complete trigger, stage DAG and scope definition of an automation.
+/// Complete trigger, condition, stage DAG and scope definition of an automation.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Spec {
     pub triggers: Vec<Trigger>,
+    #[serde(default)]
+    pub conditions: Conditions,
     pub stages: Vec<Stage>,
     pub scope: Scope,
 }
@@ -182,10 +188,25 @@ impl Spec {
             .any(|trigger| matches!(trigger, Trigger::AppletSubmission { .. }))
     }
 
+    pub fn has_schedules(&self) -> bool {
+        self.triggers
+            .iter()
+            .any(|trigger| matches!(trigger, Trigger::Schedule(_)))
+    }
+
     pub fn has_runs(&self) -> bool {
         self.stages
             .iter()
             .any(|stage| matches!(stage.kind, StageKind::Run { .. }))
+    }
+
+    pub fn runs_workflow(&self, target: Ulid) -> bool {
+        self.stages.iter().any(|stage| {
+            matches!(
+                stage.kind,
+                StageKind::Run { workflow_id, .. } if workflow_id == target
+            )
+        })
     }
 }
 
@@ -217,6 +238,8 @@ pub struct Automation {
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     pub revision: u64,
+    /// Optional primary workflow linked to this automation (e.g. from unified Studio saves).
+    pub workflow_id: Option<Ulid>,
 }
 
 impl Automation {
@@ -285,6 +308,7 @@ pub struct KeptEvent {
     pub event: SourceEvent,
     pub reason: String,
     pub kept_at_ms: u64,
+    pub payload: Option<TriggerPayload>,
 }
 
 impl KeptEvent {

@@ -55,7 +55,7 @@ fn enforces_dag_edges() {
     let actor = UserId::new(Ulid::from_parts(1, 9), RealmId([1; 32]));
     let mut spec = Spec::default();
     spec.triggers.push(Trigger::Manual { form_json: None });
-    spec.scope.limits.max_concurrent_workflows = 2;
+    spec.scope.limits.max_concurrent_workflows = Some(2);
     spec.stages.push(run_stage("a", vec![], When::Passed));
     spec.stages
         .push(copy_stage("quarantine", "a", When::Failed));
@@ -132,7 +132,7 @@ fn enforces_dag_edges() {
 fn enforces_caps_cancel() {
     let mut spec = Spec::default();
     spec.triggers.push(Trigger::Manual { form_json: None });
-    spec.scope.limits.max_concurrent_workflows = 2;
+    spec.scope.limits.max_concurrent_workflows = Some(2);
     spec.stages.push(run_stage("r1", vec![], When::Passed));
     spec.stages.push(run_stage("r2", vec![], When::Passed));
     spec.stages.push(run_stage("r3", vec![], When::Passed));

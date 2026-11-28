@@ -13,6 +13,7 @@ pub const KEPT_ROW: u8 = 3;
 pub const SEEN_ROW: u8 = 4;
 pub const USAGE_ROW: u8 = 5;
 pub const REPLAY_ROW: u8 = 6;
+pub const SCHEDULE_ROW: u8 = 7;
 
 /// Row tags in `AUTOMATION_RUNS_KEYSPACE`.
 pub const FIRING_ROW: u8 = 1;
@@ -73,6 +74,19 @@ pub fn seen_key(automation_id: Ulid, source: &str) -> Key {
     row.push(SEEN_ROW);
     row.extend_from_slice(&automation_id.to_bytes());
     row.extend_from_slice(hash.as_bytes());
+    Key::from(row)
+}
+
+/// Prefix of every active scheduled automation index row in `AUTOMATIONS_KEYSPACE`.
+pub fn schedule_prefix() -> Key {
+    Key::from(vec![SCHEDULE_ROW])
+}
+
+/// Last processed schedule slot timestamp (8 big-endian bytes) for one automation.
+pub fn schedule_key(automation_id: Ulid) -> Key {
+    let mut row = Vec::with_capacity(17);
+    row.push(SCHEDULE_ROW);
+    row.extend_from_slice(&automation_id.to_bytes());
     Key::from(row)
 }
 

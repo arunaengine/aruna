@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use super::record::Spec;
+use super::rules::conditions_widen;
 use crate::structs::execution::workflow_run::RunLimits;
 
 /// Default hard limits applied when an automation does not specify tighter ones.
@@ -35,33 +36,18 @@ impl Audience {
 }
 
 /// Hard caps on firing rate, concurrency, copy volume, chain depth and task compute.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// `None` uses the node's default bound, so explicitly chosen limits remain distinct from defaults.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Limits {
-    pub max_active_firings: u32,
-    pub max_concurrent_workflows: u32,
-    pub per_hour: u32,
-    pub per_day: u32,
-    pub bytes_per_day: u64,
+    pub max_active_firings: Option<u32>,
+    pub max_concurrent_workflows: Option<u32>,
+    pub per_hour: Option<u32>,
+    pub per_day: Option<u32>,
+    pub bytes_per_day: Option<u64>,
     pub cpu_cores: Option<u32>,
     pub ram_bytes: Option<u64>,
     pub walltime_ms: Option<u64>,
-    pub max_chain_depth: u8,
-}
-
-impl Default for Limits {
-    fn default() -> Self {
-        Self {
-            max_active_firings: DEFAULT_ACTIVE_FIRINGS,
-            max_concurrent_workflows: DEFAULT_CONCURRENT_WORKFLOWS,
-            per_hour: DEFAULT_PER_HOUR,
-            per_day: DEFAULT_PER_DAY,
-            bytes_per_day: DEFAULT_BYTES_DAY,
-            cpu_cores: None,
-            ram_bytes: None,
-            walltime_ms: None,
-            max_chain_depth: DEFAULT_CHAIN_DEPTH,
-        }
-    }
+    pub max_chain_depth: Option<u8>,
 }
 
 /// Approved permissions, targets and limits for an automation.
@@ -78,29 +64,54 @@ pub struct Scope {
 }
 
 impl Limits {
+    pub fn active_firings(&self) -> u32 {
+        self.max_active_firings.unwrap_or(DEFAULT_ACTIVE_FIRINGS)
+    }
+
+    pub fn concurrent_workflows(&self) -> u32 {
+        self.max_concurrent_workflows
+            .unwrap_or(DEFAULT_CONCURRENT_WORKFLOWS)
+    }
+
+    pub fn hour_limit(&self) -> u32 {
+        self.per_hour.unwrap_or(DEFAULT_PER_HOUR)
+    }
+
+    pub fn day_limit(&self) -> u32 {
+        self.per_day.unwrap_or(DEFAULT_PER_DAY)
+    }
+
+    pub fn copy_bytes_day(&self) -> u64 {
+        self.bytes_per_day.unwrap_or(DEFAULT_BYTES_DAY)
+    }
+
+    pub fn chain_depth(&self) -> u8 {
+        self.max_chain_depth.unwrap_or(DEFAULT_CHAIN_DEPTH)
+    }
+
     /// Compute and active-run caps forwarded to each workflow run started by this automation.
     pub fn run_limits(&self) -> RunLimits {
         RunLimits {
             cpu_cores: self.cpu_cores,
             ram_bytes: self.ram_bytes,
             walltime_ms: self.walltime_ms,
-            active_cap: Some(self.max_concurrent_workflows),
+            active_cap: Some(self.concurrent_workflows()),
         }
     }
 
-    /// Whether every bound in `self` is at least as strict as `other`.
+    /// Whether every effective bound in `self` is at least as strict as `other`.
     pub fn is_tighter_than(&self, other: &Self) -> bool {
         let opt = |a: Option<u64>, b: Option<u64>| match (a, b) {
             (_, None) => true,
             (Some(a), Some(b)) => a <= b,
             (None, Some(_)) => false,
         };
-        self.max_active_firings <= other.max_active_firings
-            && self.max_concurrent_workflows <= other.max_concurrent_workflows
-            && self.per_hour <= other.per_hour
-            && self.per_day <= other.per_day
-            && self.bytes_per_day <= other.bytes_per_day
-            && self.max_chain_depth <= other.max_chain_depth
+        self.active_firings() <= other.active_firings()
+            && self.concurrent_workflows() <= other.concurrent_workflows()
+            && self.hour_limit() <= other.hour_limit()
+            && self.day_limit() <= other.day_limit()
+            && self.copy_bytes_day() <= other.copy_bytes_day()
+            && self.chain_depth() <= other.chain_depth()
             && opt(
                 self.cpu_cores.map(u64::from),
                 other.cpu_cores.map(u64::from),
@@ -118,6 +129,9 @@ fn subset<T: Ord>(after: &[T], before: &[T]) -> bool {
 /// Whether changing `before` to `after` widens authority or alters executable behavior.
 pub fn is_widening(before: &Spec, after: &Spec) -> bool {
     if before.stages != after.stages {
+        return true;
+    }
+    if conditions_widen(&before.conditions, &after.conditions) {
         return true;
     }
     if after
@@ -153,17 +167,21 @@ mod tests {
         let mut base = Spec::default();
         base.triggers.push(Trigger::Manual { form_json: None });
         base.scope.read = vec!["/r/g/a/**".into(), "/r/g/b/**".into()];
-        base.scope.limits.per_hour = 20;
+        base.scope.limits.per_hour = Some(20);
 
         let mut narrow = base.clone();
         narrow.scope.read = vec!["/r/g/a/**".into()];
-        narrow.scope.limits.per_hour = 10;
+        narrow.scope.limits.per_hour = Some(10);
         narrow.scope.limits.cpu_cores = Some(2);
         assert!(!is_widening(&base, &narrow));
 
         let mut wide_limit = base.clone();
-        wide_limit.scope.limits.per_hour = 25;
+        wide_limit.scope.limits.per_hour = Some(25);
         assert!(is_widening(&base, &wide_limit));
+
+        let mut reset_default = base.clone();
+        reset_default.scope.limits.per_hour = None;
+        assert!(is_widening(&base, &reset_default));
 
         let mut wide_path = base.clone();
         wide_path.scope.read.push("/r/g/c/**".into());

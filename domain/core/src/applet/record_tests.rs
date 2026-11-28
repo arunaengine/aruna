@@ -55,6 +55,7 @@ pub(crate) fn applet() -> Applet {
         created_by: user(1),
         created_at_ms: 1,
         revision: 1,
+        automations: Vec::new(),
     }
 }
 

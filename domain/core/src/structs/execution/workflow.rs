@@ -75,6 +75,8 @@ pub struct WorkflowRecord {
     pub created_by: UserId,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+    /// Optional automation linked to this workflow via unified Studio save.
+    pub automation_id: Option<Ulid>,
 }
 
 /// The preflight results of a version, as JSON text, stored at import or on the first read.

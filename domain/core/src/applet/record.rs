@@ -303,6 +303,8 @@ pub struct Applet {
     pub created_at_ms: u64,
     /// Raised by every write of the record.
     pub revision: u64,
+    /// Group automations this applet is configured to start on submission.
+    pub automations: Vec<Ulid>,
 }
 
 /// Why a lifecycle change is refused.
