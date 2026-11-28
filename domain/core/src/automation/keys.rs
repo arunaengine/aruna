@@ -13,7 +13,8 @@ pub const KEPT_ROW: u8 = 3;
 pub const SEEN_ROW: u8 = 4;
 pub const USAGE_ROW: u8 = 5;
 pub const REPLAY_ROW: u8 = 6;
-pub const SCHEDULE_ROW: u8 = 7;
+pub const SCHEDULE_DUE_ROW: u8 = 7;
+pub const SCHEDULE_CURSOR_ROW: u8 = 8;
 
 /// Row tags in `AUTOMATION_RUNS_KEYSPACE`.
 pub const FIRING_ROW: u8 = 1;
@@ -77,15 +78,34 @@ pub fn seen_key(automation_id: Ulid, source: &str) -> Key {
     Key::from(row)
 }
 
-/// Prefix of every active scheduled automation index row in `AUTOMATIONS_KEYSPACE`.
-pub fn schedule_prefix() -> Key {
-    Key::from(vec![SCHEDULE_ROW])
+/// Prefix of every due-time-ordered scheduled automation index row in `AUTOMATIONS_KEYSPACE`.
+pub fn schedule_due_prefix() -> Key {
+    Key::from(vec![SCHEDULE_DUE_ROW])
 }
 
-/// Last processed schedule slot timestamp (8 big-endian bytes) for one automation.
-pub fn schedule_key(automation_id: Ulid) -> Key {
+/// Due-time-ordered index row `[SCHEDULE_DUE_ROW, due_ms_be8, automation_id_16]` for one automation.
+pub fn schedule_due_key(due_ms: u64, automation_id: Ulid) -> Key {
+    let mut row = Vec::with_capacity(25);
+    row.push(SCHEDULE_DUE_ROW);
+    row.extend_from_slice(&due_ms.to_be_bytes());
+    row.extend_from_slice(&automation_id.to_bytes());
+    Key::from(row)
+}
+
+/// Parses a `SCHEDULE_DUE_ROW` key into `(due_ms, automation_id)`.
+pub fn parse_due_key(key: &[u8]) -> Option<(u64, Ulid)> {
+    if key.len() != 25 || key.first().copied() != Some(SCHEDULE_DUE_ROW) {
+        return None;
+    }
+    let due_bytes: [u8; 8] = key.get(1..9)?.try_into().ok()?;
+    let id_bytes: [u8; 16] = key.get(9..25)?.try_into().ok()?;
+    Some((u64::from_be_bytes(due_bytes), Ulid::from_bytes(id_bytes)))
+}
+
+/// Per-automation schedule cursor storing its current due timestamp and per-schedule anchors.
+pub fn schedule_cursor_key(automation_id: Ulid) -> Key {
     let mut row = Vec::with_capacity(17);
-    row.push(SCHEDULE_ROW);
+    row.push(SCHEDULE_CURSOR_ROW);
     row.extend_from_slice(&automation_id.to_bytes());
     Key::from(row)
 }
