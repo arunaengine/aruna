@@ -1,15 +1,16 @@
-//! Tests wildcard applet triggers, applet automation linking, approval diffs and feature gates.
+//! Tests wildcard applet triggers, outside-input approval, diffs and feature gates.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeSet;
 
 use aruna_core::applet::record::{
-    Access, Applet, Embedding, Grants, Lifecycle as AppletLifecycle, SubmissionReceipt, applet_key,
-    group_key, submission_key,
+    Access, Applet, Embedding, Grants, Lifecycle as AppletLifecycle, StartGrant, SubmissionReceipt,
+    applet_key, group_key, submission_key,
 };
 use aruna_core::automation::record::Trigger;
-use aruna_core::automation::rules::{Condition, ConditionMode, Conditions, Weekday};
+use aruna_core::automation::rules::{Condition, ConditionMode, Conditions};
+use aruna_core::automation::schedule::Weekday;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::keyspaces::APPLETS_KEYSPACE;
 use aruna_core::operation::Operation;
@@ -21,11 +22,13 @@ use aruna_ops_identity::document_repository::GetConfigError;
 use aruna_runner::driver::drive;
 use ulid::Ulid;
 
-use super::LinkAppletOperation;
+use super::{AppletLinkTarget, LinkAppletOperation};
 use crate::applets::AppletError;
 use crate::automations::AutoError;
+use crate::automations::change::AutoChange;
 use crate::automations::diff::DiffAutoOperation;
 use crate::automations::flow_tests::Env;
+use crate::automations::lifecycle::ChangeAutoOperation;
 use crate::automations::matcher::MatchEventsOperation;
 
 fn sample_applet(env: &Env, applet_id: Ulid, slug: &str, access: Access) -> Applet {
@@ -68,8 +71,12 @@ fn steps_link_phases() {
         aruna_core::user::id::UserId::local(Ulid::from_bytes([1; 16]), realm),
         realm,
     );
+    let target = AppletLinkTarget {
+        applet_id,
+        expected_revision: Some(1),
+    };
 
-    let mut operation = LinkAppletOperation::new(&auth, (applet_id, Some(1)), vec![auto_id], node);
+    let mut operation = LinkAppletOperation::new(&auth, target, vec![auto_id], node);
     assert!(matches!(
         operation.first(),
         Ok(Next::Call(IoCall::Child(_)))
@@ -133,7 +140,7 @@ fn steps_link_phases() {
     ));
 
     // Enabled features advance to batch-reading target automations, then rejecting cross-group IDs.
-    let mut enabled_op = LinkAppletOperation::new(&auth, (applet_id, Some(1)), vec![auto_id], node)
+    let mut enabled_op = LinkAppletOperation::new(&auth, target, vec![auto_id], node)
         .with_disabled_features(BTreeSet::new());
     assert!(matches!(
         enabled_op.first(),
@@ -180,6 +187,7 @@ fn steps_link_phases() {
         created_at_ms: 1,
         updated_at_ms: 1,
         revision: 1,
+        identity_synced_revision: 0,
         workflow_id: None,
     };
     let cross_group = enabled_op.next(IoResult::Values(vec![Some(
@@ -189,20 +197,25 @@ fn steps_link_phases() {
 }
 
 #[tokio::test]
-async fn matches_wildcard_applets() {
+async fn guards_wildcard_applets() {
     let env = Env::new().await;
-    let linked_id = Ulid::from_bytes([51; 16]);
-    let unlinked_id = Ulid::from_bytes([52; 16]);
+    let public_id = Ulid::from_bytes([51; 16]);
+    let private_id = Ulid::from_bytes([52; 16]);
     let removed_id = Ulid::from_bytes([53; 16]);
+    let foreign_id = Ulid::from_bytes([54; 16]);
+
+    let mut foreign = sample_applet(&env, foreign_id, "secret-other-group", Access::Public);
+    foreign.group_id = Ulid::from_bytes([99; 16]);
 
     for applet in [
-        sample_applet(&env, linked_id, "public-intake", Access::Public),
-        sample_applet(&env, unlinked_id, "private-other", Access::Private),
+        sample_applet(&env, public_id, "public-intake", Access::Public),
+        sample_applet(&env, private_id, "private-intake", Access::Private),
         {
             let mut down = sample_applet(&env, removed_id, "old-intake", Access::Public);
             down.lifecycle = AppletLifecycle::TakenDown;
             down
         },
+        foreign,
     ] {
         env.write_row(
             APPLETS_KEYSPACE,
@@ -212,12 +225,13 @@ async fn matches_wildcard_applets() {
         .await;
         env.write_row(
             APPLETS_KEYSPACE,
-            group_key(env.group, applet.applet_id),
+            group_key(applet.group_id, applet.applet_id),
             Vec::new(),
         )
         .await;
     }
 
+    // Approved wildcard automation WITHOUT allow_outside_input rejects linking a public applet.
     let mut spec = env.base_spec();
     spec.triggers = vec![Trigger::AppletSubmission { applet_id: None }];
     spec.conditions = Conditions {
@@ -227,13 +241,121 @@ async fn matches_wildcard_applets() {
             zone: "UTC".into(),
         }],
     };
-    let automation = env.create_active(spec).await;
+    let automation = env.create_active(spec.clone()).await;
 
-    // Link the live public applet via the domain operation.
+    let blocked = drive(
+        LinkAppletOperation::new(
+            &env.member,
+            AppletLinkTarget {
+                applet_id: public_id,
+                expected_revision: Some(1),
+            },
+            vec![automation.automation_id],
+            env.node,
+        ),
+        &env.ctx,
+    )
+    .await;
+    assert!(
+        matches!(blocked, Err(AutoError::Conflict(_))),
+        "expected Conflict linking public applet without allow_outside_input, got {blocked:?}"
+    );
+
+    // Linking a private applet succeeds, but if it later becomes public, admission skips it.
+    drive(
+        LinkAppletOperation::new(
+            &env.member,
+            AppletLinkTarget {
+                applet_id: private_id,
+                expected_revision: Some(1),
+            },
+            vec![automation.automation_id],
+            env.node,
+        ),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    let mut turned_public = sample_applet(&env, private_id, "private-intake", Access::Public);
+    turned_public.automations = vec![automation.automation_id];
+    env.write_row(
+        APPLETS_KEYSPACE,
+        applet_key(private_id),
+        turned_public.to_bytes().unwrap(),
+    )
+    .await;
+    let path = group_permission_path(env.realm, env.group, env.node);
+    let flipped_version = Ulid::from_bytes([80; 16]);
+    let flipped_receipt = SubmissionReceipt {
+        applet_id: private_id,
+        version_id: flipped_version,
+        pseudonym: "vis-80".into(),
+        guest: false,
+        outside_input: true,
+        bucket: "uploads".into(),
+        key: "in/80.json".into(),
+        files: Vec::new(),
+        created_at_ms: 19,
+    };
+    env.write_row(
+        APPLETS_KEYSPACE,
+        submission_key(private_id, flipped_version),
+        flipped_receipt.to_bytes().unwrap(),
+    )
+    .await;
+    env.journal(&SourceEvent::applet_submission(
+        env.group,
+        path.clone(),
+        (private_id, flipped_version),
+        None,
+        19,
+    ))
+    .await;
+    let blocked_run = drive(MatchEventsOperation::new(env.realm), &env.ctx)
+        .await
+        .unwrap();
+    assert_eq!((blocked_run.fired, blocked_run.skipped), (0, 1));
+
+    // Approving `allow_outside_input = true` requires admin approval (widening), then allows link+fire.
+    let mut outside_spec = spec;
+    outside_spec.scope.allow_outside_input = true;
+    let pending = drive(
+        ChangeAutoOperation::new(
+            &env.member,
+            (automation.automation_id, Some(automation.revision)),
+            AutoChange::Update {
+                name: None,
+                description: None,
+                spec: Some(outside_spec),
+                workflow_id: None,
+            },
+            env.node,
+        ),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    assert!(pending.pending.is_some());
+    assert!(!pending.spec.scope.allow_outside_input);
+    drive(
+        ChangeAutoOperation::new(
+            &env.owner,
+            (automation.automation_id, Some(pending.revision)),
+            AutoChange::Approve,
+            env.node,
+        ),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+
     let updated = drive(
         LinkAppletOperation::new(
             &env.owner,
-            (linked_id, Some(1)),
+            AppletLinkTarget {
+                applet_id: public_id,
+                expected_revision: Some(1),
+            },
             vec![automation.automation_id, automation.automation_id],
             env.node,
         ),
@@ -243,7 +365,7 @@ async fn matches_wildcard_applets() {
     .unwrap();
     assert_eq!(updated.automations, vec![automation.automation_id]);
 
-    // Approval diff lists linked live applets, marks outside_input, and reports conditions.
+    // Approval diff lists linked live applets and marks outside_input.
     let diff = drive(
         DiffAutoOperation::new(&env.owner, automation.automation_id, env.node, None),
         &env.ctx,
@@ -251,43 +373,88 @@ async fn matches_wildcard_applets() {
     .await
     .unwrap();
     assert!(diff.diff.outside_input);
-    assert_eq!(diff.diff.linked_applets.len(), 1);
-    assert_eq!(diff.diff.linked_applets[0].applet_id, linked_id);
-    assert!(diff.diff.linked_applets[0].outside_input);
+    assert!(
+        diff.diff
+            .linked_applets
+            .iter()
+            .any(|item| item.applet_id == public_id)
+    );
 
-    // Submissions from linked applet fire; submissions from unlinked applet are ignored.
-    let path = group_permission_path(env.realm, env.group, env.node);
-    for (seed, applet_id) in [(81u8, linked_id), (82u8, unlinked_id)] {
-        let version_id = Ulid::from_bytes([seed; 16]);
-        let receipt = SubmissionReceipt {
-            applet_id,
-            version_id,
-            pseudonym: format!("vis-{seed}"),
-            guest: false,
-            outside_input: applet_id == linked_id,
-            bucket: "uploads".into(),
-            key: format!("in/{seed}.json"),
-            files: Vec::new(),
-            created_at_ms: 20,
-        };
-        env.write_row(
-            APPLETS_KEYSPACE,
-            submission_key(applet_id, version_id),
-            receipt.to_bytes().unwrap(),
-        )
-        .await;
-        let event = SourceEvent::applet_submission(
-            env.group,
-            path.clone(),
-            (applet_id, version_id),
-            None,
-            20,
-        );
-        env.journal(&event).await;
-    }
-
+    // Submissions from linked public applet now fire cleanly.
+    let version_id = Ulid::from_bytes([81; 16]);
+    let receipt = SubmissionReceipt {
+        applet_id: public_id,
+        version_id,
+        pseudonym: "vis-81".into(),
+        guest: false,
+        outside_input: true,
+        bucket: "uploads".into(),
+        key: "in/81.json".into(),
+        files: Vec::new(),
+        created_at_ms: 20,
+    };
+    env.write_row(
+        APPLETS_KEYSPACE,
+        submission_key(public_id, version_id),
+        receipt.to_bytes().unwrap(),
+    )
+    .await;
+    env.journal(&SourceEvent::applet_submission(
+        env.group,
+        path,
+        (public_id, version_id),
+        None,
+        20,
+    ))
+    .await;
     let report = drive(MatchEventsOperation::new(env.realm), &env.ctx)
         .await
         .unwrap();
-    assert_eq!((report.scanned, report.fired, report.kept), (2, 1, 0));
+    assert_eq!((report.scanned, report.fired, report.kept), (1, 1, 0));
+
+    // Diff hides foreign-group applet metadata and merges run_finished + applet_submission flags.
+    let mut start_applet = sample_applet(
+        &env,
+        Ulid::from_bytes([55; 16]),
+        "dup-start",
+        Access::Private,
+    );
+    start_applet.grants.start = Some(StartGrant::Workflow {
+        workflow_id: Ulid::from_bytes([60; 16]),
+        version: 1,
+    });
+    env.write_row(
+        APPLETS_KEYSPACE,
+        applet_key(start_applet.applet_id),
+        start_applet.to_bytes().unwrap(),
+    )
+    .await;
+    let mut mixed_spec = env.base_spec();
+    mixed_spec.triggers = vec![
+        Trigger::RunFinished {
+            workflow_id: Ulid::from_bytes([60; 16]),
+            status: None,
+            applet_id: Some(start_applet.applet_id),
+        },
+        Trigger::AppletSubmission {
+            applet_id: Some(start_applet.applet_id),
+        },
+        Trigger::AppletSubmission {
+            applet_id: Some(foreign_id),
+        },
+    ];
+    let mixed_auto = env.create_active(mixed_spec).await;
+    let mixed_diff = drive(
+        DiffAutoOperation::new(&env.owner, mixed_auto.automation_id, env.node, None),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    assert!(!mixed_diff.diff.outside_input);
+    assert_eq!(mixed_diff.diff.linked_applets.len(), 1);
+    assert_eq!(
+        mixed_diff.diff.linked_applets[0].applet_id,
+        start_applet.applet_id
+    );
+    assert_eq!(mixed_diff.diff.applet_warnings.len(), 1);
 }
