@@ -431,98 +431,380 @@ fn local_slot_ms(date: Date, time: ClockTime, zone: &TimeZone) -> Option<u64> {
     u64::try_from(timestamp.as_millisecond()).ok()
 }
 
-/// Returns every scheduled slot timestamp in `(after_ms, now_ms]` for one schedule trigger.
-pub fn due_slots(schedule: &ScheduleSpec, after_ms: u64, now_ms: u64) -> Vec<u64> {
-    if after_ms >= now_ms {
-        return Vec::new();
+fn hourly_step_minutes(schedule: &ScheduleSpec) -> Option<i64> {
+    let hours = schedule.hours?;
+    (1..=24).contains(&hours).then_some(i64::from(hours) * 60)
+}
+
+fn collect_day_range(
+    schedule: &ScheduleSpec,
+    zone: &TimeZone,
+    first_day: i64,
+    last_day: i64,
+    after_ms: u64,
+    now_ms: u64,
+    out: &mut BTreeSet<u64>,
+) {
+    if first_day > last_day {
+        return;
     }
-    let Ok(zone) = TimeZone::get(schedule.zone.trim()) else {
-        return Vec::new();
-    };
-    let Some(end_timestamp) = i64::try_from(now_ms)
-        .ok()
-        .and_then(|ms| Timestamp::from_millisecond(ms).ok())
-    else {
-        return Vec::new();
-    };
-    let end_date = zone.to_datetime(end_timestamp).date();
-    let floor_date = end_date
-        .checked_sub(MAX_SCAN_DAYS.days())
-        .unwrap_or(end_date);
-    let raw_start = i64::try_from(after_ms)
-        .ok()
-        .and_then(|ms| Timestamp::from_millisecond(ms).ok())
-        .map(|timestamp| zone.to_datetime(timestamp).date())
-        .unwrap_or(floor_date);
-    let start_date = raw_start.yesterday().unwrap_or(raw_start).max(floor_date);
-    let stop_date = end_date.tomorrow().unwrap_or(end_date);
-    let times = slot_minutes(schedule);
-    let mut slots = BTreeSet::new();
-    let mut current = start_date;
-    while current <= stop_date {
-        let weekday = Weekday::from_jiff(current.weekday());
-        let day_ok = schedule.every != ScheduleEvery::Week || schedule.days.contains(&weekday);
-        if day_ok {
-            for &minutes in &times {
-                if let Some(ms) = local_slot_ms(current, minutes, &zone)
+    match schedule.every {
+        ScheduleEvery::Day => {
+            for day in first_day..=last_day {
+                if let Some(date) = civil_from_days(day)
+                    && let Some(ms) = local_slot_ms(date, schedule.at, zone)
                     && ms > after_ms
                     && ms <= now_ms
                 {
-                    slots.insert(ms);
+                    out.insert(ms);
                 }
             }
         }
-        let Ok(next) = current.tomorrow() else {
-            break;
-        };
-        current = next;
-    }
-    slots.into_iter().collect()
-}
-
-/// Merges every schedule trigger in `spec` into sorted unique due slots in `(after_ms, now_ms]`.
-pub fn schedule_due_slots(spec: &Spec, after_ms: u64, now_ms: u64) -> Vec<u64> {
-    let mut all = BTreeSet::new();
-    for trigger in &spec.triggers {
-        if let Trigger::Schedule(schedule) = trigger {
-            all.extend(due_slots(schedule, after_ms, now_ms));
+        ScheduleEvery::Week => {
+            for day in first_day..=last_day {
+                if schedule.days.contains(&weekday_for_days(day))
+                    && let Some(date) = civil_from_days(day)
+                    && let Some(ms) = local_slot_ms(date, schedule.at, zone)
+                    && ms > after_ms
+                    && ms <= now_ms
+                {
+                    out.insert(ms);
+                }
+            }
+        }
+        ScheduleEvery::Hours => {
+            let Some(step_minutes) = hourly_step_minutes(schedule) else {
+                return;
+            };
+            let anchor = i64::from(schedule.at.minutes_since_midnight());
+            let low_minute = first_day.saturating_mul(1440);
+            let high_minute = last_day.saturating_add(1).saturating_mul(1440) - 1;
+            let mut index = (low_minute - anchor).div_euclid(step_minutes);
+            if anchor + index * step_minutes < low_minute {
+                index += 1;
+            }
+            let end_index = (high_minute - anchor).div_euclid(step_minutes);
+            for slot_index in index..=end_index {
+                let total_minutes = anchor + slot_index * step_minutes;
+                let day = total_minutes.div_euclid(1440);
+                let minute_of_day = total_minutes.rem_euclid(1440) as u16;
+                let Some(clock) =
+                    ClockTime::new((minute_of_day / 60) as u8, (minute_of_day % 60) as u8)
+                else {
+                    continue;
+                };
+                if let Some(date) = civil_from_days(day)
+                    && let Some(ms) = local_slot_ms(date, clock, zone)
+                    && ms > after_ms
+                    && ms <= now_ms
+                {
+                    out.insert(ms);
+                }
+            }
         }
     }
-    all.into_iter().collect()
+}
+
+fn count_interior_slots(schedule: &ScheduleSpec, first_day: i64, last_day: i64) -> u64 {
+    if first_day > last_day {
+        return 0;
+    }
+    let total_days = (last_day - first_day + 1) as u64;
+    match schedule.every {
+        ScheduleEvery::Day => total_days,
+        ScheduleEvery::Week => {
+            let mut unique_days: Vec<Weekday> = schedule.days.clone();
+            unique_days.sort_by_key(|day| day.ordinal());
+            unique_days.dedup();
+            if unique_days.is_empty() {
+                return 0;
+            }
+            let full_weeks = total_days / 7;
+            let remainder = (total_days % 7) as i64;
+            let mut extra = 0u64;
+            for offset in 0..remainder {
+                if unique_days.contains(&weekday_for_days(first_day + offset)) {
+                    extra += 1;
+                }
+            }
+            full_weeks
+                .saturating_mul(unique_days.len() as u64)
+                .saturating_add(extra)
+        }
+        ScheduleEvery::Hours => {
+            let Some(step_minutes) = hourly_step_minutes(schedule) else {
+                return 0;
+            };
+            let anchor = i64::from(schedule.at.minutes_since_midnight());
+            let low_minute = first_day.saturating_mul(1440);
+            let high_minute = last_day.saturating_add(1).saturating_mul(1440) - 1;
+            let mut first_index = (low_minute - anchor).div_euclid(step_minutes);
+            if anchor + first_index * step_minutes < low_minute {
+                first_index += 1;
+            }
+            let last_index = (high_minute - anchor).div_euclid(step_minutes);
+            if first_index > last_index {
+                0
+            } else {
+                (last_index - first_index + 1) as u64
+            }
+        }
+    }
+}
+
+/// Evaluates missed and live slots in `(after_ms, now_ms]` for one schedule in O(1) time.
+pub fn schedule_due_single(schedule: &ScheduleSpec, after_ms: u64, now_ms: u64) -> ScheduleDue {
+    if after_ms >= now_ms || validate_schedule(schedule).is_err() {
+        return ScheduleDue::default();
+    }
+    let Ok(zone) = parse_zone(&schedule.zone, "schedule trigger") else {
+        return ScheduleDue::default();
+    };
+    let (Some(start_ts), Some(end_ts)) = (
+        i64::try_from(after_ms)
+            .ok()
+            .and_then(|ms| Timestamp::from_millisecond(ms).ok()),
+        i64::try_from(now_ms)
+            .ok()
+            .and_then(|ms| Timestamp::from_millisecond(ms).ok()),
+    ) else {
+        return ScheduleDue::default();
+    };
+    let live_cutoff = now_ms.saturating_sub(LIVE_GRACE_MS);
+    let cutoff_ts = i64::try_from(live_cutoff)
+        .ok()
+        .and_then(|ms| Timestamp::from_millisecond(ms).ok())
+        .unwrap_or(end_ts);
+    let start_day = date_to_days(zone.to_datetime(start_ts).date());
+    let cutoff_day = date_to_days(zone.to_datetime(cutoff_ts).date());
+    let end_day = date_to_days(zone.to_datetime(end_ts).date());
+
+    if end_day - start_day <= DIRECT_EVAL_DAYS {
+        let mut slots = BTreeSet::new();
+        collect_day_range(
+            schedule,
+            &zone,
+            start_day - 1,
+            end_day + 1,
+            after_ms,
+            now_ms,
+            &mut slots,
+        );
+        return summarize_slots(&slots, live_cutoff);
+    }
+
+    let mut left_slots = BTreeSet::new();
+    collect_day_range(
+        schedule,
+        &zone,
+        start_day - 1,
+        start_day + BOUNDARY_DAYS,
+        after_ms,
+        live_cutoff.saturating_sub(1),
+        &mut left_slots,
+    );
+    let mut right_slots = BTreeSet::new();
+    collect_day_range(
+        schedule,
+        &zone,
+        cutoff_day - BOUNDARY_DAYS,
+        end_day + 1,
+        after_ms,
+        now_ms,
+        &mut right_slots,
+    );
+    let interior_count = count_interior_slots(
+        schedule,
+        start_day + BOUNDARY_DAYS + 1,
+        cutoff_day - BOUNDARY_DAYS - 1,
+    );
+    let right_missed: Vec<u64> = right_slots
+        .iter()
+        .copied()
+        .filter(|ms| *ms < live_cutoff)
+        .collect();
+    let live_slot_ms = right_slots.iter().copied().find(|ms| *ms >= live_cutoff);
+    let missed_count = (left_slots.len() as u64)
+        .saturating_add(interior_count)
+        .saturating_add(right_missed.len() as u64);
+    let first_missed_ms = left_slots
+        .iter()
+        .next()
+        .copied()
+        .or_else(|| right_missed.first().copied());
+    let last_missed_ms = right_missed
+        .last()
+        .copied()
+        .or_else(|| left_slots.iter().next_back().copied());
+    ScheduleDue {
+        missed_count,
+        first_missed_ms,
+        last_missed_ms,
+        live_slot_ms,
+    }
+}
+
+fn summarize_slots(slots: &BTreeSet<u64>, live_cutoff: u64) -> ScheduleDue {
+    let mut missed_count = 0u64;
+    let mut first_missed_ms = None;
+    let mut last_missed_ms = None;
+    let mut live_slot_ms = None;
+    for &ms in slots {
+        if ms < live_cutoff {
+            missed_count = missed_count.saturating_add(1);
+            if first_missed_ms.is_none() {
+                first_missed_ms = Some(ms);
+            }
+            last_missed_ms = Some(ms);
+        } else if live_slot_ms.is_none() {
+            live_slot_ms = Some(ms);
+        }
+    }
+    ScheduleDue {
+        missed_count,
+        first_missed_ms,
+        last_missed_ms,
+        live_slot_ms,
+    }
+}
+
+/// Evaluates missed and live schedule starts across all triggers in `spec` using `cursor`.
+pub fn schedule_due(spec: &Spec, cursor: &ScheduleCursor, now_ms: u64) -> ScheduleDue {
+    let schedules = unique_schedules(spec);
+    if schedules.is_empty() {
+        return ScheduleDue::default();
+    }
+    let live_cutoff = now_ms.saturating_sub(LIVE_GRACE_MS);
+    let all_short = schedules.iter().all(|schedule| {
+        let last_ms = cursor
+            .anchors
+            .iter()
+            .find(|anchor| anchor.schedule == *schedule)
+            .map_or(now_ms, |anchor| anchor.last_ms);
+        now_ms.saturating_sub(last_ms) <= (DIRECT_EVAL_DAYS as u64) * 86_400_000
+    });
+    if all_short {
+        let mut combined = BTreeSet::new();
+        for schedule in &schedules {
+            let last_ms = cursor
+                .anchors
+                .iter()
+                .find(|anchor| anchor.schedule == *schedule)
+                .map_or(now_ms, |anchor| anchor.last_ms);
+            if last_ms >= now_ms || validate_schedule(schedule).is_err() {
+                continue;
+            }
+            let Ok(zone) = parse_zone(&schedule.zone, "schedule trigger") else {
+                continue;
+            };
+            let (Some(start_ts), Some(end_ts)) = (
+                i64::try_from(last_ms)
+                    .ok()
+                    .and_then(|ms| Timestamp::from_millisecond(ms).ok()),
+                i64::try_from(now_ms)
+                    .ok()
+                    .and_then(|ms| Timestamp::from_millisecond(ms).ok()),
+            ) else {
+                continue;
+            };
+            let start_day = date_to_days(zone.to_datetime(start_ts).date());
+            let end_day = date_to_days(zone.to_datetime(end_ts).date());
+            collect_day_range(
+                schedule,
+                &zone,
+                start_day - 1,
+                end_day + 1,
+                last_ms,
+                now_ms,
+                &mut combined,
+            );
+        }
+        return summarize_slots(&combined, live_cutoff);
+    }
+
+    let mut summary = ScheduleDue::default();
+    for schedule in &schedules {
+        let last_ms = cursor
+            .anchors
+            .iter()
+            .find(|anchor| anchor.schedule == *schedule)
+            .map_or(now_ms, |anchor| anchor.last_ms);
+        let part = schedule_due_single(schedule, last_ms, now_ms);
+        summary.missed_count = summary.missed_count.saturating_add(part.missed_count);
+        if let Some(first) = part.first_missed_ms {
+            summary.first_missed_ms = Some(
+                summary
+                    .first_missed_ms
+                    .map_or(first, |prev| prev.min(first)),
+            );
+        }
+        if let Some(last) = part.last_missed_ms {
+            summary.last_missed_ms =
+                Some(summary.last_missed_ms.map_or(last, |prev| prev.max(last)));
+        }
+        if let Some(live) = part.live_slot_ms {
+            summary.live_slot_ms = Some(summary.live_slot_ms.map_or(live, |prev| prev.min(live)));
+        }
+    }
+    summary
 }
 
 /// Next scheduled start strictly after `after_ms` across all schedule triggers in `spec`.
 pub fn next_start(spec: &Spec, after_ms: u64) -> Option<u64> {
-    let mut best: Option<u64> = None;
-    for trigger in &spec.triggers {
-        if let Trigger::Schedule(schedule) = trigger
-            && let Some(ms) = next_slot(schedule, after_ms)
-        {
-            best = Some(best.map_or(ms, |previous| previous.min(ms)));
-        }
-    }
-    best
+    spec.triggers
+        .iter()
+        .filter_map(|trigger| match trigger {
+            Trigger::Schedule(schedule) => next_slot(schedule, after_ms),
+            _ => None,
+        })
+        .min()
 }
 
-fn next_slot(schedule: &ScheduleSpec, after_ms: u64) -> Option<u64> {
-    let zone = TimeZone::get(schedule.zone.trim()).ok()?;
+/// Next scheduled start strictly after `after_ms` for one schedule trigger.
+pub fn next_slot(schedule: &ScheduleSpec, after_ms: u64) -> Option<u64> {
+    validate_schedule(schedule).ok()?;
+    let zone = parse_zone(&schedule.zone, "schedule trigger").ok()?;
     let timestamp = Timestamp::from_millisecond(i64::try_from(after_ms).ok()?).ok()?;
-    let start = zone.to_datetime(timestamp).date();
-    let times = slot_minutes(schedule);
-    let mut current = start.yesterday().unwrap_or(start);
-    for _ in 0..10 {
-        let weekday = Weekday::from_jiff(current.weekday());
-        let day_ok = schedule.every != ScheduleEvery::Week || schedule.days.contains(&weekday);
-        if day_ok {
-            for &minutes in &times {
-                if let Some(ms) = local_slot_ms(current, minutes, &zone)
-                    && ms > after_ms
-                {
-                    return Some(ms);
-                }
-            }
+    let start_day = date_to_days(zone.to_datetime(timestamp).date());
+    let mut candidates = BTreeSet::new();
+    match schedule.every {
+        ScheduleEvery::Day => {
+            collect_day_range(
+                schedule,
+                &zone,
+                start_day - 1,
+                start_day + 2,
+                after_ms,
+                u64::MAX,
+                &mut candidates,
+            );
         }
-        current = current.tomorrow().ok()?;
+        ScheduleEvery::Week => {
+            collect_day_range(
+                schedule,
+                &zone,
+                start_day - 1,
+                start_day + 8,
+                after_ms,
+                u64::MAX,
+                &mut candidates,
+            );
+        }
+        ScheduleEvery::Hours => {
+            collect_day_range(
+                schedule,
+                &zone,
+                start_day - 1,
+                start_day + 2,
+                after_ms,
+                u64::MAX,
+                &mut candidates,
+            );
+        }
     }
-    None
+    candidates.into_iter().next()
 }
+
+#[cfg(test)]
+#[path = "schedule_tests.rs"]
+mod tests;
