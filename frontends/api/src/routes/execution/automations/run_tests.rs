@@ -126,6 +126,7 @@ async fn runs_and_visitors() {
         ),
         reason: "paused".into(),
         kept_at_ms: 5,
+        payload: None,
     };
     write_doc(
         &h.state.get_ctx(),
@@ -187,6 +188,7 @@ async fn runs_and_visitors() {
         created_by: h.owner.user_id,
         created_at_ms: 1,
         revision: 1,
+        automations: Vec::new(),
     };
     let vis_run = Ulid::from_bytes([78; 16]);
     let rec = WorkflowRunRecord {
