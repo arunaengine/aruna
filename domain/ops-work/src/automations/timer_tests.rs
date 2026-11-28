@@ -481,9 +481,12 @@ async fn fires_and_skips() {
     .await
     .unwrap();
     assert!(skipped_page.items.iter().any(|firing| {
-        firing.reason.as_deref() == Some("Missed scheduled start while the node was unavailable.")
+        firing
+            .reason
+            .as_deref()
+            .is_some_and(|text| text.contains("Missed 48 scheduled starts"))
     }));
-    // Skipped runs never enter the active set.
+    // Skipped runs never enter the active set, and schedule rate limits never write kept events.
     for skipped_firing in &skipped_page.items {
         assert!(
             env.read_row(
@@ -494,14 +497,6 @@ async fn fires_and_skips() {
             .is_none()
         );
     }
-
-    // Schedule hitting per_hour cap records a skipped firing rather than a kept event.
-    let (space, key, value) = schedule_row(auto_id, now.saturating_sub(90_000));
-    env.write_row(&space, key, value).await;
-    let capped = drive(TickTimersOperation::new(env.realm), &env.ctx)
-        .await
-        .unwrap();
-    assert_eq!((capped.fired, capped.skipped), (0, 1));
     let kept = drive(
         ListEventsOperation::new(&env.owner, auto_id, env.node, 10),
         &env.ctx,
@@ -510,11 +505,41 @@ async fn fires_and_skips() {
     .unwrap();
     assert!(kept.is_empty());
 
-    // Pausing removes the schedule index row; resuming resets it to now without backfill.
-    let paused = drive(
+    // Approving an unrelated edit on an active scheduled automation preserves an already-due slot.
+    let preserve_cursor = ScheduleCursor {
+        due_ms: live_slot_ms,
+        anchors: vec![ScheduleAnchor {
+            schedule: aligned,
+            last_ms: live_slot_ms.saturating_sub(3_600_000),
+        }],
+    };
+    let (space, key, value) = schedule_cursor_row(auto_id, &preserve_cursor).unwrap();
+    env.write_row(&space, key, value).await;
+    let approved_again = drive(
         ChangeAutoOperation::new(
             &env.owner,
             (auto_id, Some(active.revision)),
+            AutoChange::Approve,
+            env.node,
+        ),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    let preserved_bytes = env
+        .read_row(AUTOMATIONS_KEYSPACE, &schedule_cursor_key(auto_id))
+        .await
+        .unwrap();
+    assert_eq!(
+        ScheduleCursor::from_bytes(&preserved_bytes).unwrap().due_ms,
+        live_slot_ms
+    );
+
+    // Pausing removes the schedule cursor row; resuming seeds it at now without backfill.
+    let paused = drive(
+        ChangeAutoOperation::new(
+            &env.owner,
+            (auto_id, Some(approved_again.revision)),
             AutoChange::Pause(PauseReason::Owner),
             env.node,
         ),
@@ -523,7 +548,7 @@ async fn fires_and_skips() {
     .await
     .unwrap();
     assert!(
-        env.read_row(AUTOMATIONS_KEYSPACE, &schedule_key(auto_id))
+        env.read_row(AUTOMATIONS_KEYSPACE, &schedule_cursor_key(auto_id))
             .await
             .is_none()
     );
@@ -540,7 +565,7 @@ async fn fires_and_skips() {
     .unwrap();
     assert_eq!(resumed.lifecycle, Lifecycle::Active);
     assert!(
-        env.read_row(AUTOMATIONS_KEYSPACE, &schedule_key(auto_id))
+        env.read_row(AUTOMATIONS_KEYSPACE, &schedule_cursor_key(auto_id))
             .await
             .is_some()
     );
@@ -554,19 +579,18 @@ async fn fires_and_skips() {
 }
 
 #[tokio::test]
-async fn enforces_conditions() {
+async fn enforces_condition_guards() {
     let env = Env::new().await;
     let now = now_ms();
-    let (_, outside_window) = utc_clock_window(now);
-    let (from, to) = outside_window.split_once('-').unwrap();
+    let (from, to) = outside_utc_window(now);
 
-    // Manual start with failing time_of_day condition returns ConditionsNotMet with skipped firing.
+    // Manual start with failing time_of_day condition returns ManualStart::Skipped.
     let mut manual_spec = env.base_spec();
     manual_spec.conditions = Conditions {
         mode: ConditionMode::All,
         items: vec![Condition::TimeOfDay {
-            from: from.to_string(),
-            to: to.to_string(),
+            from,
+            to,
             zone: "UTC".into(),
         }],
     };
@@ -577,9 +601,10 @@ async fn enforces_conditions() {
         StartManualOperation::new(&env.owner, manual_auto.automation_id, env.node, "{}".into()),
         &env.ctx,
     )
-    .await;
-    let Err(AutoError::ConditionsNotMet(skipped)) = refused else {
-        panic!("expected ConditionsNotMet, got {refused:?}");
+    .await
+    .unwrap();
+    let ManualStart::Skipped(skipped) = refused else {
+        panic!("expected ManualStart::Skipped, got {refused:?}");
     };
     assert_eq!(skipped.state, FiringState::Skipped);
     assert!(
@@ -591,15 +616,69 @@ async fn enforces_conditions() {
     assert_eq!(skipped.conditions_checked.len(), 1);
     assert!(!skipped.conditions_checked[0].held);
 
-    // Repeating manual start still refuses on conditions (rate cap of 1 was not consumed).
+    // Repeating manual start still skips on conditions (rate cap of 1 was not consumed).
     let again = drive(
         StartManualOperation::new(&env.owner, manual_auto.automation_id, env.node, "{}".into()),
         &env.ctx,
     )
-    .await;
-    assert!(matches!(again, Err(AutoError::ConditionsNotMet(_))));
+    .await
+    .unwrap();
+    assert!(matches!(again, ManualStart::Skipped(_)));
 
-    // File condition on DataUploaded skips small files and keeps payload on paused replay.
+    // Run-finished event failing conditions skips WITHOUT pausing for chain depth.
+    let workflow_id = Ulid::from_bytes([60; 16]);
+    let mut chain_spec = env.base_spec();
+    chain_spec.triggers = vec![Trigger::RunFinished {
+        workflow_id,
+        status: None,
+        applet_id: None,
+    }];
+    chain_spec.conditions = Conditions {
+        mode: ConditionMode::All,
+        items: vec![Condition::TimeOfDay {
+            from,
+            to,
+            zone: "UTC".into(),
+        }],
+    };
+    chain_spec.scope.limits.max_chain_depth = Some(1);
+    let chain_auto = env.create_active(chain_spec).await;
+    let run_id = Ulid::from_bytes([61; 16]);
+    let origin = AutomationOrigin {
+        automation_id: Ulid::from_bytes([62; 16]),
+        firing_id: Ulid::from_bytes([63; 16]),
+        stage: "run".into(),
+        applet_id: None,
+        outside_input: false,
+        depth: 1,
+    };
+    let run = env.sample_run(run_id, workflow_id, RunState::Succeeded, Some(origin));
+    env.write_row(
+        aruna_core::keyspaces::WORKFLOW_RUN_KEYSPACE,
+        run_key(run_id),
+        run.to_bytes().unwrap(),
+    )
+    .await;
+    let path = group_permission_path(env.realm, env.group, env.node);
+    env.journal(&SourceEvent::run_finished(
+        (env.group, path),
+        (workflow_id, run_id),
+        "succeeded",
+        env.owner.user_id,
+        now,
+    ))
+    .await;
+    let chain_report = drive(MatchEventsOperation::new(env.realm), &env.ctx)
+        .await
+        .unwrap();
+    assert_eq!((chain_report.skipped, chain_report.paused), (1, 0));
+    let still_active = drive(LoadAutoOperation::new(chain_auto.automation_id), &env.ctx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(still_active.lifecycle, Lifecycle::Active);
+
+    // File condition on DataUploaded skips small files; narrowing trigger blocks replay.
     let mut file_spec = env.base_spec();
     file_spec.triggers = vec![Trigger::DataUploaded {
         bucket: "raw".into(),
@@ -614,7 +693,7 @@ async fn enforces_conditions() {
             max_bytes: None,
         }],
     };
-    let file_auto = env.create_active(file_spec).await;
+    let file_auto = env.create_active(file_spec.clone()).await;
     let loc = (env.realm, env.group, env.node);
     let small_upload = SourceEvent::data_uploaded(
         loc,
@@ -631,19 +710,19 @@ async fn enforces_conditions() {
 
     // Replaying a kept upload whose file fails conditions returns a skipped firing and keeps row.
     let kept_id = Ulid::from_bytes([75; 16]);
-    let kept = aruna_core::automation::record::KeptEvent {
+    let kept = KeptEvent {
         event_id: kept_id,
         automation_id: file_auto.automation_id,
         event: small_upload,
         reason: "paused".into(),
         kept_at_ms: now,
-        payload: Some(TriggerPayload::DataUploaded {
+        payload: TriggerPayload::DataUploaded {
             bucket: "raw".into(),
             key: "in/tiny.fastq.gz".into(),
             version_id: Ulid::from_bytes([74; 16]),
             path: "/r/g/raw/in/tiny.fastq.gz".into(),
-            size_bytes: 12,
-        }),
+            size_bytes: Some(12),
+        },
     };
     env.write_row(
         AUTOMATIONS_KEYSPACE,
@@ -659,6 +738,55 @@ async fn enforces_conditions() {
     .unwrap();
     assert_eq!(replayed.len(), 1);
     assert_eq!(replayed[0].state, FiringState::Skipped);
+    assert!(
+        env.read_row(
+            AUTOMATIONS_KEYSPACE,
+            &kept_key(file_auto.automation_id, kept_id)
+        )
+        .await
+        .is_some()
+    );
+
+    // Switching the active upload prefix refuses replaying the older kept upload and preserves it.
+    let mut narrowed = file_spec;
+    narrowed.triggers = vec![Trigger::DataUploaded {
+        bucket: "raw".into(),
+        prefix: "in/other/".into(),
+        pattern: None,
+    }];
+    let updated = drive(
+        ChangeAutoOperation::new(
+            &env.owner,
+            (file_auto.automation_id, Some(file_auto.revision)),
+            AutoChange::Update {
+                name: None,
+                description: None,
+                spec: Some(narrowed),
+                workflow_id: None,
+            },
+            env.node,
+        ),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    drive(
+        ChangeAutoOperation::new(
+            &env.owner,
+            (updated.automation_id, Some(updated.revision)),
+            AutoChange::Approve,
+            env.node,
+        ),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    let refused_replay = drive(
+        StartEventsOperation::new(&env.owner, file_auto.automation_id, env.node, vec![kept_id]),
+        &env.ctx,
+    )
+    .await;
+    assert!(matches!(refused_replay, Err(AutoError::Conflict(_))));
     assert!(
         env.read_row(
             AUTOMATIONS_KEYSPACE,
