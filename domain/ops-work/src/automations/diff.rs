@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 use aruna_core::applet::record::{Access, Applet, Lifecycle as AppletLifecycle};
 use aruna_core::automation::diff::{
@@ -28,6 +28,12 @@ pub struct AutoDiffResult {
     pub revision: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingApplet {
+    applet_id: Ulid,
+    is_submission: bool,
+}
+
 #[derive(Debug, PartialEq)]
 enum DiffStep {
     Access,
@@ -47,8 +53,7 @@ pub struct DiffAutoOperation {
     auto: Option<Automation>,
     peers: Vec<PeerSummary>,
     has_wildcard: bool,
-    applet_ids: Vec<(Ulid, bool)>,
-    seen_applets: BTreeSet<Ulid>,
+    pending_applets: Vec<PendingApplet>,
     outside_input: bool,
     start_applets: Vec<(Ulid, String)>,
     linked_applets: Vec<LinkedApplet>,
@@ -65,8 +70,7 @@ impl DiffAutoOperation {
             auto: None,
             peers: Vec::new(),
             has_wildcard: false,
-            applet_ids: Vec::new(),
-            seen_applets: BTreeSet::new(),
+            pending_applets: Vec::new(),
             outside_input: false,
             start_applets: Vec::new(),
             linked_applets: Vec::new(),
@@ -88,14 +92,13 @@ impl DiffAutoOperation {
     }
 
     fn collect_applets(&mut self, spec: &Spec) {
+        let mut collected: BTreeMap<Ulid, bool> = BTreeMap::new();
         for trigger in &spec.triggers {
             match trigger {
                 Trigger::AppletSubmission {
                     applet_id: Some(applet_id),
                 } => {
-                    if self.seen_applets.insert(*applet_id) {
-                        self.applet_ids.push((*applet_id, true));
-                    }
+                    *collected.entry(*applet_id).or_insert(false) |= true;
                 }
                 Trigger::AppletSubmission { applet_id: None } => {
                     self.has_wildcard = true;
@@ -103,21 +106,33 @@ impl DiffAutoOperation {
                 Trigger::RunFinished {
                     applet_id: Some(applet_id),
                     ..
-                } if self.seen_applets.insert(*applet_id) => {
-                    self.applet_ids.push((*applet_id, false));
+                } => {
+                    collected.entry(*applet_id).or_insert(false);
                 }
                 _ => {}
             }
         }
+        self.pending_applets = collected
+            .into_iter()
+            .map(|(applet_id, is_submission)| PendingApplet {
+                applet_id,
+                is_submission,
+            })
+            .collect();
     }
 
-    fn record_applet(&mut self, applet: &Applet, is_sub: bool) {
+    fn record_applet(&mut self, applet: &Applet, is_submission: bool) {
         let outside = applet.access == Access::Public || applet.guests.is_some();
         if outside {
             self.outside_input = true;
         }
-        if is_sub {
-            if applet.grants.start.is_some() {
+        if is_submission {
+            if applet.grants.start.is_some()
+                && !self
+                    .start_applets
+                    .iter()
+                    .any(|(id, _)| *id == applet.applet_id)
+            {
                 self.start_applets
                     .push((applet.applet_id, applet.slug.clone()));
             }
@@ -148,9 +163,9 @@ impl DiffAutoOperation {
     }
 
     fn next_applet(&mut self) -> Next<AutoDiffResult> {
-        if let Some((applet_id, _)) = self.applet_ids.last().copied() {
+        if let Some(pending) = self.pending_applets.last().copied() {
             self.step = DiffStep::Applets;
-            return Next::Call(IoCall::child(LoadAppletOperation::new(applet_id)));
+            return Next::Call(IoCall::child(LoadAppletOperation::new(pending.applet_id)));
         }
         self.step = DiffStep::Backends;
         Next::Call(IoCall::child(SandboxOperation))
@@ -162,6 +177,7 @@ impl Operation for DiffAutoOperation {
     type Error = AutoError;
 
     fn first(&mut self) -> Result<Next<AutoDiffResult>, AutoError> {
+        self.step = DiffStep::Access;
         let access = AutoAccessOperation::new(&self.auth, self.id, self.local, Need::Read);
         Ok(Next::Call(IoCall::child(access)))
     }
@@ -199,27 +215,35 @@ impl Operation for DiffAutoOperation {
                 }
             }
             DiffStep::GroupApplets => {
-                let auto_id = self.auto.as_ref().ok_or(IoError::Unfinished)?.automation_id;
+                let auto = self.auto.as_ref().ok_or(IoError::Unfinished)?;
+                let (auto_id, group_id) = (auto.automation_id, auto.group_id);
                 let applets = result
                     .child::<Vec<Applet>, AppletError>()?
-                    .unwrap_or_default();
+                    .map_err(|error| AutoError::Storage(error.to_string()))?;
                 for applet in applets {
-                    if applet.lifecycle != AppletLifecycle::TakenDown
+                    if applet.group_id == group_id
+                        && applet.lifecycle != AppletLifecycle::TakenDown
                         && applet.automations.contains(&auto_id)
                     {
-                        self.seen_applets.insert(applet.applet_id);
-                        self.applet_ids.retain(|(id, _)| *id != applet.applet_id);
+                        self.pending_applets
+                            .retain(|pending| pending.applet_id != applet.applet_id);
                         self.record_applet(&applet, true);
                     }
                 }
                 Ok(self.next_applet())
             }
             DiffStep::Applets => {
-                let Some((_, is_sub)) = self.applet_ids.pop() else {
+                let Some(pending) = self.pending_applets.pop() else {
                     return Err(IoError::Unfinished.into());
                 };
-                if let Ok(Some(applet)) = result.child::<Option<Applet>, AppletError>()? {
-                    self.record_applet(&applet, is_sub);
+                let group_id = self.auto.as_ref().ok_or(IoError::Unfinished)?.group_id;
+                let loaded = result
+                    .child::<Option<Applet>, AppletError>()?
+                    .map_err(|error| AutoError::Storage(error.to_string()))?;
+                if let Some(applet) = loaded
+                    && applet.group_id == group_id
+                {
+                    self.record_applet(&applet, pending.is_submission);
                 }
                 Ok(self.next_applet())
             }

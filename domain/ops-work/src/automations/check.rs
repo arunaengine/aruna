@@ -156,7 +156,7 @@ fn sample_trigger(
             });
             let version_id = sample_ulid(sample, "version_id").unwrap_or(Ulid::nil());
             let path = sample_str(sample, "path").unwrap_or_else(|| format!("/{bkt}/{key}"));
-            let size_bytes = sample_u64(sample, "size_bytes").unwrap_or(0);
+            let size_bytes = sample_u64(sample, "size_bytes");
             TriggerPayload::DataUploaded {
                 bucket: bkt,
                 key,
@@ -491,16 +491,19 @@ impl Operation for CheckAutoOperation {
                 Ok(self.next_step())
             }
             CheckStep::GroupApplets => {
-                let auto_id = self.auto.as_ref().ok_or(IoError::Unfinished)?.automation_id;
-                if let Ok(applets) = result.child::<Vec<Applet>, AppletError>()? {
-                    for applet in applets {
-                        if applet.lifecycle != AppletLifecycle::TakenDown
-                            && applet.automations.contains(&auto_id)
-                        {
-                            self.applet_ids.retain(|id| *id != applet.applet_id);
-                            if applet.access == Access::Public || applet.guests.is_some() {
-                                self.outside_input = true;
-                            }
+                let auto = self.auto.as_ref().ok_or(IoError::Unfinished)?;
+                let (auto_id, group_id) = (auto.automation_id, auto.group_id);
+                let applets = result
+                    .child::<Vec<Applet>, AppletError>()?
+                    .map_err(|error| AutoError::Storage(error.to_string()))?;
+                for applet in applets {
+                    if applet.group_id == group_id
+                        && applet.lifecycle != AppletLifecycle::TakenDown
+                        && applet.automations.contains(&auto_id)
+                    {
+                        self.applet_ids.retain(|id| *id != applet.applet_id);
+                        if applet.access == Access::Public || applet.guests.is_some() {
+                            self.outside_input = true;
                         }
                     }
                 }
@@ -514,16 +517,17 @@ impl Operation for CheckAutoOperation {
                 let Some(applet_id) = self.applet_ids.pop() else {
                     return Err(IoError::Unfinished.into());
                 };
+                let group_id = self.auto.as_ref().ok_or(IoError::Unfinished)?.group_id;
                 match result.child::<Option<Applet>, AppletError>()? {
-                    Ok(Some(applet)) => {
+                    Ok(Some(applet)) if applet.group_id == group_id => {
                         if applet.access == Access::Public || applet.guests.is_some() {
                             self.outside_input = true;
                         }
                     }
-                    Ok(None) => self
+                    Ok(_) => self
                         .diagnostics
                         .push(format!("referenced applet `{applet_id}` not found")),
-                    Err(err) => self.diagnostics.push(err.to_string()),
+                    Err(error) => return Err(AutoError::Storage(error.to_string())),
                 }
                 if self.applet_ids.is_empty() {
                     self.step = CheckStep::Backends;
@@ -537,7 +541,14 @@ impl Operation for CheckAutoOperation {
                     .unwrap_or_default();
                 let auto = self.auto.as_ref().ok_or(IoError::Unfinished)?;
                 let spec = auto.pending.as_ref().map(|p| &p.spec).unwrap_or(&auto.spec);
+                let detected_outside = self.outside_input;
+                self.outside_input |= spec.scope.allow_outside_input;
                 self.unsandboxed = spec.has_runs() && !public_ready(&backends);
+                if detected_outside && !spec.scope.allow_outside_input {
+                    self.diagnostics.push(
+                        "linked or referenced applet accepts outside input; enable scope.allow_outside_input and approve it".into(),
+                    );
+                }
                 if self.outside_input && self.unsandboxed {
                     self.diagnostics.push(
                         "outside-input workflow runs require a sandboxed compute backend".into(),

@@ -4,9 +4,9 @@
 
 use std::collections::BTreeSet;
 
-use aruna_core::applet::record::Applet;
+use aruna_core::applet::record::{Access, Applet};
 use aruna_core::automation::keys::record_key;
-use aruna_core::automation::record::{Automation, Lifecycle};
+use aruna_core::automation::record::{Automation, Lifecycle, Trigger};
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::AUTOMATIONS_KEYSPACE;
@@ -20,6 +20,13 @@ use ulid::Ulid;
 use super::{AutoError, check_feature};
 use crate::applets::change::{AppletChange, ChangeAppletOperation};
 use crate::applets::{AppletAccessOperation, AppletError, Need as AppletNeed};
+
+/// Target applet and optional optimistic revision for [`LinkAppletOperation`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AppletLinkTarget {
+    pub applet_id: Ulid,
+    pub expected_revision: Option<u64>,
+}
 
 #[derive(Debug, PartialEq)]
 enum LinkStep {
@@ -43,13 +50,12 @@ fn map_applet(error: AppletError) -> AutoError {
     }
 }
 
-/// Validates feature switches, applet write rights and same-group automations, then updates the
-/// applet's linked automation list in one atomic domain operation.
+/// Validates feature switches, applet write rights, same-group automations and outside-input
+/// approval, then updates the applet's linked automation list in one atomic domain operation.
 #[derive(Debug, PartialEq)]
 pub struct LinkAppletOperation {
     auth: AuthContext,
-    applet_id: Ulid,
-    expected_revision: Option<u64>,
+    target: AppletLinkTarget,
     automation_ids: Vec<Ulid>,
     local: NodeId,
     disabled_features: BTreeSet<Feature>,
@@ -59,7 +65,7 @@ pub struct LinkAppletOperation {
 impl LinkAppletOperation {
     pub fn new(
         auth: &AuthContext,
-        (applet_id, expected_revision): (Ulid, Option<u64>),
+        target: AppletLinkTarget,
         mut automation_ids: Vec<Ulid>,
         local: NodeId,
     ) -> Self {
@@ -67,8 +73,7 @@ impl LinkAppletOperation {
         automation_ids.retain(|id| seen.insert(*id));
         Self {
             auth: auth.clone(),
-            applet_id,
-            expected_revision,
+            target,
             automation_ids,
             local,
             disabled_features: BTreeSet::new(),
@@ -82,14 +87,14 @@ impl LinkAppletOperation {
     }
 
     fn apply_change(&mut self) -> Next<Applet> {
-        let op = ChangeAppletOperation::new(
+        let change = ChangeAppletOperation::new(
             &self.auth,
-            (self.applet_id, self.expected_revision),
+            (self.target.applet_id, self.target.expected_revision),
             AppletChange::Automations(self.automation_ids.clone()),
             self.local,
         );
         self.step = LinkStep::Change;
-        Next::Call(IoCall::child(op))
+        Next::Call(IoCall::child(change))
     }
 }
 
@@ -98,7 +103,8 @@ impl Operation for LinkAppletOperation {
     type Error = AutoError;
 
     fn first(&mut self) -> Result<Next<Applet>, AutoError> {
-        let access = AppletAccessOperation::new(&self.auth, self.applet_id, AppletNeed::Write);
+        let access =
+            AppletAccessOperation::new(&self.auth, self.target.applet_id, AppletNeed::Write);
         self.step = LinkStep::Access;
         Ok(Next::Call(IoCall::child(access)))
     }
@@ -143,6 +149,7 @@ impl Operation for LinkAppletOperation {
             }
             LinkStep::ReadAutomations(applet) => {
                 let values = result.values()?;
+                let applet_outside = applet.access == Access::Public || applet.guests.is_some();
                 for (index, automation_id) in self.automation_ids.iter().enumerate() {
                     let Some(bytes) = values.get(index).and_then(Option::as_deref) else {
                         return Err(AutoError::NotFound);
@@ -154,6 +161,18 @@ impl Operation for LinkAppletOperation {
                     if automation.group_id != applet.group_id {
                         return Err(AutoError::Invalid(format!(
                             "automation `{automation_id}` belongs to a different group"
+                        )));
+                    }
+                    let wildcard = automation.spec.triggers.iter().any(|trigger| {
+                        matches!(trigger, Trigger::AppletSubmission { applet_id: None })
+                    });
+                    if applet_outside
+                        && wildcard
+                        && automation.approved_by.is_some()
+                        && !automation.spec.scope.allow_outside_input
+                    {
+                        return Err(AutoError::Conflict(format!(
+                            "automation `{automation_id}` is not approved for outside input; approve scope.allow_outside_input first"
                         )));
                     }
                 }

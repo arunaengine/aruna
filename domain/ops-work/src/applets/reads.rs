@@ -10,7 +10,7 @@ use aruna_core::keyspaces::{APPLET_HOSTS_KEYSPACE, APPLETS_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::group_permission_path;
-use aruna_core::types::GroupId;
+use aruna_core::types::{GroupId, Key};
 use ulid::Ulid;
 
 use super::{AppletError, allowed, applet_answer, authorize_path, host_answer, read_applet};
@@ -205,7 +205,7 @@ impl GroupAppletsOperation {
         }
     }
 
-    fn page(&self, after: Option<aruna_core::types::Key>) -> Next<Vec<Applet>> {
+    fn page(&self, after: Option<Key>) -> Next<Vec<Applet>> {
         Next::Call(IoCall::Page {
             space: APPLETS_KEYSPACE.to_string(),
             prefix: group_prefix(self.group_id),
@@ -254,5 +254,98 @@ impl Operation for GroupAppletsOperation {
             self.applets.push(Applet::from_bytes(&value)?);
         }
         Ok(self.next_batch())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::applet::record::{Access, Embedding, Grants, Lifecycle};
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
+
+    fn sample_applet(group_id: GroupId, applet_id: Ulid) -> Applet {
+        let realm = RealmId([2; 32]);
+        Applet {
+            applet_id,
+            group_id,
+            name: "Demo".into(),
+            slug: "demo".into(),
+            host: "demo.apps.local".into(),
+            repository: None,
+            host_node: iroh::SecretKey::from_bytes(&[3; 32]).public(),
+            lifecycle: Lifecycle::Live,
+            access: Access::Private,
+            live: Some(1),
+            versions: Vec::new(),
+            drafts: Vec::new(),
+            grants: Grants::default(),
+            embedding: Embedding::default(),
+            guests: None,
+            domains: Vec::new(),
+            pending: None,
+            account: None,
+            role_id: None,
+            visitor_salt: [0; 32],
+            created_by: UserId::local(Ulid::from_bytes([1; 16]), realm),
+            created_at_ms: 1,
+            revision: 1,
+            automations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn pages_group_applets() {
+        let group_id = Ulid::from_bytes([11; 16]);
+        let first_id = Ulid::from_bytes([12; 16]);
+        let second_id = Ulid::from_bytes([13; 16]);
+        let mut operation = GroupAppletsOperation::new(group_id);
+
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Page { after: None, .. }))
+        ));
+
+        let cursor = group_key(group_id, first_id);
+        let second_page = operation
+            .next(IoResult::Page {
+                rows: vec![(cursor.clone(), Vec::new().into())],
+                next: Some(cursor),
+            })
+            .unwrap();
+        assert!(matches!(
+            second_page,
+            Next::Call(IoCall::Page { after: Some(_), .. })
+        ));
+
+        let read_batch = operation
+            .next(IoResult::Page {
+                rows: vec![(group_key(group_id, second_id), Vec::new().into())],
+                next: None,
+            })
+            .unwrap();
+        assert!(matches!(read_batch, Next::Call(IoCall::Read(ref keys)) if keys.len() == 2));
+
+        let first = sample_applet(group_id, first_id);
+        let done = operation
+            .next(IoResult::Values(vec![
+                Some(first.to_bytes().unwrap().into()),
+                None,
+            ]))
+            .unwrap();
+        assert_eq!(done, Next::Done(vec![first]));
+
+        // Empty group completes immediately after the index page without a Read call.
+        let mut empty = GroupAppletsOperation::new(group_id);
+        assert!(matches!(empty.first(), Ok(Next::Call(IoCall::Page { .. }))));
+        assert_eq!(
+            empty
+                .next(IoResult::Page {
+                    rows: Vec::new(),
+                    next: None,
+                })
+                .unwrap(),
+            Next::Done(Vec::new())
+        );
     }
 }

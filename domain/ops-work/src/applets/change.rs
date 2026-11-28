@@ -3,6 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeSet;
+
 use aruna_core::applet::hosts::{HostKind, HostRow, host_key};
 use aruna_core::applet::notices::{Notice, notice_key};
 use aruna_core::applet::record::{
@@ -271,7 +273,7 @@ pub fn apply(
             if applet.lifecycle == Lifecycle::TakenDown {
                 return Err(AppletError::Conflict("the applet is taken down".into()));
             }
-            let mut seen = std::collections::BTreeSet::new();
+            let mut seen = BTreeSet::new();
             ids.retain(|id| seen.insert(*id));
             applet.automations = ids;
         }
