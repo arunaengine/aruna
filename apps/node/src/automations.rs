@@ -33,13 +33,18 @@ pub fn spawn_worker(
 ) {
     let token = shutdown.token();
     shutdown.spawn(async move {
+        let mut match_cursor: Option<Vec<u8>> = None;
         loop {
             let mut busy = false;
             let matcher = MatchEventsOperation::new(realm_id)
-                .with_disabled_features(disabled_features.clone());
+                .with_disabled_features(disabled_features.clone())
+                .with_after(match_cursor.clone());
             match drive(matcher, context.as_ref()).await {
                 Ok(report) => {
-                    if report.scanned > report.deferred || report.fired > 0 || report.skipped > 0 {
+                    let made_progress =
+                        report.scanned > report.deferred || report.fired > 0 || report.skipped > 0;
+                    match_cursor = report.next_cursor.clone();
+                    if made_progress || match_cursor.is_some() {
                         busy = true;
                         debug!(?report, "Matched automation journal events");
                     }

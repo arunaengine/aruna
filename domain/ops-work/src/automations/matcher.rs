@@ -41,7 +41,7 @@ use crate::plugins::rows::StoreError;
 
 const MATCH_BATCH: usize = 128;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MatchReport {
     pub scanned: usize,
     pub fired: usize,
@@ -49,6 +49,7 @@ pub struct MatchReport {
     pub kept: usize,
     pub paused: usize,
     pub deferred: usize,
+    pub next_cursor: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,11 +104,11 @@ enum MatchStep {
 pub struct MatchEventsOperation {
     realm_id: RealmId,
     disabled_features: BTreeSet<Feature>,
+    after: Option<Vec<u8>>,
     ids: IdMint,
     now_ms: u64,
     config: Option<RealmConfigDocument>,
     autos: Vec<Automation>,
-    next_page: Option<Vec<u8>>,
     rows: Vec<JournalRow>,
     current_row: Option<(Vec<u8>, RowDisposition)>,
     matches: Vec<PendingMatch>,
@@ -120,17 +121,22 @@ impl MatchEventsOperation {
         Self {
             realm_id,
             disabled_features: BTreeSet::new(),
+            after: None,
             ids: IdMint::default(),
             now_ms: 0,
             config: None,
             autos: Vec::new(),
-            next_page: None,
             rows: Vec::new(),
             current_row: None,
             matches: Vec::new(),
             report: MatchReport::default(),
-            step: MatchStep::Config,
+            step: MatchStep::Journal,
         }
+    }
+
+    pub fn with_after(mut self, after: Option<Vec<u8>>) -> Self {
+        self.after = after;
+        self
     }
 
     fn retain_current(&mut self) {
@@ -241,15 +247,7 @@ impl MatchEventsOperation {
 
     fn next_row(&mut self) -> Result<Next<MatchReport>, AutoError> {
         let Some((row_key, event)) = self.rows.pop() else {
-            if let Some(after) = self.next_page.take() {
-                self.step = MatchStep::Journal;
-                return Ok(Next::Call(IoCall::child(journal_page(
-                    AUTO_PENDING_ROW,
-                    Some(after),
-                    MATCH_BATCH,
-                ))));
-            }
-            return Ok(Next::Done(self.report));
+            return Ok(Next::Done(std::mem::take(&mut self.report)));
         };
         self.current_row = Some((row_key, RowDisposition::Drop));
         for automation_index in 0..self.autos.len() {
@@ -377,14 +375,32 @@ impl Operation for MatchEventsOperation {
     }
 
     fn first(&mut self) -> Result<Next<MatchReport>, AutoError> {
-        self.step = MatchStep::Config;
-        Ok(Next::Call(IoCall::child(GetConfigOperation::new(
-            self.realm_id,
+        self.step = MatchStep::Journal;
+        Ok(Next::Call(IoCall::child(journal_page(
+            AUTO_PENDING_ROW,
+            self.after.clone(),
+            MATCH_BATCH,
         ))))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<MatchReport>, AutoError> {
         match std::mem::replace(&mut self.step, MatchStep::Write) {
+            MatchStep::Journal => {
+                let (mut rows, next) = result
+                    .child::<(Vec<JournalRow>, Option<Vec<u8>>), StoreError>()?
+                    .map_err(|error| AutoError::Storage(error.detail()))?;
+                self.report.next_cursor = next;
+                self.report.scanned = rows.len();
+                if rows.is_empty() {
+                    return Ok(Next::Done(std::mem::take(&mut self.report)));
+                }
+                rows.reverse();
+                self.rows = rows;
+                self.step = MatchStep::Config;
+                Ok(Next::Call(IoCall::child(GetConfigOperation::new(
+                    self.realm_id,
+                ))))
+            }
             MatchStep::Config => {
                 self.config = result.child::<RealmConfigDocument, GetConfigError>()?.ok();
                 self.step = MatchStep::Autos;
@@ -402,21 +418,6 @@ impl Operation for MatchEventsOperation {
                     self.step = MatchStep::Autos;
                     return Ok(Next::Call(autos_page(Some(after))));
                 }
-                self.step = MatchStep::Journal;
-                Ok(Next::Call(IoCall::child(journal_page(
-                    AUTO_PENDING_ROW,
-                    None,
-                    MATCH_BATCH,
-                ))))
-            }
-            MatchStep::Journal => {
-                let (mut rows, next) = result
-                    .child::<(Vec<JournalRow>, Option<Vec<u8>>), StoreError>()?
-                    .map_err(|error| AutoError::Storage(error.detail()))?;
-                self.next_page = next;
-                self.report.scanned += rows.len();
-                rows.reverse();
-                self.rows = rows;
                 self.next_row()
             }
             MatchStep::Seen {
@@ -851,33 +852,66 @@ mod tests {
             ))
         };
 
-        // Unavailable uploads stay pending for retry while healthy rows across pages proceed.
+        // Empty pending journal short-circuits without loading config or automations.
+        let mut empty_op = MatchEventsOperation::new(realm);
+        assert!(matches!(empty_op.first(), Ok(Next::Call(IoCall::Child(_)))));
+        assert_eq!(empty_op.step, MatchStep::Journal);
+        assert_eq!(
+            empty_op
+                .next(IoResult::Child(ChildOutcome::new(Ok::<_, StoreError>((
+                    Vec::<JournalRow>::new(),
+                    None::<Vec<u8>>,
+                )))))
+                .unwrap(),
+            Next::Done(MatchReport::default())
+        );
+
+        // Unavailable uploads stay pending while healthy rows proceed one page per turn.
         for head_error in [
             HeadObjectError::ManagedCopyError(ManagedCopyError::NotServeable(
                 ManagedCopyState::UnresolvedDeparted,
             )),
             HeadObjectError::StorageError(StorageError::CommitFailed),
         ] {
-            let mut scan_op = MatchEventsOperation::new(realm);
-            scan_op.config = Some(config.clone());
-            scan_op.autos.push(auto.clone());
-            scan_op.step = MatchStep::Journal;
+            let mut turn_one = MatchEventsOperation::new(realm);
+            assert!(matches!(turn_one.first(), Ok(Next::Call(IoCall::Child(_)))));
+            assert_eq!(turn_one.step, MatchStep::Journal);
             let page_one = vec![
                 (vec![AUTO_PENDING_ROW, 1], event.clone()),
                 (vec![AUTO_PENDING_ROW, 2], second_event.clone()),
             ];
-            let seen_first = scan_op
+            let cursor = vec![AUTO_PENDING_ROW, 2];
+            // Journal page is read before Config and Autos so new automations are never missed.
+            let load_config = turn_one
                 .next(IoResult::Child(ChildOutcome::new(Ok::<_, StoreError>((
                     page_one,
-                    Some(vec![AUTO_PENDING_ROW, 2]),
+                    Some(cursor.clone()),
                 )))))
                 .unwrap();
+            assert!(matches!(load_config, Next::Call(IoCall::Child(_))));
+            assert_eq!(turn_one.step, MatchStep::Config);
+            let load_autos = turn_one
+                .next(IoResult::Child(ChildOutcome::new(Ok::<_, GetConfigError>(
+                    config.clone(),
+                ))))
+                .unwrap();
+            assert!(matches!(load_autos, Next::Call(IoCall::Page { .. })));
+            assert_eq!(turn_one.step, MatchStep::Autos);
+            let seen_first = turn_one
+                .next(IoResult::Page {
+                    rows: vec![(
+                        aruna_core::automation::keys::record_key(auto.automation_id),
+                        auto.to_bytes().unwrap().into(),
+                    )],
+                    next: None,
+                })
+                .unwrap();
             assert!(matches!(seen_first, Next::Call(IoCall::Read(_))));
-            let head_first = scan_op.next(IoResult::Values(vec![None])).unwrap();
+            let head_first = turn_one.next(IoResult::Values(vec![None])).unwrap();
             assert!(matches!(head_first, Next::Call(IoCall::Child(_))));
 
             // Non-definitive HEAD error retains row 1 and moves directly to row 2 (no Delete).
-            let seen_second = scan_op
+            let seen_second = turn_one
                 .next(IoResult::Child(ChildOutcome::new(Err::<
                     HeadObjectResult,
                     HeadObjectError,
@@ -885,21 +919,21 @@ mod tests {
                     head_error
                 ))))
                 .unwrap();
-            assert_eq!(scan_op.report.deferred, 1);
+            assert_eq!(turn_one.report.deferred, 1);
             assert!(matches!(seen_second, Next::Call(IoCall::Read(_))));
 
-            let head_second = scan_op.next(IoResult::Values(vec![None])).unwrap();
+            let head_second = turn_one.next(IoResult::Values(vec![None])).unwrap();
             assert!(matches!(head_second, Next::Call(IoCall::Child(_))));
             assert!(
-                matches!(scan_op.step, MatchStep::EnrichUpload { ref key, .. } if key == "in/second.csv")
+                matches!(turn_one.step, MatchStep::EnrichUpload { ref key, .. } if key == "in/second.csv")
             );
-            let admit_second = scan_op
+            let admit_second = turn_one
                 .next(IoResult::Child(ChildOutcome::new(
                     Ok::<_, HeadObjectError>(healthy_head.clone()),
                 )))
                 .unwrap();
             assert!(matches!(admit_second, Next::Call(IoCall::Child(_))));
-            let drop_second = scan_op
+            let drop_second = turn_one
                 .next(IoResult::Child(ChildOutcome::new(Ok::<_, AutoError>(
                     created(81),
                 ))))
@@ -909,31 +943,66 @@ mod tests {
                 Next::Call(IoCall::Delete(ref keys)) if keys[0].1.as_ref() == [AUTO_PENDING_ROW, 2]
             ));
 
-            // Draining page 1 requests page 2 using the stored continuation cursor.
-            let next_page_call = scan_op.next(IoResult::Done).unwrap();
-            assert!(matches!(next_page_call, Next::Call(IoCall::Child(_))));
-            assert_eq!(scan_op.step, MatchStep::Journal);
+            // Turn 1 yields the continuation cursor so timers and firings run before page 2.
+            let turn_one_done = turn_one.next(IoResult::Done).unwrap();
+            assert_eq!(
+                turn_one_done,
+                Next::Done(MatchReport {
+                    scanned: 2,
+                    fired: 1,
+                    skipped: 0,
+                    kept: 0,
+                    paused: 0,
+                    deferred: 1,
+                    next_cursor: Some(cursor.clone()),
+                })
+            );
 
+            // Turn 2 resumes from the cursor and reloads automations including a newly added one.
+            let mut late_auto = sample_auto(realm, node, group);
+            late_auto.automation_id = Ulid::from_bytes([23; 16]);
+            late_auto.spec.triggers.push(Trigger::DataUploaded {
+                bucket: "raw".into(),
+                prefix: "in/third".into(),
+                pattern: None,
+            });
+            let mut turn_two = MatchEventsOperation::new(realm).with_after(Some(cursor));
+            assert!(matches!(turn_two.first(), Ok(Next::Call(IoCall::Child(_)))));
+            assert_eq!(turn_two.step, MatchStep::Journal);
             let page_two = vec![(vec![AUTO_PENDING_ROW, 3], third_event.clone())];
-            let seen_third = scan_op
+            turn_two
                 .next(IoResult::Child(ChildOutcome::new(Ok::<_, StoreError>((
                     page_two,
                     None::<Vec<u8>>,
                 )))))
                 .unwrap();
+            turn_two
+                .next(IoResult::Child(ChildOutcome::new(Ok::<_, GetConfigError>(
+                    config.clone(),
+                ))))
+                .unwrap();
+            let seen_third = turn_two
+                .next(IoResult::Page {
+                    rows: vec![(
+                        aruna_core::automation::keys::record_key(late_auto.automation_id),
+                        late_auto.to_bytes().unwrap().into(),
+                    )],
+                    next: None,
+                })
+                .unwrap();
             assert!(matches!(seen_third, Next::Call(IoCall::Read(_))));
-            let head_third = scan_op.next(IoResult::Values(vec![None])).unwrap();
+            let head_third = turn_two.next(IoResult::Values(vec![None])).unwrap();
             assert!(matches!(head_third, Next::Call(IoCall::Child(_))));
             assert!(
-                matches!(scan_op.step, MatchStep::EnrichUpload { ref key, .. } if key == "in/third.csv")
+                matches!(turn_two.step, MatchStep::EnrichUpload { ref key, .. } if key == "in/third.csv")
             );
-            let admit_third = scan_op
+            let admit_third = turn_two
                 .next(IoResult::Child(ChildOutcome::new(
                     Ok::<_, HeadObjectError>(healthy_head.clone()),
                 )))
                 .unwrap();
             assert!(matches!(admit_third, Next::Call(IoCall::Child(_))));
-            let drop_third = scan_op
+            let drop_third = turn_two
                 .next(IoResult::Child(ChildOutcome::new(Ok::<_, AutoError>(
                     created(82),
                 ))))
@@ -942,16 +1011,17 @@ mod tests {
                 drop_third,
                 Next::Call(IoCall::Delete(ref keys)) if keys[0].1.as_ref() == [AUTO_PENDING_ROW, 3]
             ));
-            let finished = scan_op.next(IoResult::Done).unwrap();
+            let finished = turn_two.next(IoResult::Done).unwrap();
             assert_eq!(
                 finished,
                 Next::Done(MatchReport {
-                    scanned: 3,
-                    fired: 2,
+                    scanned: 1,
+                    fired: 1,
                     skipped: 0,
                     kept: 0,
                     paused: 0,
-                    deferred: 1,
+                    deferred: 0,
+                    next_cursor: None,
                 })
             );
         }
