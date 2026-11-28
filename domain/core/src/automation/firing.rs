@@ -168,7 +168,7 @@ pub enum TriggerPayload {
         key: String,
         version_id: Ulid,
         path: String,
-        size_bytes: u64,
+        size_bytes: Option<u64>,
     },
     RunFinished {
         workflow_id: Ulid,
@@ -224,6 +224,19 @@ impl TriggerPayload {
             Self::Schedule { .. } => "schedule",
         }
     }
+}
+
+/// Parameters for recording a terminal `Skipped` firing without activating any stages.
+pub struct SkippedFiring<'a> {
+    pub firing_id: Ulid,
+    pub automation_id: Ulid,
+    pub group_id: GroupId,
+    pub revision: u64,
+    pub spec: &'a Spec,
+    pub trigger: TriggerPayload,
+    pub reason: String,
+    pub conditions_checked: Vec<ConditionCheck>,
+    pub now_ms: u64,
 }
 
 /// One execution of an automation DAG, pinned to the approved `spec` at start time.
@@ -292,35 +305,24 @@ impl Firing {
     }
 
     /// Constructs a terminal `Skipped` start record without activating any stages.
-    #[allow(clippy::too_many_arguments)]
-    pub fn skipped(
-        firing_id: Ulid,
-        automation_id: Ulid,
-        group_id: GroupId,
-        revision: u64,
-        spec: &Spec,
-        trigger: TriggerPayload,
-        reason: String,
-        conditions_checked: Vec<ConditionCheck>,
-        now_ms: u64,
-    ) -> Self {
+    pub fn skipped(input: SkippedFiring<'_>) -> Self {
         Self {
-            firing_id,
-            automation_id,
-            group_id,
-            revision,
+            firing_id: input.firing_id,
+            automation_id: input.automation_id,
+            group_id: input.group_id,
+            revision: input.revision,
             attempt: 1,
             state: FiringState::Skipped,
-            spec: spec.clone(),
-            trigger,
+            spec: input.spec.clone(),
+            trigger: input.trigger,
             stages: Vec::new(),
             resolutions: Vec::new(),
-            created_at_ms: now_ms,
-            updated_at_ms: now_ms,
-            finished_at_ms: Some(now_ms),
+            created_at_ms: input.now_ms,
+            updated_at_ms: input.now_ms,
+            finished_at_ms: Some(input.now_ms),
             error: None,
-            reason: Some(reason),
-            conditions_checked,
+            reason: Some(input.reason),
+            conditions_checked: input.conditions_checked,
         }
     }
 
@@ -411,7 +413,8 @@ impl Firing {
             .then(|| self.finished_at_ms.unwrap_or(now_ms));
     }
 
-    /// Audited human resolution of a `NeedsAttention` stage (`done=true` -> Succeeded, `false` -> Failed).
+    /// Audited human resolution of a `NeedsAttention` stage (`done = true` -> Succeeded,
+    /// `false` -> Failed).
     pub fn resolve(
         &mut self,
         stage_name: &str,

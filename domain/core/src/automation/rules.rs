@@ -1,21 +1,15 @@
-//! Automation start conditions evaluated purely against IANA time zones and file payloads.
+//! Automation start conditions evaluated purely against bundled IANA time zones and file payloads.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeSet;
+
 use jiff::Timestamp;
-use jiff::tz::TimeZone;
 use serde::{Deserialize, Serialize};
 
 use super::firing::TriggerPayload;
 use super::glob::glob_match;
-pub use super::schedule::{
-    LIVE_GRACE_MS, ScheduleEvery, ScheduleSpec, Weekday, days_text, due_slots, next_start,
-    parse_clock_time, schedule_due_slots, validate_schedule,
-};
-use super::schedule::{format_clock_time, parse_zone};
-
-/// Maximum condition items allowed on one automation spec.
-pub const MAX_CONDITIONS: usize = 16;
+use super::schedule::{ClockTime, Weekday, days_text, parse_zone};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConditionMode {
@@ -42,11 +36,11 @@ impl ConditionMode {
 }
 
 /// One guard condition evaluated after a trigger matches and before rate/concurrency limits.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Condition {
     TimeOfDay {
-        from: String,
-        to: String,
+        from: ClockTime,
+        to: ClockTime,
         zone: String,
     },
     Weekdays {
@@ -73,10 +67,32 @@ impl Conditions {
     }
 }
 
+/// Kind of condition or limit recorded on a firing's `conditions_checked` list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ConditionCheckKind {
+    TimeOfDay,
+    Weekdays,
+    File,
+    Starts,
+    ActiveLimit,
+}
+
+impl ConditionCheckKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TimeOfDay => "time_of_day",
+            Self::Weekdays => "weekdays",
+            Self::File => "file",
+            Self::Starts => "starts",
+            Self::ActiveLimit => "one_at_a_time",
+        }
+    }
+}
+
 /// Recorded outcome of evaluating one condition or limit for a firing or skipped start.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConditionCheck {
-    pub kind: String,
+    pub kind: ConditionCheckKind,
     pub text: String,
     pub held: bool,
     pub why: String,
@@ -90,18 +106,18 @@ pub struct ConditionEvaluation {
     pub checked: Vec<ConditionCheck>,
 }
 
-/// Formats byte counts cleanly for condition descriptions and skip reasons.
+/// Formats binary byte counts cleanly for condition descriptions and skip reasons.
 pub fn format_bytes(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = KIB * 1024.0;
     const GIB: f64 = MIB * 1024.0;
     let amount = bytes as f64;
     if bytes >= 1024 * 1024 * 1024 {
-        format!("{:.1} GB", amount / GIB)
+        format!("{:.1} GiB", amount / GIB)
     } else if bytes >= 1024 * 1024 {
-        format!("{:.1} MB", amount / MIB)
+        format!("{:.1} MiB", amount / MIB)
     } else if bytes >= 1024 {
-        format!("{:.1} KB", amount / KIB)
+        format!("{:.1} KiB", amount / KIB)
     } else {
         format!("{bytes} B")
     }
@@ -109,22 +125,17 @@ pub fn format_bytes(bytes: u64) -> String {
 
 /// Validates every condition item on an automation spec.
 pub fn validate_conditions(conditions: &Conditions) -> Result<(), String> {
-    if conditions.items.len() > MAX_CONDITIONS {
-        return Err(format!(
-            "automations allow at most {MAX_CONDITIONS} conditions"
-        ));
-    }
     for condition in &conditions.items {
         match condition {
             Condition::TimeOfDay { from, to, zone } => {
                 parse_zone(zone, "time_of_day condition")?;
-                let Some(start) = parse_clock_time(from) else {
+                if !from.is_valid() {
                     return Err("time_of_day `from` must be HH:MM (00:00..23:59)".into());
-                };
-                let Some(end) = parse_clock_time(to) else {
+                }
+                if !to.is_valid() {
                     return Err("time_of_day `to` must be HH:MM (00:00..23:59)".into());
-                };
-                if start == end {
+                }
+                if from == to {
                     return Err("time_of_day `from` and `to` must differ".into());
                 }
             }
@@ -162,10 +173,7 @@ pub fn validate_conditions(conditions: &Conditions) -> Result<(), String> {
 pub fn condition_text(condition: &Condition) -> String {
     match condition {
         Condition::TimeOfDay { from, to, zone } => {
-            let overnight = match (parse_clock_time(from), parse_clock_time(to)) {
-                (Some(start), Some(end)) if start > end => ", over midnight",
-                _ => "",
-            };
+            let overnight = if from > to { ", over midnight" } else { "" };
             format!("Between {from} and {to} {zone}{overnight}")
         }
         Condition::Weekdays { days, zone } => format!("{} ({zone})", days_text(days)),
@@ -219,35 +227,29 @@ pub fn evaluate_conditions(
         let (kind, held, not_applicable, why) = match condition {
             Condition::TimeOfDay { from, to, zone } => {
                 let outcome = timestamp.and_then(|instant| {
-                    let tz = TimeZone::get(zone.trim()).ok()?;
-                    let local = tz.to_datetime(instant);
-                    let current =
-                        u16::from(local.hour() as u8) * 60 + u16::from(local.minute() as u8);
-                    let start = parse_clock_time(from)?;
-                    let end = parse_clock_time(to)?;
-                    let inside = if start <= end {
-                        current >= start && current < end
+                    let time_zone = parse_zone(zone, "time_of_day condition").ok()?;
+                    let local = time_zone.to_datetime(instant);
+                    let current = ClockTime::new(local.hour() as u8, local.minute() as u8)?;
+                    let inside = if from <= to {
+                        current >= *from && current < *to
                     } else {
-                        current >= start || current < end
+                        current >= *from || current < *to
                     };
                     let why = if inside {
-                        format!("It was {} {zone}.", format_clock_time(current))
+                        format!("It was {current} {zone}.")
                     } else {
-                        format!(
-                            "It was {} {zone}, outside {from} to {to} {zone}.",
-                            format_clock_time(current)
-                        )
+                        format!("It was {current} {zone}, outside {from} to {to} {zone}.")
                     };
                     Some((inside, why))
                 });
                 let (held, why) =
                     outcome.unwrap_or_else(|| (false, format!("Invalid time zone `{zone}`.")));
-                ("time_of_day", held, false, why)
+                (ConditionCheckKind::TimeOfDay, held, false, why)
             }
             Condition::Weekdays { days, zone } => {
                 let outcome = timestamp.and_then(|instant| {
-                    let tz = TimeZone::get(zone.trim()).ok()?;
-                    let weekday = Weekday::from_jiff(tz.to_datetime(instant).weekday());
+                    let time_zone = parse_zone(zone, "weekdays condition").ok()?;
+                    let weekday = Weekday::from_jiff(time_zone.to_datetime(instant).weekday());
                     let allowed = days.contains(&weekday);
                     let why = if allowed {
                         format!("It was {} in {zone}.", weekday.label())
@@ -262,7 +264,7 @@ pub fn evaluate_conditions(
                 });
                 let (held, why) =
                     outcome.unwrap_or_else(|| (false, format!("Invalid time zone `{zone}`.")));
-                ("weekdays", held, false, why)
+                (ConditionCheckKind::Weekdays, held, false, why)
             }
             Condition::File {
                 pattern,
@@ -273,42 +275,48 @@ pub fn evaluate_conditions(
                     key, size_bytes, ..
                 } => {
                     let name = key.rsplit('/').next().unwrap_or(key);
+                    let needs_size = min_bytes.is_some() || max_bytes.is_some();
                     let (held, why) = if let Some(glob) = pattern
                         && !glob_match(glob, name)
                     {
                         (false, format!("The file {name} does not match {glob}."))
-                    } else if let Some(minimum) = min_bytes
-                        && size_bytes < minimum
+                    } else if needs_size && size_bytes.is_none() {
+                        (false, format!("The size of file {name} is unavailable."))
+                    } else if let (Some(minimum), Some(actual)) = (min_bytes, size_bytes)
+                        && actual < minimum
                     {
                         (
                             false,
                             format!(
                                 "The file {name} is {}, less than {}.",
-                                format_bytes(*size_bytes),
+                                format_bytes(*actual),
                                 format_bytes(*minimum)
                             ),
                         )
-                    } else if let Some(maximum) = max_bytes
-                        && size_bytes > maximum
+                    } else if let (Some(maximum), Some(actual)) = (max_bytes, size_bytes)
+                        && actual > maximum
                     {
                         (
                             false,
                             format!(
                                 "The file {name} is {}, more than {}.",
-                                format_bytes(*size_bytes),
+                                format_bytes(*actual),
                                 format_bytes(*maximum)
                             ),
                         )
                     } else {
-                        (
-                            true,
-                            format!("The file {name} is {}.", format_bytes(*size_bytes)),
-                        )
+                        match size_bytes {
+                            Some(actual) => (
+                                true,
+                                format!("The file {name} is {}.", format_bytes(*actual)),
+                            ),
+                            None => (true, format!("The file {name} matches.")),
+                        }
                     };
-                    ("file", held, false, why)
+                    (ConditionCheckKind::File, held, false, why)
                 }
                 _ => (
-                    "file",
+                    ConditionCheckKind::File,
                     true,
                     true,
                     "This start has no file, so the condition does not apply.".into(),
@@ -316,23 +324,21 @@ pub fn evaluate_conditions(
             },
         };
         checked.push(ConditionCheck {
-            kind: kind.into(),
+            kind,
             text,
             held,
             why,
         });
         applicable.push(!not_applicable);
     }
+    let evaluated: Vec<&ConditionCheck> = checked
+        .iter()
+        .zip(&applicable)
+        .filter_map(|(item, &applies)| applies.then_some(item))
+        .collect();
     let ok = match conditions.mode {
         ConditionMode::All => checked.iter().all(|item| item.held),
-        ConditionMode::Any => {
-            let evaluated: Vec<&ConditionCheck> = checked
-                .iter()
-                .zip(&applicable)
-                .filter_map(|(item, &applies)| applies.then_some(item))
-                .collect();
-            evaluated.is_empty() || evaluated.iter().any(|item| item.held)
-        }
+        ConditionMode::Any => !evaluated.is_empty() && evaluated.iter().any(|item| item.held),
     };
     let reason = if ok {
         None
@@ -344,6 +350,9 @@ pub fn evaluate_conditions(
             .collect();
         match conditions.mode {
             ConditionMode::All => failed.first().map(|text| (*text).to_string()),
+            ConditionMode::Any if evaluated.is_empty() => {
+                Some("None of the conditions applied to this start.".into())
+            }
             ConditionMode::Any => {
                 Some(format!("None of the conditions held. {}", failed.join(" ")))
             }
@@ -356,18 +365,51 @@ pub fn evaluate_conditions(
     }
 }
 
+fn canonical_condition(condition: &Condition) -> Condition {
+    match condition {
+        Condition::TimeOfDay { from, to, zone } => Condition::TimeOfDay {
+            from: *from,
+            to: *to,
+            zone: zone.trim().to_string(),
+        },
+        Condition::Weekdays { days, zone } => {
+            let mut normalized = days.clone();
+            normalized.sort_by_key(|day| day.ordinal());
+            normalized.dedup();
+            Condition::Weekdays {
+                days: normalized,
+                zone: zone.trim().to_string(),
+            }
+        }
+        Condition::File { .. } => condition.clone(),
+    }
+}
+
 /// Whether changing conditions from `before` to `after` widens when the automation can start.
 pub fn conditions_widen(before: &Conditions, after: &Conditions) -> bool {
-    if before.items.is_empty() {
+    let before_set: BTreeSet<Condition> = before.items.iter().map(canonical_condition).collect();
+    let after_set: BTreeSet<Condition> = after.items.iter().map(canonical_condition).collect();
+    if before_set.is_empty() {
         return false;
     }
-    if after.items.is_empty() {
+    if after_set.is_empty() {
         return true;
     }
-    if before.mode == ConditionMode::All && after.mode == ConditionMode::All {
-        return before.items.iter().any(|item| !after.items.contains(item));
+    match (before.mode, after.mode) {
+        (ConditionMode::All, ConditionMode::All) => !before_set.is_subset(&after_set),
+        (ConditionMode::Any, ConditionMode::Any) => !after_set.is_subset(&before_set),
+        (ConditionMode::Any, ConditionMode::All) => {
+            // Switching Any -> All narrows only if at least one always-applicable condition from
+            // `before` is required in `after`; otherwise a non-file start could pass All([File])
+            // when Any([File]) would refuse it.
+            !before_set
+                .intersection(&after_set)
+                .any(|item| !matches!(item, Condition::File { .. }))
+        }
+        (ConditionMode::All, ConditionMode::Any) => {
+            !(before_set.len() == 1 && before_set == after_set)
+        }
     }
-    before != after
 }
 
 #[cfg(test)]

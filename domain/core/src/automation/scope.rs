@@ -60,6 +60,7 @@ pub struct Scope {
     pub audiences: Vec<Audience>,
     pub secrets: Vec<String>,
     pub allow_downgrade: bool,
+    pub allow_outside_input: bool,
     pub limits: Limits,
 }
 
@@ -101,9 +102,9 @@ impl Limits {
 
     /// Whether every effective bound in `self` is at least as strict as `other`.
     pub fn is_tighter_than(&self, other: &Self) -> bool {
-        let opt = |a: Option<u64>, b: Option<u64>| match (a, b) {
+        let within_bound = |after: Option<u64>, before: Option<u64>| match (after, before) {
             (_, None) => true,
-            (Some(a), Some(b)) => a <= b,
+            (Some(after), Some(before)) => after <= before,
             (None, Some(_)) => false,
         };
         self.active_firings() <= other.active_firings()
@@ -112,12 +113,12 @@ impl Limits {
             && self.day_limit() <= other.day_limit()
             && self.copy_bytes_day() <= other.copy_bytes_day()
             && self.chain_depth() <= other.chain_depth()
-            && opt(
+            && within_bound(
                 self.cpu_cores.map(u64::from),
                 other.cpu_cores.map(u64::from),
             )
-            && opt(self.ram_bytes, other.ram_bytes)
-            && opt(self.walltime_ms, other.walltime_ms)
+            && within_bound(self.ram_bytes, other.ram_bytes)
+            && within_bound(self.walltime_ms, other.walltime_ms)
     }
 }
 
@@ -141,20 +142,23 @@ pub fn is_widening(before: &Spec, after: &Spec) -> bool {
     {
         return true;
     }
-    let (bs, as_) = (&before.scope, &after.scope);
-    if !subset(&as_.read, &bs.read)
-        || !subset(&as_.write, &bs.write)
-        || !subset(&as_.metadata, &bs.metadata)
-        || !subset(&as_.workflows, &bs.workflows)
-        || !subset(&as_.audiences, &bs.audiences)
-        || !subset(&as_.secrets, &bs.secrets)
+    let (before_scope, after_scope) = (&before.scope, &after.scope);
+    if !subset(&after_scope.read, &before_scope.read)
+        || !subset(&after_scope.write, &before_scope.write)
+        || !subset(&after_scope.metadata, &before_scope.metadata)
+        || !subset(&after_scope.workflows, &before_scope.workflows)
+        || !subset(&after_scope.audiences, &before_scope.audiences)
+        || !subset(&after_scope.secrets, &before_scope.secrets)
     {
         return true;
     }
-    if as_.allow_downgrade && !bs.allow_downgrade {
+    if after_scope.allow_downgrade && !before_scope.allow_downgrade {
         return true;
     }
-    !as_.limits.is_tighter_than(&bs.limits)
+    if after_scope.allow_outside_input && !before_scope.allow_outside_input {
+        return true;
+    }
+    !after_scope.limits.is_tighter_than(&before_scope.limits)
 }
 
 #[cfg(test)]
@@ -190,5 +194,10 @@ mod tests {
         let mut downgrade = base.clone();
         downgrade.scope.allow_downgrade = true;
         assert!(is_widening(&base, &downgrade));
+
+        let mut outside = base.clone();
+        outside.scope.allow_outside_input = true;
+        assert!(is_widening(&base, &outside));
+        assert!(!is_widening(&outside, &base));
     }
 }

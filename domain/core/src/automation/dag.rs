@@ -8,7 +8,8 @@ use ulid::Ulid;
 
 use super::glob::expand_copy;
 use super::record::{Spec, Stage, StageKind, Trigger};
-use super::rules::{validate_conditions, validate_schedule};
+use super::rules::validate_conditions;
+use super::schedule::validate_schedule;
 use super::scope::{Limits, MAX_CHAIN_DEPTH};
 use crate::id::NodeId;
 use crate::permission_path::{path_within, permission_pattern_matches, role_path_confined};
@@ -125,7 +126,7 @@ fn check_triggers(triggers: &[Trigger]) -> Result<(), String> {
                     return Err("data_uploaded filename pattern must not contain `/`".into());
                 }
             }
-            Trigger::Schedule(sched) => validate_schedule(sched)?,
+            Trigger::Schedule(schedule) => validate_schedule(schedule)?,
             _ => {}
         }
     }

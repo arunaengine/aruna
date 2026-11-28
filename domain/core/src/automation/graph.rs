@@ -4,7 +4,7 @@
 
 use super::dag::effective_needs;
 use super::record::{Spec, StageKind, Trigger};
-use super::rules::{ScheduleEvery, ScheduleSpec, days_text};
+use super::schedule::{ScheduleEvery, ScheduleSpec, days_text};
 
 /// Node category matching `WorkflowGraphBody` in the API wire contract.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,14 +40,22 @@ pub struct AutoGraph {
     pub complete: bool,
 }
 
-fn schedule_label(sched: &ScheduleSpec) -> String {
-    match sched.every {
-        ScheduleEvery::Day => format!("Every day at {} {}", sched.at, sched.zone),
-        ScheduleEvery::Week => format!("{} at {} {}", days_text(&sched.days), sched.at, sched.zone),
+fn schedule_label(schedule: &ScheduleSpec) -> String {
+    match schedule.every {
+        ScheduleEvery::Day => format!("Every day at {} {}", schedule.at, schedule.zone),
+        ScheduleEvery::Week => format!(
+            "{} at {} {}",
+            days_text(&schedule.days),
+            schedule.at,
+            schedule.zone
+        ),
         ScheduleEvery::Hours => {
-            let n = sched.hours.unwrap_or(1);
-            let unit = if n == 1 { "hour" } else { "hours" };
-            format!("Every {n} {unit} from {} {}", sched.at, sched.zone)
+            let hours = schedule.hours.unwrap_or(1);
+            let unit = if hours == 1 { "hour" } else { "hours" };
+            format!(
+                "Every {hours} {unit} from {} {}",
+                schedule.at, schedule.zone
+            )
         }
     }
 }
@@ -67,7 +75,7 @@ fn trigger_label(trigger: &Trigger) -> (&'static str, String) {
         Trigger::AppletSubmission { applet_id: None } => {
             ("applet_submission", "Any linked applet".into())
         }
-        Trigger::Schedule(sched) => ("schedule", schedule_label(sched)),
+        Trigger::Schedule(schedule) => ("schedule", schedule_label(schedule)),
     }
 }
 

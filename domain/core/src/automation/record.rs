@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use super::firing::TriggerPayload;
-use super::rules::{Conditions, ScheduleSpec};
+use super::rules::Conditions;
+use super::schedule::ScheduleSpec;
 use super::scope::{Audience, Scope};
 use crate::errors::ConversionError;
 use crate::id::NodeId;
@@ -175,7 +176,6 @@ pub struct Stage {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Spec {
     pub triggers: Vec<Trigger>,
-    #[serde(default)]
     pub conditions: Conditions,
     pub stages: Vec<Stage>,
     pub scope: Scope,
@@ -238,6 +238,8 @@ pub struct Automation {
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     pub revision: u64,
+    /// Last automation revision whose service account and role were synchronized.
+    pub identity_synced_revision: u64,
     /// Optional primary workflow linked to this automation (e.g. from unified Studio saves).
     pub workflow_id: Option<Ulid>,
 }
@@ -246,6 +248,15 @@ impl Automation {
     /// Whether this automation should hold an active service account and role right now.
     pub fn wants_account(&self) -> bool {
         self.lifecycle == Lifecycle::Active && self.approved_by.is_some()
+    }
+
+    /// Whether the service account or role needs synchronization with the current revision.
+    pub fn needs_identity_sync(&self) -> bool {
+        let has_role = self.account.is_some() && self.role_id.is_some();
+        if self.wants_account() != has_role {
+            return true;
+        }
+        self.wants_account() && self.identity_synced_revision < self.revision
     }
 
     /// The human admin whose authority manages the service account and role.
@@ -308,7 +319,7 @@ pub struct KeptEvent {
     pub event: SourceEvent,
     pub reason: String,
     pub kept_at_ms: u64,
-    pub payload: Option<TriggerPayload>,
+    pub payload: TriggerPayload,
 }
 
 impl KeptEvent {
