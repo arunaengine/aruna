@@ -186,13 +186,19 @@ impl Operation for LoadAppletOperation {
     }
 }
 
+#[derive(Debug, PartialEq)]
+enum GroupReadStep {
+    Page,
+    Read,
+}
+
 /// Loads every applet of `group_id` without caller auth checks (for internal automation checks).
 #[derive(Debug, PartialEq)]
 pub struct GroupAppletsOperation {
     group_id: GroupId,
     ids: Vec<Ulid>,
     applets: Vec<Applet>,
-    reading: bool,
+    step: GroupReadStep,
 }
 
 impl GroupAppletsOperation {
@@ -201,7 +207,7 @@ impl GroupAppletsOperation {
             group_id,
             ids: Vec::new(),
             applets: Vec::new(),
-            reading: false,
+            step: GroupReadStep::Page,
         }
     }
 
@@ -224,7 +230,7 @@ impl GroupAppletsOperation {
             .drain(..take)
             .map(|id| (APPLETS_KEYSPACE.to_string(), applet_key(id)))
             .collect();
-        self.reading = true;
+        self.step = GroupReadStep::Read;
         Next::Call(IoCall::Read(reads))
     }
 }
@@ -234,26 +240,34 @@ impl Operation for GroupAppletsOperation {
     type Error = AppletError;
 
     fn first(&mut self) -> Result<Next<Vec<Applet>>, AppletError> {
+        self.step = GroupReadStep::Page;
         Ok(self.page(None))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Vec<Applet>>, AppletError> {
-        if !self.reading {
-            let (rows, more) = result.page()?;
-            for (key, _) in rows {
-                if let Some(bytes) = key.get(17..33).and_then(|s| <[u8; 16]>::try_from(s).ok()) {
-                    self.ids.push(Ulid::from_bytes(bytes));
+        match self.step {
+            GroupReadStep::Page => {
+                let (rows, more) = result.page()?;
+                for (key, _) in rows {
+                    if let Some(bytes) = key
+                        .get(17..33)
+                        .and_then(|slice| <[u8; 16]>::try_from(slice).ok())
+                    {
+                        self.ids.push(Ulid::from_bytes(bytes));
+                    }
                 }
+                if let Some(after) = more {
+                    return Ok(self.page(Some(after)));
+                }
+                Ok(self.next_batch())
             }
-            if let Some(after) = more {
-                return Ok(self.page(Some(after)));
+            GroupReadStep::Read => {
+                for value in result.values()?.into_iter().flatten() {
+                    self.applets.push(Applet::from_bytes(&value)?);
+                }
+                Ok(self.next_batch())
             }
-            return Ok(self.next_batch());
         }
-        for value in result.values()?.into_iter().flatten() {
-            self.applets.push(Applet::from_bytes(&value)?);
-        }
-        Ok(self.next_batch())
     }
 }
 

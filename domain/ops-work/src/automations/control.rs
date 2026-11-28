@@ -15,19 +15,19 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::features::Feature;
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::{Key, KeySpace, Value};
 use aruna_ops_data::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
-use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::document_repository::GetConfigOperation;
 use aruna_ops_identity::groups::admin_check::AdminCheckOperation;
 use ulid::Ulid;
 
 use super::copy_stage::{source_count, source_length, stage_intent_id};
 use super::firing_reads::GetFiringOperation;
 pub(crate) use super::firing_tx::{FiringDelta, FiringTxOp, FiringTxResult};
-use super::{AutoAccessOperation, AutoError, Need, automation_auth_for, check_feature};
+use super::{AutoAccessOperation, AutoError, Need, automation_auth_for, check_features};
 use crate::plugins::intents::{IntentRecord, IntentState, intent_scan_in, resolved_rows_in};
 use crate::plugins::rows::{Rows, StoreError, decode, encode, row, scan_rows};
 use crate::workflows::CatalogError;
@@ -597,16 +597,11 @@ impl Operation for ResumeFiringOperation {
                 ))))
             }
             ResumeStep::Config(auto) => {
-                let config = result
-                    .child::<RealmConfigDocument, GetConfigError>()?
-                    .map_err(|_| {
-                        AutoError::Unavailable("the realm feature policy cannot be read".into())
-                    })?;
-                check_feature(
-                    &config,
+                check_features(
+                    result,
                     &self.disabled_features,
-                    Feature::Automations,
                     auto.group_id,
+                    &[Feature::Automations],
                 )?;
                 let tx = FiringTxOp::new(auto.automation_id, self.firing_id, FiringDelta::Resume);
                 self.step = ResumeStep::Commit;
@@ -724,16 +719,11 @@ impl Operation for DecideStageOperation {
                 Ok(self.commit_decision(auto.automation_id))
             }
             DecideStep::Config(auto) => {
-                let config = result
-                    .child::<RealmConfigDocument, GetConfigError>()?
-                    .map_err(|_| {
-                        AutoError::Unavailable("the realm feature policy cannot be read".into())
-                    })?;
-                check_feature(
-                    &config,
+                check_features(
+                    result,
                     &self.disabled_features,
-                    Feature::Automations,
                     auto.group_id,
+                    &[Feature::Automations],
                 )?;
                 Ok(self.commit_decision(auto.automation_id))
             }

@@ -13,14 +13,13 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::execution::workflow::workflow_permission_path;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::features::Feature;
-use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::document_repository::GetConfigOperation;
 use aruna_ops_identity::groups::admin_check::AdminCheckOperation;
 use ulid::Ulid;
 
 use super::change::{AutoChange, WriteAutoOperation};
 use super::identity::SyncIdentityOperation;
-use super::{AutoAccessOperation, AutoError, Need, allowed, authorize_path, check_feature};
+use super::{AutoAccessOperation, AutoError, Need, allowed, authorize_path, check_features};
 
 #[derive(Debug, PartialEq)]
 enum Step {
@@ -74,11 +73,12 @@ impl ChangeAutoOperation {
                 spec: Some(next_spec),
                 ..
             } => next_spec.uses_applets(),
-            _ => auto
+            AutoChange::Approve => auto
                 .pending
                 .as_ref()
                 .map_or(&auto.spec, |pending| &pending.spec)
                 .uses_applets(),
+            _ => auto.spec.uses_applets(),
         }
     }
 
@@ -135,25 +135,12 @@ impl Operation for ChangeAutoOperation {
                 Ok(self.after_config(auto))
             }
             Step::Config(auto) => {
-                let config = result
-                    .child::<RealmConfigDocument, GetConfigError>()?
-                    .map_err(|_| {
-                        AutoError::Unavailable("the realm feature policy cannot be read".into())
-                    })?;
-                check_feature(
-                    &config,
-                    &self.disabled_features,
-                    Feature::Automations,
-                    auto.group_id,
-                )?;
-                if self.uses_applets(&auto) {
-                    check_feature(
-                        &config,
-                        &self.disabled_features,
-                        Feature::Applets,
-                        auto.group_id,
-                    )?;
-                }
+                let features: &[Feature] = if self.uses_applets(&auto) {
+                    &[Feature::Automations, Feature::Applets]
+                } else {
+                    &[Feature::Automations]
+                };
+                check_features(result, &self.disabled_features, auto.group_id, features)?;
                 Ok(self.after_config(*auto))
             }
             Step::AuthWorkflow(auto) => {

@@ -14,6 +14,7 @@ use aruna_core::automation::record::{
     Automation, KeptEvent, Lifecycle, PauseReason, RunStatus, Trigger,
 };
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::errors::StagingSourceError;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     APPLETS_KEYSPACE, AUTOMATIONS_KEYSPACE, EVENT_JOURNAL_KEYSPACE, WORKFLOW_RUN_KEYSPACE,
@@ -322,6 +323,7 @@ impl MatchEventsOperation {
             event.source.clone(),
             event.actor,
             payload.clone(),
+            self.now_ms,
         );
         self.step = MatchStep::Admit {
             automation_index,
@@ -459,7 +461,8 @@ impl Operation for MatchEventsOperation {
                     Err(
                         HeadObjectError::NoSuchKey
                         | HeadObjectError::NoSuchVersion
-                        | HeadObjectError::DeleteMarker,
+                        | HeadObjectError::DeleteMarker
+                        | HeadObjectError::StagingSourceError(StagingSourceError::NotFound),
                     ) => None,
                     Err(error) => return Err(AutoError::Storage(error.to_string())),
                 };
@@ -610,13 +613,13 @@ impl Operation for MatchEventsOperation {
                 Ok(
                     AdmitOutcome::AlreadySeen | AdmitOutcome::Existing(_) | AdmitOutcome::Unmatched,
                 ) => self.next_match(),
-                Err(AutoError::Limited(message)) => {
-                    let reason = if message.contains("active") {
+                Err(AutoError::Limited { reason, .. }) => {
+                    let kept_reason = if reason.contains("active") {
                         "max_active_firings"
                     } else {
                         "rate_limited"
                     };
-                    self.write_kept(automation_index, *event, *payload, reason)
+                    self.write_kept(automation_index, *event, *payload, kept_reason)
                 }
                 Err(AutoError::Conflict(_)) => {
                     self.write_kept(automation_index, *event, *payload, "paused")
@@ -675,7 +678,12 @@ mod tests {
         let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
         let group = Ulid::from_bytes([11; 16]);
         let owner = UserId::local(Ulid::from_bytes([1; 16]), realm);
-        let auto = sample_auto(realm, node, group);
+        let mut auto = sample_auto(realm, node, group);
+        auto.spec.triggers.push(Trigger::DataUploaded {
+            bucket: "raw".into(),
+            prefix: "in/".into(),
+            pattern: None,
+        });
         let path = group_permission_path(realm, group, node);
         let event = SourceEvent::run_finished(
             (group, path),
@@ -732,7 +740,12 @@ mod tests {
         let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
         let group = Ulid::from_bytes([11; 16]);
         let owner = UserId::local(Ulid::from_bytes([1; 16]), realm);
-        let auto = sample_auto(realm, node, group);
+        let mut auto = sample_auto(realm, node, group);
+        auto.spec.triggers.push(Trigger::DataUploaded {
+            bucket: "raw".into(),
+            prefix: "in/".into(),
+            pattern: None,
+        });
         let version_id = Ulid::from_bytes([30; 16]);
         let event = SourceEvent::data_uploaded(
             (realm, group, node),
@@ -769,13 +782,14 @@ mod tests {
         ))));
         assert!(matches!(storage_err, Err(AutoError::Storage(_))));
 
-        // NoSuchKey yields size_bytes = None and proceeds to Admit.
+        // NoSuchKey and missing native-reference sources yield size_bytes = None so the journal
+        // never stalls and subsequent pending events still progress.
         let mut missing_op = MatchEventsOperation::new(realm);
-        missing_op.config = Some(config);
-        missing_op.autos.push(auto);
+        missing_op.config = Some(config.clone());
+        missing_op.autos.push(auto.clone());
         missing_op.step = MatchStep::EnrichUpload {
             automation_index: 0,
-            event: Box::new(event),
+            event: Box::new(event.clone()),
             bucket: "raw".into(),
             version_id,
             key: "in/file.csv".into(),
@@ -794,5 +808,59 @@ mod tests {
             MatchStep::Admit { ref payload, .. }
                 if matches!(payload.as_ref(), TriggerPayload::DataUploaded { size_bytes: None, .. })
         ));
+
+        let second_version = Ulid::from_bytes([66; 16]);
+        let second_event = SourceEvent::data_uploaded(
+            (realm, group, node),
+            ("raw", "in/second.csv"),
+            second_version,
+            None,
+            2,
+        );
+        let mut ref_missing = MatchEventsOperation::new(realm);
+        ref_missing.config = Some(config);
+        ref_missing.autos.push(auto);
+        ref_missing.current_key = Some(vec![AUTO_PENDING_ROW, 1]);
+        ref_missing
+            .rows
+            .push((vec![AUTO_PENDING_ROW, 2], second_event));
+        ref_missing.step = MatchStep::EnrichUpload {
+            automation_index: 0,
+            event: Box::new(event),
+            bucket: "raw".into(),
+            version_id,
+            key: "in/file.csv".into(),
+        };
+        let to_admit = ref_missing
+            .next(IoResult::Child(ChildOutcome::new(Err::<
+                HeadObjectResult,
+                HeadObjectError,
+            >(
+                HeadObjectError::StagingSourceError(StagingSourceError::NotFound),
+            ))))
+            .unwrap();
+        assert!(matches!(to_admit, Next::Call(IoCall::Child(_))));
+        assert!(matches!(
+            ref_missing.step,
+            MatchStep::Admit { ref payload, .. }
+                if matches!(payload.as_ref(), TriggerPayload::DataUploaded { size_bytes: None, .. })
+        ));
+        // Completing admission deletes the first pending row and advances to the second event.
+        let drop_first = ref_missing
+            .next(IoResult::Child(ChildOutcome::new(Ok::<
+                AdmitOutcome,
+                AutoError,
+            >(
+                AdmitOutcome::AlreadySeen,
+            ))))
+            .unwrap();
+        assert!(matches!(drop_first, Next::Call(IoCall::Delete(_))));
+        let read_second = ref_missing.next(IoResult::Done).unwrap();
+        assert!(matches!(read_second, Next::Call(IoCall::Read(_))));
+        let head_second = ref_missing.next(IoResult::Values(vec![None])).unwrap();
+        assert!(matches!(head_second, Next::Call(IoCall::Child(_))));
+        assert!(
+            matches!(ref_missing.step, MatchStep::EnrichUpload { ref key, .. } if key == "in/second.csv")
+        );
     }
 }

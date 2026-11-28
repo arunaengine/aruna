@@ -15,14 +15,13 @@ use aruna_core::operation::Operation;
 use aruna_core::plugin_runs::SourceEvent;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::features::Feature;
-use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::document_repository::GetConfigOperation;
 use ulid::Ulid;
 
 #[cfg(test)]
 pub(crate) use super::admit::new_firing_rows;
 pub(crate) use super::admit::{AdmitFiringOp, AdmitOutcome, parse_replay};
-use super::{AutoAccessOperation, AutoError, Need, check_feature};
+use super::{AutoAccessOperation, AutoError, Need, check_features};
 
 /// Parses a `DataUploaded` source event into `(bucket, version_id, key)`.
 pub(crate) fn parse_upload(event: &SourceEvent) -> Option<(String, Ulid, String)> {
@@ -112,23 +111,19 @@ impl Operation for StartManualOperation {
                 ))))
             }
             ManualStep::Config(auto) => {
-                let config = result
-                    .child::<RealmConfigDocument, GetConfigError>()?
-                    .map_err(|_| {
-                        AutoError::Unavailable("the realm feature policy cannot be read".into())
-                    })?;
-                check_feature(
-                    &config,
+                check_features(
+                    result,
                     &self.disabled_features,
-                    Feature::Automations,
                     auto.group_id,
+                    &[Feature::Automations],
                 )?;
                 let firing_id = self.ids.mint(self.now_ms);
                 let payload = TriggerPayload::Manual {
                     values_json: self.values_json.clone(),
                     actor: self.auth.user_id,
                 };
-                let admit = AdmitFiringOp::manual(auto.automation_id, firing_id, payload);
+                let admit =
+                    AdmitFiringOp::manual(auto.automation_id, firing_id, payload, self.now_ms);
                 self.step = ManualStep::Admit;
                 Ok(Next::Call(IoCall::retry(
                     admit,
@@ -220,7 +215,13 @@ impl StartEventsOperation {
             }
             ReplayItem::Kept(kept) => {
                 let firing_id = self.ids.mint(self.now_ms);
-                let admit = AdmitFiringOp::replay(self.id, kept.event_id, firing_id, kept.payload);
+                let admit = AdmitFiringOp::replay(
+                    self.id,
+                    kept.event_id,
+                    firing_id,
+                    kept.payload,
+                    self.now_ms,
+                );
                 self.step = ReplayStep::Admit;
                 Ok(Next::Call(IoCall::retry(admit, &self.id.to_bytes())))
             }
@@ -259,25 +260,12 @@ impl Operation for StartEventsOperation {
                 ))))
             }
             ReplayStep::Config(auto) => {
-                let config = result
-                    .child::<RealmConfigDocument, GetConfigError>()?
-                    .map_err(|_| {
-                        AutoError::Unavailable("the realm feature policy cannot be read".into())
-                    })?;
-                check_feature(
-                    &config,
-                    &self.disabled_features,
-                    Feature::Automations,
-                    auto.group_id,
-                )?;
-                if auto.spec.uses_applets() {
-                    check_feature(
-                        &config,
-                        &self.disabled_features,
-                        Feature::Applets,
-                        auto.group_id,
-                    )?;
-                }
+                let features: &[Feature] = if auto.spec.uses_applets() {
+                    &[Feature::Automations, Feature::Applets]
+                } else {
+                    &[Feature::Automations]
+                };
+                check_features(result, &self.disabled_features, auto.group_id, features)?;
                 let mut reads = Vec::with_capacity(self.event_ids.len() * 2);
                 for event_id in &self.event_ids {
                     reads.push((
