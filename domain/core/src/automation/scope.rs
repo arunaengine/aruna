@@ -102,9 +102,9 @@ impl Limits {
 
     /// Whether every effective bound in `self` is at least as strict as `other`.
     pub fn is_tighter_than(&self, other: &Self) -> bool {
-        let within_bound = |after: Option<u64>, before: Option<u64>| match (after, before) {
+        let opt = |a: Option<u64>, b: Option<u64>| match (a, b) {
             (_, None) => true,
-            (Some(after), Some(before)) => after <= before,
+            (Some(a), Some(b)) => a <= b,
             (None, Some(_)) => false,
         };
         self.active_firings() <= other.active_firings()
@@ -113,12 +113,12 @@ impl Limits {
             && self.day_limit() <= other.day_limit()
             && self.copy_bytes_day() <= other.copy_bytes_day()
             && self.chain_depth() <= other.chain_depth()
-            && within_bound(
+            && opt(
                 self.cpu_cores.map(u64::from),
                 other.cpu_cores.map(u64::from),
             )
-            && within_bound(self.ram_bytes, other.ram_bytes)
-            && within_bound(self.walltime_ms, other.walltime_ms)
+            && opt(self.ram_bytes, other.ram_bytes)
+            && opt(self.walltime_ms, other.walltime_ms)
     }
 }
 

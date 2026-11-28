@@ -4,7 +4,7 @@
 
 use ulid::Ulid;
 
-use crate::types::Key;
+use crate::types::{GroupId, Key};
 
 /// Row tags in `AUTOMATIONS_KEYSPACE`.
 pub const RECORD_ROW: u8 = 1;
@@ -15,6 +15,7 @@ pub const USAGE_ROW: u8 = 5;
 pub const REPLAY_ROW: u8 = 6;
 pub const SCHEDULE_DUE_ROW: u8 = 7;
 pub const SCHEDULE_CURSOR_ROW: u8 = 8;
+pub const GROUP_ROW: u8 = 9;
 
 /// Row tags in `AUTOMATION_RUNS_KEYSPACE`.
 pub const FIRING_ROW: u8 = 1;
@@ -83,7 +84,14 @@ pub fn schedule_due_prefix() -> Key {
     Key::from(vec![SCHEDULE_DUE_ROW])
 }
 
-/// Due-time-ordered index row `[SCHEDULE_DUE_ROW, due_ms_be8, automation_id_16]` for one automation.
+/// Parsed fields of a `SCHEDULE_DUE_ROW` index key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DueEntry {
+    pub due_ms: u64,
+    pub automation_id: Ulid,
+}
+
+/// Due-time-ordered index row `[SCHEDULE_DUE_ROW, due_ms_be8, automation_id_16]`.
 pub fn schedule_due_key(due_ms: u64, automation_id: Ulid) -> Key {
     let mut row = Vec::with_capacity(25);
     row.push(SCHEDULE_DUE_ROW);
@@ -92,14 +100,17 @@ pub fn schedule_due_key(due_ms: u64, automation_id: Ulid) -> Key {
     Key::from(row)
 }
 
-/// Parses a `SCHEDULE_DUE_ROW` key into `(due_ms, automation_id)`.
-pub fn parse_due_key(key: &[u8]) -> Option<(u64, Ulid)> {
+/// Parses a `SCHEDULE_DUE_ROW` key into its due timestamp and automation ID.
+pub fn parse_due_key(key: &[u8]) -> Option<DueEntry> {
     if key.len() != 25 || key.first().copied() != Some(SCHEDULE_DUE_ROW) {
         return None;
     }
     let due_bytes: [u8; 8] = key.get(1..9)?.try_into().ok()?;
     let id_bytes: [u8; 16] = key.get(9..25)?.try_into().ok()?;
-    Some((u64::from_be_bytes(due_bytes), Ulid::from_bytes(id_bytes)))
+    Some(DueEntry {
+        due_ms: u64::from_be_bytes(due_bytes),
+        automation_id: Ulid::from_bytes(id_bytes),
+    })
 }
 
 /// Per-automation schedule cursor storing its current due timestamp and per-schedule anchors.
@@ -108,6 +119,32 @@ pub fn schedule_cursor_key(automation_id: Ulid) -> Key {
     row.push(SCHEDULE_CURSOR_ROW);
     row.extend_from_slice(&automation_id.to_bytes());
     Key::from(row)
+}
+
+/// Prefix of every group-scoped automation index row in `AUTOMATIONS_KEYSPACE`.
+pub fn group_prefix(group_id: GroupId) -> Key {
+    let mut row = Vec::with_capacity(17);
+    row.push(GROUP_ROW);
+    row.extend_from_slice(&group_id.to_bytes());
+    Key::from(row)
+}
+
+/// Group-scoped index row `[GROUP_ROW, group_id_16, automation_id_16]` for one automation.
+pub fn group_auto_key(group_id: GroupId, automation_id: Ulid) -> Key {
+    let mut row = Vec::with_capacity(33);
+    row.push(GROUP_ROW);
+    row.extend_from_slice(&group_id.to_bytes());
+    row.extend_from_slice(&automation_id.to_bytes());
+    Key::from(row)
+}
+
+/// Parses the `automation_id` from a `GROUP_ROW` key.
+pub fn parse_group_key(key: &[u8]) -> Option<Ulid> {
+    if key.len() != 33 || key.first().copied() != Some(GROUP_ROW) {
+        return None;
+    }
+    let id_bytes: [u8; 16] = key.get(17..33)?.try_into().ok()?;
+    Some(Ulid::from_bytes(id_bytes))
 }
 
 pub fn firing_prefix(automation_id: Ulid) -> Key {

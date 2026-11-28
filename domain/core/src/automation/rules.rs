@@ -211,10 +211,17 @@ pub fn evaluate_conditions(
     payload: &TriggerPayload,
 ) -> ConditionEvaluation {
     if conditions.items.is_empty() {
-        return ConditionEvaluation {
-            ok: true,
-            reason: None,
-            checked: Vec::new(),
+        return match conditions.mode {
+            ConditionMode::All => ConditionEvaluation {
+                ok: true,
+                reason: None,
+                checked: Vec::new(),
+            },
+            ConditionMode::Any => ConditionEvaluation {
+                ok: false,
+                reason: Some("None of the conditions applied to this start.".into()),
+                checked: Vec::new(),
+            },
         };
     }
     let timestamp = i64::try_from(now_ms)
@@ -389,10 +396,14 @@ fn canonical_condition(condition: &Condition) -> Condition {
 pub fn conditions_widen(before: &Conditions, after: &Conditions) -> bool {
     let before_set: BTreeSet<Condition> = before.items.iter().map(canonical_condition).collect();
     let after_set: BTreeSet<Condition> = after.items.iter().map(canonical_condition).collect();
-    if before_set.is_empty() {
+    let before_always = before_set.is_empty() && before.mode == ConditionMode::All;
+    let before_never = before_set.is_empty() && before.mode == ConditionMode::Any;
+    let after_always = after_set.is_empty() && after.mode == ConditionMode::All;
+    let after_never = after_set.is_empty() && after.mode == ConditionMode::Any;
+    if before_always || after_never {
         return false;
     }
-    if after_set.is_empty() {
+    if before_never || after_always {
         return true;
     }
     match (before.mode, after.mode) {

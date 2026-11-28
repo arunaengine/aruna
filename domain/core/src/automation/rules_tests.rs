@@ -147,6 +147,22 @@ fn evaluates_unknown_size() {
         ],
     };
     assert!(!evaluate_conditions(&any_mixed, now, &schedule_payload).ok);
+
+    // Empty Any never holds; empty All holds by default.
+    let empty_any = Conditions {
+        mode: ConditionMode::Any,
+        items: Vec::new(),
+    };
+    let empty_any_eval = evaluate_conditions(&empty_any, now, &schedule_payload);
+    assert!(!empty_any_eval.ok);
+    assert!(empty_any_eval.checked.is_empty());
+    assert!(
+        empty_any_eval
+            .reason
+            .as_deref()
+            .is_some_and(|text| text.contains("None of the conditions applied"))
+    );
+    assert!(evaluate_conditions(&Conditions::default(), now, &schedule_payload).ok);
 }
 
 #[test]
@@ -212,4 +228,17 @@ fn checks_condition_widening() {
     };
     assert!(conditions_widen(&any_file, &all_file));
     assert!(!conditions_widen(&all_file, &any_file));
+
+    // Empty Any is always-fail (narrowest); empty All is always-pass (widest).
+    let empty_any = Conditions {
+        mode: ConditionMode::Any,
+        items: Vec::new(),
+    };
+    assert!(!conditions_widen(&empty_any, &empty_any));
+    assert!(conditions_widen(&empty_any, &empty));
+    assert!(conditions_widen(&empty_any, &all_one));
+    assert!(conditions_widen(&empty_any, &any_one));
+    assert!(!conditions_widen(&empty, &empty_any));
+    assert!(!conditions_widen(&all_one, &empty_any));
+    assert!(!conditions_widen(&any_one, &empty_any));
 }

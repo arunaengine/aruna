@@ -6,9 +6,9 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::LazyLock;
 
-use jiff::Timestamp;
 use jiff::civil::{Date, DateTime, Weekday as JiffDay};
 use jiff::tz::{TimeZone, TimeZoneDatabase};
+use jiff::{Span, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use super::record::{Spec, Trigger};
@@ -17,10 +17,13 @@ use crate::errors::ConversionError;
 /// Grace window for firing a due schedule slot live rather than recording it as missed.
 pub const LIVE_GRACE_MS: u64 = 120_000;
 
-const DIRECT_EVAL_DAYS: i64 = 21;
-const BOUNDARY_DAYS: i64 = 7;
+const DAY_MS: u64 = 86_400_000;
+const DIRECT_DAYS: i64 = 21;
+const TRANSITION_MARGIN_MS: u64 = 2 * DAY_MS;
+const MAX_PERIOD_DAYS: u64 = 4096;
+const EPOCH_DATE: Date = Date::constant(1970, 1, 1);
 
-static BUNDLED_TZDB: LazyLock<TimeZoneDatabase> = LazyLock::new(TimeZoneDatabase::bundled);
+static BUNDLED_ZONES: LazyLock<TimeZoneDatabase> = LazyLock::new(TimeZoneDatabase::bundled);
 
 /// Validated wall-clock hour and minute (`00:00`..=`23:59`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -192,6 +195,15 @@ pub struct ScheduleAnchor {
     pub last_ms: u64,
 }
 
+/// How [`ScheduleCursor::for_spec`] initializes anchors when rebuilding a cursor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorMode {
+    /// Starts every schedule fresh from `now_ms` (activation or resume).
+    Reset,
+    /// Preserves anchors of unchanged schedules on an already-active automation.
+    Preserve,
+}
+
 /// Persisted due-time cursor for one active scheduled automation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScheduleCursor {
@@ -201,12 +213,20 @@ pub struct ScheduleCursor {
 }
 
 impl ScheduleCursor {
+    /// Returns the recorded anchor instant for `schedule`, or `fallback_ms` if absent.
+    pub fn anchor_for(&self, schedule: &ScheduleSpec, fallback_ms: u64) -> u64 {
+        self.anchors
+            .iter()
+            .find(|anchor| anchor.schedule == *schedule)
+            .map_or(fallback_ms, |anchor| anchor.last_ms)
+    }
+
     /// Builds or updates the schedule cursor for `spec`, preserving existing per-schedule anchors
-    /// when the automation was already active so unrelated edits never erase already-due slots.
+    /// under [`CursorMode::Preserve`] so unrelated edits never erase already-due slots.
     pub fn for_spec(
         spec: &Spec,
         existing: Option<&Self>,
-        was_active: bool,
+        mode: CursorMode,
         now_ms: u64,
     ) -> Option<Self> {
         let schedules = unique_schedules(spec);
@@ -215,21 +235,13 @@ impl ScheduleCursor {
         }
         let mut anchors = Vec::with_capacity(schedules.len());
         for schedule in schedules {
-            let preserved = if was_active {
-                existing.and_then(|cursor| {
-                    cursor
-                        .anchors
-                        .iter()
-                        .find(|anchor| anchor.schedule == schedule)
-                        .map(|anchor| anchor.last_ms)
-                })
-            } else {
-                None
+            let last_ms = match mode {
+                CursorMode::Preserve => existing
+                    .map(|cursor| cursor.anchor_for(&schedule, now_ms))
+                    .unwrap_or(now_ms),
+                CursorMode::Reset => now_ms,
             };
-            anchors.push(ScheduleAnchor {
-                schedule,
-                last_ms: preserved.unwrap_or(now_ms),
-            });
+            anchors.push(ScheduleAnchor { schedule, last_ms });
         }
         let due_ms = anchors
             .iter()
@@ -246,11 +258,7 @@ impl ScheduleCursor {
         }
         let mut anchors = Vec::with_capacity(schedules.len());
         for schedule in schedules {
-            let previous = self
-                .anchors
-                .iter()
-                .find(|anchor| anchor.schedule == schedule)
-                .map_or(now_ms, |anchor| anchor.last_ms);
+            let previous = self.anchor_for(&schedule, now_ms);
             anchors.push(ScheduleAnchor {
                 schedule,
                 last_ms: previous.max(processed_ms),
@@ -287,7 +295,7 @@ pub(crate) fn parse_zone(zone: &str, label: &str) -> Result<TimeZone, String> {
     if trimmed.is_empty() {
         return Err(format!("{label} needs an IANA time zone"));
     }
-    BUNDLED_TZDB
+    BUNDLED_ZONES
         .get(trimmed)
         .map_err(|_| format!("{label} has unknown IANA time zone `{trimmed}`"))
 }
@@ -369,51 +377,16 @@ fn unique_schedules(spec: &Spec) -> Vec<ScheduleSpec> {
     schedules
 }
 
-pub(crate) fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
-    let adjusted_year = i64::from(year) - i64::from(month <= 2);
-    let era = adjusted_year.div_euclid(400);
-    let year_of_era = adjusted_year - era * 400;
-    let month_i64 = i64::from(month);
-    let day_i64 = i64::from(day);
-    let day_of_year =
-        (153 * (month_i64 + if month_i64 > 2 { -3 } else { 9 }) + 2) / 5 + day_i64 - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
+fn day_index(date: Date) -> Option<i64> {
+    EPOCH_DATE
+        .until(date)
+        .ok()
+        .map(|span| i64::from(span.get_days()))
 }
 
-pub(crate) fn civil_from_days(days: i64) -> Option<Date> {
-    let shifted = days.checked_add(719_468)?;
-    let era = shifted.div_euclid(146_097);
-    let day_of_era = shifted - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146_096) / 365;
-    let adjusted_year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_part = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_part + 2) / 5 + 1;
-    let month = month_part + if month_part < 10 { 3 } else { -9 };
-    let year = adjusted_year + i64::from(month <= 2);
-    Date::new(i16::try_from(year).ok()?, month as i8, day as i8).ok()
-}
-
-fn date_to_days(date: Date) -> i64 {
-    days_from_civil(
-        i32::from(date.year()),
-        u32::try_from(date.month()).unwrap_or(1),
-        u32::try_from(date.day()).unwrap_or(1),
-    )
-}
-
-fn weekday_for_days(days: i64) -> Weekday {
-    match (days + 3).rem_euclid(7) {
-        0 => Weekday::Monday,
-        1 => Weekday::Tuesday,
-        2 => Weekday::Wednesday,
-        3 => Weekday::Thursday,
-        4 => Weekday::Friday,
-        5 => Weekday::Saturday,
-        _ => Weekday::Sunday,
-    }
+fn date_for_day(day: i64) -> Option<Date> {
+    let span = Span::new().try_days(day).ok()?;
+    EPOCH_DATE.checked_add(span).ok()
 }
 
 fn local_slot_ms(date: Date, time: ClockTime, zone: &TimeZone) -> Option<u64> {
@@ -451,7 +424,7 @@ fn collect_day_range(
     match schedule.every {
         ScheduleEvery::Day => {
             for day in first_day..=last_day {
-                if let Some(date) = civil_from_days(day)
+                if let Some(date) = date_for_day(day)
                     && let Some(ms) = local_slot_ms(date, schedule.at, zone)
                     && ms > after_ms
                     && ms <= now_ms
@@ -462,8 +435,8 @@ fn collect_day_range(
         }
         ScheduleEvery::Week => {
             for day in first_day..=last_day {
-                if schedule.days.contains(&weekday_for_days(day))
-                    && let Some(date) = civil_from_days(day)
+                if let Some(date) = date_for_day(day)
+                    && schedule.days.contains(&Weekday::from_jiff(date.weekday()))
                     && let Some(ms) = local_slot_ms(date, schedule.at, zone)
                     && ms > after_ms
                     && ms <= now_ms
@@ -493,7 +466,7 @@ fn collect_day_range(
                 else {
                     continue;
                 };
-                if let Some(date) = civil_from_days(day)
+                if let Some(date) = date_for_day(day)
                     && let Some(ms) = local_slot_ms(date, clock, zone)
                     && ms > after_ms
                     && ms <= now_ms
