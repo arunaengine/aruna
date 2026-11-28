@@ -50,6 +50,7 @@ pub struct ListAutosOperation {
     group_id: GroupId,
     local: NodeId,
     lifecycle: Option<Lifecycle>,
+    workflow_id: Option<Ulid>,
     after: Option<Ulid>,
     limit: usize,
     authorized: bool,
@@ -69,11 +70,17 @@ impl ListAutosOperation {
             group_id,
             local,
             lifecycle,
+            workflow_id: None,
             after,
             limit: limit.clamp(1, 500),
             authorized: false,
             found: Vec::new(),
         }
+    }
+
+    pub fn with_workflow(mut self, workflow_id: Option<Ulid>) -> Self {
+        self.workflow_id = workflow_id;
+        self
     }
 }
 
@@ -103,6 +110,9 @@ impl Operation for ListAutosOperation {
             if item.group_id == self.group_id
                 && item.lifecycle != Lifecycle::Removed
                 && self.lifecycle.is_none_or(|want| item.lifecycle == want)
+                && self
+                    .workflow_id
+                    .is_none_or(|wf| item.workflow_id == Some(wf) || item.spec.runs_workflow(wf))
             {
                 self.found.push(item);
             }

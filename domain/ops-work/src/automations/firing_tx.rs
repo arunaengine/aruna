@@ -501,7 +501,7 @@ impl Operation for FiringTxOp {
                     let auto = Automation::from_bytes(&auto_bytes)?;
                     self.step = TxStep::CheckActive {
                         out: Box::new(out),
-                        limit: auto.spec.scope.limits.max_active_firings,
+                        limit: auto.spec.scope.limits.active_firings(),
                         active_count: 0,
                     };
                     return Ok(Next::Call(active_page(None)));

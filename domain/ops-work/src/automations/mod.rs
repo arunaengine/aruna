@@ -3,8 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod admit;
+pub mod applet_link;
 pub mod change;
 pub mod check;
+mod commit_bundle;
 pub mod control;
 pub mod copy_stage;
 #[cfg(test)]
@@ -29,12 +31,16 @@ pub mod run_stage;
 pub mod runner;
 #[cfg(test)]
 mod runner_tests;
+pub mod save;
 mod schedule;
 pub mod start;
+pub mod timer;
 pub mod upkeep;
 
 use aruna_core::automation::firing::Firing;
-use aruna_core::automation::keys::{active_prefix, firing_key, record_key, record_prefix};
+use aruna_core::automation::keys::{
+    active_prefix, firing_key, record_key, record_prefix, schedule_key, schedule_prefix,
+};
 use aruna_core::automation::record::{Automation, Lifecycle, Spec};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::ConversionError;
@@ -43,12 +49,14 @@ use aruna_core::keyspaces::{AUTOMATION_RUNS_KEYSPACE, AUTOMATIONS_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
-use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::identity::features::{Feature, Resolved, resolve};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::blob::group_permission_path;
-use aruna_core::types::{Key, KeySpace, Value};
+use aruna_core::types::{GroupId, Key, KeySpace, Value};
 use aruna_ops_identity::auth::error::AuthorizeError;
 use aruna_ops_identity::auth::request_authorization::AuthorizeOperation;
 use byteview::ByteView;
+use std::collections::BTreeSet;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -58,6 +66,8 @@ pub enum AutoError {
     NotFound,
     #[error("permission denied")]
     Forbidden,
+    #[error("feature `{}` is disabled", .0.name())]
+    FeatureOff(Feature, Resolved),
     #[error("{0}")]
     Invalid(String),
     #[error("{0}")]
@@ -66,6 +76,10 @@ pub enum AutoError {
     Capacity(String),
     #[error("{0}")]
     Limited(String),
+    #[error("{}", .0.reason.as_deref().unwrap_or("conditions were not met"))]
+    ConditionsNotMet(Box<Firing>),
+    #[error("{0}")]
+    Unavailable(String),
     #[error("storage failed: {0}")]
     Storage(String),
 }
@@ -151,6 +165,36 @@ pub(crate) fn auto_row(auto: &Automation) -> Result<(KeySpace, Key, Value), Auto
         record_key(auto.automation_id),
         ByteView::from(auto.to_bytes()?),
     ))
+}
+
+pub(crate) fn schedule_page(after: Option<Key>) -> IoCall {
+    IoCall::Page {
+        space: AUTOMATIONS_KEYSPACE.to_string(),
+        prefix: schedule_prefix(),
+        after,
+        limit: 256,
+    }
+}
+
+pub(crate) fn check_feature(
+    config: &RealmConfigDocument,
+    disabled: &BTreeSet<Feature>,
+    feature: Feature,
+    group_id: GroupId,
+) -> Result<(), AutoError> {
+    let resolved = resolve(config, disabled, feature, Some(&group_id));
+    match resolved.on {
+        true => Ok(()),
+        false => Err(AutoError::FeatureOff(feature, resolved)),
+    }
+}
+
+pub(crate) fn schedule_row(automation_id: Ulid, ms: u64) -> (KeySpace, Key, Value) {
+    (
+        AUTOMATIONS_KEYSPACE.to_string(),
+        schedule_key(automation_id),
+        ByteView::from(ms.to_be_bytes().to_vec()),
+    )
 }
 
 pub(crate) fn firing_row(firing: &Firing) -> Result<(KeySpace, Key, Value), AutoError> {

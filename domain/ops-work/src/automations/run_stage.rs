@@ -101,6 +101,15 @@ pub(crate) fn trigger_vars(trigger: &TriggerPayload) -> BTreeMap<String, Value> 
             map.insert("trigger.bucket".into(), Value::String(bucket.clone()));
             map.insert("trigger.key".into(), Value::String(key.clone()));
         }
+        TriggerPayload::Schedule { at_ms } => {
+            let at = i64::try_from(*at_ms)
+                .ok()
+                .and_then(chrono::DateTime::from_timestamp_millis)
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_else(|| at_ms.to_string());
+            map.insert("trigger.at".into(), Value::String(at));
+            map.insert("trigger.at_ms".into(), Value::Number((*at_ms).into()));
+        }
     }
     map
 }

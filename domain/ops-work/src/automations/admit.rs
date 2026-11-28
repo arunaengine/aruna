@@ -1,16 +1,18 @@
-//! Atomic firing admission checking lifecycle, rate limits, active slots and dedup/replay rows.
+//! Atomic firing admission checking lifecycle, conditions, limits, active slots and dedup rows.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::applet::record::{Applet, Lifecycle as AppletLifecycle, applet_key};
 use aruna_core::automation::firing::{Firing, TriggerPayload};
 use aruna_core::automation::glob::glob_match;
 use aruna_core::automation::keys::{
-    active_key, firing_key, index_key, kept_key, record_key, replay_key, seen_key,
+    active_key, firing_key, index_key, kept_key, record_key, replay_key, schedule_key, seen_key,
 };
 use aruna_core::automation::record::{Automation, Lifecycle, Trigger};
+use aruna_core::automation::rules::{ConditionCheck, LIVE_GRACE_MS, evaluate_conditions};
 use aruna_core::automation::usage::{CounterKind, Window, count_u64, counter_key};
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::keyspaces::{AUTOMATION_RUNS_KEYSPACE, AUTOMATIONS_KEYSPACE};
+use aruna_core::keyspaces::{APPLETS_KEYSPACE, AUTOMATION_RUNS_KEYSPACE, AUTOMATIONS_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::types::{Key, KeySpace, Value};
 use aruna_core::user::id::UserId;
@@ -18,9 +20,9 @@ use byteview::ByteView;
 use ulid::Ulid;
 
 use super::firing_reads::decode_ulid;
-use super::{AutoError, active_page, firing_row};
+use super::{AutoError, active_page, firing_row, schedule_row};
 
-/// Writes a newly created firing along with its active-set and firing-id index rows.
+/// Writes a newly created firing along with its active-set (when active) and firing-id index rows.
 pub(crate) fn new_firing_rows(firing: &Firing) -> Result<Vec<(KeySpace, Key, Value)>, AutoError> {
     let auto_bytes = ByteView::from(firing.automation_id.to_bytes().to_vec());
     let mut rows = vec![
@@ -69,11 +71,15 @@ pub(crate) enum AdmitSource {
     Replay {
         event_id: Ulid,
     },
+    Schedule {
+        slot_ms: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum AdmitOutcome {
     Created(Firing),
+    Skipped(Firing),
     Existing(Firing),
     AlreadySeen,
     Unmatched,
@@ -91,6 +97,7 @@ fn match_payload(
     auto: &Automation,
     payload: &TriggerPayload,
     actor: Option<UserId>,
+    applet_linked: bool,
 ) -> PayloadMatch {
     if auto.account.is_some() && actor == auto.account {
         return PayloadMatch::Unmatched;
@@ -108,6 +115,10 @@ fn match_payload(
                 PayloadMatch::Unmatched
             }
         }
+        TriggerPayload::Schedule { .. } => match auto.spec.has_schedules() {
+            true => PayloadMatch::Matched,
+            false => PayloadMatch::Unmatched,
+        },
         TriggerPayload::DataUploaded { bucket, key, .. } => {
             let file = key.rsplit('/').next().unwrap_or(key);
             let hit = auto.spec.triggers.iter().any(|trigger| match trigger {
@@ -128,10 +139,11 @@ fn match_payload(
             }
         }
         TriggerPayload::AppletSubmission { applet_id, .. } => {
-            let hit =
-                auto.spec.triggers.iter().any(
-                    |t| matches!(t, Trigger::AppletSubmission { applet_id: a } if a == applet_id),
-                );
+            let hit = auto.spec.triggers.iter().any(|t| match t {
+                Trigger::AppletSubmission { applet_id: Some(a) } => a == applet_id,
+                Trigger::AppletSubmission { applet_id: None } => applet_linked,
+                _ => false,
+            });
             match hit {
                 true => PayloadMatch::Matched,
                 false => PayloadMatch::Unmatched,
@@ -158,12 +170,21 @@ fn match_payload(
             });
             if !hit {
                 PayloadMatch::Unmatched
-            } else if *depth >= auto.spec.scope.limits.max_chain_depth {
+            } else if *depth >= auto.spec.scope.limits.chain_depth() {
                 PayloadMatch::ChainDepth
             } else {
                 PayloadMatch::Matched
             }
         }
+    }
+}
+
+fn limit_check(kind: &str, text: String, why: String) -> ConditionCheck {
+    ConditionCheck {
+        kind: kind.into(),
+        text,
+        held: false,
+        why,
     }
 }
 
@@ -174,17 +195,19 @@ enum AdmitStep {
     Active {
         auto: Box<Automation>,
         counters: Vec<(Key, u64)>,
+        checks: Vec<ConditionCheck>,
         active_count: u32,
     },
     Write {
         firing: Box<Firing>,
+        skipped: bool,
         drop_kept: Option<Key>,
     },
     DropKept(Box<Firing>),
 }
 
-/// Atomically verifies lifecycle, dedup/replay state, rate counters and `max_active_firings`, then
-/// creates the firing and claims its slot and kept/seen row in one write transaction.
+/// Atomically verifies lifecycle, dedup/replay state, conditions, rate counters and active slots,
+/// then creates the firing (or terminal `Skipped` record) in one write transaction.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct AdmitFiringOp {
     auto_id: Ulid,
@@ -234,6 +257,15 @@ impl AdmitFiringOp {
         )
     }
 
+    pub(crate) fn schedule(auto_id: Ulid, firing_id: Ulid, slot_ms: u64) -> Self {
+        Self::new(
+            auto_id,
+            firing_id,
+            TriggerPayload::Schedule { at_ms: slot_ms },
+            AdmitSource::Schedule { slot_ms },
+        )
+    }
+
     fn new(auto_id: Ulid, firing_id: Ulid, payload: TriggerPayload, source: AdmitSource) -> Self {
         Self {
             auto_id,
@@ -257,6 +289,45 @@ impl AdmitFiringOp {
             (Window::Day, Window::Day.start(self.now_ms)),
         );
         (hour, day)
+    }
+
+    fn write_skipped(
+        &mut self,
+        auto: &Automation,
+        reason: String,
+        checks: Vec<ConditionCheck>,
+    ) -> Result<Next<AdmitOutcome>, AutoError> {
+        let firing = Firing::skipped(
+            self.firing_id,
+            auto.automation_id,
+            auto.group_id,
+            auto.revision,
+            &auto.spec,
+            self.payload.clone(),
+            reason,
+            checks,
+            self.now_ms,
+        );
+        let mut writes = new_firing_rows(&firing)?;
+        match &self.source {
+            AdmitSource::Manual | AdmitSource::Replay { .. } => {}
+            AdmitSource::Journal { source, .. } => {
+                writes.push((
+                    AUTOMATIONS_KEYSPACE.to_string(),
+                    seen_key(auto.automation_id, source),
+                    ByteView::from(self.now_ms.to_be_bytes().to_vec()),
+                ));
+            }
+            AdmitSource::Schedule { slot_ms } => {
+                writes.push(schedule_row(auto.automation_id, *slot_ms));
+            }
+        }
+        self.step = AdmitStep::Write {
+            firing: Box::new(firing),
+            skipped: true,
+            drop_kept: None,
+        };
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 }
 
@@ -287,6 +358,9 @@ impl Operation for AdmitFiringOp {
                     AUTOMATIONS_KEYSPACE.to_string(),
                     seen_key(self.auto_id, source),
                 ));
+                if let TriggerPayload::AppletSubmission { applet_id, .. } = &self.payload {
+                    reads.push((APPLETS_KEYSPACE.to_string(), applet_key(*applet_id)));
+                }
             }
             AdmitSource::Replay { event_id } => {
                 reads.push((
@@ -297,6 +371,9 @@ impl Operation for AdmitFiringOp {
                     AUTOMATIONS_KEYSPACE.to_string(),
                     kept_key(self.auto_id, *event_id),
                 ));
+            }
+            AdmitSource::Schedule { .. } => {
+                reads.push((AUTOMATIONS_KEYSPACE.to_string(), schedule_key(self.auto_id)));
             }
         }
         Ok(Next::Call(IoCall::Read(reads)))
@@ -347,8 +424,21 @@ impl Operation for AdmitFiringOp {
                         if values.get(3).and_then(Option::as_ref).is_some() {
                             return Ok(Next::Done(AdmitOutcome::AlreadySeen));
                         }
-                        if auto.revision != *matched_revision {
-                            match match_payload(&auto, &self.payload, *actor) {
+                        let applet_linked = values
+                            .get(4)
+                            .and_then(Option::as_deref)
+                            .and_then(|bytes| Applet::from_bytes(bytes).ok())
+                            .is_some_and(|applet| {
+                                applet.lifecycle != AppletLifecycle::TakenDown
+                                    && applet.group_id == auto.group_id
+                                    && applet.automations.contains(&auto.automation_id)
+                            });
+                        let is_wildcard =
+                            auto.spec.triggers.iter().any(|t| {
+                                matches!(t, Trigger::AppletSubmission { applet_id: None })
+                            });
+                        if auto.revision != *matched_revision || is_wildcard {
+                            match match_payload(&auto, &self.payload, *actor, applet_linked) {
                                 PayloadMatch::Matched => {}
                                 PayloadMatch::Unmatched => {
                                     return Ok(Next::Done(AdmitOutcome::Unmatched));
@@ -364,14 +454,56 @@ impl Operation for AdmitFiringOp {
                             return Err(AutoError::NotFound);
                         }
                     }
+                    AdmitSource::Schedule { slot_ms } => {
+                        if !auto.spec.has_schedules() {
+                            return Ok(Next::Done(AdmitOutcome::Unmatched));
+                        }
+                        let last_ms = count_u64(values.get(3).and_then(Option::as_deref));
+                        if last_ms >= *slot_ms {
+                            return Ok(Next::Done(AdmitOutcome::AlreadySeen));
+                        }
+                        if self.now_ms.saturating_sub(*slot_ms) > LIVE_GRACE_MS {
+                            return self.write_skipped(
+                                &auto,
+                                "Missed scheduled start while the node was unavailable.".into(),
+                                Vec::new(),
+                            );
+                        }
+                    }
+                }
+                let eval = evaluate_conditions(&auto.spec.conditions, self.now_ms, &self.payload);
+                if !eval.ok {
+                    let reason = eval
+                        .reason
+                        .unwrap_or_else(|| "Conditions were not met.".into());
+                    return self.write_skipped(&auto, reason, eval.checked);
                 }
                 let (hour_key, day_key) = self.counter_keys();
                 let limits = &auto.spec.scope.limits;
-                let hour_next =
-                    count_u64(values.get(1).and_then(Option::as_deref)).saturating_add(1);
-                let day_next =
-                    count_u64(values.get(2).and_then(Option::as_deref)).saturating_add(1);
-                if hour_next > u64::from(limits.per_hour) || day_next > u64::from(limits.per_day) {
+                let hour_cap = limits.hour_limit();
+                let day_cap = limits.day_limit();
+                let hour_cur = count_u64(values.get(1).and_then(Option::as_deref));
+                let day_cur = count_u64(values.get(2).and_then(Option::as_deref));
+                let hour_next = hour_cur.saturating_add(1);
+                let day_next = day_cur.saturating_add(1);
+                if hour_next > u64::from(hour_cap) || day_next > u64::from(day_cap) {
+                    if matches!(self.source, AdmitSource::Schedule { .. }) {
+                        let (text, why) = if hour_next > u64::from(hour_cap) {
+                            (
+                                format!("At most {hour_cap} starts per hour"),
+                                format!("{hour_cur} starts in this hour already."),
+                            )
+                        } else {
+                            (
+                                format!("At most {day_cap} starts per day"),
+                                format!("{day_cur} starts today already."),
+                            )
+                        };
+                        let mut checks = eval.checked;
+                        let reason = format!("{text}. {why}");
+                        checks.push(limit_check("starts", text, why));
+                        return self.write_skipped(&auto, reason, checks);
+                    }
                     return Err(AutoError::Limited(
                         "automation rate or byte cap reached".into(),
                     ));
@@ -379,6 +511,7 @@ impl Operation for AdmitFiringOp {
                 self.step = AdmitStep::Active {
                     auto: Box::new(auto),
                     counters: vec![(hour_key, hour_next), (day_key, day_next)],
+                    checks: eval.checked,
                     active_count: 0,
                 };
                 Ok(Next::Call(active_page(None)))
@@ -391,6 +524,7 @@ impl Operation for AdmitFiringOp {
             AdmitStep::Active {
                 auto,
                 counters,
+                mut checks,
                 mut active_count,
             } => {
                 let (rows, next) = result.page()?;
@@ -403,11 +537,28 @@ impl Operation for AdmitFiringOp {
                     self.step = AdmitStep::Active {
                         auto,
                         counters,
+                        checks,
                         active_count,
                     };
                     return Ok(Next::Call(active_page(Some(after))));
                 }
-                if active_count >= auto.spec.scope.limits.max_active_firings {
+                let active_cap = auto.spec.scope.limits.active_firings();
+                if active_count >= active_cap {
+                    if matches!(self.source, AdmitSource::Schedule { .. }) {
+                        let text = if active_cap == 1 {
+                            "Only one run at a time".into()
+                        } else {
+                            format!("At most {active_cap} runs at a time")
+                        };
+                        let why = if active_cap == 1 {
+                            "A run is still going.".into()
+                        } else {
+                            format!("{active_count} runs are still going.")
+                        };
+                        let reason = format!("{text}. {why}");
+                        checks.push(limit_check("one_at_a_time", text, why));
+                        return self.write_skipped(&auto, reason, checks);
+                    }
                     return Err(AutoError::Limited(
                         "max_active_firings limit reached".into(),
                     ));
@@ -420,7 +571,8 @@ impl Operation for AdmitFiringOp {
                     &auto.spec,
                     self.payload.clone(),
                     self.now_ms,
-                );
+                )
+                .with_checks(checks);
                 let mut writes = new_firing_rows(&firing)?;
                 for (key, next_val) in counters {
                     writes.push((
@@ -447,14 +599,22 @@ impl Operation for AdmitFiringOp {
                         ));
                         drop_kept = Some(kept_key(auto.automation_id, *event_id));
                     }
+                    AdmitSource::Schedule { slot_ms } => {
+                        writes.push(schedule_row(auto.automation_id, *slot_ms));
+                    }
                 }
                 self.step = AdmitStep::Write {
                     firing: Box::new(firing),
+                    skipped: false,
                     drop_kept,
                 };
                 Ok(Next::Call(IoCall::Write(writes)))
             }
-            AdmitStep::Write { firing, drop_kept } => {
+            AdmitStep::Write {
+                firing,
+                skipped,
+                drop_kept,
+            } => {
                 result.done()?;
                 if let Some(key) = drop_kept {
                     self.step = AdmitStep::DropKept(firing);
@@ -463,7 +623,11 @@ impl Operation for AdmitFiringOp {
                         key,
                     )])));
                 }
-                Ok(Next::Done(AdmitOutcome::Created(*firing)))
+                let out = match skipped {
+                    true => AdmitOutcome::Skipped(*firing),
+                    false => AdmitOutcome::Created(*firing),
+                };
+                Ok(Next::Done(out))
             }
             AdmitStep::DropKept(firing) => {
                 result.done()?;

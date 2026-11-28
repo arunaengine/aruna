@@ -3,11 +3,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::automation::dag::{validate_scope, validate_spec};
+use aruna_core::automation::keys::schedule_key;
 use aruna_core::automation::record::{Automation, Lifecycle, PauseReason, PendingChange, Spec};
 use aruna_core::automation::scope::is_widening;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
+use aruna_core::keyspaces::AUTOMATIONS_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
@@ -17,7 +19,9 @@ use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
 use super::firing_reads::decode_ulid;
-use super::{AutoError, active_page, allowed, authorize_path, auto_answer, auto_row, read_auto};
+use super::{
+    AutoError, active_page, allowed, authorize_path, auto_answer, auto_row, read_auto, schedule_row,
+};
 
 const MAX_NAME: usize = 120;
 
@@ -27,6 +31,7 @@ pub struct NewAuto {
     pub name: String,
     pub description: String,
     pub spec: Spec,
+    pub workflow_id: Option<Ulid>,
 }
 
 /// Creates a new draft automation on `local` after checking group WRITE and validating its DAG.
@@ -114,6 +119,7 @@ impl Operation for CreateAutoOperation {
             created_at_ms: self.now_ms,
             updated_at_ms: self.now_ms,
             revision: 1,
+            workflow_id: self.input.workflow_id,
         };
         let row = auto_row(&record)?;
         self.record = Some(record);
@@ -132,6 +138,7 @@ pub enum AutoChange {
         name: Option<String>,
         description: Option<String>,
         spec: Option<Spec>,
+        workflow_id: Option<Option<Ulid>>,
     },
     RequestApproval,
     Approve,
@@ -158,7 +165,7 @@ impl AutoChange {
     }
 }
 
-fn apply(
+pub(crate) fn apply_change(
     auto: &mut Automation,
     change: AutoChange,
     actor: UserId,
@@ -173,6 +180,7 @@ fn apply(
             name,
             description,
             spec,
+            workflow_id,
         } => {
             if let Some(name) = name {
                 let trimmed = name.trim();
@@ -185,6 +193,9 @@ fn apply(
             }
             if let Some(desc) = description {
                 auto.description = desc.trim().to_string();
+            }
+            if let Some(wf) = workflow_id {
+                auto.workflow_id = wf;
             }
             if let Some(next_spec) = spec {
                 validate_spec(&next_spec).map_err(AutoError::Invalid)?;
@@ -284,7 +295,11 @@ fn apply(
 enum WriteStep {
     Read,
     CheckActive(Box<Automation>),
-    Write(Box<Automation>),
+    Write {
+        record: Box<Automation>,
+        drop_schedule: bool,
+    },
+    DropSchedule(Box<Automation>),
 }
 
 /// Applies one [`AutoChange`] transactionally with optional optimistic `expected` revision check.
@@ -322,16 +337,32 @@ impl WriteAutoOperation {
     }
 
     fn commit(&mut self, mut auto: Automation) -> Result<Next<Automation>, AutoError> {
-        apply(
+        let reset_schedule = matches!(self.change, AutoChange::Approve | AutoChange::Resume);
+        let clear_schedule = matches!(
+            self.change,
+            AutoChange::Pause(_)
+                | AutoChange::Delete
+                | AutoChange::Approve
+                | AutoChange::Update { .. }
+        );
+        apply_change(
             &mut auto,
             self.change.clone(),
             self.actor,
             self.realm_id,
             self.now_ms,
         )?;
-        let row = auto_row(&auto)?;
-        self.step = WriteStep::Write(Box::new(auto));
-        Ok(Next::Call(IoCall::Write(vec![row])))
+        let mut writes = vec![auto_row(&auto)?];
+        let keep_schedule = auto.lifecycle == Lifecycle::Active && auto.spec.has_schedules();
+        if reset_schedule && keep_schedule {
+            writes.push(schedule_row(auto.automation_id, self.now_ms));
+        }
+        let drop_schedule = clear_schedule && !keep_schedule;
+        self.step = WriteStep::Write {
+            record: Box::new(auto),
+            drop_schedule,
+        };
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 }
 
@@ -383,7 +414,22 @@ impl Operation for WriteAutoOperation {
                 }
                 self.commit(*auto)
             }
-            WriteStep::Write(record) => {
+            WriteStep::Write {
+                record,
+                drop_schedule,
+            } => {
+                result.done()?;
+                if drop_schedule {
+                    let key = schedule_key(record.automation_id);
+                    self.step = WriteStep::DropSchedule(record);
+                    return Ok(Next::Call(IoCall::Delete(vec![(
+                        AUTOMATIONS_KEYSPACE.to_string(),
+                        key,
+                    )])));
+                }
+                Ok(Next::Done(*record))
+            }
+            WriteStep::DropSchedule(record) => {
                 result.done()?;
                 Ok(Next::Done(*record))
             }
