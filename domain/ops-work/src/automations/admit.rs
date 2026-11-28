@@ -24,7 +24,8 @@ use ulid::Ulid;
 
 use super::firing_reads::decode_ulid;
 use super::{
-    AutoError, ScheduleSync, active_page, firing_row, plan_cursor_transition, window_retry_after,
+    ACTIVE_RETRY_SECONDS, AutoError, ScheduleSync, active_page, clear_schedule_rows, firing_row,
+    pinned_retry_after, plan_cursor_transition,
 };
 
 /// Writes a newly created firing along with its active-set (when active) and firing-id index rows.
@@ -226,6 +227,7 @@ pub(crate) struct AdmitFiringOp {
     payload: TriggerPayload,
     source: AdmitSource,
     now_ms: u64,
+    window_ms: u64,
     rate_keys: (Key, Key),
     step: AdmitStep,
 }
@@ -319,6 +321,7 @@ impl AdmitFiringOp {
             payload,
             source,
             now_ms: window_ms,
+            window_ms,
             rate_keys: rate_keys_for(auto_id, window_ms),
             step: AdmitStep::Read,
         }
@@ -472,8 +475,7 @@ impl Operation for AdmitFiringOp {
                         && let Some(cursor_bytes) = values.get(3).and_then(Option::as_deref)
                     {
                         let cursor = ScheduleCursor::from_bytes(cursor_bytes)?;
-                        let sync =
-                            plan_cursor_transition(self.auto_id, Ulid::nil(), Some(&cursor), None)?;
+                        let sync = clear_schedule_rows(self.auto_id, &cursor);
                         return self.apply_idle_sync(sync, IdleOutcome::Unmatched);
                     }
                     return Err(AutoError::NotFound);
@@ -497,12 +499,10 @@ impl Operation for AdmitFiringOp {
                             .map(ScheduleCursor::from_bytes)
                             .transpose()?;
                         if auto.lifecycle != Lifecycle::Active || !auto.spec.has_schedules() {
-                            let sync = plan_cursor_transition(
-                                self.auto_id,
-                                auto.group_id,
-                                stored_cursor.as_ref(),
-                                None,
-                            )?;
+                            let sync = stored_cursor
+                                .as_ref()
+                                .map(|cursor| clear_schedule_rows(self.auto_id, cursor))
+                                .unwrap_or_default();
                             return self.apply_idle_sync(sync, IdleOutcome::Unmatched);
                         }
                         let Some(cursor) = stored_cursor else {
@@ -654,7 +654,10 @@ impl Operation for AdmitFiringOp {
                         checks.push(limit_check(ConditionCheckKind::ActiveLimit, text, why));
                         return self.write_skipped(&auto, reason, checks, schedule_sync);
                     }
-                    return Err(AutoError::limited("max_active_firings limit reached", 30));
+                    return Err(AutoError::limited(
+                        "max_active_firings limit reached",
+                        ACTIVE_RETRY_SECONDS,
+                    ));
                 }
                 let firing = Firing::new(
                     self.firing_id,
@@ -760,8 +763,9 @@ impl AdmitFiringOp {
         let day_count = count_u64(values.get(2).and_then(Option::as_deref));
         let hour_next = hour_count.saturating_add(1);
         let day_next = day_count.saturating_add(1);
-        if hour_next > u64::from(hour_cap) || day_next > u64::from(day_cap) {
-            let over_hour = hour_next > u64::from(hour_cap);
+        let over_hour = hour_next > u64::from(hour_cap);
+        let over_day = day_next > u64::from(day_cap);
+        if over_hour || over_day {
             if matches!(self.source, AdmitSource::Schedule) {
                 let (text, why) = if over_hour {
                     (
@@ -779,11 +783,18 @@ impl AdmitFiringOp {
                 checks.push(limit_check(ConditionCheckKind::Starts, text, why));
                 return self.write_skipped(&auto, reason, checks, schedule_sync);
             }
-            let retry_after = if over_hour {
-                window_retry_after(Window::Hour, self.now_ms)
-            } else {
-                window_retry_after(Window::Day, self.now_ms)
-            };
+            let mut retry_after = 1u64;
+            if over_hour {
+                retry_after = retry_after.max(pinned_retry_after(
+                    Window::Hour,
+                    self.window_ms,
+                    self.now_ms,
+                ));
+            }
+            if over_day {
+                retry_after =
+                    retry_after.max(pinned_retry_after(Window::Day, self.window_ms, self.now_ms));
+            }
             return Err(AutoError::limited(
                 "automation rate or byte cap reached",
                 retry_after,

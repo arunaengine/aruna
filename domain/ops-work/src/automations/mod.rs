@@ -44,6 +44,7 @@ use aruna_core::automation::keys::{
 };
 use aruna_core::automation::record::{Automation, Lifecycle, Spec};
 use aruna_core::automation::schedule::{CursorMode, ScheduleCursor};
+use aruna_core::automation::usage::Window;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::ConversionError;
 use aruna_core::id::NodeId;
@@ -94,14 +95,19 @@ impl AutoError {
     }
 }
 
-pub(crate) fn window_retry_after(
-    window: aruna_core::automation::usage::Window,
-    now_ms: u64,
-) -> u64 {
+pub(crate) const ACTIVE_RETRY_SECONDS: u64 = 30;
+pub(crate) const APPLET_RETRY_SECONDS: u64 = 60;
+
+pub(crate) fn pinned_retry_after(window: Window, pinned_ms: u64, now_ms: u64) -> u64 {
     let span = window.span_ms();
-    let elapsed = now_ms % span;
-    let remaining_ms = span.saturating_sub(elapsed);
-    remaining_ms.div_ceil(1_000).max(1)
+    let expiry_ms = u64::from(window.start(pinned_ms))
+        .saturating_add(1)
+        .saturating_mul(span);
+    expiry_ms.saturating_sub(now_ms).div_ceil(1_000).max(1)
+}
+
+pub(crate) fn window_retry_after(window: Window, now_ms: u64) -> u64 {
+    pinned_retry_after(window, now_ms, now_ms)
 }
 
 impl From<IoError> for AutoError {
@@ -179,10 +185,6 @@ pub(crate) fn auto_answer(result: IoResult) -> Result<Option<Automation>, AutoEr
         .transpose()?)
 }
 
-pub(crate) fn auto_row(auto: &Automation) -> Result<(KeySpace, Key, Value), AutoError> {
-    Ok(crate::automation_row(auto)?)
-}
-
 pub(crate) fn group_auto_row(auto: &Automation) -> (KeySpace, Key, Value) {
     (
         AUTOMATIONS_KEYSPACE.to_string(),
@@ -192,7 +194,7 @@ pub(crate) fn group_auto_row(auto: &Automation) -> (KeySpace, Key, Value) {
 }
 
 pub(crate) fn auto_rows(auto: &Automation) -> Result<Vec<(KeySpace, Key, Value)>, AutoError> {
-    let mut rows = vec![auto_row(auto)?];
+    let mut rows = vec![crate::automation_row(auto)?];
     if auto.lifecycle != Lifecycle::Removed {
         rows.push(group_auto_row(auto));
     }
@@ -288,6 +290,23 @@ pub(crate) fn plan_schedule_sync(
         None
     };
     plan_cursor_transition(auto.automation_id, auto.group_id, previous, next.as_ref())
+}
+
+/// Deletes the due-index and cursor rows for a schedule cursor when no next slot exists.
+pub(crate) fn clear_schedule_rows(automation_id: Ulid, previous: &ScheduleCursor) -> ScheduleSync {
+    ScheduleSync {
+        writes: Vec::new(),
+        deletes: vec![
+            (
+                AUTOMATIONS_KEYSPACE.to_string(),
+                schedule_due_key(previous.due_ms, automation_id),
+            ),
+            (
+                AUTOMATIONS_KEYSPACE.to_string(),
+                schedule_cursor_key(automation_id),
+            ),
+        ],
+    }
 }
 
 /// Computes the due-index and cursor row writes/deletes to move from `previous` to `next`.

@@ -462,7 +462,9 @@ impl Operation for MatchEventsOperation {
                         HeadObjectError::NoSuchKey
                         | HeadObjectError::NoSuchVersion
                         | HeadObjectError::DeleteMarker
-                        | HeadObjectError::StagingSourceError(StagingSourceError::NotFound),
+                        | HeadObjectError::StagingSourceError(
+                            StagingSourceError::NotFound | StagingSourceError::AccessDenied,
+                        ),
                     ) => None,
                     Err(error) => return Err(AutoError::Storage(error.to_string())),
                 };
@@ -817,50 +819,55 @@ mod tests {
             None,
             2,
         );
-        let mut ref_missing = MatchEventsOperation::new(realm);
-        ref_missing.config = Some(config);
-        ref_missing.autos.push(auto);
-        ref_missing.current_key = Some(vec![AUTO_PENDING_ROW, 1]);
-        ref_missing
-            .rows
-            .push((vec![AUTO_PENDING_ROW, 2], second_event));
-        ref_missing.step = MatchStep::EnrichUpload {
-            automation_index: 0,
-            event: Box::new(event),
-            bucket: "raw".into(),
-            version_id,
-            key: "in/file.csv".into(),
-        };
-        let to_admit = ref_missing
-            .next(IoResult::Child(ChildOutcome::new(Err::<
-                HeadObjectResult,
-                HeadObjectError,
-            >(
-                HeadObjectError::StagingSourceError(StagingSourceError::NotFound),
-            ))))
-            .unwrap();
-        assert!(matches!(to_admit, Next::Call(IoCall::Child(_))));
-        assert!(matches!(
-            ref_missing.step,
-            MatchStep::Admit { ref payload, .. }
-                if matches!(payload.as_ref(), TriggerPayload::DataUploaded { size_bytes: None, .. })
-        ));
-        // Completing admission deletes the first pending row and advances to the second event.
-        let drop_first = ref_missing
-            .next(IoResult::Child(ChildOutcome::new(Ok::<
-                AdmitOutcome,
-                AutoError,
-            >(
-                AdmitOutcome::AlreadySeen,
-            ))))
-            .unwrap();
-        assert!(matches!(drop_first, Next::Call(IoCall::Delete(_))));
-        let read_second = ref_missing.next(IoResult::Done).unwrap();
-        assert!(matches!(read_second, Next::Call(IoCall::Read(_))));
-        let head_second = ref_missing.next(IoResult::Values(vec![None])).unwrap();
-        assert!(matches!(head_second, Next::Call(IoCall::Child(_))));
-        assert!(
-            matches!(ref_missing.step, MatchStep::EnrichUpload { ref key, .. } if key == "in/second.csv")
-        );
+        for head_error in [
+            StagingSourceError::NotFound,
+            StagingSourceError::AccessDenied,
+        ] {
+            let mut ref_op = MatchEventsOperation::new(realm);
+            ref_op.config = Some(config.clone());
+            ref_op.autos.push(auto.clone());
+            ref_op.current_key = Some(vec![AUTO_PENDING_ROW, 1]);
+            ref_op
+                .rows
+                .push((vec![AUTO_PENDING_ROW, 2], second_event.clone()));
+            ref_op.step = MatchStep::EnrichUpload {
+                automation_index: 0,
+                event: Box::new(event.clone()),
+                bucket: "raw".into(),
+                version_id,
+                key: "in/file.csv".into(),
+            };
+            let to_admit = ref_op
+                .next(IoResult::Child(ChildOutcome::new(Err::<
+                    HeadObjectResult,
+                    HeadObjectError,
+                >(
+                    HeadObjectError::StagingSourceError(head_error),
+                ))))
+                .unwrap();
+            assert!(matches!(to_admit, Next::Call(IoCall::Child(_))));
+            assert!(matches!(
+                ref_op.step,
+                MatchStep::Admit { ref payload, .. }
+                    if matches!(payload.as_ref(), TriggerPayload::DataUploaded { size_bytes: None, .. })
+            ));
+            // Completing admission deletes the first pending row and advances to the second event.
+            let drop_first = ref_op
+                .next(IoResult::Child(ChildOutcome::new(Ok::<
+                    AdmitOutcome,
+                    AutoError,
+                >(
+                    AdmitOutcome::AlreadySeen,
+                ))))
+                .unwrap();
+            assert!(matches!(drop_first, Next::Call(IoCall::Delete(_))));
+            let read_second = ref_op.next(IoResult::Done).unwrap();
+            assert!(matches!(read_second, Next::Call(IoCall::Read(_))));
+            let head_second = ref_op.next(IoResult::Values(vec![None])).unwrap();
+            assert!(matches!(head_second, Next::Call(IoCall::Child(_))));
+            assert!(
+                matches!(ref_op.step, MatchStep::EnrichUpload { ref key, .. } if key == "in/second.csv")
+            );
+        }
     }
 }

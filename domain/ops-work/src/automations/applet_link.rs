@@ -16,7 +16,7 @@ use aruna_core::structs::identity::features::Feature;
 use aruna_ops_identity::document_repository::GetConfigOperation;
 use ulid::Ulid;
 
-use super::{AutoError, check_features};
+use super::{APPLET_RETRY_SECONDS, AutoError, check_features};
 use crate::applets::{AppletAccessOperation, AppletError, Need as AppletNeed, record_rows};
 
 /// Target applet and optional optimistic revision for [`LinkAppletOperation`].
@@ -39,7 +39,7 @@ fn map_applet(error: AppletError) -> AutoError {
         AppletError::Forbidden => AutoError::Forbidden,
         AppletError::Invalid(reason) => AutoError::Invalid(reason),
         AppletError::Conflict(reason) => AutoError::Conflict(reason),
-        AppletError::Limited(reason) => AutoError::limited(reason, 60),
+        AppletError::Limited(reason) => AutoError::limited(reason, APPLET_RETRY_SECONDS),
         AppletError::Elsewhere(node) => AutoError::Conflict(format!(
             "the applet is hosted on node {node}; send changes there"
         )),

@@ -97,20 +97,25 @@ impl Operation for CountUsageOperation {
         }
         let values = result.values()?;
         let mut writes = Vec::with_capacity(self.rows.len());
+        let mut retry_after: Option<u64> = None;
         for ((key, window, add, cap), stored) in
             std::mem::take(&mut self.rows).into_iter().zip(values)
         {
             let next = count_u64(stored.as_deref()).saturating_add(add);
             if next > cap {
-                return Err(AutoError::limited(
-                    "automation rate or byte cap reached",
-                    window_retry_after(window, self.now_ms),
-                ));
+                let wait = window_retry_after(window, self.now_ms);
+                retry_after = Some(retry_after.map_or(wait, |prev| prev.max(wait)));
             }
             writes.push((
                 AUTOMATIONS_KEYSPACE.to_string(),
                 key,
                 Value::from(next.to_be_bytes().to_vec()),
+            ));
+        }
+        if let Some(wait) = retry_after {
+            return Err(AutoError::limited(
+                "automation rate or byte cap reached",
+                wait,
             ));
         }
         Ok(Next::Call(IoCall::Write(writes)))

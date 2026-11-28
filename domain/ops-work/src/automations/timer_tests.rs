@@ -328,7 +328,7 @@ fn steps_admit_phases() {
     let initial_day_key = first_reads[2].1.clone();
 
     // Retry clones the pre-first() op and stamps after midnight UTC; keys must not change.
-    let mut attempt_two = initial_template;
+    let mut attempt_two = initial_template.clone();
     attempt_two.stamp(utc_midnight + 1_000);
     let Next::Call(IoCall::Read(retry_reads)) = attempt_two.first().unwrap() else {
         panic!("expected Read");
@@ -339,6 +339,7 @@ fn steps_admit_phases() {
     let mut manual_auto = auto;
     manual_auto.spec.triggers = vec![Trigger::Manual { form_json: None }];
     manual_auto.spec.scope.limits.per_hour = Some(5);
+    manual_auto.spec.scope.limits.per_day = Some(10);
     assert!(matches!(
         attempt_two.next(IoResult::Values(vec![
             Some(manual_auto.to_bytes().unwrap().into()),
@@ -358,6 +359,69 @@ fn steps_admit_phases() {
     };
     assert!(writes.iter().any(|(_, key, _)| *key == initial_hour_key));
     assert!(writes.iter().any(|(_, key, _)| *key == initial_day_key));
+
+    // 4. Retry-After reflects the latest exceeded pinned window, floored at 1s after expiry.
+    let mut expired_retry = initial_template;
+    expired_retry.stamp(utc_midnight + 1_000);
+    expired_retry.first().unwrap();
+    let expired_limit = expired_retry.next(IoResult::Values(vec![
+        Some(manual_auto.to_bytes().unwrap().into()),
+        None,
+        Some(10u64.to_be_bytes().to_vec().into()),
+    ]));
+    assert!(matches!(
+        expired_limit,
+        Err(AutoError::Limited { retry_after: 1, .. })
+    ));
+
+    let mid_morning = utc_midnight + 10 * 3_600_000 + 30 * 60_000;
+    let mut both_caps = AdmitFiringOp::manual(
+        auto_id,
+        firing_id,
+        TriggerPayload::Manual {
+            values_json: "{}".into(),
+            actor: aruna_core::user::id::UserId::nil(realm),
+        },
+        mid_morning,
+    );
+    both_caps.stamp(mid_morning);
+    both_caps.first().unwrap();
+    let both_err = both_caps.next(IoResult::Values(vec![
+        Some(manual_auto.to_bytes().unwrap().into()),
+        Some(5u64.to_be_bytes().to_vec().into()),
+        Some(10u64.to_be_bytes().to_vec().into()),
+    ]));
+    assert!(matches!(
+        both_err,
+        Err(AutoError::Limited {
+            retry_after: 48_600,
+            ..
+        })
+    ));
+
+    let mut hour_only = AdmitFiringOp::manual(
+        auto_id,
+        firing_id,
+        TriggerPayload::Manual {
+            values_json: "{}".into(),
+            actor: aruna_core::user::id::UserId::nil(realm),
+        },
+        mid_morning,
+    );
+    hour_only.stamp(mid_morning);
+    hour_only.first().unwrap();
+    let hour_err = hour_only.next(IoResult::Values(vec![
+        Some(manual_auto.to_bytes().unwrap().into()),
+        Some(5u64.to_be_bytes().to_vec().into()),
+        Some(5u64.to_be_bytes().to_vec().into()),
+    ]));
+    assert!(matches!(
+        hour_err,
+        Err(AutoError::Limited {
+            retry_after: 1_800,
+            ..
+        })
+    ));
 }
 
 #[tokio::test]

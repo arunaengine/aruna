@@ -17,7 +17,7 @@ use ulid::Ulid;
 use super::copy_stage::StageOutcome;
 use super::firing_reads::decode_ulid;
 use super::run_stage::render_text;
-use super::{AutoError, active_page, firing_row};
+use super::{ACTIVE_RETRY_SECONDS, AutoError, active_page, firing_row};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PollDelta {
@@ -530,7 +530,10 @@ impl Operation for FiringTxOp {
                     return Ok(Next::Call(active_page(Some(after))));
                 }
                 if active_count >= limit {
-                    return Err(AutoError::limited("max_active_firings limit reached", 30));
+                    return Err(AutoError::limited(
+                        "max_active_firings limit reached",
+                        ACTIVE_RETRY_SECONDS,
+                    ));
                 }
                 self.commit_out(*out)
             }
