@@ -401,8 +401,8 @@ async fn triggers_and_save() {
     let h = Harness::new().await;
     h.set_features(true, true).await;
 
-    // Missing zone on weekdays, time_of_day or schedule is rejected with 400.
-    for bad_spec in [
+    // Omitting required `zone` fails JSON deserialization (422); blank/unknown `zone` fails 400.
+    for missing_zone in [
         json!({
             "triggers": [{"kind": "manual"}],
             "conditions": {"mode": "all", "items": [{"kind": "weekdays", "days": ["mon"]}]},
@@ -426,7 +426,23 @@ async fn triggers_and_save() {
                 &h.owner,
                 "POST",
                 "/compute/automations",
-                Some(json!({"group_id": h.group.to_string(), "name": "bad", "spec": bad_spec})),
+                Some(json!({"group_id": h.group.to_string(), "name": "bad", "spec": missing_zone})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{err}");
+    }
+    for bad_zone in ["", "Mars/Olympus"] {
+        let spec = json!({
+            "triggers": [{"kind": "schedule", "every": "day", "at": "06:00", "zone": bad_zone}],
+            "stages": [{"name": "a", "kind": "notify", "audience": "group_admins", "message": "hi"}],
+            "scope": {"audiences": ["group_admins"]}
+        });
+        let (status, err) = h
+            .call(
+                &h.owner,
+                "POST",
+                "/compute/automations",
+                Some(json!({"group_id": h.group.to_string(), "name": "bad", "spec": spec})),
             )
             .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
@@ -567,6 +583,7 @@ async fn triggers_and_save() {
     assert_eq!(saved["workflow"]["automation_id"], paired_auto);
     assert_eq!(saved["automation"]["workflow_id"], workflow_id);
     assert_eq!(saved["version"]["version"], "1");
+    assert_eq!(saved["identity_synced"], true);
 
     let (status, by_workflow) = h
         .call(

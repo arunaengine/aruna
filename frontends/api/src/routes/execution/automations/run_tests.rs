@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 
 use aruna_core::applet::record::{Access, Applet, Embedding, Folder, Grants, Lifecycle as AppLife};
+use aruna_core::automation::firing::TriggerPayload;
 use aruna_core::automation::keys::kept_key;
 use aruna_core::automation::record::KeptEvent;
 use aruna_core::keyspaces::{AUTOMATIONS_KEYSPACE, WORKFLOW_RUN_KEYSPACE};
@@ -126,7 +127,13 @@ async fn runs_and_visitors() {
         ),
         reason: "paused".into(),
         kept_at_ms: 5,
-        payload: None,
+        payload: TriggerPayload::DataUploaded {
+            bucket: "raw".into(),
+            key: "in/x.csv".into(),
+            version_id: Ulid::from_bytes([89; 16]),
+            path: format!("/{}/g/{}/data/{}/raw/in/x.csv", h.realm, h.group, h.node),
+            size_bytes: Some(42),
+        },
     };
     write_doc(
         &h.state.get_ctx(),

@@ -38,7 +38,8 @@ pub struct UpdateInput {
     pub name: Option<String>,
     /// Optional replacement description.
     pub description: Option<String>,
-    /// Optional replacement spec JSON object; widening changes on an active automation wait for admin approval.
+    /// Optional replacement spec JSON object; widening changes on an active automation wait
+    /// for admin approval.
     pub spec: Option<JsonPayload>,
 }
 

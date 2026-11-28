@@ -7,7 +7,6 @@ use aruna_core::automation::firing::{
 };
 use aruna_core::automation::record::KeptEvent;
 use aruna_core::automation::rules::ConditionCheck;
-use aruna_core::plugin_runs::{SourceEvent, SourceKind};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use utoipa::{IntoParams, ToSchema};
@@ -41,28 +40,28 @@ pub struct StageReceiptBody {
 }
 
 impl StageReceiptBody {
-    fn from_domain(rec: &StageReceipt) -> Self {
+    fn from_domain(receipt: &StageReceipt) -> Self {
         Self {
-            workflow_run_id: rec.workflow_run_id.map(|id| id.to_string()),
-            outputs_count: rec.outputs.len(),
-            copied: rec
+            workflow_run_id: receipt.workflow_run_id.map(|id| id.to_string()),
+            outputs_count: receipt.outputs.len(),
+            copied: receipt
                 .copied
                 .iter()
-                .map(|c: &CopiedFile| CopiedFileBody {
-                    source_key: c.source_key.clone(),
-                    source_version: c.source_version.to_string(),
-                    dest_bucket: c.dest_bucket.clone(),
-                    dest_key: c.dest_key.clone(),
-                    dest_version: c.dest_version.to_string(),
-                    bytes: c.bytes,
+                .map(|file: &CopiedFile| CopiedFileBody {
+                    source_key: file.source_key.clone(),
+                    source_version: file.source_version.to_string(),
+                    dest_bucket: file.dest_bucket.clone(),
+                    dest_key: file.dest_key.clone(),
+                    dest_version: file.dest_version.to_string(),
+                    bytes: file.bytes,
                 })
                 .collect(),
-            dataset_id: rec.dataset_id.map(|id| id.to_string()),
-            notified: rec.notified,
-            approved_by: rec.approved_by.map(|u| u.to_string()),
-            rejected_by: rec.rejected_by.map(|u| u.to_string()),
-            expires_at: rec.expires_at_ms.map(rfc3339),
-            preview: rec.preview_json.clone(),
+            dataset_id: receipt.dataset_id.map(|id| id.to_string()),
+            notified: receipt.notified,
+            approved_by: receipt.approved_by.map(|user| user.to_string()),
+            rejected_by: receipt.rejected_by.map(|user| user.to_string()),
+            expires_at: receipt.expires_at_ms.map(rfc3339),
+            preview: receipt.preview_json.clone(),
         }
     }
 }
@@ -115,7 +114,7 @@ pub struct ConditionCheckBody {
 impl From<&ConditionCheck> for ConditionCheckBody {
     fn from(check: &ConditionCheck) -> Self {
         Self {
-            kind: check.kind.clone(),
+            kind: check.kind.as_str().into(),
             text: check.text.clone(),
             held: check.held,
             why: check.why.clone(),
@@ -138,7 +137,8 @@ pub enum TriggerEventBody {
         key: String,
         version_id: String,
         path: String,
-        size_bytes: u64,
+        /// Object size in bytes, or `null` if the uploaded version was unavailable when matched.
+        size_bytes: Option<u64>,
     },
     RunFinished {
         workflow_id: String,
@@ -227,54 +227,6 @@ impl TriggerEventBody {
             },
         }
     }
-
-    fn from_source(event: &SourceEvent) -> Option<Self> {
-        match event.kind {
-            SourceKind::DataUploaded => {
-                let mut parts = event.source.splitn(5, '/');
-                if parts.next()? != "data_uploaded" {
-                    return None;
-                }
-                let _node = parts.next()?;
-                let bucket = parts.next()?.to_string();
-                let version_id = parts.next()?.to_string();
-                let key = parts.next()?.to_string();
-                Some(Self::DataUploaded {
-                    bucket,
-                    key,
-                    version_id,
-                    path: event.path.clone(),
-                    size_bytes: 0,
-                })
-            }
-            SourceKind::RunFinished => Some(Self::RunFinished {
-                workflow_id: event.resource.clone(),
-                run_id: event.revision.clone(),
-                status: event
-                    .source
-                    .rsplit('/')
-                    .next()
-                    .filter(|text| matches!(*text, "succeeded" | "failed"))
-                    .unwrap_or_default()
-                    .to_string(),
-                outputs_count: 0,
-                applet_id: None,
-                outside_input: false,
-                depth: 0,
-            }),
-            SourceKind::AppletSubmission => Some(Self::AppletSubmission {
-                applet_id: event.resource.clone(),
-                version_id: event.revision.clone(),
-                pseudonym: String::new(),
-                guest: false,
-                outside_input: false,
-                bucket: String::new(),
-                key: String::new(),
-                files_count: 0,
-            }),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
@@ -334,12 +286,12 @@ impl FiringBody {
             resolutions: firing
                 .resolutions
                 .iter()
-                .map(|r: &Resolution| ResolutionBody {
-                    stage: r.stage.clone(),
-                    done: r.done,
-                    actor: r.actor.to_string(),
-                    note: r.note.clone(),
-                    at: rfc3339(r.at_ms),
+                .map(|resolution: &Resolution| ResolutionBody {
+                    stage: resolution.stage.clone(),
+                    done: resolution.done,
+                    actor: resolution.actor.to_string(),
+                    note: resolution.note.clone(),
+                    at: rfc3339(resolution.at_ms),
                 })
                 .collect(),
             created_at: rfc3339(firing.created_at_ms),
@@ -397,6 +349,27 @@ pub struct ConditionsRefusalBody {
     pub firing: FiringBody,
 }
 
+/// Standard 409 conflict body returned when an automation cannot start in its current state.
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+#[schema(as = AutomationStateConflict)]
+pub struct StateConflictBody {
+    pub error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
+}
+
+/// 409 response union for `POST /compute/automations/{automation_id}/start`.
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(untagged)]
+#[schema(as = StartAutomationConflict)]
+pub enum StartConflictBody {
+    Conditions(Box<ConditionsRefusalBody>),
+    Conflict(StateConflictBody),
+}
+
 #[derive(Clone, Debug, Serialize, ToSchema)]
 #[schema(as = AutomationRunPage, example = json!({
     "items": [{
@@ -431,7 +404,8 @@ pub struct FiringQuery {
     pub group_id: Option<String>,
     /// Optional automation ULID filter.
     pub automation_id: Option<String>,
-    /// Optional firing state filter (`running`, `waiting_for_approval`, `needs_attention`, `cancelling`, `succeeded`, `failed`, `cancelled`, `skipped`).
+    /// Optional firing state filter (`running`, `waiting_for_approval`, `needs_attention`,
+    /// `cancelling`, `succeeded`, `failed`, `cancelled`, `skipped`).
     pub state: Option<String>,
     /// Pagination cursor returned by the previous page.
     pub cursor: Option<String>,
@@ -472,7 +446,14 @@ pub struct DecideRequest {
     "reason": "automation paused",
     "kept_at": "2026-11-26T12:04:00+00:00",
     "actor": null,
-    "event": null
+    "event": {
+        "kind": "data_uploaded",
+        "bucket": "reads",
+        "key": "run1/a.fastq",
+        "version_id": "01K8W1C0000000000000000000",
+        "path": "/realm/g/01JABCDEF0123456789ABCDEFG/data/node/reads/run1/a.fastq",
+        "size_bytes": 1024
+    }
 }))]
 pub struct KeptEventBody {
     pub event_id: String,
@@ -482,16 +463,11 @@ pub struct KeptEventBody {
     pub reason: String,
     pub kept_at: String,
     pub actor: Option<String>,
-    pub event: Option<TriggerEventBody>,
+    pub event: TriggerEventBody,
 }
 
 impl KeptEventBody {
     pub fn from_domain(kept: &KeptEvent) -> Self {
-        let event = kept
-            .payload
-            .as_ref()
-            .map(TriggerEventBody::from_payload)
-            .or_else(|| TriggerEventBody::from_source(&kept.event));
         Self {
             event_id: kept.event_id.to_string(),
             kind: kept.event.kind.name().into(),
@@ -499,8 +475,8 @@ impl KeptEventBody {
             revision: kept.event.revision.clone(),
             reason: kept.reason.clone(),
             kept_at: rfc3339(kept.kept_at_ms),
-            actor: kept.event.actor.map(|u| u.to_string()),
-            event,
+            actor: kept.event.actor.map(|user| user.to_string()),
+            event: TriggerEventBody::from_payload(&kept.payload),
         }
     }
 }

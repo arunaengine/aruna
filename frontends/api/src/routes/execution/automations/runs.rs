@@ -18,7 +18,7 @@ use utoipa_axum::routes;
 use super::run_wire::{
     DecideRequest, FiringBody, FiringPageBody, FiringQuery, ResolveRequest, parse_firing_state,
 };
-use super::{auto_error, limit, param_id, path_id, require_switches};
+use super::{auto_error, limit, param_id, path_id};
 use crate::auth::{RealmAuth, UnrestrictedAuth};
 use crate::error::{ErrorResponse, ServerResult};
 use crate::server::state::ServerState;
@@ -223,14 +223,8 @@ pub async fn resume_firing(
     Path(id): Path<String>,
 ) -> ServerResult<Json<FiringBody>> {
     let id = path_id(&id)?;
-    let (_, auto) = drive(
-        GetFiringOperation::new(&auth, id, state.get_node_id()),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(auto_error)?;
-    require_switches(&state, auto.group_id, false).await?;
-    let op = ResumeFiringOperation::new(&auth, id, state.get_node_id());
+    let op = ResumeFiringOperation::new(&auth, id, state.get_node_id())
+        .with_disabled_features(state.disabled_features());
     let firing = drive(op, &state.get_ctx()).await.map_err(auto_error)?;
     Ok(Json(FiringBody::from_domain(&firing)))
 }
@@ -243,16 +237,8 @@ async fn decide_stage(
     note: Option<String>,
 ) -> ServerResult<Json<FiringBody>> {
     let id = path_id(&id)?;
-    if approve {
-        let (_, auto) = drive(
-            GetFiringOperation::new(auth, id, state.get_node_id()),
-            &state.get_ctx(),
-        )
-        .await
-        .map_err(auto_error)?;
-        require_switches(state, auto.group_id, false).await?;
-    }
-    let op = DecideStageOperation::new(auth, id, stage, approve, note, state.get_node_id());
+    let op = DecideStageOperation::new(auth, id, stage, approve, note, state.get_node_id())
+        .with_disabled_features(state.disabled_features());
     let firing = drive(op, &state.get_ctx()).await.map_err(auto_error)?;
     Ok(Json(FiringBody::from_domain(&firing)))
 }
