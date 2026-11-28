@@ -67,19 +67,34 @@ impl ChangeAutoOperation {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn expected_revision(&self) -> Option<u64> {
+        self.expected
+    }
+
     fn uses_applets(&self, auto: &Automation) -> bool {
         match &self.change {
             AutoChange::Update {
                 spec: Some(next_spec),
                 ..
             } => next_spec.uses_applets(),
-            AutoChange::Approve => auto
+            AutoChange::Approve | AutoChange::RequestApproval => auto
                 .pending
                 .as_ref()
                 .map_or(&auto.spec, |pending| &pending.spec)
                 .uses_applets(),
             _ => auto.spec.uses_applets(),
         }
+    }
+
+    fn binds_checked_revision(&self) -> bool {
+        matches!(
+            self.change,
+            AutoChange::Approve
+                | AutoChange::RequestApproval
+                | AutoChange::Resume
+                | AutoChange::Update { spec: None, .. }
+        )
     }
 
     fn after_config(&mut self, auto: Automation) -> Next<Automation> {
@@ -141,6 +156,9 @@ impl Operation for ChangeAutoOperation {
                     &[Feature::Automations]
                 };
                 check_features(result, &self.disabled_features, auto.group_id, features)?;
+                if self.expected.is_none() && self.binds_checked_revision() {
+                    self.expected = Some(auto.revision);
+                }
                 Ok(self.after_config(*auto))
             }
             Step::AuthWorkflow(auto) => {

@@ -226,7 +226,9 @@ fn steps_gate_phases() {
     use aruna_core::automation::record::{Automation, Lifecycle, PendingChange};
     use aruna_core::errors::AuthorizationError;
 
+    use crate::automations::change::WriteAutoOperation;
     use crate::automations::control::{DecideStageOperation, ResumeFiringOperation};
+    use crate::automations::firing_tx::FiringTxResult;
     use crate::automations::start::{StartEventsOperation, StartManualOperation};
 
     let realm = aruna_core::structs::identity::realm::RealmId([6; 32]);
@@ -388,11 +390,11 @@ fn steps_gate_phases() {
     reject_stage.first().unwrap();
     reject_stage
         .next(IoResult::Child(ChildOutcome::new(Ok::<_, AutoError>((
-            firing,
+            firing.clone(),
             manual_auto,
         )))))
         .unwrap();
-    // Reject skips Config and commits directly.
+    // Reject skips Config and commits directly, finishing on the transaction child outcome.
     let reject_next = reject_stage
         .next(IoResult::Child(ChildOutcome::new(Ok::<
             _,
@@ -400,8 +402,22 @@ fn steps_gate_phases() {
         >(true))))
         .unwrap();
     assert!(matches!(reject_next, Next::Call(IoCall::Child(_))));
+    let reject_done = reject_stage
+        .next(IoResult::Child(ChildOutcome::new(Ok::<
+            FiringTxResult,
+            AutoError,
+        >(
+            FiringTxResult {
+                firing: firing.clone(),
+                changed: true,
+                claimed: false,
+                child_runs: Vec::new(),
+            },
+        ))))
+        .unwrap();
+    assert!(matches!(reject_done, Next::Done(done) if done.firing_id == firing.firing_id));
 
-    // 5. ChangeAutoOperation::Resume checks auto.spec, while Approve checks pending.spec.
+    // 5. Resume checks auto.spec, while Approve and RequestApproval check pending.spec.
     let pending_applet = PendingChange {
         spec: applet_spec.clone(),
         requested_by: auth.user_id,
@@ -423,23 +439,22 @@ fn steps_gate_phases() {
         ))));
     assert!(matches!(resume_allowed, Ok(Next::Call(IoCall::Child(_)))));
 
-    // Applets off: Approve is refused because pending.spec uses applets.
-    let mut approve_pending =
-        ChangeAutoOperation::new(&auth, (auto_id, None), AutoChange::Approve, node);
-    approve_pending.first().unwrap();
-    approve_pending
-        .next(IoResult::Child(ChildOutcome::new(Ok::<_, AutoError>(
-            manual_with_pending,
+    // Applets off: Approve and RequestApproval are refused because pending.spec uses applets.
+    for change in [AutoChange::Approve, AutoChange::RequestApproval] {
+        let mut op = ChangeAutoOperation::new(&auth, (auto_id, None), change, node);
+        op.first().unwrap();
+        op.next(IoResult::Child(ChildOutcome::new(Ok::<_, AutoError>(
+            manual_with_pending.clone(),
         ))))
         .unwrap();
-    let approve_refused =
-        approve_pending.next(IoResult::Child(ChildOutcome::new(Ok::<_, GetConfigError>(
+        let refused = op.next(IoResult::Child(ChildOutcome::new(Ok::<_, GetConfigError>(
             config_for(true, false),
         ))));
-    assert!(matches!(
-        approve_refused,
-        Err(AutoError::FeatureOff(Feature::Applets, _))
-    ));
+        assert!(matches!(
+            refused,
+            Err(AutoError::FeatureOff(Feature::Applets, _))
+        ));
+    }
 
     // Applets off: Resume on approved applet spec with pending manual spec is refused.
     let pending_manual = PendingChange {
@@ -453,7 +468,7 @@ fn steps_gate_phases() {
     resume_applet.first().unwrap();
     resume_applet
         .next(IoResult::Child(ChildOutcome::new(Ok::<_, AutoError>(
-            applet_with_pending,
+            applet_with_pending.clone(),
         ))))
         .unwrap();
     let resume_refused =
@@ -464,6 +479,53 @@ fn steps_gate_phases() {
         resume_refused,
         Err(AutoError::FeatureOff(Feature::Applets, _))
     ));
+
+    // Applets off: RequestApproval and Approve allow a pending manual spec and bind revision.
+    let mut request_manual =
+        ChangeAutoOperation::new(&auth, (auto_id, None), AutoChange::RequestApproval, node);
+    request_manual.first().unwrap();
+    request_manual
+        .next(IoResult::Child(ChildOutcome::new(Ok::<_, AutoError>(
+            applet_with_pending.clone(),
+        ))))
+        .unwrap();
+    let request_ok = request_manual.next(IoResult::Child(ChildOutcome::new(
+        Ok::<_, GetConfigError>(config_for(true, false)),
+    )));
+    assert!(matches!(request_ok, Ok(Next::Call(IoCall::Child(_)))));
+    assert_eq!(request_manual.expected_revision(), Some(2));
+
+    let mut approve_manual =
+        ChangeAutoOperation::new(&auth, (auto_id, None), AutoChange::Approve, node);
+    approve_manual.first().unwrap();
+    approve_manual
+        .next(IoResult::Child(ChildOutcome::new(Ok::<_, AutoError>(
+            applet_with_pending.clone(),
+        ))))
+        .unwrap();
+    let approve_admin =
+        approve_manual.next(IoResult::Child(ChildOutcome::new(Ok::<_, GetConfigError>(
+            config_for(true, false),
+        ))));
+    assert!(matches!(approve_admin, Ok(Next::Call(IoCall::Child(_)))));
+    assert_eq!(approve_manual.expected_revision(), Some(2));
+
+    // Concurrent reject bumps revision before write; bound approval conflicts on commit.
+    let mut rejected_auto = applet_with_pending;
+    rejected_auto.pending = None;
+    rejected_auto.revision = 3;
+    let mut write_op = WriteAutoOperation::new(
+        (auto_id, approve_manual.expected_revision()),
+        AutoChange::Approve,
+        auth.user_id,
+        realm,
+    );
+    write_op.first().unwrap();
+    let write_conflict = write_op.next(IoResult::Values(vec![
+        Some(rejected_auto.to_bytes().unwrap().into()),
+        None,
+    ]));
+    assert!(matches!(write_conflict, Err(AutoError::Conflict(_))));
 }
 
 #[tokio::test]

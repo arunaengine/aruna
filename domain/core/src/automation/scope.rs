@@ -142,23 +142,23 @@ pub fn is_widening(before: &Spec, after: &Spec) -> bool {
     {
         return true;
     }
-    let (before_scope, after_scope) = (&before.scope, &after.scope);
-    if !subset(&after_scope.read, &before_scope.read)
-        || !subset(&after_scope.write, &before_scope.write)
-        || !subset(&after_scope.metadata, &before_scope.metadata)
-        || !subset(&after_scope.workflows, &before_scope.workflows)
-        || !subset(&after_scope.audiences, &before_scope.audiences)
-        || !subset(&after_scope.secrets, &before_scope.secrets)
+    let (bs, as_) = (&before.scope, &after.scope);
+    if !subset(&as_.read, &bs.read)
+        || !subset(&as_.write, &bs.write)
+        || !subset(&as_.metadata, &bs.metadata)
+        || !subset(&as_.workflows, &bs.workflows)
+        || !subset(&as_.audiences, &bs.audiences)
+        || !subset(&as_.secrets, &bs.secrets)
     {
         return true;
     }
-    if after_scope.allow_downgrade && !before_scope.allow_downgrade {
+    if as_.allow_downgrade && !bs.allow_downgrade {
         return true;
     }
-    if after_scope.allow_outside_input && !before_scope.allow_outside_input {
+    if as_.allow_outside_input && !bs.allow_outside_input {
         return true;
     }
-    !after_scope.limits.is_tighter_than(&before_scope.limits)
+    !as_.limits.is_tighter_than(&bs.limits)
 }
 
 #[cfg(test)]

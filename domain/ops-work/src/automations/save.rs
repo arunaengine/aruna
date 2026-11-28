@@ -275,9 +275,8 @@ impl Operation for SaveBundleOperation {
                         saved.automation = updated;
                     }
                     Err(_) => {
-                        // The workflow and automation rows already committed; execution paths
-                        // follow `auto.spec`, and periodic upkeep repairs the role from the
-                        // persisted `identity_synced_revision < revision` gap.
+                        // Rows already committed; execution follows `auto.spec` and upkeep
+                        // repairs the role from `identity_synced_revision < revision`.
                         saved.identity_synced = false;
                     }
                 }

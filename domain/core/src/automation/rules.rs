@@ -410,9 +410,8 @@ pub fn conditions_widen(before: &Conditions, after: &Conditions) -> bool {
         (ConditionMode::All, ConditionMode::All) => !before_set.is_subset(&after_set),
         (ConditionMode::Any, ConditionMode::Any) => !after_set.is_subset(&before_set),
         (ConditionMode::Any, ConditionMode::All) => {
-            // Switching Any -> All narrows only if at least one always-applicable condition from
-            // `before` is required in `after`; otherwise a non-file start could pass All([File])
-            // when Any([File]) would refuse it.
+            // Any -> All narrows only if an always-applicable condition stays required;
+            // otherwise a non-file start could pass All([File]) where Any([File]) fails.
             !before_set
                 .intersection(&after_set)
                 .any(|item| !matches!(item, Condition::File { .. }))
