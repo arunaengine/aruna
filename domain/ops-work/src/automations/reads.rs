@@ -110,9 +110,9 @@ impl Operation for ListAutosOperation {
             if item.group_id == self.group_id
                 && item.lifecycle != Lifecycle::Removed
                 && self.lifecycle.is_none_or(|want| item.lifecycle == want)
-                && self
-                    .workflow_id
-                    .is_none_or(|wf| item.workflow_id == Some(wf) || item.spec.runs_workflow(wf))
+                && self.workflow_id.is_none_or(|workflow_id| {
+                    item.workflow_id == Some(workflow_id) || item.spec.runs_workflow(workflow_id)
+                })
             {
                 self.found.push(item);
             }

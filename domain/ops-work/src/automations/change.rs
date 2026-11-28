@@ -337,6 +337,7 @@ pub enum AutoChange {
     Identity {
         account: Option<UserId>,
         role_id: Option<RoleId>,
+        synced_revision: u64,
     },
 }
 
@@ -351,6 +352,23 @@ impl AutoChange {
     pub fn needs_admin(&self) -> bool {
         matches!(self, Self::Approve | Self::Reject)
     }
+
+    pub fn requires_features(&self) -> bool {
+        matches!(
+            self,
+            Self::Update { .. } | Self::RequestApproval | Self::Approve | Self::Resume
+        )
+    }
+
+    pub fn edits_workflow_link(&self) -> bool {
+        matches!(
+            self,
+            Self::Update {
+                workflow_id: Some(_),
+                ..
+            }
+        )
+    }
 }
 
 pub(crate) fn apply_change(
@@ -363,6 +381,7 @@ pub(crate) fn apply_change(
     if auto.lifecycle == Lifecycle::Removed && !matches!(change, AutoChange::Identity { .. }) {
         return Err(AutoError::Conflict("automation has been removed".into()));
     }
+    let previous_revision = auto.revision;
     match change {
         AutoChange::Update {
             name,
@@ -371,19 +390,13 @@ pub(crate) fn apply_change(
             workflow_id,
         } => {
             if let Some(name) = name {
-                let trimmed = name.trim();
-                if trimmed.is_empty() || trimmed.chars().count() > MAX_NAME {
-                    return Err(AutoError::Invalid(format!(
-                        "name needs 1..={MAX_NAME} chars"
-                    )));
-                }
-                auto.name = trimmed.to_string();
+                auto.name = validate_name(&name)?;
             }
             if let Some(desc) = description {
                 auto.description = desc.trim().to_string();
             }
-            if let Some(wf) = workflow_id {
-                auto.workflow_id = wf;
+            if let Some(next_workflow_id) = workflow_id {
+                auto.workflow_id = next_workflow_id;
             }
             if let Some(next_spec) = spec {
                 validate_spec(&next_spec).map_err(AutoError::Invalid)?;
@@ -468,10 +481,23 @@ pub(crate) fn apply_change(
         AutoChange::Delete => {
             auto.lifecycle = Lifecycle::Removed;
             auto.pending = None;
+            auto.workflow_id = None;
         }
-        AutoChange::Identity { account, role_id } => {
+        AutoChange::Identity {
+            account,
+            role_id,
+            synced_revision,
+        } => {
             auto.account = account;
             auto.role_id = role_id;
+            auto.updated_at_ms = now_ms;
+            auto.revision = auto.revision.saturating_add(1);
+            if synced_revision >= previous_revision {
+                auto.identity_synced_revision = auto.revision;
+            } else {
+                auto.identity_synced_revision = auto.identity_synced_revision.max(synced_revision);
+            }
+            return Ok(());
         }
     }
     auto.updated_at_ms = now_ms;
@@ -482,15 +508,25 @@ pub(crate) fn apply_change(
 #[derive(Clone, Debug, PartialEq)]
 enum WriteStep {
     Read,
-    CheckActive(Box<Automation>),
+    CheckActive {
+        auto: Box<Automation>,
+        cursor: Option<ScheduleCursor>,
+    },
+    ReadWorkflows {
+        auto: Box<Automation>,
+        cursor: Option<ScheduleCursor>,
+        old_workflow: Option<Ulid>,
+        new_workflow: Option<Ulid>,
+    },
     Write {
         record: Box<Automation>,
-        drop_schedule: bool,
+        deletes: Vec<(KeySpace, Key)>,
     },
-    DropSchedule(Box<Automation>),
+    DropRows(Box<Automation>),
 }
 
-/// Applies one [`AutoChange`] transactionally with optional optimistic `expected` revision check.
+/// Applies one [`AutoChange`] transactionally with optimistic revision check, workflow-link
+/// maintenance and due-time schedule cursor updates.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WriteAutoOperation {
     id: Ulid,
@@ -524,15 +560,51 @@ impl WriteAutoOperation {
         Self::new((id, None), change, actor, realm_id)
     }
 
-    fn commit(&mut self, mut auto: Automation) -> Result<Next<Automation>, AutoError> {
-        let reset_schedule = matches!(self.change, AutoChange::Approve | AutoChange::Resume);
-        let clear_schedule = matches!(
-            self.change,
-            AutoChange::Pause(_)
-                | AutoChange::Delete
-                | AutoChange::Approve
-                | AutoChange::Update { .. }
-        );
+    fn target_workflow(&self, current: Option<Ulid>) -> Option<Ulid> {
+        match &self.change {
+            AutoChange::Update {
+                workflow_id: Some(next),
+                ..
+            } => *next,
+            AutoChange::Delete => None,
+            _ => current,
+        }
+    }
+
+    fn begin_commit(
+        &mut self,
+        auto: Automation,
+        cursor: Option<ScheduleCursor>,
+    ) -> Result<Next<Automation>, AutoError> {
+        let old_workflow = auto.workflow_id;
+        let new_workflow = self.target_workflow(old_workflow);
+        if old_workflow != new_workflow {
+            let mut reads = Vec::new();
+            if let Some(previous_id) = old_workflow {
+                reads.push((WORKFLOW_KEYSPACE.to_string(), workflow_key(previous_id)));
+            }
+            if let Some(target_id) = new_workflow {
+                reads.push((WORKFLOW_KEYSPACE.to_string(), workflow_key(target_id)));
+            }
+            self.step = WriteStep::ReadWorkflows {
+                auto: Box::new(auto),
+                cursor,
+                old_workflow,
+                new_workflow,
+            };
+            return Ok(Next::Call(IoCall::Read(reads)));
+        }
+        self.commit(auto, cursor, Vec::new())
+    }
+
+    fn commit(
+        &mut self,
+        mut auto: Automation,
+        cursor: Option<ScheduleCursor>,
+        extra_writes: Vec<(KeySpace, Key, Value)>,
+    ) -> Result<Next<Automation>, AutoError> {
+        let was_active = auto.lifecycle == Lifecycle::Active;
+        let update_schedule = !matches!(self.change, AutoChange::Identity { .. });
         apply_change(
             &mut auto,
             self.change.clone(),
@@ -541,14 +613,17 @@ impl WriteAutoOperation {
             self.now_ms,
         )?;
         let mut writes = vec![auto_row(&auto)?];
-        let keep_schedule = auto.lifecycle == Lifecycle::Active && auto.spec.has_schedules();
-        if reset_schedule && keep_schedule {
-            writes.push(schedule_row(auto.automation_id, self.now_ms));
-        }
-        let drop_schedule = clear_schedule && !keep_schedule;
+        writes.extend(extra_writes);
+        let deletes = if update_schedule {
+            let sync = plan_schedule_sync(&auto, cursor.as_ref(), was_active, self.now_ms)?;
+            writes.extend(sync.writes);
+            sync.deletes
+        } else {
+            Vec::new()
+        };
         self.step = WriteStep::Write {
             record: Box::new(auto),
-            drop_schedule,
+            deletes,
         };
         Ok(Next::Call(IoCall::Write(writes)))
     }
@@ -568,13 +643,29 @@ impl Operation for WriteAutoOperation {
 
     fn first(&mut self) -> Result<Next<Automation>, AutoError> {
         self.step = WriteStep::Read;
-        Ok(Next::Call(read_auto(self.id)))
+        Ok(Next::Call(IoCall::Read(vec![
+            (AUTOMATIONS_KEYSPACE.to_string(), record_key(self.id)),
+            (
+                AUTOMATIONS_KEYSPACE.to_string(),
+                schedule_cursor_key(self.id),
+            ),
+        ])))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Automation>, AutoError> {
         match std::mem::replace(&mut self.step, WriteStep::Read) {
             WriteStep::Read => {
-                let auto = auto_answer(result)?.ok_or(AutoError::NotFound)?;
+                let values = result.values()?;
+                let auto_bytes = values
+                    .first()
+                    .and_then(Option::as_deref)
+                    .ok_or(AutoError::NotFound)?;
+                let auto = Automation::from_bytes(auto_bytes)?;
+                let cursor = values
+                    .get(1)
+                    .and_then(Option::as_deref)
+                    .map(ScheduleCursor::from_bytes)
+                    .transpose()?;
                 if self.expected.is_some_and(|exp| exp != auto.revision) {
                     return Err(AutoError::Conflict(
                         "automation changed meanwhile; read again".into(),
@@ -582,12 +673,15 @@ impl Operation for WriteAutoOperation {
                 }
                 if matches!(self.change, AutoChange::Delete) && auto.lifecycle != Lifecycle::Removed
                 {
-                    self.step = WriteStep::CheckActive(Box::new(auto));
+                    self.step = WriteStep::CheckActive {
+                        auto: Box::new(auto),
+                        cursor,
+                    };
                     return Ok(Next::Call(active_page(None)));
                 }
-                self.commit(auto)
+                self.begin_commit(auto, cursor)
             }
-            WriteStep::CheckActive(auto) => {
+            WriteStep::CheckActive { auto, cursor } => {
                 let (rows, next) = result.page()?;
                 for (_, value) in rows {
                     if decode_ulid(&value) == Some(self.id) {
@@ -597,27 +691,65 @@ impl Operation for WriteAutoOperation {
                     }
                 }
                 if let Some(after) = next {
-                    self.step = WriteStep::CheckActive(auto);
+                    self.step = WriteStep::CheckActive { auto, cursor };
                     return Ok(Next::Call(active_page(Some(after))));
                 }
-                self.commit(*auto)
+                self.begin_commit(*auto, cursor)
             }
-            WriteStep::Write {
-                record,
-                drop_schedule,
+            WriteStep::ReadWorkflows {
+                auto,
+                cursor,
+                old_workflow,
+                new_workflow,
             } => {
+                let values = result.values()?;
+                let mut index = 0usize;
+                let mut extra_writes = Vec::new();
+                if old_workflow.is_some() {
+                    if let Some(bytes) = values.get(index).and_then(Option::as_deref) {
+                        let mut previous = WorkflowRecord::from_bytes(bytes)?;
+                        if previous.automation_id == Some(auto.automation_id) {
+                            previous.automation_id = None;
+                            previous.updated_at_ms = self.now_ms;
+                            extra_writes.push(workflow_row(&previous)?);
+                        }
+                    }
+                    index += 1;
+                }
+                if new_workflow.is_some() {
+                    let bytes = values
+                        .get(index)
+                        .and_then(Option::as_deref)
+                        .ok_or(AutoError::NotFound)?;
+                    let mut target = WorkflowRecord::from_bytes(bytes)?;
+                    if target.group_id != auto.group_id {
+                        return Err(AutoError::Invalid(
+                            "workflow belongs to a different group".into(),
+                        ));
+                    }
+                    if target
+                        .automation_id
+                        .is_some_and(|existing| existing != auto.automation_id)
+                    {
+                        return Err(AutoError::Conflict(
+                            "workflow is already linked to another automation".into(),
+                        ));
+                    }
+                    target.automation_id = Some(auto.automation_id);
+                    target.updated_at_ms = self.now_ms;
+                    extra_writes.push(workflow_row(&target)?);
+                }
+                self.commit(*auto, cursor, extra_writes)
+            }
+            WriteStep::Write { record, deletes } => {
                 result.done()?;
-                if drop_schedule {
-                    let key = schedule_key(record.automation_id);
-                    self.step = WriteStep::DropSchedule(record);
-                    return Ok(Next::Call(IoCall::Delete(vec![(
-                        AUTOMATIONS_KEYSPACE.to_string(),
-                        key,
-                    )])));
+                if !deletes.is_empty() {
+                    self.step = WriteStep::DropRows(record);
+                    return Ok(Next::Call(IoCall::Delete(deletes)));
                 }
                 Ok(Next::Done(*record))
             }
-            WriteStep::DropSchedule(record) => {
+            WriteStep::DropRows(record) => {
                 result.done()?;
                 Ok(Next::Done(*record))
             }

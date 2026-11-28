@@ -62,7 +62,7 @@ pub(crate) fn trigger_vars(trigger: &TriggerPayload) -> BTreeMap<String, Value> 
             map.insert("trigger.filename".into(), Value::String(file));
             map.insert(
                 "trigger.size_bytes".into(),
-                Value::Number((*size_bytes).into()),
+                size_bytes.map_or(Value::Null, |bytes| Value::Number(bytes.into())),
             );
         }
         TriggerPayload::RunFinished {
@@ -102,12 +102,7 @@ pub(crate) fn trigger_vars(trigger: &TriggerPayload) -> BTreeMap<String, Value> 
             map.insert("trigger.key".into(), Value::String(key.clone()));
         }
         TriggerPayload::Schedule { at_ms } => {
-            let at = i64::try_from(*at_ms)
-                .ok()
-                .and_then(chrono::DateTime::from_timestamp_millis)
-                .map(|dt| dt.to_rfc3339())
-                .unwrap_or_else(|| at_ms.to_string());
-            map.insert("trigger.at".into(), Value::String(at));
+            map.insert("trigger.at".into(), Value::String(crate::rfc3339(*at_ms)));
             map.insert("trigger.at_ms".into(), Value::Number((*at_ms).into()));
         }
     }
@@ -251,7 +246,7 @@ pub(crate) fn render_text(raw: &str, firing: &Firing) -> String {
     render_str(raw, &vars)
 }
 
-/// Substitutes `{{...}}` placeholders in both JSON value positions and string literals, then parses.
+/// Substitutes `{{...}}` placeholders in JSON value positions and string literals, then parses.
 pub(crate) fn render_json_with(
     raw: &str,
     vars: &BTreeMap<String, Value>,
