@@ -5,11 +5,12 @@
 use std::collections::BTreeSet;
 
 use aruna_core::automation::record::{Automation, Lifecycle};
-use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::WORKFLOW_KEYSPACE;
 use aruna_core::operation::Operation;
+use aruna_core::rows::read_row;
 use aruna_core::structs::execution::workflow::{
     StoredWorkflowLanguage, WorkflowRecord, workflow_key, workflow_permission_path,
 };
@@ -19,7 +20,7 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 
-use super::commit_bundle::{CommitBundleOperation, map_catalog};
+use super::commit_bundle::{CommitBundleInput, CommitBundleOperation, map_catalog};
 pub use super::commit_bundle::{SaveAutomation, SaveBundle, SaveWorkflow, SavedBundle};
 use super::identity::SyncIdentityOperation;
 use super::{AutoError, allowed, authorize_path, auto_answer, check_feature, read_auto};
@@ -36,6 +37,7 @@ enum SaveStep {
     Prepare,
     Commit,
     Sync(Box<SavedBundle>),
+    Done,
 }
 
 /// Checks feature switches and write permissions, preflights workflow source when provided,
@@ -97,22 +99,20 @@ impl SaveBundleOperation {
             Some(id) => (id, false),
             None => (self.ids.mint(self.now_ms), true),
         };
-        let commit = CommitBundleOperation::new(
-            (
-                self.input.group_id,
-                self.local,
-                self.auth.realm_id,
-                self.auth.user_id,
-            ),
-            (workflow_id, workflow_new),
-            (automation_id, automation_new),
-            (
-                self.input.workflow.clone(),
-                self.input.automation.clone(),
-                self.prepared.take(),
-            ),
-            self.now_ms,
-        );
+        let commit = CommitBundleOperation::new(CommitBundleInput {
+            group_id: self.input.group_id,
+            local: self.local,
+            realm_id: self.auth.realm_id,
+            actor: self.auth.user_id,
+            workflow_id,
+            workflow_new,
+            automation_id,
+            automation_new,
+            workflow: self.input.workflow.clone(),
+            automation: self.input.automation.clone(),
+            prepared: self.prepared.take(),
+            now_ms: self.now_ms,
+        });
         self.step = SaveStep::Commit;
         Ok(Next::Call(IoCall::retry(commit, &automation_id.to_bytes())))
     }
@@ -162,7 +162,7 @@ impl Operation for SaveBundleOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<SavedBundle>, AutoError> {
-        match std::mem::replace(&mut self.step, SaveStep::Commit) {
+        match std::mem::replace(&mut self.step, SaveStep::Done) {
             SaveStep::Config => {
                 let config = result
                     .child::<RealmConfigDocument, GetConfigError>()?
@@ -217,7 +217,7 @@ impl Operation for SaveBundleOperation {
                 }
                 if let Some(workflow_id) = self.input.workflow.workflow_id {
                     self.step = SaveStep::LoadWorkflow;
-                    return Ok(Next::Call(aruna_core::rows::read_row(
+                    return Ok(Next::Call(read_row(
                         WORKFLOW_KEYSPACE,
                         workflow_key(workflow_id),
                     )));
@@ -272,10 +272,8 @@ impl Operation for SaveBundleOperation {
                 self.start_commit()
             }
             SaveStep::Commit => {
-                let saved = result.child::<SavedBundle, AutoError>()??;
-                if self.input.automation.automation_id.is_some()
-                    && (saved.automation.wants_account() || saved.automation.account.is_some())
-                {
+                let mut saved = result.child::<SavedBundle, AutoError>()??;
+                if saved.automation.needs_identity_sync() && saved.automation.granter().is_some() {
                     let sync = SyncIdentityOperation::new(
                         &saved.automation,
                         (self.local, self.auth.realm_id),
@@ -283,12 +281,25 @@ impl Operation for SaveBundleOperation {
                     self.step = SaveStep::Sync(Box::new(saved));
                     return Ok(Next::Call(IoCall::child(sync)));
                 }
+                saved.identity_synced = true;
                 Ok(Next::Done(saved))
             }
             SaveStep::Sync(mut saved) => {
-                saved.automation = result.child::<Automation, AutoError>()??;
+                match result.child::<Automation, AutoError>()? {
+                    Ok(updated) => {
+                        saved.automation = updated;
+                        saved.identity_synced = true;
+                    }
+                    Err(_) => {
+                        // The workflow and automation rows already committed; execution paths
+                        // follow `auto.spec`, and periodic upkeep repairs the role from the
+                        // persisted `identity_synced_revision < revision` gap.
+                        saved.identity_synced = false;
+                    }
+                }
                 Ok(Next::Done(*saved))
             }
+            SaveStep::Done => Err(IoError::Unfinished.into()),
         }
     }
 

@@ -3,27 +3,27 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::automation::dag::{validate_scope, validate_spec};
-use aruna_core::automation::keys::{record_key, schedule_key};
+use aruna_core::automation::keys::{record_key, schedule_cursor_key};
 use aruna_core::automation::record::{Automation, Lifecycle, Spec, StageKind};
+use aruna_core::automation::schedule::ScheduleCursor;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{AUTOMATIONS_KEYSPACE, WORKFLOW_KEYSPACE, WORKFLOW_VERSION_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::read_row;
 use aruna_core::structs::execution::workflow::{
     StoredWorkflowLanguage, WorkflowRecord, WorkflowVisibility, version_key, workflow_key,
 };
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::types::GroupId;
+use aruna_core::types::{GroupId, Key, KeySpace};
 use aruna_core::user::id::UserId;
 use aruna_core::workflow::WorkflowError;
 use ulid::Ulid;
 
-use super::change::{AutoChange, apply_change};
-use super::{AutoError, auto_row};
+use super::change::{AutoChange, DraftAutoInput, apply_change, draft_automation, validate_name};
+use super::{AutoError, auto_row, plan_schedule_sync};
 use crate::workflows::CatalogError;
 use crate::workflows::import::{Created, Prepared, SourceInput, version_write_rows};
-
-const MAX_NAME: usize = 120;
 
 /// Workflow part of a unified Studio save.
 #[derive(Clone, Debug, PartialEq)]
@@ -63,6 +63,25 @@ pub struct SavedBundle {
     pub workflow: WorkflowRecord,
     pub created: Option<Created>,
     pub automation: Automation,
+    /// Whether the automation's service account role is synchronized with the saved revision.
+    pub identity_synced: bool,
+}
+
+/// Named parameters for [`CommitBundleOperation`].
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CommitBundleInput {
+    pub group_id: GroupId,
+    pub local: NodeId,
+    pub realm_id: RealmId,
+    pub actor: UserId,
+    pub workflow_id: Ulid,
+    pub workflow_new: bool,
+    pub automation_id: Ulid,
+    pub automation_new: bool,
+    pub workflow: SaveWorkflow,
+    pub automation: SaveAutomation,
+    pub prepared: Option<Prepared>,
+    pub now_ms: u64,
 }
 
 pub(crate) fn map_catalog(error: CatalogError) -> AutoError {
@@ -128,53 +147,26 @@ enum CommitStep {
     CheckVersion {
         workflow: WorkflowRecord,
         automation: Option<Automation>,
+        cursor: Option<ScheduleCursor>,
     },
     Write {
         saved: Box<SavedBundle>,
-        drop_schedule: bool,
+        deletes: Vec<(KeySpace, Key)>,
     },
-    DropSchedule(Box<SavedBundle>),
+    DropRows(Box<SavedBundle>),
 }
 
-/// Atomically writes workflow, version, source and automation rows in one write transaction.
+/// Atomically writes workflow, version, source, schedule cursor and automation rows in one tx.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CommitBundleOperation {
-    pub(crate) group_id: GroupId,
-    pub(crate) local: NodeId,
-    pub(crate) realm_id: RealmId,
-    pub(crate) actor: UserId,
-    pub(crate) workflow_id: Ulid,
-    pub(crate) workflow_new: bool,
-    pub(crate) automation_id: Ulid,
-    pub(crate) automation_new: bool,
-    pub(crate) workflow: SaveWorkflow,
-    pub(crate) automation: SaveAutomation,
-    pub(crate) prepared: Option<Prepared>,
-    pub(crate) now_ms: u64,
+    input: CommitBundleInput,
     step: CommitStep,
 }
 
 impl CommitBundleOperation {
-    pub(crate) fn new(
-        (group_id, local, realm_id, actor): (GroupId, NodeId, RealmId, UserId),
-        (workflow_id, workflow_new): (Ulid, bool),
-        (automation_id, automation_new): (Ulid, bool),
-        (workflow, automation, prepared): (SaveWorkflow, SaveAutomation, Option<Prepared>),
-        now_ms: u64,
-    ) -> Self {
+    pub(crate) fn new(input: CommitBundleInput) -> Self {
         Self {
-            group_id,
-            local,
-            realm_id,
-            actor,
-            workflow_id,
-            workflow_new,
-            automation_id,
-            automation_new,
-            workflow,
-            automation,
-            prepared,
-            now_ms,
+            input,
             step: CommitStep::Read,
         }
     }
@@ -183,44 +175,54 @@ impl CommitBundleOperation {
         &mut self,
         mut workflow: WorkflowRecord,
         existing_automation: Option<Automation>,
+        cursor: Option<ScheduleCursor>,
     ) -> Result<Next<SavedBundle>, AutoError> {
-        let has_prepared = self.prepared.is_some();
+        let has_prepared = self.input.prepared.is_some();
         let target_version = if has_prepared {
             workflow.version_count + 1
         } else {
             workflow.version_count
         };
-        if let Some(name) = &self.workflow.name {
+        if let Some(name) = &self.input.workflow.name {
             let trimmed = name.trim();
             if trimmed.is_empty() {
                 return Err(AutoError::Invalid("a workflow needs a name".into()));
             }
             workflow.name = trimmed.to_string();
         }
-        if let Some(description) = &self.workflow.description {
+        if let Some(description) = &self.input.workflow.description {
             workflow.description = description.clone();
         }
-        if let Some(visibility) = self.workflow.visibility {
+        if let Some(visibility) = self.input.workflow.visibility {
             workflow.visibility = visibility;
         }
-        workflow.automation_id = Some(self.automation_id);
+        workflow.automation_id = Some(self.input.automation_id);
 
-        let mut spec = self.automation.spec.clone();
+        let mut spec = self.input.automation.spec.clone();
         if target_version > 0 {
             pin_spec(
                 &mut spec,
-                self.workflow_id,
+                self.input.workflow_id,
                 target_version,
-                self.automation.pin_version && has_prepared,
+                self.input.automation.pin_version && has_prepared,
             );
         }
         validate_spec(&spec).map_err(AutoError::Invalid)?;
-        validate_scope(&spec, self.realm_id, self.group_id, self.local)
-            .map_err(AutoError::Invalid)?;
+        validate_scope(
+            &spec,
+            self.input.realm_id,
+            self.input.group_id,
+            self.input.local,
+        )
+        .map_err(AutoError::Invalid)?;
 
+        let was_active = existing_automation
+            .as_ref()
+            .is_some_and(|item| item.lifecycle == Lifecycle::Active);
         let automation = match existing_automation {
             Some(mut automation) => {
                 if self
+                    .input
                     .automation
                     .expected_revision
                     .is_some_and(|expected| expected != automation.revision)
@@ -232,89 +234,80 @@ impl CommitBundleOperation {
                 apply_change(
                     &mut automation,
                     AutoChange::Update {
-                        name: self.automation.name.clone(),
-                        description: self.automation.description.clone(),
+                        name: self.input.automation.name.clone(),
+                        description: self.input.automation.description.clone(),
                         spec: Some(spec),
-                        workflow_id: Some(Some(self.workflow_id)),
+                        workflow_id: Some(Some(self.input.workflow_id)),
                     },
-                    self.actor,
-                    self.realm_id,
-                    self.now_ms,
+                    self.input.actor,
+                    self.input.realm_id,
+                    self.input.now_ms,
                 )?;
                 automation
             }
             None => {
-                let raw = self
+                let raw_name = self
+                    .input
                     .automation
                     .name
                     .as_deref()
-                    .unwrap_or(&workflow.name)
-                    .trim();
-                if raw.is_empty() || raw.chars().count() > MAX_NAME {
-                    return Err(AutoError::Invalid(format!(
-                        "name needs 1..={MAX_NAME} chars"
-                    )));
-                }
-                Automation {
-                    automation_id: self.automation_id,
-                    group_id: self.group_id,
-                    name: raw.to_string(),
+                    .unwrap_or(&workflow.name);
+                let name = validate_name(raw_name)?;
+                draft_automation(DraftAutoInput {
+                    automation_id: self.input.automation_id,
+                    group_id: self.input.group_id,
+                    name,
                     description: self
+                        .input
                         .automation
                         .description
                         .as_deref()
                         .unwrap_or_default()
                         .trim()
                         .to_string(),
-                    host_node: self.local,
-                    lifecycle: Lifecycle::Draft,
-                    pause_reason: None,
+                    host_node: self.input.local,
                     spec,
-                    pending: None,
-                    account: None,
-                    role_id: None,
-                    approved_by: None,
-                    approved_at_ms: None,
-                    created_by: self.actor,
-                    created_at_ms: self.now_ms,
-                    updated_at_ms: self.now_ms,
-                    revision: 1,
-                    workflow_id: Some(self.workflow_id),
-                }
+                    created_by: self.input.actor,
+                    now_ms: self.input.now_ms,
+                    workflow_id: Some(self.input.workflow_id),
+                })
             }
         };
 
-        let (created, mut writes) = if let Some(prepared) = self.prepared.clone() {
+        let (created, mut writes) = if let Some(prepared) = self.input.prepared.clone() {
             let (created, rows) = version_write_rows(
-                self.workflow_id,
+                self.input.workflow_id,
                 &mut workflow,
                 prepared,
-                self.actor,
-                self.workflow.message.clone(),
-                self.now_ms,
+                self.input.actor,
+                self.input.workflow.message.clone(),
+                self.input.now_ms,
             )
             .map_err(map_catalog)?;
             (Some(created), rows)
         } else {
-            workflow.updated_at_ms = self.now_ms;
+            workflow.updated_at_ms = self.input.now_ms;
             let row = (
                 WORKFLOW_KEYSPACE.into(),
-                workflow_key(self.workflow_id),
+                workflow_key(self.input.workflow_id),
                 workflow.to_bytes()?.into(),
             );
             (None, vec![row])
         };
-        let drop_schedule = !self.automation_new
-            && (automation.lifecycle != Lifecycle::Active || !automation.spec.has_schedules());
         writes.push(auto_row(&automation)?);
+        let schedule_sync =
+            plan_schedule_sync(&automation, cursor.as_ref(), was_active, self.input.now_ms)?;
+        writes.extend(schedule_sync.writes);
+        let identity_synced = !automation.needs_identity_sync();
         let saved = SavedBundle {
             workflow,
             created,
             automation,
+            identity_synced,
         };
         self.step = CommitStep::Write {
             saved: Box::new(saved),
-            drop_schedule,
+            deletes: schedule_sync.deletes,
         };
         Ok(Next::Call(IoCall::Write(writes)))
     }
@@ -329,19 +322,23 @@ impl Operation for CommitBundleOperation {
     }
 
     fn stamp(&mut self, now_ms: u64) {
-        self.now_ms = now_ms;
+        self.input.now_ms = now_ms;
     }
 
     fn first(&mut self) -> Result<Next<SavedBundle>, AutoError> {
         self.step = CommitStep::Read;
         let mut reads = vec![(
             WORKFLOW_KEYSPACE.to_string(),
-            workflow_key(self.workflow_id),
+            workflow_key(self.input.workflow_id),
         )];
-        if !self.automation_new {
+        if !self.input.automation_new {
             reads.push((
                 AUTOMATIONS_KEYSPACE.to_string(),
-                record_key(self.automation_id),
+                record_key(self.input.automation_id),
+            ));
+            reads.push((
+                AUTOMATIONS_KEYSPACE.to_string(),
+                schedule_cursor_key(self.input.automation_id),
             ));
         }
         Ok(Next::Call(IoCall::Read(reads)))
@@ -352,19 +349,19 @@ impl Operation for CommitBundleOperation {
             CommitStep::Read => {
                 let values = result.values()?;
                 let stored_workflow = values.first().and_then(Option::as_deref);
-                let workflow = match (stored_workflow, self.workflow_new) {
+                let workflow = match (stored_workflow, self.input.workflow_new) {
                     (None, true) => {
                         let prepared_language =
-                            self.prepared.as_ref().and_then(|item| item.language);
-                        let language =
-                            prepared_language
-                                .or(self.workflow.language)
-                                .ok_or_else(|| {
-                                    AutoError::Invalid(
-                                        "the language of the workflow is not known".into(),
-                                    )
-                                })?;
+                            self.input.prepared.as_ref().and_then(|item| item.language);
+                        let language = prepared_language
+                            .or(self.input.workflow.language)
+                            .ok_or_else(|| {
+                                AutoError::Invalid(
+                                    "the language of the workflow is not known".into(),
+                                )
+                            })?;
                         let name = self
+                            .input
                             .workflow
                             .name
                             .as_deref()
@@ -372,29 +369,37 @@ impl Operation for CommitBundleOperation {
                             .filter(|text| !text.is_empty())
                             .ok_or_else(|| AutoError::Invalid("a workflow needs a name".into()))?;
                         WorkflowRecord {
-                            workflow_id: self.workflow_id,
-                            group_id: self.group_id,
+                            workflow_id: self.input.workflow_id,
+                            group_id: self.input.group_id,
                             name: name.to_string(),
-                            description: self.workflow.description.clone().flatten(),
+                            description: self.input.workflow.description.clone().flatten(),
                             language,
-                            visibility: self.workflow.visibility.unwrap_or_default(),
+                            visibility: self.input.workflow.visibility.unwrap_or_default(),
                             version_count: 0,
                             edam_formats: Vec::new(),
-                            created_by: self.actor,
-                            created_at_ms: self.now_ms,
-                            updated_at_ms: self.now_ms,
-                            automation_id: Some(self.automation_id),
+                            created_by: self.input.actor,
+                            created_at_ms: self.input.now_ms,
+                            updated_at_ms: self.input.now_ms,
+                            automation_id: Some(self.input.automation_id),
                         }
                     }
                     (Some(bytes), false) => {
                         let record = WorkflowRecord::from_bytes(bytes)?;
-                        if record.group_id != self.group_id {
+                        if record.group_id != self.input.group_id {
                             return Err(AutoError::Invalid(
                                 "workflow belongs to a different group".into(),
                             ));
                         }
+                        if record
+                            .automation_id
+                            .is_some_and(|existing| existing != self.input.automation_id)
+                        {
+                            return Err(AutoError::Conflict(
+                                "workflow is already linked to another automation".into(),
+                            ));
+                        }
                         if let Some(prepared_language) =
-                            self.prepared.as_ref().and_then(|item| item.language)
+                            self.input.prepared.as_ref().and_then(|item| item.language)
                             && prepared_language != record.language
                         {
                             return Err(AutoError::Invalid(format!(
@@ -410,8 +415,8 @@ impl Operation for CommitBundleOperation {
                         return Err(AutoError::Conflict("the workflow exists".into()));
                     }
                 };
-                let existing_automation = if self.automation_new {
-                    None
+                let (existing_automation, cursor) = if self.input.automation_new {
+                    (None, None)
                 } else {
                     let bytes = values
                         .get(1)
@@ -421,53 +426,61 @@ impl Operation for CommitBundleOperation {
                     if automation.lifecycle == Lifecycle::Removed {
                         return Err(AutoError::NotFound);
                     }
-                    if automation.group_id != self.group_id {
+                    if automation.group_id != self.input.group_id {
                         return Err(AutoError::Invalid(
                             "automation belongs to a different group".into(),
                         ));
                     }
-                    Some(automation)
+                    if automation
+                        .workflow_id
+                        .is_some_and(|existing| existing != self.input.workflow_id)
+                    {
+                        return Err(AutoError::Conflict(
+                            "automation is already linked to another workflow".into(),
+                        ));
+                    }
+                    let cursor = values
+                        .get(2)
+                        .and_then(Option::as_deref)
+                        .map(ScheduleCursor::from_bytes)
+                        .transpose()?;
+                    (Some(automation), cursor)
                 };
-                if self.prepared.is_some() {
+                if self.input.prepared.is_some() {
                     let next_version = workflow.version_count + 1;
                     self.step = CommitStep::CheckVersion {
                         workflow,
                         automation: existing_automation,
+                        cursor,
                     };
-                    return Ok(Next::Call(aruna_core::rows::read_row(
+                    return Ok(Next::Call(read_row(
                         WORKFLOW_VERSION_KEYSPACE,
-                        version_key(self.workflow_id, next_version),
+                        version_key(self.input.workflow_id, next_version),
                     )));
                 }
-                self.write_all(workflow, existing_automation)
+                self.write_all(workflow, existing_automation, cursor)
             }
             CommitStep::CheckVersion {
                 workflow,
                 automation,
+                cursor,
             } => {
                 if result.value()?.is_some() {
                     return Err(AutoError::Conflict(
                         "the workflow version already exists".into(),
                     ));
                 }
-                self.write_all(workflow, automation)
+                self.write_all(workflow, automation, cursor)
             }
-            CommitStep::Write {
-                saved,
-                drop_schedule,
-            } => {
+            CommitStep::Write { saved, deletes } => {
                 result.done()?;
-                if drop_schedule {
-                    let key = schedule_key(saved.automation.automation_id);
-                    self.step = CommitStep::DropSchedule(saved);
-                    return Ok(Next::Call(IoCall::Delete(vec![(
-                        AUTOMATIONS_KEYSPACE.to_string(),
-                        key,
-                    )])));
+                if !deletes.is_empty() {
+                    self.step = CommitStep::DropRows(saved);
+                    return Ok(Next::Call(IoCall::Delete(deletes)));
                 }
                 Ok(Next::Done(*saved))
             }
-            CommitStep::DropSchedule(saved) => {
+            CommitStep::DropRows(saved) => {
                 result.done()?;
                 Ok(Next::Done(*saved))
             }
@@ -478,3 +491,7 @@ impl Operation for CommitBundleOperation {
         !matches!(error, AutoError::Storage(_))
     }
 }
+
+#[cfg(test)]
+#[path = "commit_bundle_tests.rs"]
+mod tests;
