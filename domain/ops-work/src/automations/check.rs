@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use aruna_core::applet::record::{Access, Applet, SubmissionFile};
+use aruna_core::applet::record::{Access, Applet, Lifecycle as AppletLifecycle, SubmissionFile};
 use aruna_core::automation::dag::{validate_scope, validate_spec};
 use aruna_core::automation::firing::TriggerPayload;
 use aruna_core::automation::glob::{expand_copy, format_date};
@@ -23,7 +23,7 @@ use super::run_stage::{parse_inputs_with, render_json_with, trigger_vars};
 use super::{AutoAccessOperation, AutoError, Need};
 use crate::applets::AppletError;
 use crate::applets::backends::{SandboxOperation, Sandboxing, public_ready};
-use crate::applets::reads::LoadAppletOperation;
+use crate::applets::reads::{GroupAppletsOperation, LoadAppletOperation};
 use crate::workflows::CatalogError;
 use crate::workflows::inspect::{ValidateValuesOperation, ValuesReport};
 use crate::workflows::runs::run::merge_run_inputs;
@@ -49,6 +49,7 @@ pub struct AutoCheckReport {
 #[derive(Debug, PartialEq)]
 enum CheckStep {
     Access,
+    GroupApplets,
     Applets,
     Backends,
     Workflow(String, bool),
@@ -189,7 +190,9 @@ fn sample_trigger(
             }
         }
         Trigger::AppletSubmission { applet_id } => TriggerPayload::AppletSubmission {
-            applet_id: *applet_id,
+            applet_id: applet_id
+                .or_else(|| sample_ulid(sample, "applet_id"))
+                .unwrap_or(Ulid::nil()),
             version_id: sample_ulid(sample, "version_id").unwrap_or(Ulid::nil()),
             pseudonym: sample_str(sample, "pseudonym").unwrap_or_else(|| "sample".into()),
             guest: false,
@@ -197,6 +200,9 @@ fn sample_trigger(
             bucket: sample_str(sample, "bucket").unwrap_or_else(|| "sample".into()),
             key: sample_str(sample, "key").unwrap_or_else(|| "sample".into()),
             files: sample_files(sample)?,
+        },
+        Trigger::Schedule(_) => TriggerPayload::Schedule {
+            at_ms: sample_u64(sample, "at_ms").unwrap_or(0),
         },
     })
 }
@@ -282,6 +288,7 @@ pub struct CheckAutoOperation {
     sample: Option<Value>,
     now_ms: u64,
     auto: Option<Automation>,
+    has_wildcard: bool,
     applet_ids: Vec<Ulid>,
     run_checks: Vec<RunCheck>,
     outside_input: bool,
@@ -301,6 +308,7 @@ impl CheckAutoOperation {
             sample,
             now_ms: 0,
             auto: None,
+            has_wildcard: false,
             applet_ids: Vec::new(),
             run_checks: Vec::new(),
             outside_input: false,
@@ -325,7 +333,13 @@ impl CheckAutoOperation {
         let mut seen_applets = BTreeSet::new();
         for trigger in &spec.triggers {
             let applet = match trigger {
-                Trigger::AppletSubmission { applet_id } => Some(*applet_id),
+                Trigger::AppletSubmission {
+                    applet_id: Some(id),
+                } => Some(*id),
+                Trigger::AppletSubmission { applet_id: None } => {
+                    self.has_wildcard = true;
+                    None
+                }
                 Trigger::RunFinished { applet_id, .. } => *applet_id,
                 _ => None,
             };
@@ -462,7 +476,34 @@ impl Operation for CheckAutoOperation {
             CheckStep::Access => {
                 let auto = result.child::<Automation, AutoError>()??;
                 self.prepare(&auto);
+                let group_id = auto.group_id;
                 self.auto = Some(auto);
+                if self.has_wildcard {
+                    self.step = CheckStep::GroupApplets;
+                    return Ok(Next::Call(IoCall::child(GroupAppletsOperation::new(
+                        group_id,
+                    ))));
+                }
+                if self.applet_ids.is_empty() {
+                    self.step = CheckStep::Backends;
+                    return Ok(Next::Call(IoCall::child(SandboxOperation)));
+                }
+                Ok(self.next_step())
+            }
+            CheckStep::GroupApplets => {
+                let auto_id = self.auto.as_ref().ok_or(IoError::Unfinished)?.automation_id;
+                if let Ok(applets) = result.child::<Vec<Applet>, AppletError>()? {
+                    for applet in applets {
+                        if applet.lifecycle != AppletLifecycle::TakenDown
+                            && applet.automations.contains(&auto_id)
+                        {
+                            self.applet_ids.retain(|id| *id != applet.applet_id);
+                            if applet.access == Access::Public || applet.guests.is_some() {
+                                self.outside_input = true;
+                            }
+                        }
+                    }
+                }
                 if self.applet_ids.is_empty() {
                     self.step = CheckStep::Backends;
                     return Ok(Next::Call(IoCall::child(SandboxOperation)));

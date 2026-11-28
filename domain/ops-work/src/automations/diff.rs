@@ -4,9 +4,10 @@
 
 use std::collections::BTreeSet;
 
-use aruna_core::applet::record::{Access, Applet};
+use aruna_core::applet::record::{Access, Applet, Lifecycle as AppletLifecycle};
 use aruna_core::automation::diff::{
-    ApprovalDiff, DiffContext, PeerSummary, approval_diff, run_workflows, write_targets,
+    ApprovalDiff, DiffContext, LinkedApplet, PeerSummary, approval_diff, run_workflows,
+    write_targets,
 };
 use aruna_core::automation::record::{Automation, Lifecycle, Spec, Trigger};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -18,7 +19,7 @@ use ulid::Ulid;
 use super::{AutoAccessOperation, AutoError, Need, autos_page};
 use crate::applets::AppletError;
 use crate::applets::backends::{SandboxOperation, Sandboxing, public_ready};
-use crate::applets::reads::LoadAppletOperation;
+use crate::applets::reads::{GroupAppletsOperation, LoadAppletOperation};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AutoDiffResult {
@@ -31,6 +32,7 @@ pub struct AutoDiffResult {
 enum DiffStep {
     Access,
     Peers,
+    GroupApplets,
     Applets,
     Backends,
 }
@@ -44,9 +46,12 @@ pub struct DiffAutoOperation {
     proposed: Option<Spec>,
     auto: Option<Automation>,
     peers: Vec<PeerSummary>,
+    has_wildcard: bool,
     applet_ids: Vec<(Ulid, bool)>,
+    seen_applets: BTreeSet<Ulid>,
     outside_input: bool,
     start_applets: Vec<(Ulid, String)>,
+    linked_applets: Vec<LinkedApplet>,
     step: DiffStep,
 }
 
@@ -59,9 +64,12 @@ impl DiffAutoOperation {
             proposed,
             auto: None,
             peers: Vec::new(),
+            has_wildcard: false,
             applet_ids: Vec::new(),
+            seen_applets: BTreeSet::new(),
             outside_input: false,
             start_applets: Vec::new(),
+            linked_applets: Vec::new(),
             step: DiffStep::Access,
         }
     }
@@ -80,23 +88,63 @@ impl DiffAutoOperation {
     }
 
     fn collect_applets(&mut self, spec: &Spec) {
-        let mut seen = BTreeSet::new();
         for trigger in &spec.triggers {
             match trigger {
-                Trigger::AppletSubmission { applet_id } => {
-                    if seen.insert(*applet_id) {
+                Trigger::AppletSubmission {
+                    applet_id: Some(applet_id),
+                } => {
+                    if self.seen_applets.insert(*applet_id) {
                         self.applet_ids.push((*applet_id, true));
                     }
+                }
+                Trigger::AppletSubmission { applet_id: None } => {
+                    self.has_wildcard = true;
                 }
                 Trigger::RunFinished {
                     applet_id: Some(applet_id),
                     ..
-                } if seen.insert(*applet_id) => {
+                } if self.seen_applets.insert(*applet_id) => {
                     self.applet_ids.push((*applet_id, false));
                 }
                 _ => {}
             }
         }
+    }
+
+    fn record_applet(&mut self, applet: &Applet, is_sub: bool) {
+        let outside = applet.access == Access::Public || applet.guests.is_some();
+        if outside {
+            self.outside_input = true;
+        }
+        if is_sub {
+            if applet.grants.start.is_some() {
+                self.start_applets
+                    .push((applet.applet_id, applet.slug.clone()));
+            }
+            if !self
+                .linked_applets
+                .iter()
+                .any(|item| item.applet_id == applet.applet_id)
+            {
+                self.linked_applets.push(LinkedApplet {
+                    applet_id: applet.applet_id,
+                    name: applet.name.clone(),
+                    slug: applet.slug.clone(),
+                    outside_input: outside,
+                });
+            }
+        }
+    }
+
+    fn after_peers(&mut self) -> Result<Next<AutoDiffResult>, AutoError> {
+        if self.has_wildcard {
+            let group_id = self.auto.as_ref().ok_or(IoError::Unfinished)?.group_id;
+            self.step = DiffStep::GroupApplets;
+            return Ok(Next::Call(IoCall::child(GroupAppletsOperation::new(
+                group_id,
+            ))));
+        }
+        Ok(self.next_applet())
     }
 
     fn next_applet(&mut self) -> Next<AutoDiffResult> {
@@ -147,20 +195,31 @@ impl Operation for DiffAutoOperation {
                 }
                 match next {
                     Some(after) => Ok(Next::Call(autos_page(Some(after)))),
-                    None => Ok(self.next_applet()),
+                    None => self.after_peers(),
                 }
             }
+            DiffStep::GroupApplets => {
+                let auto_id = self.auto.as_ref().ok_or(IoError::Unfinished)?.automation_id;
+                let applets = result
+                    .child::<Vec<Applet>, AppletError>()?
+                    .unwrap_or_default();
+                for applet in applets {
+                    if applet.lifecycle != AppletLifecycle::TakenDown
+                        && applet.automations.contains(&auto_id)
+                    {
+                        self.seen_applets.insert(applet.applet_id);
+                        self.applet_ids.retain(|(id, _)| *id != applet.applet_id);
+                        self.record_applet(&applet, true);
+                    }
+                }
+                Ok(self.next_applet())
+            }
             DiffStep::Applets => {
-                let Some((applet_id, is_sub)) = self.applet_ids.pop() else {
+                let Some((_, is_sub)) = self.applet_ids.pop() else {
                     return Err(IoError::Unfinished.into());
                 };
                 if let Ok(Some(applet)) = result.child::<Option<Applet>, AppletError>()? {
-                    if applet.access == Access::Public || applet.guests.is_some() {
-                        self.outside_input = true;
-                    }
-                    if is_sub && applet.grants.start.is_some() {
-                        self.start_applets.push((applet_id, applet.slug));
-                    }
+                    self.record_applet(&applet, is_sub);
                 }
                 Ok(self.next_applet())
             }
@@ -170,6 +229,7 @@ impl Operation for DiffAutoOperation {
                     .unwrap_or_default();
                 let peers = std::mem::take(&mut self.peers);
                 let start_applets = std::mem::take(&mut self.start_applets);
+                let linked_applets = std::mem::take(&mut self.linked_applets);
                 let auto = self.auto.as_ref().ok_or(IoError::Unfinished)?;
                 let (next_spec, current, pending) = self.next_spec(auto);
                 let ctx = DiffContext {
@@ -177,6 +237,7 @@ impl Operation for DiffAutoOperation {
                     unsandboxed: next_spec.has_runs() && !public_ready(&backends),
                     peers,
                     start_applets,
+                    linked_applets,
                 };
                 let diff = approval_diff(current, next_spec, &ctx);
                 Ok(Next::Done(AutoDiffResult {
