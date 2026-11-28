@@ -40,28 +40,28 @@ pub struct StageReceiptBody {
 }
 
 impl StageReceiptBody {
-    fn from_domain(receipt: &StageReceipt) -> Self {
+    fn from_domain(rec: &StageReceipt) -> Self {
         Self {
-            workflow_run_id: receipt.workflow_run_id.map(|id| id.to_string()),
-            outputs_count: receipt.outputs.len(),
-            copied: receipt
+            workflow_run_id: rec.workflow_run_id.map(|id| id.to_string()),
+            outputs_count: rec.outputs.len(),
+            copied: rec
                 .copied
                 .iter()
-                .map(|file: &CopiedFile| CopiedFileBody {
-                    source_key: file.source_key.clone(),
-                    source_version: file.source_version.to_string(),
-                    dest_bucket: file.dest_bucket.clone(),
-                    dest_key: file.dest_key.clone(),
-                    dest_version: file.dest_version.to_string(),
-                    bytes: file.bytes,
+                .map(|c: &CopiedFile| CopiedFileBody {
+                    source_key: c.source_key.clone(),
+                    source_version: c.source_version.to_string(),
+                    dest_bucket: c.dest_bucket.clone(),
+                    dest_key: c.dest_key.clone(),
+                    dest_version: c.dest_version.to_string(),
+                    bytes: c.bytes,
                 })
                 .collect(),
-            dataset_id: receipt.dataset_id.map(|id| id.to_string()),
-            notified: receipt.notified,
-            approved_by: receipt.approved_by.map(|user| user.to_string()),
-            rejected_by: receipt.rejected_by.map(|user| user.to_string()),
-            expires_at: receipt.expires_at_ms.map(rfc3339),
-            preview: receipt.preview_json.clone(),
+            dataset_id: rec.dataset_id.map(|id| id.to_string()),
+            notified: rec.notified,
+            approved_by: rec.approved_by.map(|u| u.to_string()),
+            rejected_by: rec.rejected_by.map(|u| u.to_string()),
+            expires_at: rec.expires_at_ms.map(rfc3339),
+            preview: rec.preview_json.clone(),
         }
     }
 }

@@ -101,6 +101,13 @@ pub enum ServerError {
     /// A refusal with its own status and machine-readable code, such as `bucket_locked`.
     #[error("{2}")]
     Refused(StatusCode, &'static str, String),
+    /// A rate or concurrency limit refusal carrying a `Retry-After` interval in seconds.
+    #[error("{message}")]
+    Limited {
+        code: &'static str,
+        message: String,
+        retry_after: u64,
+    },
     /// A feature the node, realm or group has off refused a new start or write.
     #[error("{}", feature_message(.0, .1))]
     FeatureOff(Feature, Resolved),
@@ -435,10 +442,13 @@ impl IntoResponse for ServerError {
                 axum::http::HeaderValue::from_static("1"),
             );
         }
-        if let ServerError::AssistantQuota { retry_after, .. } = &self {
-            response
-                .headers_mut()
-                .insert(axum::http::header::RETRY_AFTER, (*retry_after).into());
+        if let ServerError::AssistantQuota { retry_after, .. }
+        | ServerError::Limited { retry_after, .. } = &self
+        {
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                (*retry_after).max(1).into(),
+            );
         }
         response
     }
@@ -513,6 +523,7 @@ impl ServerError {
             | ServerError::ServiceUnavailableReason(_)
             | ServerError::NoManagementNode => StatusCode::SERVICE_UNAVAILABLE,
             ServerError::Refused(status, ..) => *status,
+            ServerError::Limited { .. } => StatusCode::TOO_MANY_REQUESTS,
             ServerError::FeatureOff(..) => StatusCode::FORBIDDEN,
         }
     }
@@ -550,6 +561,7 @@ impl ServerError {
             ServerError::NoManagementNode => "no_management_node".to_string(),
             ServerError::RelayFailed => "relay_failed".to_string(),
             ServerError::Refused(_, code, _) => (*code).to_string(),
+            ServerError::Limited { code, .. } => (*code).to_string(),
             ServerError::FeatureOff(..) => "feature_disabled".to_string(),
         }
     }

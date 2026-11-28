@@ -16,7 +16,7 @@ use utoipa_axum::routes;
 
 use super::run_wire::{
     ConditionsRefusalBody, FiringBody, KeptEventBody, StartConflictBody, StartEventsRequest,
-    StartRequest,
+    StartRequest, StateConflictBody,
 };
 use super::{auto_error, param_id, path_id};
 use crate::auth::{RealmAuth, UnrestrictedAuth};
@@ -107,26 +107,32 @@ pub async fn start_automation(
         .unwrap_or_else(|| "{}".into());
     let operation = StartManualOperation::new(&auth, id, state.get_node_id(), values)
         .with_disabled_features(state.disabled_features());
-    match drive(operation, &state.get_ctx())
-        .await
-        .map_err(auto_error)?
-    {
-        ManualStart::Started(firing) => {
+    match drive(operation, &state.get_ctx()).await {
+        Ok(ManualStart::Started(firing)) => {
             Ok((StatusCode::ACCEPTED, Json(FiringBody::from_domain(&firing))).into_response())
         }
-        ManualStart::Skipped(firing) => {
+        Ok(ManualStart::Skipped(firing)) => {
             let message = firing
                 .reason
                 .clone()
                 .unwrap_or_else(|| "Conditions were not met.".into());
-            let refusal = ConditionsRefusalBody {
+            let body = StartConflictBody::Conditions(Box::new(ConditionsRefusalBody {
                 error: "conditions_not_met".into(),
                 code: "conditions_not_met".into(),
                 message,
                 firing: FiringBody::from_domain(&firing),
-            };
-            Ok((StatusCode::CONFLICT, Json(refusal)).into_response())
+            }));
+            Ok((StatusCode::CONFLICT, Json(body)).into_response())
         }
+        Err(aruna_ops_work::automations::AutoError::Conflict(message)) => {
+            let body = StartConflictBody::Conflict(StateConflictBody {
+                error: message,
+                code: Some("Conflict".into()),
+                details: None,
+            });
+            Ok((StatusCode::CONFLICT, Json(body)).into_response())
+        }
+        Err(error) => Err(auto_error(error)),
     }
 }
 

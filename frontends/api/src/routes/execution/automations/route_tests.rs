@@ -180,13 +180,13 @@ impl Harness {
         .await;
     }
 
-    pub(super) async fn call(
+    pub(super) async fn call_with_headers(
         &self,
         auth: &AuthContext,
         method: &str,
         uri: &str,
         body: Option<Value>,
-    ) -> (StatusCode, Value) {
+    ) -> (StatusCode, axum::http::HeaderMap, Value) {
         let (router, _) = super::router()
             .merge(crate::routes::applets::router())
             .merge(crate::routes::execution::workflow::router())
@@ -204,8 +204,20 @@ impl Harness {
             .with_state(self.state.clone());
         let resp = router.oneshot(req).await.unwrap();
         let status = resp.status();
+        let headers = resp.headers().clone();
         let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let val = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, headers, val)
+    }
+
+    pub(super) async fn call(
+        &self,
+        auth: &AuthContext,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let (status, _, val) = self.call_with_headers(auth, method, uri, body).await;
         (status, val)
     }
 
@@ -655,4 +667,103 @@ async fn triggers_and_save() {
         )
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // HTTP 429 on manual start and kept-event replay includes a positive Retry-After header.
+    let mut capped_spec = h.base_spec();
+    capped_spec["scope"]["limits"] = json!({"per_hour": 1});
+    let (status, capped_created) = h
+        .call(
+            &h.owner,
+            "POST",
+            "/compute/automations",
+            Some(json!({
+                "group_id": h.group.to_string(),
+                "name": "rate-capped",
+                "spec": capped_spec
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{capped_created}");
+    let capped_id = capped_created["automation_id"].as_str().unwrap();
+    let (status, approved) = h
+        .call(
+            &h.owner,
+            "POST",
+            &format!("/compute/automations/{capped_id}/approve"),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{approved}");
+
+    let (status, _) = h
+        .call(
+            &h.owner,
+            "POST",
+            &format!("/compute/automations/{capped_id}/start"),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    let (status, headers, limited_body) = h
+        .call_with_headers(
+            &h.owner,
+            "POST",
+            &format!("/compute/automations/{capped_id}/start"),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{limited_body}");
+    let retry_after: u64 = headers
+        .get(header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|text| text.parse().ok())
+        .expect("429 manual start must return positive integer Retry-After");
+    assert!(retry_after >= 1);
+
+    let capped_ulid = Ulid::from_string(capped_id).unwrap();
+    let kept_id = Ulid::from_bytes([77; 16]);
+    let upload_event = aruna_core::plugin_runs::SourceEvent::data_uploaded(
+        (h.realm, h.group, h.node),
+        ("raw", "in/file.csv"),
+        Ulid::from_bytes([78; 16]),
+        Some(h.owner.user_id),
+        10,
+    );
+    let kept = aruna_core::automation::record::KeptEvent {
+        event_id: kept_id,
+        automation_id: capped_ulid,
+        event: upload_event,
+        reason: "paused".into(),
+        kept_at_ms: 10,
+        payload: aruna_core::automation::firing::TriggerPayload::DataUploaded {
+            bucket: "raw".into(),
+            key: "in/file.csv".into(),
+            version_id: Ulid::from_bytes([78; 16]),
+            path: format!("/{}/g/{}/data/{}/raw/in/file.csv", h.realm, h.group, h.node),
+            size_bytes: Some(12),
+        },
+    };
+    write_doc(
+        &h.state.get_ctx(),
+        aruna_core::keyspaces::AUTOMATIONS_KEYSPACE,
+        aruna_core::automation::keys::kept_key(capped_ulid, kept_id),
+        kept.to_bytes().unwrap().into(),
+    )
+    .await;
+    let (status, replay_headers, replay_body) = h
+        .call_with_headers(
+            &h.owner,
+            "POST",
+            &format!("/compute/automations/{capped_id}/events/start"),
+            Some(json!({"event_ids": [kept_id.to_string()]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{replay_body}");
+    let replay_retry: u64 = replay_headers
+        .get(header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|text| text.parse().ok())
+        .expect("429 replay must return positive integer Retry-After");
+    assert!(replay_retry >= 1);
 }

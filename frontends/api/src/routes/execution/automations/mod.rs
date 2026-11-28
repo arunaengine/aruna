@@ -56,11 +56,14 @@ pub(crate) fn auto_error(error: AutoError) -> ServerError {
         AutoError::FeatureOff(feature, state) => ServerError::FeatureOff(feature, state),
         AutoError::Invalid(msg) => ServerError::BadRequestReason(msg),
         AutoError::Conflict(msg) | AutoError::Capacity(msg) => ServerError::Conflict(msg),
-        AutoError::Limited(msg) => ServerError::Refused(
-            axum::http::StatusCode::TOO_MANY_REQUESTS,
-            "automation_limited",
-            msg,
-        ),
+        AutoError::Limited {
+            reason,
+            retry_after,
+        } => ServerError::Limited {
+            code: "automation_limited",
+            message: reason,
+            retry_after,
+        },
         AutoError::Unavailable(msg) => ServerError::ServiceUnavailableReason(msg),
         AutoError::Storage(msg) => ServerError::InternalError(msg.into()),
     }
