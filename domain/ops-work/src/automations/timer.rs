@@ -1,12 +1,13 @@
-//! Schedule trigger worker firing due slots and recording missed slots while unavailable.
+//! Due-time-indexed schedule trigger worker firing live slots and summarizing missed ranges.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeSet;
 
-use aruna_core::automation::record::{Automation, Lifecycle};
-use aruna_core::automation::rules::schedule_due_slots;
-use aruna_core::automation::usage::count_u64;
+use aruna_core::automation::firing::TriggerPayload;
+use aruna_core::automation::keys::parse_due_key;
+use aruna_core::automation::record::Lifecycle;
+use aruna_core::automation::schedule::next_start;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
@@ -17,11 +18,7 @@ use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation
 use ulid::Ulid;
 
 use super::admit::{AdmitFiringOp, AdmitOutcome};
-use super::firing_reads::decode_ulid;
-use super::{AutoError, auto_answer, read_auto, schedule_page};
-
-/// Maximum due or missed schedule slots processed for one automation per worker tick.
-const SLOTS_PER_TICK: usize = 16;
+use super::{AutoError, auto_answer, read_auto, schedule_due_page};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TimerReport {
@@ -34,12 +31,15 @@ pub struct TimerReport {
 enum TimerStep {
     Config,
     Index,
-    LoadAutomation(u64),
-    AdmitSlot(Box<Automation>),
+    LoadAutomation(Ulid),
+    AdmitSlot {
+        automation_id: Ulid,
+        previous_at_ms: Option<u64>,
+    },
 }
 
-/// Evaluates active scheduled automations via the `SCHEDULE_ROW` index, firing live slots and
-/// recording missed slots as `skipped` without retroactively making them up.
+/// Evaluates due scheduled automations via the due-time-ordered `SCHEDULE_DUE_ROW` index,
+/// stopping at the first future key and validating schedules inside each admission transaction.
 #[derive(Debug, PartialEq)]
 pub struct TickTimersOperation {
     realm_id: RealmId,
@@ -47,8 +47,8 @@ pub struct TickTimersOperation {
     ids: IdMint,
     now_ms: u64,
     config: Option<RealmConfigDocument>,
-    entries: Vec<(Ulid, u64)>,
-    slots: Vec<u64>,
+    seen_ids: BTreeSet<Ulid>,
+    due_ids: Vec<Ulid>,
     report: TimerReport,
     step: TimerStep,
 }
@@ -61,8 +61,8 @@ impl TickTimersOperation {
             ids: IdMint::default(),
             now_ms: 0,
             config: None,
-            entries: Vec::new(),
-            slots: Vec::new(),
+            seen_ids: BTreeSet::new(),
+            due_ids: Vec::new(),
             report: TimerReport::default(),
             step: TimerStep::Config,
         }
@@ -86,22 +86,25 @@ impl TickTimersOperation {
     }
 
     fn next_entry(&mut self) -> Next<TimerReport> {
-        let Some((automation_id, last_ms)) = self.entries.pop() else {
+        let Some(automation_id) = self.due_ids.pop() else {
             return Next::Done(self.report);
         };
         self.report.checked += 1;
-        self.step = TimerStep::LoadAutomation(last_ms);
+        self.step = TimerStep::LoadAutomation(automation_id);
         Next::Call(read_auto(automation_id))
     }
 
-    fn next_slot(&mut self, automation: Box<Automation>) -> Next<TimerReport> {
-        let Some(slot_ms) = self.slots.pop() else {
-            return self.next_entry();
-        };
-        let automation_id = automation.automation_id;
+    fn admit_slot(
+        &mut self,
+        automation_id: Ulid,
+        previous_at_ms: Option<u64>,
+    ) -> Next<TimerReport> {
         let firing_id = self.ids.mint(self.now_ms);
-        let admit = AdmitFiringOp::schedule(automation_id, firing_id, slot_ms);
-        self.step = TimerStep::AdmitSlot(automation);
+        let admit = AdmitFiringOp::schedule(automation_id, firing_id);
+        self.step = TimerStep::AdmitSlot {
+            automation_id,
+            previous_at_ms,
+        };
         Next::Call(IoCall::retry(admit, &automation_id.to_bytes()))
     }
 }
@@ -119,6 +122,7 @@ impl Operation for TickTimersOperation {
     }
 
     fn first(&mut self) -> Result<Next<TimerReport>, AutoError> {
+        self.step = TimerStep::Config;
         Ok(Next::Call(IoCall::child(GetConfigOperation::new(
             self.realm_id,
         ))))
@@ -129,51 +133,67 @@ impl Operation for TickTimersOperation {
             TimerStep::Config => {
                 self.config = result.child::<RealmConfigDocument, GetConfigError>()?.ok();
                 self.step = TimerStep::Index;
-                Ok(Next::Call(schedule_page(None)))
+                Ok(Next::Call(schedule_due_page(None)))
             }
             TimerStep::Index => {
                 let (rows, next) = result.page()?;
-                for (key, value) in rows {
-                    if let Some(automation_id) = key.get(1..17).and_then(decode_ulid) {
-                        self.entries.push((automation_id, count_u64(Some(&value))));
+                let mut reached_future = false;
+                for (key, _) in rows {
+                    let Some((due_ms, automation_id)) = parse_due_key(&key) else {
+                        continue;
+                    };
+                    if due_ms > self.now_ms {
+                        reached_future = true;
+                        break;
+                    }
+                    if self.seen_ids.insert(automation_id) {
+                        self.due_ids.push(automation_id);
                     }
                 }
-                if let Some(after) = next {
+                if !reached_future && let Some(after) = next {
                     self.step = TimerStep::Index;
-                    return Ok(Next::Call(schedule_page(Some(after))));
+                    return Ok(Next::Call(schedule_due_page(Some(after))));
                 }
+                self.due_ids.reverse();
                 Ok(self.next_entry())
             }
-            TimerStep::LoadAutomation(last_ms) => {
+            TimerStep::LoadAutomation(automation_id) => {
                 let Some(automation) = auto_answer(result)? else {
-                    return Ok(self.next_entry());
+                    return Ok(self.admit_slot(automation_id, None));
                 };
-                if automation.lifecycle != Lifecycle::Active
-                    || !automation.spec.has_schedules()
-                    || !self.feature_on(automation.group_id)
+                if automation.lifecycle == Lifecycle::Active
+                    && automation.spec.has_schedules()
+                    && !self.feature_on(automation.group_id)
                 {
                     return Ok(self.next_entry());
                 }
-                let mut due = schedule_due_slots(&automation.spec, last_ms, self.now_ms);
-                if due.len() > SLOTS_PER_TICK {
-                    let drop = due.len() - SLOTS_PER_TICK;
-                    due.drain(..drop);
-                }
-                due.reverse();
-                self.slots = due;
-                Ok(self.next_slot(Box::new(automation)))
+                Ok(self.admit_slot(automation_id, None))
             }
-            TimerStep::AdmitSlot(automation) => {
-                match result.child::<AdmitOutcome, AutoError>()? {
-                    Ok(AdmitOutcome::Created(_)) => self.report.fired += 1,
-                    Ok(AdmitOutcome::Skipped(_)) => self.report.skipped += 1,
+            TimerStep::AdmitSlot {
+                automation_id,
+                previous_at_ms,
+            } => {
+                let firing = match result.child::<AdmitOutcome, AutoError>()? {
+                    Ok(AdmitOutcome::Created(firing)) => {
+                        self.report.fired += 1;
+                        firing
+                    }
+                    Ok(AdmitOutcome::Skipped(firing)) => {
+                        self.report.skipped += 1;
+                        firing
+                    }
                     Ok(_) | Err(AutoError::Conflict(_)) | Err(AutoError::NotFound) => {
-                        self.slots.clear();
                         return Ok(self.next_entry());
                     }
                     Err(error) => return Err(error),
+                };
+                if let TriggerPayload::Schedule { at_ms } = &firing.trigger
+                    && previous_at_ms.is_none_or(|previous| *at_ms > previous)
+                    && next_start(&firing.spec, *at_ms).is_some_and(|due| due <= self.now_ms)
+                {
+                    return Ok(self.admit_slot(automation_id, Some(*at_ms)));
                 }
-                Ok(self.next_slot(automation))
+                Ok(self.next_entry())
             }
         }
     }

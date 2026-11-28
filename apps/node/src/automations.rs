@@ -1,4 +1,5 @@
-//! Background worker ticking automation event matching and DAG firing progress until shutdown.
+//! Background worker ticking automation event matching, schedule triggers and DAG firing
+//! progress until shutdown.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -21,7 +22,7 @@ use tracing::{debug, warn};
 const WORKER_IDLE: Duration = Duration::from_secs(2);
 const WORKER_BUSY: Duration = Duration::from_millis(200);
 
-/// Runs automation journal matching and DAG firing advancement until shutdown.
+/// Runs automation journal matching, schedule trigger ticks and DAG firing advancement until shutdown.
 pub fn spawn_worker(
     context: Arc<DriverContext>,
     jobs_runtime: Arc<JobsRuntime>,
