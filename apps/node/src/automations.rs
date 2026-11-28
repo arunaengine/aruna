@@ -1,4 +1,5 @@
-//! Background worker ticking automation event matching and DAG firing progress until shutdown.
+//! Background worker ticking automation event matching, schedule triggers and DAG firing
+//! progress until shutdown.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -10,8 +11,9 @@ use aruna_core::id::NodeId;
 use aruna_core::structs::identity::features::Feature;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_ops_work::automations::control::AckCancelsOperation;
-use aruna_ops_work::automations::matcher::MatchEventsOperation;
+use aruna_ops_work::automations::matcher::{MatchCursor, MatchEventsOperation};
 use aruna_ops_work::automations::runner::StepFiringsOperation;
+use aruna_ops_work::automations::timer::TickTimersOperation;
 use aruna_runner::driver::{DriverContext, drive};
 use aruna_runner::jobs::runtime::JobsRuntime;
 use aruna_scheduler::shutdown::Shutdown;
@@ -20,7 +22,7 @@ use tracing::{debug, warn};
 const WORKER_IDLE: Duration = Duration::from_secs(2);
 const WORKER_BUSY: Duration = Duration::from_millis(200);
 
-/// Runs automation journal matching and DAG firing advancement until shutdown.
+/// Runs automation journal matching, schedule ticks and DAG firing advancement until shutdown.
 pub fn spawn_worker(
     context: Arc<DriverContext>,
     jobs_runtime: Arc<JobsRuntime>,
@@ -31,18 +33,34 @@ pub fn spawn_worker(
 ) {
     let token = shutdown.token();
     shutdown.spawn(async move {
+        let mut match_cursor: Option<MatchCursor> = None;
         loop {
             let mut busy = false;
             let matcher = MatchEventsOperation::new(realm_id)
-                .with_disabled_features(disabled_features.clone());
+                .with_disabled_features(disabled_features.clone())
+                .with_cursor(match_cursor.clone());
             match drive(matcher, context.as_ref()).await {
                 Ok(report) => {
-                    if report.scanned > 0 || report.fired > 0 {
+                    let made_progress =
+                        report.scanned > report.deferred || report.fired > 0 || report.skipped > 0;
+                    match_cursor = report.next_cursor.clone();
+                    if made_progress || match_cursor.is_some() {
                         busy = true;
                         debug!(?report, "Matched automation journal events");
                     }
                 }
                 Err(error) => warn!(%error, "Automation event matching failed"),
+            }
+            let timers = TickTimersOperation::new(realm_id)
+                .with_disabled_features(disabled_features.clone());
+            match drive(timers, context.as_ref()).await {
+                Ok(report) => {
+                    if report.fired > 0 || report.skipped > 0 {
+                        busy = true;
+                        debug!(?report, "Processed scheduled automation triggers");
+                    }
+                }
+                Err(error) => warn!(%error, "Automation schedule tick failed"),
             }
             let stepper = StepFiringsOperation::new((node_id, realm_id))
                 .with_disabled_features(disabled_features.clone());

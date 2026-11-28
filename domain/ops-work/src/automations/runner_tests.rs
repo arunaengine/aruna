@@ -24,7 +24,7 @@ use super::control::{
 use super::firing_reads::GetFiringOperation;
 use super::flow_tests::Env;
 use super::runner::StepFiringsOperation;
-use super::start::{StartManualOperation, new_firing_rows};
+use super::start::{ManualStart, StartManualOperation, new_firing_rows};
 use super::upkeep::AutoUpkeepOperation;
 
 #[tokio::test]
@@ -33,6 +33,7 @@ async fn stages_and_edges() {
     let wf_id = Ulid::from_bytes([61; 16]);
     let spec = Spec {
         triggers: vec![Trigger::Manual { form_json: None }],
+        conditions: Default::default(),
         stages: vec![
             Stage {
                 name: "gate".into(),
@@ -59,12 +60,14 @@ async fn stages_and_edges() {
         },
     };
     let auto = env.create_active(spec).await;
-    let started = drive(
+    let ManualStart::Started(started) = drive(
         StartManualOperation::new(&env.owner, auto.automation_id, env.node, "{}".into()),
         &env.ctx,
     )
     .await
-    .unwrap();
+    .unwrap() else {
+        panic!("expected started firing");
+    };
     drive(StepFiringsOperation::new((env.node, env.realm)), &env.ctx)
         .await
         .unwrap();
@@ -205,6 +208,7 @@ async fn stages_and_edges() {
     .await;
     let cancel_spec = Spec {
         triggers: vec![Trigger::Manual { form_json: None }],
+        conditions: Default::default(),
         stages: vec![Stage {
             name: "run".into(),
             needs: Some(vec![]),
@@ -293,6 +297,13 @@ async fn stages_and_edges() {
         ),
         reason: "paused".into(),
         kept_at_ms: 1,
+        payload: TriggerPayload::DataUploaded {
+            bucket: "raw".into(),
+            key: "in/old.csv".into(),
+            version_id: Ulid::from_bytes([99; 16]),
+            path: "/r/g/raw/in/old.csv".into(),
+            size_bytes: Some(10),
+        },
     };
     env.write_row(
         AUTOMATIONS_KEYSPACE,
@@ -321,6 +332,7 @@ async fn pinned_spec_cancel() {
     let env = Env::new().await;
     let spec_v1 = Spec {
         triggers: vec![Trigger::Manual { form_json: None }],
+        conditions: Default::default(),
         stages: vec![
             Stage {
                 name: "gate".into(),
@@ -347,12 +359,14 @@ async fn pinned_spec_cancel() {
         },
     };
     let auto = env.create_active(spec_v1.clone()).await;
-    let started = drive(
+    let ManualStart::Started(started) = drive(
         StartManualOperation::new(&env.owner, auto.automation_id, env.node, "{}".into()),
         &env.ctx,
     )
     .await
-    .unwrap();
+    .unwrap() else {
+        panic!("expected started firing");
+    };
     drive(StepFiringsOperation::new((env.node, env.realm)), &env.ctx)
         .await
         .unwrap();
@@ -377,6 +391,7 @@ async fn pinned_spec_cancel() {
                 name: None,
                 description: None,
                 spec: Some(spec_v2),
+                workflow_id: None,
             },
             env.node,
         ),
@@ -458,6 +473,7 @@ async fn pinned_spec_cancel() {
     // Concurrent cancel during copy preserves committed file receipt and ends Cancelled.
     let copy_spec = Spec {
         triggers: vec![Trigger::Manual { form_json: None }],
+        conditions: Default::default(),
         stages: vec![Stage {
             name: "copy".into(),
             needs: Some(vec![]),
@@ -529,6 +545,7 @@ async fn pinned_spec_cancel() {
     let wf_id = Ulid::from_bytes([66; 16]);
     let run_spec = Spec {
         triggers: vec![Trigger::Manual { form_json: None }],
+        conditions: Default::default(),
         stages: vec![Stage {
             name: "run".into(),
             needs: Some(vec![]),
@@ -597,7 +614,7 @@ async fn pinned_spec_cancel() {
 
     // Resuming a failed firing respects max_active_firings (#7).
     let mut cap_spec = spec_v1.clone();
-    cap_spec.scope.limits.max_active_firings = 1;
+    cap_spec.scope.limits.max_active_firings = Some(1);
     let cap_auto = env.create_active(cap_spec.clone()).await;
     let mut failed_f = Firing::new(
         Ulid::from_bytes([105; 16]),
@@ -639,7 +656,7 @@ async fn pinned_spec_cancel() {
     )
     .await;
     assert!(
-        matches!(capped_resume, Err(AutoError::Limited(_))),
+        matches!(capped_resume, Err(AutoError::Limited { .. })),
         "{capped_resume:?}"
     );
     assert!(

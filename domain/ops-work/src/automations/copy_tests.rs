@@ -48,6 +48,7 @@ async fn copy_stage_checks() {
     );
     let mut spec = Spec {
         triggers: vec![Trigger::Manual { form_json: None }],
+        conditions: Default::default(),
         stages: vec![
             Stage {
                 name: "run".into(),
@@ -85,7 +86,7 @@ async fn copy_stage_checks() {
             ..Scope::default()
         },
     };
-    spec.scope.limits.bytes_per_day = 500;
+    spec.scope.limits.bytes_per_day = Some(500);
     let auto = env.create_active(spec.clone()).await;
 
     let v1 = Ulid::from_parts(10, 1);
@@ -242,7 +243,7 @@ async fn copy_stage_checks() {
     assert!(matches!(count_call, Next::Call(IoCall::Child(_))));
     let over = op2
         .next(IoResult::Child(ChildOutcome::new(Err::<(), AutoError>(
-            AutoError::Limited("cap".into()),
+            AutoError::limited("cap", 60),
         ))))
         .unwrap();
     assert!(matches!(over, Next::Call(IoCall::Delete(_))));

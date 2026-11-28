@@ -11,14 +11,13 @@ mod route_tests;
 mod run_tests;
 pub mod run_wire;
 pub mod runs;
+pub mod save;
 pub mod spec_wire;
 pub mod stage_wire;
 pub mod wire;
 
 use std::sync::Arc;
 
-use aruna_core::structs::identity::features::Feature;
-use aruna_core::types::GroupId;
 use aruna_ops_work::automations::AutoError;
 use ulid::Ulid;
 use utoipa_axum::router::OpenApiRouter;
@@ -31,6 +30,7 @@ const MAX_LIMIT: usize = 500;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     records::router()
+        .merge(save::router())
         .merge(lifecycle::router())
         .merge(events::router())
         .merge(runs::router())
@@ -53,25 +53,18 @@ pub(crate) fn auto_error(error: AutoError) -> ServerError {
     match error {
         AutoError::NotFound => ServerError::NotFound,
         AutoError::Forbidden => ServerError::Forbidden,
+        AutoError::FeatureOff(feature, state) => ServerError::FeatureOff(feature, state),
         AutoError::Invalid(msg) => ServerError::BadRequestReason(msg),
         AutoError::Conflict(msg) | AutoError::Capacity(msg) => ServerError::Conflict(msg),
-        AutoError::Limited(msg) => ServerError::Refused(
-            axum::http::StatusCode::TOO_MANY_REQUESTS,
-            "automation_limited",
-            msg,
-        ),
+        AutoError::Limited {
+            reason,
+            retry_after,
+        } => ServerError::Limited {
+            code: "automation_limited",
+            message: reason,
+            retry_after,
+        },
+        AutoError::Unavailable(msg) => ServerError::ServiceUnavailableReason(msg),
         AutoError::Storage(msg) => ServerError::InternalError(msg.into()),
     }
-}
-
-pub(crate) async fn require_switches(
-    state: &ServerState,
-    group_id: GroupId,
-    uses_applets: bool,
-) -> ServerResult<()> {
-    crate::features::require(state, Feature::Automations, Some(group_id)).await?;
-    if uses_applets {
-        crate::features::require(state, Feature::Applets, Some(group_id)).await?;
-    }
-    Ok(())
 }

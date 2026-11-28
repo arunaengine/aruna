@@ -287,6 +287,7 @@ mod tests {
             created_by: admin,
             created_at_ms: 0,
             revision: 1,
+            automations: Vec::new(),
         };
         assert_eq!(
             serving(&state, &applet).await.unwrap(),

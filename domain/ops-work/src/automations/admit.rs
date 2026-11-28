@@ -1,16 +1,21 @@
-//! Atomic firing admission checking lifecycle, rate limits, active slots and dedup/replay rows.
+//! Atomic firing admission checking lifecycle, triggers, outside-input approval, conditions,
+//! chain depth, pinned rate windows, active slots, schedule cursors and dedup rows.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::automation::firing::{Firing, TriggerPayload};
+use aruna_core::applet::record::{Access, Applet, Lifecycle as AppletLifecycle, applet_key};
+use aruna_core::automation::firing::{Firing, SkippedFiring, TriggerPayload};
 use aruna_core::automation::glob::glob_match;
 use aruna_core::automation::keys::{
-    active_key, firing_key, index_key, kept_key, record_key, replay_key, seen_key,
+    active_key, firing_key, index_key, kept_key, record_key, replay_key, schedule_cursor_key,
+    seen_key,
 };
-use aruna_core::automation::record::{Automation, Lifecycle, Trigger};
+use aruna_core::automation::record::{Automation, KeptEvent, Lifecycle, Trigger};
+use aruna_core::automation::rules::{ConditionCheck, ConditionCheckKind, evaluate_conditions};
+use aruna_core::automation::schedule::{CursorMode, ScheduleCursor, schedule_due};
 use aruna_core::automation::usage::{CounterKind, Window, count_u64, counter_key};
-use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::keyspaces::{AUTOMATION_RUNS_KEYSPACE, AUTOMATIONS_KEYSPACE};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::keyspaces::{APPLETS_KEYSPACE, AUTOMATION_RUNS_KEYSPACE, AUTOMATIONS_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::types::{Key, KeySpace, Value};
 use aruna_core::user::id::UserId;
@@ -18,9 +23,12 @@ use byteview::ByteView;
 use ulid::Ulid;
 
 use super::firing_reads::decode_ulid;
-use super::{AutoError, active_page, firing_row};
+use super::{
+    ACTIVE_RETRY_SECONDS, AutoError, ScheduleSync, active_page, clear_schedule_rows, firing_row,
+    pinned_retry_after, plan_cursor_transition,
+};
 
-/// Writes a newly created firing along with its active-set and firing-id index rows.
+/// Writes a newly created firing along with its active-set (when active) and firing-id index rows.
 pub(crate) fn new_firing_rows(firing: &Firing) -> Result<Vec<(KeySpace, Key, Value)>, AutoError> {
     let auto_bytes = ByteView::from(firing.automation_id.to_bytes().to_vec());
     let mut rows = vec![
@@ -52,7 +60,7 @@ pub(crate) fn parse_replay(bytes: &[u8]) -> Option<(Ulid, u64)> {
     let firing_id = decode_ulid(bytes.get(..16)?)?;
     let at_ms = bytes
         .get(16..24)
-        .and_then(|s| <[u8; 8]>::try_from(s).ok())
+        .and_then(|slice| <[u8; 8]>::try_from(slice).ok())
         .map(u64::from_be_bytes)
         .unwrap_or(0);
     Some((firing_id, at_ms))
@@ -63,17 +71,18 @@ pub(crate) enum AdmitSource {
     Manual,
     Journal {
         source: String,
-        matched_revision: u64,
         actor: Option<UserId>,
     },
     Replay {
         event_id: Ulid,
     },
+    Schedule,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum AdmitOutcome {
     Created(Firing),
+    Skipped(Firing),
     Existing(Firing),
     AlreadySeen,
     Unmatched,
@@ -81,89 +90,109 @@ pub(crate) enum AdmitOutcome {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PayloadMatch {
-    Matched,
-    Unmatched,
-    ChainDepth,
+enum WriteOutcome {
+    Created,
+    Skipped,
+    Idle(IdleOutcome),
 }
 
-fn match_payload(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdleOutcome {
+    AlreadySeen,
+    Unmatched,
+}
+
+fn matches_trigger(
     auto: &Automation,
     payload: &TriggerPayload,
     actor: Option<UserId>,
-) -> PayloadMatch {
+    applet: Option<&Applet>,
+) -> bool {
     if auto.account.is_some() && actor == auto.account {
-        return PayloadMatch::Unmatched;
+        return false;
     }
     match payload {
-        TriggerPayload::Manual { .. } => {
-            if auto
-                .spec
-                .triggers
-                .iter()
-                .any(|t| matches!(t, Trigger::Manual { .. }))
-            {
-                PayloadMatch::Matched
-            } else {
-                PayloadMatch::Unmatched
-            }
-        }
+        TriggerPayload::Manual { .. } => auto
+            .spec
+            .triggers
+            .iter()
+            .any(|trigger| matches!(trigger, Trigger::Manual { .. })),
+        TriggerPayload::Schedule { .. } => auto.spec.has_schedules(),
         TriggerPayload::DataUploaded { bucket, key, .. } => {
             let file = key.rsplit('/').next().unwrap_or(key);
-            let hit = auto.spec.triggers.iter().any(|trigger| match trigger {
+            auto.spec.triggers.iter().any(|trigger| match trigger {
                 Trigger::DataUploaded {
-                    bucket: tb,
+                    bucket: trigger_bucket,
                     prefix,
                     pattern,
                 } => {
-                    bucket == tb
+                    bucket == trigger_bucket
                         && key.starts_with(prefix)
-                        && pattern.as_deref().is_none_or(|p| glob_match(p, file))
+                        && pattern.as_deref().is_none_or(|glob| glob_match(glob, file))
                 }
                 _ => false,
-            });
-            match hit {
-                true => PayloadMatch::Matched,
-                false => PayloadMatch::Unmatched,
-            }
+            })
         }
         TriggerPayload::AppletSubmission { applet_id, .. } => {
-            let hit =
-                auto.spec.triggers.iter().any(
-                    |t| matches!(t, Trigger::AppletSubmission { applet_id: a } if a == applet_id),
-                );
-            match hit {
-                true => PayloadMatch::Matched,
-                false => PayloadMatch::Unmatched,
-            }
+            let linked = applet.is_some_and(|record| {
+                record.lifecycle != AppletLifecycle::TakenDown
+                    && record.group_id == auto.group_id
+                    && record.automations.contains(&auto.automation_id)
+            });
+            auto.spec.triggers.iter().any(|trigger| match trigger {
+                Trigger::AppletSubmission {
+                    applet_id: Some(target_id),
+                } => target_id == applet_id,
+                Trigger::AppletSubmission { applet_id: None } => linked,
+                _ => false,
+            })
         }
         TriggerPayload::RunFinished {
             workflow_id,
             status,
             applet_id,
-            depth,
             ..
-        } => {
-            let hit = auto.spec.triggers.iter().any(|t| match t {
-                Trigger::RunFinished {
-                    workflow_id: w,
-                    status: want_status,
-                    applet_id: want_applet,
-                } => {
-                    w == workflow_id
-                        && want_status.is_none_or(|s| s == *status)
-                        && want_applet.is_none_or(|a| Some(a) == *applet_id)
-                }
-                _ => false,
-            });
-            if !hit {
-                PayloadMatch::Unmatched
-            } else if *depth >= auto.spec.scope.limits.max_chain_depth {
-                PayloadMatch::ChainDepth
-            } else {
-                PayloadMatch::Matched
+        } => auto.spec.triggers.iter().any(|trigger| match trigger {
+            Trigger::RunFinished {
+                workflow_id: target_workflow,
+                status: want_status,
+                applet_id: want_applet,
+            } => {
+                target_workflow == workflow_id
+                    && want_status.is_none_or(|wanted| wanted == *status)
+                    && want_applet.is_none_or(|wanted| Some(wanted) == *applet_id)
             }
-        }
+            _ => false,
+        }),
+    }
+}
+
+fn is_outside_submission(payload: &TriggerPayload, applet: Option<&Applet>) -> bool {
+    if payload.outside_input() {
+        return true;
+    }
+    matches!(payload, TriggerPayload::AppletSubmission { .. })
+        && applet.is_some_and(|record| record.access == Access::Public || record.guests.is_some())
+}
+
+fn limit_check(kind: ConditionCheckKind, text: String, why: String) -> ConditionCheck {
+    ConditionCheck {
+        kind,
+        text,
+        held: false,
+        why,
+    }
+}
+
+fn missed_reason(missed_count: u64, first_ms: u64, last_ms: u64) -> String {
+    if missed_count == 1 {
+        "Missed scheduled start while the node was unavailable.".into()
+    } else {
+        format!(
+            "Missed {missed_count} scheduled starts between {} and {} while the node was unavailable.",
+            crate::rfc3339(first_ms),
+            crate::rfc3339(last_ms)
+        )
     }
 }
 
@@ -174,17 +203,23 @@ enum AdmitStep {
     Active {
         auto: Box<Automation>,
         counters: Vec<(Key, u64)>,
+        checks: Vec<ConditionCheck>,
+        schedule_sync: Option<ScheduleSync>,
         active_count: u32,
     },
     Write {
-        firing: Box<Firing>,
-        drop_kept: Option<Key>,
+        firing: Option<Box<Firing>>,
+        outcome: WriteOutcome,
+        deletes: Vec<(KeySpace, Key)>,
     },
-    DropKept(Box<Firing>),
+    DropRows {
+        firing: Option<Box<Firing>>,
+        outcome: WriteOutcome,
+    },
 }
 
-/// Atomically verifies lifecycle, dedup/replay state, rate counters and `max_active_firings`, then
-/// creates the firing and claims its slot and kept/seen row in one write transaction.
+/// Atomically verifies lifecycle, triggers, outside-input approval, dedup/replay state,
+/// conditions, chain depth, rate counters, active slots and schedule cursors in one transaction.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct AdmitFiringOp {
     auto_id: Ulid,
@@ -192,31 +227,58 @@ pub(crate) struct AdmitFiringOp {
     payload: TriggerPayload,
     source: AdmitSource,
     now_ms: u64,
+    window_ms: u64,
+    rate_keys: (Key, Key),
     step: AdmitStep,
 }
 
+fn require_active(auto: &Automation) -> Result<(), AutoError> {
+    if auto.lifecycle != Lifecycle::Active {
+        return Err(AutoError::Conflict(
+            "automation must be active to start".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn rate_keys_for(auto_id: Ulid, window_ms: u64) -> (Key, Key) {
+    let hour = counter_key(
+        auto_id,
+        CounterKind::Firings,
+        (Window::Hour, Window::Hour.start(window_ms)),
+    );
+    let day = counter_key(
+        auto_id,
+        CounterKind::Firings,
+        (Window::Day, Window::Day.start(window_ms)),
+    );
+    (hour, day)
+}
+
 impl AdmitFiringOp {
-    pub(crate) fn manual(auto_id: Ulid, firing_id: Ulid, payload: TriggerPayload) -> Self {
-        Self::new(auto_id, firing_id, payload, AdmitSource::Manual)
+    pub(crate) fn manual(
+        auto_id: Ulid,
+        firing_id: Ulid,
+        payload: TriggerPayload,
+        window_ms: u64,
+    ) -> Self {
+        Self::new(auto_id, firing_id, payload, AdmitSource::Manual, window_ms)
     }
 
     pub(crate) fn journal(
         auto_id: Ulid,
         firing_id: Ulid,
         source: String,
-        matched_revision: u64,
         actor: Option<UserId>,
         payload: TriggerPayload,
+        window_ms: u64,
     ) -> Self {
         Self::new(
             auto_id,
             firing_id,
             payload,
-            AdmitSource::Journal {
-                source,
-                matched_revision,
-                actor,
-            },
+            AdmitSource::Journal { source, actor },
+            window_ms,
         )
     }
 
@@ -225,38 +287,128 @@ impl AdmitFiringOp {
         event_id: Ulid,
         firing_id: Ulid,
         payload: TriggerPayload,
+        window_ms: u64,
     ) -> Self {
         Self::new(
             auto_id,
             firing_id,
             payload,
             AdmitSource::Replay { event_id },
+            window_ms,
         )
     }
 
-    fn new(auto_id: Ulid, firing_id: Ulid, payload: TriggerPayload, source: AdmitSource) -> Self {
+    pub(crate) fn schedule(auto_id: Ulid, firing_id: Ulid, window_ms: u64) -> Self {
+        Self::new(
+            auto_id,
+            firing_id,
+            TriggerPayload::Schedule { at_ms: 0 },
+            AdmitSource::Schedule,
+            window_ms,
+        )
+    }
+
+    fn new(
+        auto_id: Ulid,
+        firing_id: Ulid,
+        payload: TriggerPayload,
+        source: AdmitSource,
+        window_ms: u64,
+    ) -> Self {
         Self {
             auto_id,
             firing_id,
             payload,
             source,
-            now_ms: 0,
+            now_ms: window_ms,
+            window_ms,
+            rate_keys: rate_keys_for(auto_id, window_ms),
             step: AdmitStep::Read,
         }
     }
 
-    fn counter_keys(&self) -> (Key, Key) {
-        let hour = counter_key(
-            self.auto_id,
-            CounterKind::Firings,
-            (Window::Hour, Window::Hour.start(self.now_ms)),
-        );
-        let day = counter_key(
-            self.auto_id,
-            CounterKind::Firings,
-            (Window::Day, Window::Day.start(self.now_ms)),
-        );
-        (hour, day)
+    fn finish_write(
+        firing: Option<Box<Firing>>,
+        outcome: WriteOutcome,
+    ) -> Result<Next<AdmitOutcome>, AutoError> {
+        match (outcome, firing) {
+            (WriteOutcome::Created, Some(record)) => Ok(Next::Done(AdmitOutcome::Created(*record))),
+            (WriteOutcome::Skipped, Some(record)) => Ok(Next::Done(AdmitOutcome::Skipped(*record))),
+            (WriteOutcome::Idle(IdleOutcome::AlreadySeen), None) => {
+                Ok(Next::Done(AdmitOutcome::AlreadySeen))
+            }
+            (WriteOutcome::Idle(IdleOutcome::Unmatched), None) => {
+                Ok(Next::Done(AdmitOutcome::Unmatched))
+            }
+            _ => Err(IoError::Unfinished.into()),
+        }
+    }
+
+    fn apply_idle_sync(
+        &mut self,
+        sync: ScheduleSync,
+        idle: IdleOutcome,
+    ) -> Result<Next<AdmitOutcome>, AutoError> {
+        if !sync.writes.is_empty() {
+            self.step = AdmitStep::Write {
+                firing: None,
+                outcome: WriteOutcome::Idle(idle),
+                deletes: sync.deletes,
+            };
+            return Ok(Next::Call(IoCall::Write(sync.writes)));
+        }
+        if !sync.deletes.is_empty() {
+            self.step = AdmitStep::DropRows {
+                firing: None,
+                outcome: WriteOutcome::Idle(idle),
+            };
+            return Ok(Next::Call(IoCall::Delete(sync.deletes)));
+        }
+        Self::finish_write(None, WriteOutcome::Idle(idle))
+    }
+
+    fn write_skipped(
+        &mut self,
+        auto: &Automation,
+        reason: String,
+        checks: Vec<ConditionCheck>,
+        schedule_sync: Option<ScheduleSync>,
+    ) -> Result<Next<AdmitOutcome>, AutoError> {
+        let firing = Firing::skipped(SkippedFiring {
+            firing_id: self.firing_id,
+            automation_id: auto.automation_id,
+            group_id: auto.group_id,
+            revision: auto.revision,
+            spec: &auto.spec,
+            trigger: self.payload.clone(),
+            reason,
+            conditions_checked: checks,
+            now_ms: self.now_ms,
+        });
+        let mut writes = new_firing_rows(&firing)?;
+        let mut deletes = Vec::new();
+        match &self.source {
+            AdmitSource::Manual | AdmitSource::Replay { .. } => {}
+            AdmitSource::Journal { source, .. } => {
+                writes.push((
+                    AUTOMATIONS_KEYSPACE.to_string(),
+                    seen_key(auto.automation_id, source),
+                    ByteView::from(self.now_ms.to_be_bytes().to_vec()),
+                ));
+            }
+            AdmitSource::Schedule => {
+                if let Some(sync) = schedule_sync {
+                    writes.extend(sync.writes);
+                    deletes.extend(sync.deletes);
+                }
+            }
+        }
+        self.step = AdmitStep::Write {
+            firing: Some(Box::new(firing)),
+            outcome: WriteOutcome::Skipped,
+            deletes,
+        };
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 }
 
@@ -274,7 +426,7 @@ impl Operation for AdmitFiringOp {
 
     fn first(&mut self) -> Result<Next<AdmitOutcome>, AutoError> {
         self.step = AdmitStep::Read;
-        let (hour_key, day_key) = self.counter_keys();
+        let (hour_key, day_key) = self.rate_keys.clone();
         let mut reads = vec![
             (AUTOMATIONS_KEYSPACE.to_string(), record_key(self.auto_id)),
             (AUTOMATIONS_KEYSPACE.to_string(), hour_key),
@@ -287,6 +439,9 @@ impl Operation for AdmitFiringOp {
                     AUTOMATIONS_KEYSPACE.to_string(),
                     seen_key(self.auto_id, source),
                 ));
+                if let TriggerPayload::AppletSubmission { applet_id, .. } = &self.payload {
+                    reads.push((APPLETS_KEYSPACE.to_string(), applet_key(*applet_id)));
+                }
             }
             AdmitSource::Replay { event_id } => {
                 reads.push((
@@ -297,6 +452,15 @@ impl Operation for AdmitFiringOp {
                     AUTOMATIONS_KEYSPACE.to_string(),
                     kept_key(self.auto_id, *event_id),
                 ));
+                if let TriggerPayload::AppletSubmission { applet_id, .. } = &self.payload {
+                    reads.push((APPLETS_KEYSPACE.to_string(), applet_key(*applet_id)));
+                }
+            }
+            AdmitSource::Schedule => {
+                reads.push((
+                    AUTOMATIONS_KEYSPACE.to_string(),
+                    schedule_cursor_key(self.auto_id),
+                ));
             }
         }
         Ok(Next::Call(IoCall::Read(reads)))
@@ -306,10 +470,16 @@ impl Operation for AdmitFiringOp {
         match std::mem::replace(&mut self.step, AdmitStep::Read) {
             AdmitStep::Read => {
                 let values = result.values()?;
-                let auto_bytes = values
-                    .first()
-                    .and_then(Option::as_ref)
-                    .ok_or(AutoError::NotFound)?;
+                let Some(auto_bytes) = values.first().and_then(Option::as_ref) else {
+                    if matches!(self.source, AdmitSource::Schedule)
+                        && let Some(cursor_bytes) = values.get(3).and_then(Option::as_deref)
+                    {
+                        let cursor = ScheduleCursor::from_bytes(cursor_bytes)?;
+                        let sync = clear_schedule_rows(self.auto_id, &cursor);
+                        return self.apply_idle_sync(sync, IdleOutcome::Unmatched);
+                    }
+                    return Err(AutoError::NotFound);
+                };
                 let auto = Automation::from_bytes(auto_bytes)?;
                 if let AdmitSource::Replay { .. } = &self.source
                     && let Some(bytes) = values.get(3).and_then(Option::as_ref)
@@ -321,67 +491,123 @@ impl Operation for AdmitFiringOp {
                         firing_key(self.auto_id, existing_id),
                     )])));
                 }
-                if auto.lifecycle != Lifecycle::Active {
-                    return Err(AutoError::Conflict(
-                        "automation must be active to start".into(),
-                    ));
-                }
                 match &self.source {
-                    AdmitSource::Manual => {
-                        if !auto
-                            .spec
-                            .triggers
-                            .iter()
-                            .any(|t| matches!(t, Trigger::Manual { .. }))
+                    AdmitSource::Schedule => {
+                        let stored_cursor = values
+                            .get(3)
+                            .and_then(Option::as_deref)
+                            .map(ScheduleCursor::from_bytes)
+                            .transpose()?;
+                        if auto.lifecycle != Lifecycle::Active || !auto.spec.has_schedules() {
+                            let sync = stored_cursor
+                                .as_ref()
+                                .map(|cursor| clear_schedule_rows(self.auto_id, cursor))
+                                .unwrap_or_default();
+                            return self.apply_idle_sync(sync, IdleOutcome::Unmatched);
+                        }
+                        let Some(cursor) = stored_cursor else {
+                            return Ok(Next::Done(AdmitOutcome::AlreadySeen));
+                        };
+                        let due = schedule_due(&auto.spec, &cursor, self.now_ms);
+                        if due.missed_count > 0
+                            && let (Some(first_ms), Some(last_ms)) =
+                                (due.first_missed_ms, due.last_missed_ms)
                         {
+                            self.payload = TriggerPayload::Schedule { at_ms: last_ms };
+                            let next_cursor = cursor.advance(&auto.spec, last_ms, self.now_ms);
+                            let sync = plan_cursor_transition(
+                                auto.automation_id,
+                                auto.group_id,
+                                Some(&cursor),
+                                next_cursor.as_ref(),
+                            )?;
+                            let reason = missed_reason(due.missed_count, first_ms, last_ms);
+                            return self.write_skipped(&auto, reason, Vec::new(), Some(sync));
+                        }
+                        let Some(slot_ms) = due.live_slot_ms else {
+                            let refreshed = ScheduleCursor::for_spec(
+                                &auto.spec,
+                                Some(&cursor),
+                                CursorMode::Preserve,
+                                self.now_ms,
+                            );
+                            let sync = plan_cursor_transition(
+                                auto.automation_id,
+                                auto.group_id,
+                                Some(&cursor),
+                                refreshed.as_ref(),
+                            )?;
+                            return self.apply_idle_sync(sync, IdleOutcome::AlreadySeen);
+                        };
+                        self.payload = TriggerPayload::Schedule { at_ms: slot_ms };
+                        let next_cursor = cursor.advance(&auto.spec, slot_ms, self.now_ms);
+                        let schedule_sync = plan_cursor_transition(
+                            auto.automation_id,
+                            auto.group_id,
+                            Some(&cursor),
+                            next_cursor.as_ref(),
+                        )?;
+                        return self.evaluate_and_check(auto, values, Some(schedule_sync));
+                    }
+                    AdmitSource::Manual => {
+                        require_active(&auto)?;
+                        if !matches_trigger(&auto, &self.payload, None, None) {
                             return Err(AutoError::Invalid(
                                 "automation has no manual trigger".into(),
                             ));
                         }
                     }
-                    AdmitSource::Journal {
-                        matched_revision,
-                        actor,
-                        ..
-                    } => {
+                    AdmitSource::Journal { actor, .. } => {
+                        require_active(&auto)?;
                         if values.get(3).and_then(Option::as_ref).is_some() {
                             return Ok(Next::Done(AdmitOutcome::AlreadySeen));
                         }
-                        if auto.revision != *matched_revision {
-                            match match_payload(&auto, &self.payload, *actor) {
-                                PayloadMatch::Matched => {}
-                                PayloadMatch::Unmatched => {
-                                    return Ok(Next::Done(AdmitOutcome::Unmatched));
-                                }
-                                PayloadMatch::ChainDepth => {
-                                    return Ok(Next::Done(AdmitOutcome::ChainDepth));
-                                }
-                            }
+                        let applet = values
+                            .get(4)
+                            .and_then(Option::as_deref)
+                            .map(Applet::from_bytes)
+                            .transpose()?;
+                        if !matches_trigger(&auto, &self.payload, *actor, applet.as_ref()) {
+                            return Ok(Next::Done(AdmitOutcome::Unmatched));
+                        }
+                        if is_outside_submission(&self.payload, applet.as_ref())
+                            && !auto.spec.scope.allow_outside_input
+                        {
+                            return self.write_skipped(
+                                &auto,
+                                "Outside input from public or guest applets is not approved on this automation.".into(),
+                                Vec::new(),
+                                None,
+                            );
                         }
                     }
                     AdmitSource::Replay { .. } => {
-                        if values.get(4).and_then(Option::as_ref).is_none() {
-                            return Err(AutoError::NotFound);
+                        require_active(&auto)?;
+                        let kept_bytes = values
+                            .get(4)
+                            .and_then(Option::as_deref)
+                            .ok_or(AutoError::NotFound)?;
+                        let kept = KeptEvent::from_bytes(kept_bytes)?;
+                        self.payload = kept.payload;
+                        let applet = values
+                            .get(5)
+                            .and_then(Option::as_deref)
+                            .map(Applet::from_bytes)
+                            .transpose()?;
+                        if !matches_trigger(&auto, &self.payload, kept.event.actor, applet.as_ref())
+                        {
+                            return Ok(Next::Done(AdmitOutcome::Unmatched));
+                        }
+                        if is_outside_submission(&self.payload, applet.as_ref())
+                            && !auto.spec.scope.allow_outside_input
+                        {
+                            return Err(AutoError::Conflict(
+                                "outside input from public or guest applets is not approved on this automation".into(),
+                            ));
                         }
                     }
                 }
-                let (hour_key, day_key) = self.counter_keys();
-                let limits = &auto.spec.scope.limits;
-                let hour_next =
-                    count_u64(values.get(1).and_then(Option::as_deref)).saturating_add(1);
-                let day_next =
-                    count_u64(values.get(2).and_then(Option::as_deref)).saturating_add(1);
-                if hour_next > u64::from(limits.per_hour) || day_next > u64::from(limits.per_day) {
-                    return Err(AutoError::Limited(
-                        "automation rate or byte cap reached".into(),
-                    ));
-                }
-                self.step = AdmitStep::Active {
-                    auto: Box::new(auto),
-                    counters: vec![(hour_key, hour_next), (day_key, day_next)],
-                    active_count: 0,
-                };
-                Ok(Next::Call(active_page(None)))
+                self.evaluate_and_check(auto, values, None)
             }
             AdmitStep::LoadExisting => {
                 let bytes = result.value()?.ok_or(AutoError::NotFound)?;
@@ -391,6 +617,8 @@ impl Operation for AdmitFiringOp {
             AdmitStep::Active {
                 auto,
                 counters,
+                mut checks,
+                schedule_sync,
                 mut active_count,
             } => {
                 let (rows, next) = result.page()?;
@@ -403,13 +631,32 @@ impl Operation for AdmitFiringOp {
                     self.step = AdmitStep::Active {
                         auto,
                         counters,
+                        checks,
+                        schedule_sync,
                         active_count,
                     };
                     return Ok(Next::Call(active_page(Some(after))));
                 }
-                if active_count >= auto.spec.scope.limits.max_active_firings {
-                    return Err(AutoError::Limited(
-                        "max_active_firings limit reached".into(),
+                let active_cap = auto.spec.scope.limits.active_firings();
+                if active_count >= active_cap {
+                    if matches!(self.source, AdmitSource::Schedule) {
+                        let text = if active_cap == 1 {
+                            "Only one run at a time".into()
+                        } else {
+                            format!("At most {active_cap} runs at a time")
+                        };
+                        let why = if active_cap == 1 {
+                            "A run is still going.".into()
+                        } else {
+                            format!("{active_count} runs are still going.")
+                        };
+                        let reason = format!("{text}. {why}");
+                        checks.push(limit_check(ConditionCheckKind::ActiveLimit, text, why));
+                        return self.write_skipped(&auto, reason, checks, schedule_sync);
+                    }
+                    return Err(AutoError::limited(
+                        "max_active_firings limit reached",
+                        ACTIVE_RETRY_SECONDS,
                     ));
                 }
                 let firing = Firing::new(
@@ -420,7 +667,8 @@ impl Operation for AdmitFiringOp {
                     &auto.spec,
                     self.payload.clone(),
                     self.now_ms,
-                );
+                )
+                .with_checks(checks);
                 let mut writes = new_firing_rows(&firing)?;
                 for (key, next_val) in counters {
                     writes.push((
@@ -429,7 +677,7 @@ impl Operation for AdmitFiringOp {
                         Value::from(next_val.to_be_bytes().to_vec()),
                     ));
                 }
-                let mut drop_kept = None;
+                let mut deletes = Vec::new();
                 match &self.source {
                     AdmitSource::Manual => {}
                     AdmitSource::Journal { source, .. } => {
@@ -445,34 +693,120 @@ impl Operation for AdmitFiringOp {
                             replay_key(auto.automation_id, *event_id),
                             replay_value(firing.firing_id, self.now_ms),
                         ));
-                        drop_kept = Some(kept_key(auto.automation_id, *event_id));
+                        deletes.push((
+                            AUTOMATIONS_KEYSPACE.to_string(),
+                            kept_key(auto.automation_id, *event_id),
+                        ));
+                    }
+                    AdmitSource::Schedule => {
+                        if let Some(sync) = schedule_sync {
+                            writes.extend(sync.writes);
+                            deletes.extend(sync.deletes);
+                        }
                     }
                 }
                 self.step = AdmitStep::Write {
-                    firing: Box::new(firing),
-                    drop_kept,
+                    firing: Some(Box::new(firing)),
+                    outcome: WriteOutcome::Created,
+                    deletes,
                 };
                 Ok(Next::Call(IoCall::Write(writes)))
             }
-            AdmitStep::Write { firing, drop_kept } => {
+            AdmitStep::Write {
+                firing,
+                outcome,
+                deletes,
+            } => {
                 result.done()?;
-                if let Some(key) = drop_kept {
-                    self.step = AdmitStep::DropKept(firing);
-                    return Ok(Next::Call(IoCall::Delete(vec![(
-                        AUTOMATIONS_KEYSPACE.to_string(),
-                        key,
-                    )])));
+                if !deletes.is_empty() {
+                    self.step = AdmitStep::DropRows { firing, outcome };
+                    return Ok(Next::Call(IoCall::Delete(deletes)));
                 }
-                Ok(Next::Done(AdmitOutcome::Created(*firing)))
+                Self::finish_write(firing, outcome)
             }
-            AdmitStep::DropKept(firing) => {
+            AdmitStep::DropRows { firing, outcome } => {
                 result.done()?;
-                Ok(Next::Done(AdmitOutcome::Created(*firing)))
+                Self::finish_write(firing, outcome)
             }
         }
     }
 
     fn expected_error(error: &AutoError) -> bool {
         !matches!(error, AutoError::Storage(_))
+    }
+}
+
+impl AdmitFiringOp {
+    fn evaluate_and_check(
+        &mut self,
+        auto: Automation,
+        values: Vec<Option<Value>>,
+        schedule_sync: Option<ScheduleSync>,
+    ) -> Result<Next<AdmitOutcome>, AutoError> {
+        let evaluation = evaluate_conditions(&auto.spec.conditions, self.now_ms, &self.payload);
+        if !evaluation.ok {
+            let reason = evaluation
+                .reason
+                .unwrap_or_else(|| "Conditions were not met.".into());
+            return self.write_skipped(&auto, reason, evaluation.checked, schedule_sync);
+        }
+        if matches!(self.payload, TriggerPayload::RunFinished { .. })
+            && self.payload.chain_depth() >= auto.spec.scope.limits.chain_depth()
+        {
+            return Ok(Next::Done(AdmitOutcome::ChainDepth));
+        }
+        let (hour_key, day_key) = self.rate_keys.clone();
+        let limits = &auto.spec.scope.limits;
+        let hour_cap = limits.hour_limit();
+        let day_cap = limits.day_limit();
+        let hour_count = count_u64(values.get(1).and_then(Option::as_deref));
+        let day_count = count_u64(values.get(2).and_then(Option::as_deref));
+        let hour_next = hour_count.saturating_add(1);
+        let day_next = day_count.saturating_add(1);
+        let over_hour = hour_next > u64::from(hour_cap);
+        let over_day = day_next > u64::from(day_cap);
+        if over_hour || over_day {
+            if matches!(self.source, AdmitSource::Schedule) {
+                let (text, why) = if over_hour {
+                    (
+                        format!("At most {hour_cap} starts per hour"),
+                        format!("{hour_count} starts in this hour already."),
+                    )
+                } else {
+                    (
+                        format!("At most {day_cap} starts per day"),
+                        format!("{day_count} starts today already."),
+                    )
+                };
+                let mut checks = evaluation.checked;
+                let reason = format!("{text}. {why}");
+                checks.push(limit_check(ConditionCheckKind::Starts, text, why));
+                return self.write_skipped(&auto, reason, checks, schedule_sync);
+            }
+            let mut retry_after = 1u64;
+            if over_hour {
+                retry_after = retry_after.max(pinned_retry_after(
+                    Window::Hour,
+                    self.window_ms,
+                    self.now_ms,
+                ));
+            }
+            if over_day {
+                retry_after =
+                    retry_after.max(pinned_retry_after(Window::Day, self.window_ms, self.now_ms));
+            }
+            return Err(AutoError::limited(
+                "automation rate or byte cap reached",
+                retry_after,
+            ));
+        }
+        self.step = AdmitStep::Active {
+            auto: Box::new(auto),
+            counters: vec![(hour_key, hour_next), (day_key, day_next)],
+            checks: evaluation.checked,
+            schedule_sync,
+            active_count: 0,
+        };
+        Ok(Next::Call(active_page(None)))
     }
 }

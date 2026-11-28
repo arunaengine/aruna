@@ -269,7 +269,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-coordinator"
-version = "3.0.0-alpha.213"
+version = "3.0.0-alpha.214"
 dependencies = [
  "aruna-workflow-contract",
  "executor",
@@ -294,7 +294,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-workflow-contract"
-version = "3.0.0-alpha.213"
+version = "3.0.0-alpha.214"
 dependencies = [
  "serde",
  "serde_json",

@@ -417,6 +417,7 @@ mod tests {
             created_by: UserId::nil(realm),
             created_at_ms: 0,
             revision: 1,
+            automations: Vec::new(),
         }
     }
 

@@ -529,7 +529,7 @@ pub(crate) fn cancel_reply_outcome(
 
 fn next_work(firing: &Firing, can_run: bool, used_runs: usize) -> Option<(usize, StageWork)> {
     let slots =
-        (firing.spec.scope.limits.max_concurrent_workflows as usize).saturating_sub(used_runs);
+        (firing.spec.scope.limits.concurrent_workflows() as usize).saturating_sub(used_runs);
     if can_run && let Some(&idx) = firing.ready_runs(slots).first() {
         return Some((idx, StageWork::Run(idx)));
     }

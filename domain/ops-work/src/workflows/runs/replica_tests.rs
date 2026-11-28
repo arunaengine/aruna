@@ -354,6 +354,7 @@ async fn chunks_large_replicas() {
         created_by: remote.created_by,
         created_at_ms: 1,
         updated_at_ms: 1,
+        automation_id: None,
     };
     let source_files = WorkflowFiles {
         files: vec![StoredFile {

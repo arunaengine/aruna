@@ -4,7 +4,9 @@
 
 use std::collections::BTreeSet;
 
-use aruna_core::applet::record::{SubmissionReceipt, submission_key};
+use aruna_core::applet::record::{
+    Applet, Lifecycle as AppletLifecycle, SubmissionReceipt, applet_key, submission_key,
+};
 use aruna_core::automation::firing::TriggerPayload;
 use aruna_core::automation::glob::glob_match;
 use aruna_core::automation::keys::{kept_key, seen_key};
@@ -12,6 +14,8 @@ use aruna_core::automation::record::{
     Automation, KeptEvent, Lifecycle, PauseReason, RunStatus, Trigger,
 };
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::errors::StagingSourceError;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     APPLETS_KEYSPACE, AUTOMATIONS_KEYSPACE, EVENT_JOURNAL_KEYSPACE, WORKFLOW_RUN_KEYSPACE,
@@ -22,11 +26,15 @@ use aruna_core::structs::execution::workflow_run::{RunState, WorkflowRunRecord, 
 use aruna_core::structs::identity::features::{Feature, resolve};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{GroupId, Key};
+use aruna_ops_data::s3::object::head::{
+    HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
+};
 use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 use byteview::ByteView;
 use ulid::Ulid;
 
 use super::change::{AutoChange, WriteAutoOperation};
+use super::copy_stage::source_length;
 use super::start::{AdmitFiringOp, AdmitOutcome, parse_upload};
 use super::{AutoError, autos_page};
 use crate::plugins::journal::{JournalRow, journal_page};
@@ -34,40 +42,86 @@ use crate::plugins::rows::StoreError;
 
 const MATCH_BATCH: usize = 128;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Continuation state carried across worker turns within one bounded journal sweep.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MatchCursor {
+    pub after: Vec<u8>,
+    pub end_key: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MatchReport {
     pub scanned: usize,
     pub fired: usize,
+    pub skipped: usize,
     pub kept: usize,
     pub paused: usize,
+    pub deferred: usize,
+    pub next_cursor: Option<MatchCursor>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowDisposition {
+    Drop,
+    Retain,
+}
+
+#[derive(Debug, PartialEq)]
+struct PendingMatch {
+    automation_index: usize,
+    event: SourceEvent,
 }
 
 #[derive(Debug, PartialEq)]
 enum MatchStep {
+    LastKey,
     Config,
     Autos,
     Journal,
-    Seen(usize, Box<SourceEvent>),
-    Enrich(usize, Box<SourceEvent>),
-    PauseChain(usize, Box<SourceEvent>),
-    Admit(usize, Box<SourceEvent>),
+    Seen {
+        automation_index: usize,
+        event: Box<SourceEvent>,
+    },
+    EnrichUpload {
+        automation_index: usize,
+        event: Box<SourceEvent>,
+        bucket: String,
+        version_id: Ulid,
+        key: String,
+    },
+    Enrich {
+        automation_index: usize,
+        event: Box<SourceEvent>,
+    },
+    PauseChain {
+        automation_index: usize,
+        event: Box<SourceEvent>,
+        payload: Box<TriggerPayload>,
+    },
+    Admit {
+        automation_index: usize,
+        event: Box<SourceEvent>,
+        payload: Box<TriggerPayload>,
+    },
     Write,
     DropPending,
 }
 
 /// Scans `EVENT_JOURNAL_KEYSPACE` `AUTO_PENDING_ROW` rows and fires or keeps matched events while
-/// enforcing self-loop guards, node/group feature switches, chain depth and atomic limits.
+/// enforcing self-loop guards, node/group feature switches, conditions, chain depth and limits.
 #[derive(Debug, PartialEq)]
 pub struct MatchEventsOperation {
     realm_id: RealmId,
     disabled_features: BTreeSet<Feature>,
+    after: Option<Vec<u8>>,
+    end_key: Option<Vec<u8>>,
     ids: IdMint,
     now_ms: u64,
     config: Option<RealmConfigDocument>,
     autos: Vec<Automation>,
     rows: Vec<JournalRow>,
-    current_key: Option<Vec<u8>>,
-    matches: Vec<(usize, SourceEvent)>,
+    current_row: Option<(Vec<u8>, RowDisposition)>,
+    matches: Vec<PendingMatch>,
     report: MatchReport,
     step: MatchStep,
 }
@@ -77,15 +131,34 @@ impl MatchEventsOperation {
         Self {
             realm_id,
             disabled_features: BTreeSet::new(),
+            after: None,
+            end_key: None,
             ids: IdMint::default(),
             now_ms: 0,
             config: None,
             autos: Vec::new(),
             rows: Vec::new(),
-            current_key: None,
+            current_row: None,
             matches: Vec::new(),
             report: MatchReport::default(),
-            step: MatchStep::Config,
+            step: MatchStep::LastKey,
+        }
+    }
+
+    pub fn with_cursor(mut self, cursor: Option<MatchCursor>) -> Self {
+        if let Some(cursor) = cursor {
+            self.after = Some(cursor.after);
+            self.end_key = Some(cursor.end_key);
+        } else {
+            self.after = None;
+            self.end_key = None;
+        }
+        self
+    }
+
+    fn retain_current(&mut self) {
+        if let Some((_, disposition)) = &mut self.current_row {
+            *disposition = RowDisposition::Retain;
         }
     }
 
@@ -95,10 +168,10 @@ impl MatchEventsOperation {
     }
 
     fn feature_on(&self, feature: Feature, group_id: GroupId) -> bool {
-        let Some(cfg) = &self.config else {
+        let Some(config) = &self.config else {
             return false;
         };
-        resolve(cfg, &self.disabled_features, feature, Some(&group_id)).on
+        resolve(config, &self.disabled_features, feature, Some(&group_id)).on
     }
 
     fn coarse_matches(auto: &Automation, event: &SourceEvent) -> bool {
@@ -116,13 +189,13 @@ impl MatchEventsOperation {
                 let file = key.rsplit('/').next().unwrap_or(&key);
                 auto.spec.triggers.iter().any(|trigger| match trigger {
                     Trigger::DataUploaded {
-                        bucket: tb,
+                        bucket: trigger_bucket,
                         prefix,
                         pattern,
                     } => {
-                        bucket == *tb
+                        bucket == *trigger_bucket
                             && key.starts_with(prefix)
-                            && pattern.as_deref().is_none_or(|p| glob_match(p, file))
+                            && pattern.as_deref().is_none_or(|glob| glob_match(glob, file))
                     }
                     _ => false,
                 })
@@ -131,49 +204,75 @@ impl MatchEventsOperation {
                 let Ok(applet_id) = Ulid::from_string(&event.resource) else {
                     return false;
                 };
-                auto.spec.triggers.iter().any(
-                    |t| matches!(t, Trigger::AppletSubmission { applet_id: a } if *a == applet_id),
-                )
+                auto.spec.triggers.iter().any(|trigger| match trigger {
+                    Trigger::AppletSubmission {
+                        applet_id: Some(target_id),
+                    } => *target_id == applet_id,
+                    Trigger::AppletSubmission { applet_id: None } => true,
+                    _ => false,
+                })
             }
             SourceKind::RunFinished => {
-                let Ok(wf_id) = Ulid::from_string(&event.resource) else {
+                let Ok(workflow_id) = Ulid::from_string(&event.resource) else {
                     return false;
                 };
-                auto.spec.triggers.iter().any(
-                    |t| matches!(t, Trigger::RunFinished { workflow_id: w, .. } if *w == wf_id),
-                )
+                auto.spec.triggers.iter().any(|trigger| {
+                    matches!(
+                        trigger,
+                        Trigger::RunFinished {
+                            workflow_id: target_workflow,
+                            ..
+                        } if *target_workflow == workflow_id
+                    )
+                })
             }
             _ => false,
         }
     }
 
     fn next_match(&mut self) -> Result<Next<MatchReport>, AutoError> {
-        if let Some((idx, event)) = self.matches.pop() {
-            let key = seen_key(self.autos[idx].automation_id, &event.source);
-            self.step = MatchStep::Seen(idx, Box::new(event));
+        if let Some(pending) = self.matches.pop() {
+            let key = seen_key(
+                self.autos[pending.automation_index].automation_id,
+                &pending.event.source,
+            );
+            self.step = MatchStep::Seen {
+                automation_index: pending.automation_index,
+                event: Box::new(pending.event),
+            };
             return Ok(Next::Call(IoCall::Read(vec![(
                 AUTOMATIONS_KEYSPACE.to_string(),
                 key,
             )])));
         }
-        if let Some(row_key) = self.current_key.take() {
-            self.step = MatchStep::DropPending;
-            return Ok(Next::Call(IoCall::Delete(vec![(
-                EVENT_JOURNAL_KEYSPACE.to_string(),
-                Key::from(row_key),
-            )])));
+        if let Some((row_key, disposition)) = self.current_row.take() {
+            match disposition {
+                RowDisposition::Drop => {
+                    self.step = MatchStep::DropPending;
+                    return Ok(Next::Call(IoCall::Delete(vec![(
+                        EVENT_JOURNAL_KEYSPACE.to_string(),
+                        Key::from(row_key),
+                    )])));
+                }
+                RowDisposition::Retain => {
+                    self.report.deferred += 1;
+                }
+            }
         }
         self.next_row()
     }
 
     fn next_row(&mut self) -> Result<Next<MatchReport>, AutoError> {
         let Some((row_key, event)) = self.rows.pop() else {
-            return Ok(Next::Done(self.report));
+            return Ok(Next::Done(std::mem::take(&mut self.report)));
         };
-        self.current_key = Some(row_key);
-        for idx in 0..self.autos.len() {
-            if Self::coarse_matches(&self.autos[idx], &event) {
-                self.matches.push((idx, event.clone()));
+        self.current_row = Some((row_key, RowDisposition::Drop));
+        for automation_index in 0..self.autos.len() {
+            if Self::coarse_matches(&self.autos[automation_index], &event) {
+                self.matches.push(PendingMatch {
+                    automation_index,
+                    event: event.clone(),
+                });
             }
         }
         self.matches.reverse();
@@ -182,11 +281,12 @@ impl MatchEventsOperation {
 
     fn write_kept(
         &mut self,
-        idx: usize,
+        automation_index: usize,
         event: SourceEvent,
+        payload: TriggerPayload,
         reason: &str,
     ) -> Result<Next<MatchReport>, AutoError> {
-        let auto_id = self.autos[idx].automation_id;
+        let auto_id = self.autos[automation_index].automation_id;
         let event_id = self.ids.mint(self.now_ms);
         let seen = seen_key(auto_id, &event.source);
         let kept = KeptEvent {
@@ -195,6 +295,7 @@ impl MatchEventsOperation {
             event,
             reason: reason.to_string(),
             kept_at_ms: self.now_ms,
+            payload,
         };
         let rows = vec![
             (
@@ -215,10 +316,11 @@ impl MatchEventsOperation {
 
     fn pause_chain_depth(
         &mut self,
-        idx: usize,
+        automation_index: usize,
         event: SourceEvent,
+        payload: TriggerPayload,
     ) -> Result<Next<MatchReport>, AutoError> {
-        let auto = &self.autos[idx];
+        let auto = &self.autos[automation_index];
         if auto.lifecycle == Lifecycle::Active {
             let actor = auto.approved_by.unwrap_or(auto.created_by);
             let pause = WriteAutoOperation::node(
@@ -227,45 +329,52 @@ impl MatchEventsOperation {
                 actor,
                 self.realm_id,
             );
-            self.step = MatchStep::PauseChain(idx, Box::new(event));
+            self.step = MatchStep::PauseChain {
+                automation_index,
+                event: Box::new(event),
+                payload: Box::new(payload),
+            };
             return Ok(Next::Call(IoCall::retry(
                 pause,
                 &auto.automation_id.to_bytes(),
             )));
         }
-        self.write_kept(idx, event, "chain_depth")
+        self.write_kept(automation_index, event, payload, "chain_depth")
     }
 
     fn decide(
         &mut self,
-        idx: usize,
+        automation_index: usize,
         event: SourceEvent,
         payload: TriggerPayload,
     ) -> Result<Next<MatchReport>, AutoError> {
-        let auto = &self.autos[idx];
+        let auto = &self.autos[automation_index];
         if auto.lifecycle != Lifecycle::Active {
-            return self.write_kept(idx, event, auto.lifecycle.as_str());
+            return self.write_kept(automation_index, event, payload, auto.lifecycle.as_str());
         }
         if !self.feature_on(Feature::Automations, auto.group_id) {
-            return self.write_kept(idx, event, "feature_disabled");
+            return self.write_kept(automation_index, event, payload, "feature_disabled");
         }
         if matches!(payload, TriggerPayload::AppletSubmission { .. })
             && !self.feature_on(Feature::Applets, auto.group_id)
         {
-            return self.write_kept(idx, event, "applets_disabled");
+            return self.write_kept(automation_index, event, payload, "applets_disabled");
         }
         let auto_id = auto.automation_id;
-        let matched_revision = auto.revision;
         let firing_id = self.ids.mint(self.now_ms);
         let admit = AdmitFiringOp::journal(
             auto_id,
             firing_id,
             event.source.clone(),
-            matched_revision,
             event.actor,
-            payload,
+            payload.clone(),
+            self.now_ms,
         );
-        self.step = MatchStep::Admit(idx, Box::new(event));
+        self.step = MatchStep::Admit {
+            automation_index,
+            event: Box::new(event),
+            payload: Box::new(payload),
+        };
         Ok(Next::Call(IoCall::retry(admit, &auto_id.to_bytes())))
     }
 }
@@ -283,14 +392,66 @@ impl Operation for MatchEventsOperation {
     }
 
     fn first(&mut self) -> Result<Next<MatchReport>, AutoError> {
-        let cfg = GetConfigOperation::new(self.realm_id);
-        Ok(Next::Call(IoCall::child(cfg)))
+        if self.end_key.is_some() {
+            self.step = MatchStep::Journal;
+            return Ok(Next::Call(IoCall::child(journal_page(
+                AUTO_PENDING_ROW,
+                self.after.clone(),
+                MATCH_BATCH,
+            ))));
+        }
+        self.step = MatchStep::LastKey;
+        Ok(Next::Call(IoCall::from(Effect::Storage(
+            StorageEffect::Last {
+                key_space: EVENT_JOURNAL_KEYSPACE.to_string(),
+                prefix: Some(Key::from(vec![AUTO_PENDING_ROW])),
+                txn_id: None,
+            },
+        ))))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<MatchReport>, AutoError> {
         match std::mem::replace(&mut self.step, MatchStep::Write) {
+            MatchStep::LastKey => {
+                let (rows, _) = result.page()?;
+                let Some((last_key, _)) = rows.into_iter().next() else {
+                    return Ok(Next::Done(std::mem::take(&mut self.report)));
+                };
+                self.end_key = Some(last_key.to_vec());
+                self.step = MatchStep::Journal;
+                Ok(Next::Call(IoCall::child(journal_page(
+                    AUTO_PENDING_ROW,
+                    self.after.clone(),
+                    MATCH_BATCH,
+                ))))
+            }
+            MatchStep::Journal => {
+                let (mut rows, next) = result
+                    .child::<(Vec<JournalRow>, Option<Vec<u8>>), StoreError>()?
+                    .map_err(|error| AutoError::Storage(error.detail()))?;
+                self.report.next_cursor = next.and_then(|after| {
+                    let end_key = self.end_key.as_ref()?;
+                    (after.as_slice() < end_key.as_slice()).then(|| MatchCursor {
+                        after,
+                        end_key: end_key.clone(),
+                    })
+                });
+                self.report.scanned = rows.len();
+                if rows.is_empty() {
+                    return Ok(Next::Done(std::mem::take(&mut self.report)));
+                }
+                rows.reverse();
+                self.rows = rows;
+                self.step = MatchStep::Config;
+                Ok(Next::Call(IoCall::child(GetConfigOperation::new(
+                    self.realm_id,
+                ))))
+            }
             MatchStep::Config => {
-                self.config = result.child::<RealmConfigDocument, GetConfigError>()?.ok();
+                let config = result
+                    .child::<RealmConfigDocument, GetConfigError>()?
+                    .map_err(|error| AutoError::Storage(error.to_string()))?;
+                self.config = Some(config);
                 self.step = MatchStep::Autos;
                 Ok(Next::Call(autos_page(None)))
             }
@@ -306,23 +467,12 @@ impl Operation for MatchEventsOperation {
                     self.step = MatchStep::Autos;
                     return Ok(Next::Call(autos_page(Some(after))));
                 }
-                self.step = MatchStep::Journal;
-                Ok(Next::Call(IoCall::child(journal_page(
-                    AUTO_PENDING_ROW,
-                    None,
-                    MATCH_BATCH,
-                ))))
-            }
-            MatchStep::Journal => {
-                let (mut rows, _) = result
-                    .child::<(Vec<JournalRow>, Option<Vec<u8>>), StoreError>()?
-                    .map_err(|err| AutoError::Storage(err.detail()))?;
-                self.report.scanned = rows.len();
-                rows.reverse();
-                self.rows = rows;
                 self.next_row()
             }
-            MatchStep::Seen(idx, event) => {
+            MatchStep::Seen {
+                automation_index,
+                event,
+            } => {
                 if result.value()?.is_some() {
                     return self.next_match();
                 }
@@ -331,33 +481,47 @@ impl Operation for MatchEventsOperation {
                         let Some((bucket, version_id, key)) = parse_upload(&event) else {
                             return self.next_match();
                         };
-                        let payload = TriggerPayload::DataUploaded {
+                        let head = HeadObjectOperation::new(HeadObjectInput {
+                            bucket: bucket.clone(),
+                            key: key.clone(),
+                            version_id: Some(version_id),
+                        });
+                        self.step = MatchStep::EnrichUpload {
+                            automation_index,
+                            event,
                             bucket,
-                            key,
                             version_id,
-                            path: event.path.clone(),
-                            size_bytes: 0,
+                            key,
                         };
-                        self.decide(idx, *event, payload)
+                        Ok(Next::Call(IoCall::child(head)))
                     }
                     SourceKind::AppletSubmission => {
-                        let (Ok(applet_id), Ok(ver)) = (
+                        let (Ok(applet_id), Ok(version_id)) = (
                             Ulid::from_string(&event.resource),
                             Ulid::from_string(&event.revision),
                         ) else {
                             return self.next_match();
                         };
-                        self.step = MatchStep::Enrich(idx, event);
-                        Ok(Next::Call(IoCall::Read(vec![(
-                            APPLETS_KEYSPACE.to_string(),
-                            submission_key(applet_id, ver),
-                        )])))
+                        self.step = MatchStep::Enrich {
+                            automation_index,
+                            event,
+                        };
+                        Ok(Next::Call(IoCall::Read(vec![
+                            (
+                                APPLETS_KEYSPACE.to_string(),
+                                submission_key(applet_id, version_id),
+                            ),
+                            (APPLETS_KEYSPACE.to_string(), applet_key(applet_id)),
+                        ])))
                     }
                     SourceKind::RunFinished => {
                         let Ok(run_id) = Ulid::from_string(&event.revision) else {
                             return self.next_match();
                         };
-                        self.step = MatchStep::Enrich(idx, event);
+                        self.step = MatchStep::Enrich {
+                            automation_index,
+                            event,
+                        };
                         Ok(Next::Call(IoCall::Read(vec![(
                             WORKFLOW_RUN_KEYSPACE.to_string(),
                             run_key(run_id),
@@ -366,112 +530,188 @@ impl Operation for MatchEventsOperation {
                     _ => self.next_match(),
                 }
             }
-            MatchStep::Enrich(idx, event) => {
-                let Some(bytes) = result.value()? else {
-                    return self.next_match();
+            MatchStep::EnrichUpload {
+                automation_index,
+                event,
+                bucket,
+                version_id,
+                key,
+            } => {
+                let size_bytes = match result.child::<HeadObjectResult, HeadObjectError>()? {
+                    Ok(head) => source_length(&head),
+                    Err(
+                        HeadObjectError::NoSuchKey
+                        | HeadObjectError::NoSuchVersion
+                        | HeadObjectError::DeleteMarker
+                        | HeadObjectError::StagingSourceError(
+                            StagingSourceError::NotFound | StagingSourceError::AccessDenied,
+                        ),
+                    ) => None,
+                    Err(_) => {
+                        self.retain_current();
+                        return self.next_match();
+                    }
                 };
-                match event.kind {
-                    SourceKind::AppletSubmission => {
-                        let rec = SubmissionReceipt::from_bytes(&bytes)?;
-                        let payload = TriggerPayload::AppletSubmission {
-                            applet_id: rec.applet_id,
-                            version_id: rec.version_id,
-                            pseudonym: rec.pseudonym,
-                            guest: rec.guest,
-                            outside_input: rec.outside_input || rec.guest,
-                            bucket: rec.bucket,
-                            key: rec.key,
-                            files: rec.files,
-                        };
-                        self.decide(idx, *event, payload)
-                    }
-                    SourceKind::RunFinished => {
-                        let rec = WorkflowRunRecord::from_bytes(&bytes)?;
-                        let auto = &self.autos[idx];
-                        if rec
-                            .automation
-                            .as_ref()
-                            .is_some_and(|o| o.automation_id == auto.automation_id)
-                        {
-                            return self.next_match();
-                        }
-                        let status = match rec.state {
-                            RunState::Succeeded => RunStatus::Succeeded,
-                            RunState::Failed => RunStatus::Failed,
-                            _ => return self.next_match(),
-                        };
-                        let rec_applet = rec
-                            .automation
-                            .as_ref()
-                            .and_then(|o| o.applet_id)
-                            .or_else(|| rec.applet.as_ref().map(|a| a.applet_id));
-                        let matched = auto.spec.triggers.iter().any(|t| match t {
-                            Trigger::RunFinished {
-                                workflow_id,
-                                status: want_status,
-                                applet_id: want_applet,
-                            } => {
-                                *workflow_id == rec.workflow_id
-                                    && want_status.is_none_or(|s| s == status)
-                                    && want_applet.is_none_or(|a| Some(a) == rec_applet)
-                            }
-                            _ => false,
-                        });
-                        if !matched {
-                            return self.next_match();
-                        }
-                        let depth = rec
-                            .automation
-                            .as_ref()
-                            .map_or(0, |o| o.depth)
-                            .saturating_add(1);
-                        if depth >= auto.spec.scope.limits.max_chain_depth {
-                            return self.pause_chain_depth(idx, *event);
-                        }
-                        let outside_input =
-                            rec.automation.as_ref().is_some_and(|o| o.outside_input)
-                                || rec.applet.as_ref().is_some_and(|a| a.outside_input);
-                        let payload = TriggerPayload::RunFinished {
-                            workflow_id: rec.workflow_id,
-                            run_id: rec.run_id,
-                            status,
-                            outputs: rec.outputs,
-                            applet_id: rec_applet,
-                            outside_input,
-                            depth,
-                        };
-                        self.decide(idx, *event, payload)
-                    }
-                    _ => self.next_match(),
-                }
+                let payload = TriggerPayload::DataUploaded {
+                    bucket,
+                    key,
+                    version_id,
+                    path: event.path.clone(),
+                    size_bytes,
+                };
+                self.decide(automation_index, *event, payload)
             }
-            MatchStep::PauseChain(idx, event) => {
+            MatchStep::Enrich {
+                automation_index,
+                event,
+            } => match event.kind {
+                SourceKind::AppletSubmission => {
+                    let values = result.values()?;
+                    let Some(bytes) = values.first().and_then(Option::as_ref) else {
+                        return self.next_match();
+                    };
+                    let receipt = SubmissionReceipt::from_bytes(bytes)?;
+                    let auto = &self.autos[automation_index];
+                    let explicit = auto.spec.triggers.iter().any(|trigger| {
+                        matches!(
+                            trigger,
+                            Trigger::AppletSubmission { applet_id: Some(target_id) }
+                                if *target_id == receipt.applet_id
+                        )
+                    });
+                    if !explicit {
+                        let linked = values
+                            .get(1)
+                            .and_then(Option::as_deref)
+                            .and_then(|raw| Applet::from_bytes(raw).ok())
+                            .is_some_and(|applet| {
+                                applet.lifecycle != AppletLifecycle::TakenDown
+                                    && applet.group_id == auto.group_id
+                                    && applet.automations.contains(&auto.automation_id)
+                            });
+                        if !linked {
+                            return self.next_match();
+                        }
+                    }
+                    let payload = TriggerPayload::AppletSubmission {
+                        applet_id: receipt.applet_id,
+                        version_id: receipt.version_id,
+                        pseudonym: receipt.pseudonym,
+                        guest: receipt.guest,
+                        outside_input: receipt.outside_input || receipt.guest,
+                        bucket: receipt.bucket,
+                        key: receipt.key,
+                        files: receipt.files,
+                    };
+                    self.decide(automation_index, *event, payload)
+                }
+                SourceKind::RunFinished => {
+                    let Some(bytes) = result.value()? else {
+                        return self.next_match();
+                    };
+                    let run = WorkflowRunRecord::from_bytes(&bytes)?;
+                    let auto = &self.autos[automation_index];
+                    if run
+                        .automation
+                        .as_ref()
+                        .is_some_and(|origin| origin.automation_id == auto.automation_id)
+                    {
+                        return self.next_match();
+                    }
+                    let status = match run.state {
+                        RunState::Succeeded => RunStatus::Succeeded,
+                        RunState::Failed => RunStatus::Failed,
+                        _ => return self.next_match(),
+                    };
+                    let run_applet = run
+                        .automation
+                        .as_ref()
+                        .and_then(|origin| origin.applet_id)
+                        .or_else(|| run.applet.as_ref().map(|origin| origin.applet_id));
+                    let matched = auto.spec.triggers.iter().any(|trigger| match trigger {
+                        Trigger::RunFinished {
+                            workflow_id,
+                            status: want_status,
+                            applet_id: want_applet,
+                        } => {
+                            *workflow_id == run.workflow_id
+                                && want_status.is_none_or(|wanted| wanted == status)
+                                && want_applet.is_none_or(|wanted| Some(wanted) == run_applet)
+                        }
+                        _ => false,
+                    });
+                    if !matched {
+                        return self.next_match();
+                    }
+                    let depth = run
+                        .automation
+                        .as_ref()
+                        .map_or(0, |origin| origin.depth)
+                        .saturating_add(1);
+                    let outside_input = run
+                        .automation
+                        .as_ref()
+                        .is_some_and(|origin| origin.outside_input)
+                        || run
+                            .applet
+                            .as_ref()
+                            .is_some_and(|origin| origin.outside_input);
+                    let payload = TriggerPayload::RunFinished {
+                        workflow_id: run.workflow_id,
+                        run_id: run.run_id,
+                        status,
+                        outputs: run.outputs,
+                        applet_id: run_applet,
+                        outside_input,
+                        depth,
+                    };
+                    self.decide(automation_index, *event, payload)
+                }
+                _ => self.next_match(),
+            },
+            MatchStep::PauseChain {
+                automation_index,
+                event,
+                payload,
+            } => {
                 if let Ok(updated) = result.child::<Automation, AutoError>()? {
-                    self.autos[idx] = updated;
+                    self.autos[automation_index] = updated;
                     self.report.paused += 1;
                 }
-                self.write_kept(idx, *event, "chain_depth")
+                self.write_kept(automation_index, *event, *payload, "chain_depth")
             }
-            MatchStep::Admit(idx, event) => match result.child::<AdmitOutcome, AutoError>()? {
+            MatchStep::Admit {
+                automation_index,
+                event,
+                payload,
+            } => match result.child::<AdmitOutcome, AutoError>()? {
                 Ok(AdmitOutcome::Created(_)) => {
                     self.report.fired += 1;
                     self.next_match()
                 }
-                Ok(AdmitOutcome::ChainDepth) => self.pause_chain_depth(idx, *event),
+                Ok(AdmitOutcome::Skipped(_)) => {
+                    self.report.skipped += 1;
+                    self.next_match()
+                }
+                Ok(AdmitOutcome::ChainDepth) => {
+                    self.pause_chain_depth(automation_index, *event, *payload)
+                }
                 Ok(
                     AdmitOutcome::AlreadySeen | AdmitOutcome::Existing(_) | AdmitOutcome::Unmatched,
                 ) => self.next_match(),
-                Err(AutoError::Limited(msg)) => {
-                    let reason = if msg.contains("active") {
+                Err(AutoError::Limited { reason, .. }) => {
+                    let kept_reason = if reason.contains("active") {
                         "max_active_firings"
                     } else {
                         "rate_limited"
                     };
-                    self.write_kept(idx, *event, reason)
+                    self.write_kept(automation_index, *event, *payload, kept_reason)
                 }
-                Err(AutoError::Conflict(_)) => self.write_kept(idx, *event, "paused"),
+                Err(AutoError::Conflict(_)) => {
+                    self.write_kept(automation_index, *event, *payload, "paused")
+                }
                 Err(AutoError::NotFound) => self.next_match(),
-                Err(err) => Err(err),
+                Err(error) => Err(error),
             },
             MatchStep::Write => {
                 result.done()?;
@@ -489,18 +729,14 @@ impl Operation for MatchEventsOperation {
 mod tests {
     use super::*;
     use aruna_core::calls::ChildOutcome;
+    use aruna_core::structs::identity::features::FeatureMode;
     use aruna_core::structs::storage::blob::group_permission_path;
     use aruna_core::user::id::UserId;
 
-    #[test]
-    fn admit_depth_pauses() {
-        let realm = RealmId([9; 32]);
-        let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
-        let group = Ulid::from_bytes([11; 16]);
+    fn sample_auto(realm: RealmId, node: aruna_core::id::NodeId, group: GroupId) -> Automation {
         let owner = UserId::local(Ulid::from_bytes([1; 16]), realm);
-        let auto_id = Ulid::from_bytes([22; 16]);
-        let auto = Automation {
-            automation_id: auto_id,
+        Automation {
+            automation_id: Ulid::from_bytes([22; 16]),
             group_id: group,
             name: "chain".into(),
             description: String::new(),
@@ -517,7 +753,23 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 1,
             revision: 1,
-        };
+            identity_synced_revision: 1,
+            workflow_id: None,
+        }
+    }
+
+    #[test]
+    fn admit_depth_pauses() {
+        let realm = RealmId([9; 32]);
+        let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let group = Ulid::from_bytes([11; 16]);
+        let owner = UserId::local(Ulid::from_bytes([1; 16]), realm);
+        let mut auto = sample_auto(realm, node, group);
+        auto.spec.triggers.push(Trigger::DataUploaded {
+            bucket: "raw".into(),
+            prefix: "in/".into(),
+            pattern: None,
+        });
         let path = group_permission_path(realm, group, node);
         let event = SourceEvent::run_finished(
             (group, path),
@@ -526,26 +778,396 @@ mod tests {
             owner,
             10,
         );
-        let mut op = MatchEventsOperation::new(realm);
-        op.autos.push(auto.clone());
-        op.step = MatchStep::Admit(0, Box::new(event));
-        let next = op
+        let payload = TriggerPayload::RunFinished {
+            workflow_id: Ulid::from_bytes([60; 16]),
+            run_id: Ulid::from_bytes([61; 16]),
+            status: RunStatus::Succeeded,
+            outputs: vec![],
+            applet_id: None,
+            outside_input: false,
+            depth: 3,
+        };
+        let mut operation = MatchEventsOperation::new(realm);
+        operation.autos.push(auto.clone());
+        operation.step = MatchStep::Admit {
+            automation_index: 0,
+            event: Box::new(event),
+            payload: Box::new(payload),
+        };
+        let next = operation
             .next(IoResult::Child(ChildOutcome::new(Ok::<_, AutoError>(
                 AdmitOutcome::ChainDepth,
             ))))
             .unwrap();
         assert!(matches!(next, Next::Call(IoCall::Child(_))));
-        assert!(matches!(op.step, MatchStep::PauseChain(0, _)));
+        assert!(matches!(
+            operation.step,
+            MatchStep::PauseChain {
+                automation_index: 0,
+                ..
+            }
+        ));
         let mut paused = auto;
         paused.lifecycle = Lifecycle::Paused;
         paused.pause_reason = Some(PauseReason::ChainDepth);
-        let write = op
+        let write = operation
             .next(IoResult::Child(ChildOutcome::new(Ok::<_, AutoError>(
                 paused,
             ))))
             .unwrap();
-        assert_eq!(op.report.paused, 1);
-        assert_eq!(op.report.kept, 1);
+        assert_eq!(operation.report.paused, 1);
+        assert_eq!(operation.report.kept, 1);
         assert!(matches!(write, Next::Call(IoCall::Write(rows)) if rows.len() == 2));
+    }
+
+    #[test]
+    fn handles_upload_head() {
+        use std::collections::HashMap;
+
+        use aruna_core::automation::firing::Firing;
+        use aruna_core::errors::StorageError;
+        use aruna_core::managed_copy::ManagedCopyError;
+        use aruna_core::structs::storage::blob::ManagedCopyState;
+        use aruna_core::structs::storage::multipart::MultipartChecksumType;
+
+        let realm = RealmId([9; 32]);
+        let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let group = Ulid::from_bytes([11; 16]);
+        let owner = UserId::local(Ulid::from_bytes([1; 16]), realm);
+        let mut auto = sample_auto(realm, node, group);
+        auto.spec.triggers.push(Trigger::DataUploaded {
+            bucket: "raw".into(),
+            prefix: "in/".into(),
+            pattern: None,
+        });
+        let version_id = Ulid::from_bytes([30; 16]);
+        let event = SourceEvent::data_uploaded(
+            (realm, group, node),
+            ("raw", "in/file.csv"),
+            version_id,
+            Some(owner),
+            10,
+        );
+        let second_version = Ulid::from_bytes([66; 16]);
+        let second_event = SourceEvent::data_uploaded(
+            (realm, group, node),
+            ("raw", "in/second.csv"),
+            second_version,
+            None,
+            11,
+        );
+        let third_version = Ulid::from_bytes([67; 16]);
+        let third_event = SourceEvent::data_uploaded(
+            (realm, group, node),
+            ("raw", "in/third.csv"),
+            third_version,
+            None,
+            12,
+        );
+        let mut config = RealmConfigDocument::default_for_realm(realm, Vec::new());
+        config.features.insert(
+            Feature::Automations,
+            FeatureMode::Scoped {
+                default: true,
+                groups: Default::default(),
+            },
+        );
+        let healthy_head = HeadObjectResult {
+            location: None,
+            metadata: HashMap::new(),
+            source_metadata: None,
+            last_refresh: None,
+            version_created_at: None,
+            version_id: None,
+            resolved_version_id: None,
+            checksum_type: MultipartChecksumType::FullObject,
+            composite_hashes: HashMap::new(),
+            part_count: None,
+            source_policies: Vec::new(),
+            source_binding: None,
+        };
+        let created = |id_byte: u8| {
+            AdmitOutcome::Created(Firing::new(
+                Ulid::from_bytes([id_byte; 16]),
+                auto.automation_id,
+                group,
+                1,
+                &auto.spec,
+                TriggerPayload::Manual {
+                    values_json: "{}".into(),
+                    actor: owner,
+                },
+                10,
+            ))
+        };
+
+        // Empty pending journal short-circuits at LastKey without reading pages or config.
+        let mut empty_op = MatchEventsOperation::new(realm);
+        assert!(matches!(
+            empty_op.first(),
+            Ok(Next::Call(IoCall::Effect(_)))
+        ));
+        assert_eq!(empty_op.step, MatchStep::LastKey);
+        assert_eq!(
+            empty_op
+                .next(IoResult::Page {
+                    rows: Vec::new(),
+                    next: None,
+                })
+                .unwrap(),
+            Next::Done(MatchReport::default())
+        );
+
+        // Transient config errors propagate before any row can be marked feature_disabled.
+        let mut config_op = MatchEventsOperation::new(realm);
+        config_op.first().unwrap();
+        config_op
+            .next(IoResult::Page {
+                rows: vec![(Key::from(vec![AUTO_PENDING_ROW, 1]), Vec::new().into())],
+                next: None,
+            })
+            .unwrap();
+        config_op
+            .next(IoResult::Child(ChildOutcome::new(Ok::<_, StoreError>((
+                vec![(vec![AUTO_PENDING_ROW, 1], event.clone())],
+                None::<Vec<u8>>,
+            )))))
+            .unwrap();
+        let config_error = config_op.next(IoResult::Child(ChildOutcome::new(Err::<
+            RealmConfigDocument,
+            GetConfigError,
+        >(
+            GetConfigError::StorageError(StorageError::CommitFailed),
+        ))));
+        assert!(matches!(config_error, Err(AutoError::Storage(_))));
+
+        // Unavailable uploads stay pending while healthy rows proceed one bounded sweep page.
+        for head_error in [
+            HeadObjectError::ManagedCopyError(ManagedCopyError::NotServeable(
+                ManagedCopyState::UnresolvedDeparted,
+            )),
+            HeadObjectError::StorageError(StorageError::CommitFailed),
+        ] {
+            let mut turn_one = MatchEventsOperation::new(realm);
+            assert!(matches!(
+                turn_one.first(),
+                Ok(Next::Call(IoCall::Effect(_)))
+            ));
+            assert_eq!(turn_one.step, MatchStep::LastKey);
+            let sweep_end = vec![AUTO_PENDING_ROW, 3];
+            let read_page_one = turn_one
+                .next(IoResult::Page {
+                    rows: vec![(Key::from(sweep_end.clone()), Vec::new().into())],
+                    next: None,
+                })
+                .unwrap();
+            assert!(matches!(read_page_one, Next::Call(IoCall::Child(_))));
+            assert_eq!(turn_one.step, MatchStep::Journal);
+            let page_one = vec![
+                (vec![AUTO_PENDING_ROW, 1], event.clone()),
+                (vec![AUTO_PENDING_ROW, 2], second_event.clone()),
+            ];
+            let cursor_after = vec![AUTO_PENDING_ROW, 2];
+            // Journal page is read before Config and Autos so new automations are never missed.
+            let load_config = turn_one
+                .next(IoResult::Child(ChildOutcome::new(Ok::<_, StoreError>((
+                    page_one,
+                    Some(cursor_after.clone()),
+                )))))
+                .unwrap();
+            assert!(matches!(load_config, Next::Call(IoCall::Child(_))));
+            assert_eq!(turn_one.step, MatchStep::Config);
+            let load_autos = turn_one
+                .next(IoResult::Child(ChildOutcome::new(Ok::<_, GetConfigError>(
+                    config.clone(),
+                ))))
+                .unwrap();
+            assert!(matches!(load_autos, Next::Call(IoCall::Page { .. })));
+            assert_eq!(turn_one.step, MatchStep::Autos);
+            let seen_first = turn_one
+                .next(IoResult::Page {
+                    rows: vec![(
+                        aruna_core::automation::keys::record_key(auto.automation_id),
+                        auto.to_bytes().unwrap().into(),
+                    )],
+                    next: None,
+                })
+                .unwrap();
+            assert!(matches!(seen_first, Next::Call(IoCall::Read(_))));
+            let head_first = turn_one.next(IoResult::Values(vec![None])).unwrap();
+            assert!(matches!(head_first, Next::Call(IoCall::Child(_))));
+
+            // Non-definitive HEAD error retains row 1 and moves directly to row 2 (no Delete).
+            let seen_second = turn_one
+                .next(IoResult::Child(ChildOutcome::new(Err::<
+                    HeadObjectResult,
+                    HeadObjectError,
+                >(
+                    head_error
+                ))))
+                .unwrap();
+            assert_eq!(turn_one.report.deferred, 1);
+            assert!(matches!(seen_second, Next::Call(IoCall::Read(_))));
+
+            let head_second = turn_one.next(IoResult::Values(vec![None])).unwrap();
+            assert!(matches!(head_second, Next::Call(IoCall::Child(_))));
+            assert!(
+                matches!(turn_one.step, MatchStep::EnrichUpload { ref key, .. } if key == "in/second.csv")
+            );
+            let admit_second = turn_one
+                .next(IoResult::Child(ChildOutcome::new(
+                    Ok::<_, HeadObjectError>(healthy_head.clone()),
+                )))
+                .unwrap();
+            assert!(matches!(admit_second, Next::Call(IoCall::Child(_))));
+            let drop_second = turn_one
+                .next(IoResult::Child(ChildOutcome::new(Ok::<_, AutoError>(
+                    created(81),
+                ))))
+                .unwrap();
+            assert!(matches!(
+                drop_second,
+                Next::Call(IoCall::Delete(ref keys)) if keys[0].1.as_ref() == [AUTO_PENDING_ROW, 2]
+            ));
+
+            // Turn 1 yields the bounded cursor so timers and firings run before page 2.
+            let expected_cursor = MatchCursor {
+                after: cursor_after,
+                end_key: sweep_end,
+            };
+            let turn_one_done = turn_one.next(IoResult::Done).unwrap();
+            assert_eq!(
+                turn_one_done,
+                Next::Done(MatchReport {
+                    scanned: 2,
+                    fired: 1,
+                    skipped: 0,
+                    kept: 0,
+                    paused: 0,
+                    deferred: 1,
+                    next_cursor: Some(expected_cursor.clone()),
+                })
+            );
+
+            // Turn 2 wraps once reaching end_key even if newer rows arrived after sweep start.
+            let mut late_auto = sample_auto(realm, node, group);
+            late_auto.automation_id = Ulid::from_bytes([23; 16]);
+            late_auto.spec.triggers.push(Trigger::DataUploaded {
+                bucket: "raw".into(),
+                prefix: "in/third".into(),
+                pattern: None,
+            });
+            let mut turn_two = MatchEventsOperation::new(realm).with_cursor(Some(expected_cursor));
+            assert!(matches!(turn_two.first(), Ok(Next::Call(IoCall::Child(_)))));
+            assert_eq!(turn_two.step, MatchStep::Journal);
+            let page_two = vec![(vec![AUTO_PENDING_ROW, 3], third_event.clone())];
+            turn_two
+                .next(IoResult::Child(ChildOutcome::new(Ok::<_, StoreError>((
+                    page_two,
+                    Some(vec![AUTO_PENDING_ROW, 4]),
+                )))))
+                .unwrap();
+            turn_two
+                .next(IoResult::Child(ChildOutcome::new(Ok::<_, GetConfigError>(
+                    config.clone(),
+                ))))
+                .unwrap();
+            let seen_third = turn_two
+                .next(IoResult::Page {
+                    rows: vec![(
+                        aruna_core::automation::keys::record_key(late_auto.automation_id),
+                        late_auto.to_bytes().unwrap().into(),
+                    )],
+                    next: None,
+                })
+                .unwrap();
+            assert!(matches!(seen_third, Next::Call(IoCall::Read(_))));
+            let head_third = turn_two.next(IoResult::Values(vec![None])).unwrap();
+            assert!(matches!(head_third, Next::Call(IoCall::Child(_))));
+            assert!(
+                matches!(turn_two.step, MatchStep::EnrichUpload { ref key, .. } if key == "in/third.csv")
+            );
+            let admit_third = turn_two
+                .next(IoResult::Child(ChildOutcome::new(
+                    Ok::<_, HeadObjectError>(healthy_head.clone()),
+                )))
+                .unwrap();
+            assert!(matches!(admit_third, Next::Call(IoCall::Child(_))));
+            let drop_third = turn_two
+                .next(IoResult::Child(ChildOutcome::new(Ok::<_, AutoError>(
+                    created(82),
+                ))))
+                .unwrap();
+            assert!(matches!(
+                drop_third,
+                Next::Call(IoCall::Delete(ref keys)) if keys[0].1.as_ref() == [AUTO_PENDING_ROW, 3]
+            ));
+            let finished = turn_two.next(IoResult::Done).unwrap();
+            assert_eq!(
+                finished,
+                Next::Done(MatchReport {
+                    scanned: 1,
+                    fired: 1,
+                    skipped: 0,
+                    kept: 0,
+                    paused: 0,
+                    deferred: 0,
+                    next_cursor: None,
+                })
+            );
+        }
+
+        // Definitive absence/denial yields size_bytes = None and removes the processed row.
+        for head_error in [
+            HeadObjectError::NoSuchKey,
+            HeadObjectError::StagingSourceError(StagingSourceError::NotFound),
+            HeadObjectError::StagingSourceError(StagingSourceError::AccessDenied),
+        ] {
+            let mut ref_op = MatchEventsOperation::new(realm);
+            ref_op.config = Some(config.clone());
+            ref_op.autos.push(auto.clone());
+            ref_op.current_row = Some((vec![AUTO_PENDING_ROW, 1], RowDisposition::Drop));
+            ref_op
+                .rows
+                .push((vec![AUTO_PENDING_ROW, 2], second_event.clone()));
+            ref_op.step = MatchStep::EnrichUpload {
+                automation_index: 0,
+                event: Box::new(event.clone()),
+                bucket: "raw".into(),
+                version_id,
+                key: "in/file.csv".into(),
+            };
+            let to_admit = ref_op
+                .next(IoResult::Child(ChildOutcome::new(Err::<
+                    HeadObjectResult,
+                    HeadObjectError,
+                >(
+                    head_error
+                ))))
+                .unwrap();
+            assert!(matches!(to_admit, Next::Call(IoCall::Child(_))));
+            assert!(matches!(
+                ref_op.step,
+                MatchStep::Admit { ref payload, .. }
+                    if matches!(payload.as_ref(), TriggerPayload::DataUploaded { size_bytes: None, .. })
+            ));
+            let drop_first = ref_op
+                .next(IoResult::Child(ChildOutcome::new(Ok::<
+                    AdmitOutcome,
+                    AutoError,
+                >(
+                    AdmitOutcome::AlreadySeen,
+                ))))
+                .unwrap();
+            assert!(matches!(drop_first, Next::Call(IoCall::Delete(_))));
+            assert_eq!(ref_op.report.deferred, 0);
+            let read_second = ref_op.next(IoResult::Done).unwrap();
+            assert!(matches!(read_second, Next::Call(IoCall::Read(_))));
+            let head_second = ref_op.next(IoResult::Values(vec![None])).unwrap();
+            assert!(matches!(head_second, Next::Call(IoCall::Child(_))));
+            assert!(
+                matches!(ref_op.step, MatchStep::EnrichUpload { ref key, .. } if key == "in/second.csv")
+            );
+        }
     }
 }

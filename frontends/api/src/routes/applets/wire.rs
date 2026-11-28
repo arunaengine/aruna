@@ -181,6 +181,9 @@ pub struct AppletBody {
     pub created_at: String,
     /// Raised by every change; send it back as `expected_revision` to change the applet.
     pub revision: u64,
+    /// Group automation ULIDs started by submissions to this applet.
+    #[serde(default)]
+    pub automation_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -260,6 +263,14 @@ pub struct EmbeddingRequest {
 pub struct GuestsRequest {
     /// The policy to apply; `null` switches guest submissions off.
     pub guests: Option<GuestBody>,
+    pub expected_revision: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, ToSchema)]
+#[schema(example = json!({"automation_ids": ["01K8W3A0000000000000000000"], "expected_revision": 7}))]
+pub struct AppletAutomationsRequest {
+    /// Group automations triggered by submissions to this applet.
+    pub automation_ids: Vec<String>,
     pub expected_revision: Option<u64>,
 }
 
@@ -520,6 +531,7 @@ impl AppletBody {
             created_by: applet.created_by.to_string(),
             created_at: rfc3339(applet.created_at_ms),
             revision: applet.revision,
+            automation_ids: applet.automations.iter().map(ToString::to_string).collect(),
         }
     }
 }

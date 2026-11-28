@@ -194,6 +194,7 @@ mod tests {
             created_by: user,
             created_at_ms: 1,
             revision: 1,
+            automations: Vec::new(),
         };
         assert_eq!(run_limits(&applet, true).active_cap, Some(0));
         applet.grants.limits.cpu_cores = Some(2);

@@ -7,7 +7,17 @@ use std::collections::BTreeMap;
 use ulid::Ulid;
 
 use super::record::{Spec, Stage, StageKind, Trigger};
+use super::rules::{Condition, ConditionMode};
 use super::scope::{Audience, Limits};
+
+/// Summary of an applet able to start this automation (explicitly named or linked in settings).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkedApplet {
+    pub applet_id: Ulid,
+    pub name: String,
+    pub slug: String,
+    pub outside_input: bool,
+}
 
 /// Summary of another active or draft automation in the same group for loop detection.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -26,6 +36,8 @@ pub struct DiffContext {
     pub peers: Vec<PeerSummary>,
     /// Applets referenced by `applet_submission` triggers that also hold a direct `start` grant.
     pub start_applets: Vec<(Ulid, String)>,
+    /// All applets currently able to start this automation via explicit or wildcard triggers.
+    pub linked_applets: Vec<LinkedApplet>,
 }
 
 /// Structured diff shown to a human group admin before approving an automation or change.
@@ -33,6 +45,9 @@ pub struct DiffContext {
 pub struct ApprovalDiff {
     pub triggers_added: Vec<Trigger>,
     pub triggers_removed: Vec<Trigger>,
+    pub conditions_added: Vec<Condition>,
+    pub conditions_removed: Vec<Condition>,
+    pub conditions_mode: (Option<ConditionMode>, ConditionMode),
     pub read_added: Vec<String>,
     pub read_removed: Vec<String>,
     pub write_added: Vec<String>,
@@ -46,6 +61,7 @@ pub struct ApprovalDiff {
     pub secrets_added: Vec<String>,
     pub secrets_removed: Vec<String>,
     pub allow_downgrade: (bool, bool),
+    pub allow_outside_input: (bool, bool),
     pub stages_added: Vec<String>,
     pub stages_removed: Vec<String>,
     pub stages_changed: Vec<String>,
@@ -55,6 +71,7 @@ pub struct ApprovalDiff {
     pub unsandboxed: bool,
     pub loop_warnings: Vec<String>,
     pub applet_warnings: Vec<String>,
+    pub linked_applets: Vec<LinkedApplet>,
 }
 
 fn static_prefix(template: &str) -> String {
@@ -157,6 +174,12 @@ pub fn approval_diff(current: Option<&Spec>, next: &Spec, ctx: &DiffContext) -> 
     let empty = Spec::default();
     let before = current.unwrap_or(&empty);
     let (triggers_added, triggers_removed) = vec_diff(&before.triggers, &next.triggers);
+    let (conditions_added, conditions_removed) =
+        vec_diff(&before.conditions.items, &next.conditions.items);
+    let conditions_mode = (
+        current.map(|spec| spec.conditions.mode),
+        next.conditions.mode,
+    );
     let (read_added, read_removed) = vec_diff(&before.scope.read, &next.scope.read);
     let (write_added, write_removed) = vec_diff(&before.scope.write, &next.scope.write);
     let (metadata_added, metadata_removed) = vec_diff(&before.scope.metadata, &next.scope.metadata);
@@ -235,6 +258,9 @@ pub fn approval_diff(current: Option<&Spec>, next: &Spec, ctx: &DiffContext) -> 
     ApprovalDiff {
         triggers_added,
         triggers_removed,
+        conditions_added,
+        conditions_removed,
+        conditions_mode,
         read_added,
         read_removed,
         write_added,
@@ -248,15 +274,20 @@ pub fn approval_diff(current: Option<&Spec>, next: &Spec, ctx: &DiffContext) -> 
         secrets_added,
         secrets_removed,
         allow_downgrade: (before.scope.allow_downgrade, next.scope.allow_downgrade),
+        allow_outside_input: (
+            before.scope.allow_outside_input,
+            next.scope.allow_outside_input,
+        ),
         stages_added,
         stages_removed,
         stages_changed,
         limits_before: current.map(|spec| spec.scope.limits.clone()),
         limits_after: next.scope.limits.clone(),
-        outside_input: ctx.outside_input,
+        outside_input: ctx.outside_input || next.scope.allow_outside_input,
         unsandboxed: ctx.unsandboxed,
         loop_warnings,
         applet_warnings,
+        linked_applets: ctx.linked_applets.clone(),
     }
 }
 
@@ -270,7 +301,9 @@ mod tests {
         let wf = Ulid::from_parts(9, 1);
         let applet_id = Ulid::from_parts(9, 2);
         let mut next = Spec::default();
-        next.triggers.push(Trigger::AppletSubmission { applet_id });
+        next.triggers.push(Trigger::AppletSubmission {
+            applet_id: Some(applet_id),
+        });
         next.stages.push(Stage {
             name: "run".into(),
             needs: None,
@@ -301,6 +334,7 @@ mod tests {
                 run_workflows: vec![],
             }],
             start_applets: vec![(applet_id, "intake".into())],
+            linked_applets: vec![],
         };
         let diff = approval_diff(None, &next, &ctx);
         assert!(diff.outside_input);

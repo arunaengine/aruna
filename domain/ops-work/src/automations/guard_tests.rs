@@ -69,13 +69,14 @@ async fn runner_guards_recovery() {
     };
     let mut spec = Spec {
         triggers: vec![Trigger::Manual { form_json: None }],
+        conditions: Default::default(),
         stages: vec![run_stage],
         scope: Scope {
             workflows: vec![(wf_id, 1)],
             ..Scope::default()
         },
     };
-    spec.scope.limits.max_concurrent_workflows = 1;
+    spec.scope.limits.max_concurrent_workflows = Some(1);
     let auto = env.create_active(spec.clone()).await;
 
     // Quotes, backslashes and newlines escape safely; malformed inputs_json is rejected.
@@ -85,7 +86,7 @@ async fn runner_guards_recovery() {
         key: "dir/a\"b\\c\nd.csv".into(),
         version_id: ver,
         path: "/p".into(),
-        size_bytes: 5,
+        size_bytes: Some(5),
     };
     let qf = Firing::new(
         Ulid::from_bytes([104; 16]),
@@ -239,7 +240,7 @@ async fn runner_guards_recovery() {
     ));
     // Applet submission sample files flow into the same input merger; omitted files flag no_files.
     let applet_trig = Trigger::AppletSubmission {
-        applet_id: Ulid::from_bytes([117; 16]),
+        applet_id: Some(Ulid::from_bytes([117; 16])),
     };
     let sub_sample = json!({
         "files": [{"name": "reads", "bucket": "raw", "key": "sub/r1.fq", "version_id": ver.to_string()}]
@@ -737,6 +738,7 @@ async fn runner_guards_recovery() {
     // Multi-child API cancel defers cancel_sent until caller delivers signals and runs AckCancels.
     let two_stage_spec = Spec {
         triggers: vec![Trigger::Manual { form_json: None }],
+        conditions: Default::default(),
         stages: vec![
             spec.stages[0].clone(),
             Stage {
@@ -798,6 +800,7 @@ async fn runner_guards_recovery() {
     // Stranded claimed Notify recovers its settled intent instead of stalling (#1).
     let notify_spec = Spec {
         triggers: vec![Trigger::Manual { form_json: None }],
+        conditions: Default::default(),
         stages: vec![Stage {
             name: "ping".into(),
             needs: Some(vec![]),
@@ -946,6 +949,7 @@ async fn recovery_edge_cases() {
     let wf_id = Ulid::from_bytes([64; 16]);
     let spec = Spec {
         triggers: vec![Trigger::Manual { form_json: None }],
+        conditions: Default::default(),
         stages: vec![Stage {
             name: "run".into(),
             needs: Some(vec![]),
@@ -1148,6 +1152,7 @@ async fn recovery_edge_cases() {
     // 5. A deferred stranded run does not block sibling runs or downstream stages in the same tick.
     let par_spec = Spec {
         triggers: vec![Trigger::Manual { form_json: None }],
+        conditions: Default::default(),
         stages: vec![
             Stage {
                 name: "run_a".into(),

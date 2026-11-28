@@ -9,6 +9,7 @@ use ulid::Ulid;
 
 use super::dag::validate_spec;
 use super::record::{RunStatus, Spec, StageKind, When};
+use super::rules::ConditionCheck;
 use crate::applet::record::SubmissionFile;
 use crate::errors::ConversionError;
 use crate::structs::execution::workflow_run::RunFile;
@@ -24,6 +25,7 @@ pub enum FiringState {
     Succeeded,
     Failed,
     Cancelled,
+    Skipped,
 }
 
 impl FiringState {
@@ -37,10 +39,14 @@ impl FiringState {
             Succeeded => "succeeded",
             Failed => "failed",
             Cancelled => "cancelled",
+            Skipped => "skipped",
         }
     }
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Cancelled | Self::Skipped
+        )
     }
     pub fn is_active(self) -> bool {
         !self.is_terminal()
@@ -162,7 +168,7 @@ pub enum TriggerPayload {
         key: String,
         version_id: Ulid,
         path: String,
-        size_bytes: u64,
+        size_bytes: Option<u64>,
     },
     RunFinished {
         workflow_id: Ulid,
@@ -182,6 +188,9 @@ pub enum TriggerPayload {
         bucket: String,
         key: String,
         files: Vec<SubmissionFile>,
+    },
+    Schedule {
+        at_ms: u64,
     },
 }
 
@@ -212,8 +221,22 @@ impl TriggerPayload {
             Self::DataUploaded { .. } => "data_uploaded",
             Self::RunFinished { .. } => "run_finished",
             Self::AppletSubmission { .. } => "applet_submission",
+            Self::Schedule { .. } => "schedule",
         }
     }
+}
+
+/// Parameters for recording a terminal `Skipped` firing without activating any stages.
+pub struct SkippedFiring<'a> {
+    pub firing_id: Ulid,
+    pub automation_id: Ulid,
+    pub group_id: GroupId,
+    pub revision: u64,
+    pub spec: &'a Spec,
+    pub trigger: TriggerPayload,
+    pub reason: String,
+    pub conditions_checked: Vec<ConditionCheck>,
+    pub now_ms: u64,
 }
 
 /// One execution of an automation DAG, pinned to the approved `spec` at start time.
@@ -233,6 +256,10 @@ pub struct Firing {
     pub updated_at_ms: u64,
     pub finished_at_ms: Option<u64>,
     pub error: Option<String>,
+    /// One-sentence explanation when `state` is `Skipped`.
+    pub reason: Option<String>,
+    /// Conditions (and limits, where applicable) checked at start admission.
+    pub conditions_checked: Vec<ConditionCheck>,
 }
 
 impl Firing {
@@ -265,9 +292,38 @@ impl Firing {
             updated_at_ms: now_ms,
             finished_at_ms: None,
             error: None,
+            reason: None,
+            conditions_checked: Vec::new(),
         };
         firing.evaluate(now_ms);
         firing
+    }
+
+    pub fn with_checks(mut self, checks: Vec<ConditionCheck>) -> Self {
+        self.conditions_checked = checks;
+        self
+    }
+
+    /// Constructs a terminal `Skipped` start record without activating any stages.
+    pub fn skipped(input: SkippedFiring<'_>) -> Self {
+        Self {
+            firing_id: input.firing_id,
+            automation_id: input.automation_id,
+            group_id: input.group_id,
+            revision: input.revision,
+            attempt: 1,
+            state: FiringState::Skipped,
+            spec: input.spec.clone(),
+            trigger: input.trigger,
+            stages: Vec::new(),
+            resolutions: Vec::new(),
+            created_at_ms: input.now_ms,
+            updated_at_ms: input.now_ms,
+            finished_at_ms: Some(input.now_ms),
+            error: None,
+            reason: Some(input.reason),
+            conditions_checked: input.conditions_checked,
+        }
     }
 
     pub fn stage_index(&self, name: &str) -> Option<usize> {
@@ -357,7 +413,8 @@ impl Firing {
             .then(|| self.finished_at_ms.unwrap_or(now_ms));
     }
 
-    /// Audited human resolution of a `NeedsAttention` stage (`done=true` -> Succeeded, `false` -> Failed).
+    /// Audited human resolution of a `NeedsAttention` stage (`done = true` -> Succeeded,
+    /// `false` -> Failed).
     pub fn resolve(
         &mut self,
         stage_name: &str,
@@ -493,7 +550,7 @@ impl Firing {
 
     /// Ready `run` stage indices bounded by the remaining `available` workflow slots.
     pub fn ready_runs(&self, available: usize) -> Vec<usize> {
-        let slots = (self.spec.scope.limits.max_concurrent_workflows as usize)
+        let slots = (self.spec.scope.limits.concurrent_workflows() as usize)
             .saturating_sub(self.active_runs())
             .min(available);
         self.stages

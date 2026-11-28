@@ -66,6 +66,9 @@ pub struct WorkflowSummary {
     pub created_by: Option<String>,
     /// Whether the caller may edit, version and delete it.
     pub can_write: bool,
+    /// Optional paired automation id, when linked to an automation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automation_id: Option<String>,
 }
 
 /// One page of workflows.
@@ -187,7 +190,9 @@ pub struct WorkflowPatchBody {
     pub visibility: Option<Visibility>,
 }
 
-fn present<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Option<String>>, D::Error> {
+pub(crate) fn present<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error> {
     Option::<String>::deserialize(deserializer).map(Some)
 }
 
@@ -565,6 +570,7 @@ impl From<WorkflowView> for WorkflowSummary {
             updated_at: rfc3339(record.updated_at_ms),
             created_by: Some(record.created_by.to_string()),
             can_write: view.can_write,
+            automation_id: record.automation_id.map(|id| id.to_string()),
         }
     }
 }

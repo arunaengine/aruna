@@ -10,7 +10,7 @@ use aruna_core::keyspaces::{APPLET_HOSTS_KEYSPACE, APPLETS_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::group_permission_path;
-use aruna_core::types::GroupId;
+use aruna_core::types::{GroupId, Key};
 use ulid::Ulid;
 
 use super::{AppletError, allowed, applet_answer, authorize_path, host_answer, read_applet};
@@ -183,5 +183,183 @@ impl Operation for LoadAppletOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, AppletError> {
         Ok(Next::Done(applet_answer(result)?))
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum GroupReadStep {
+    Page,
+    Read,
+}
+
+/// Loads every applet of `group_id` without caller auth checks (for internal automation checks).
+#[derive(Debug, PartialEq)]
+pub struct GroupAppletsOperation {
+    group_id: GroupId,
+    ids: Vec<Ulid>,
+    applets: Vec<Applet>,
+    step: GroupReadStep,
+}
+
+impl GroupAppletsOperation {
+    pub fn new(group_id: GroupId) -> Self {
+        Self {
+            group_id,
+            ids: Vec::new(),
+            applets: Vec::new(),
+            step: GroupReadStep::Page,
+        }
+    }
+
+    fn page(&self, after: Option<Key>) -> Next<Vec<Applet>> {
+        Next::Call(IoCall::Page {
+            space: APPLETS_KEYSPACE.to_string(),
+            prefix: group_prefix(self.group_id),
+            after,
+            limit: 256,
+        })
+    }
+
+    fn next_batch(&mut self) -> Next<Vec<Applet>> {
+        if self.ids.is_empty() {
+            return Next::Done(std::mem::take(&mut self.applets));
+        }
+        let take = self.ids.len().min(128);
+        let reads = self
+            .ids
+            .drain(..take)
+            .map(|id| (APPLETS_KEYSPACE.to_string(), applet_key(id)))
+            .collect();
+        self.step = GroupReadStep::Read;
+        Next::Call(IoCall::Read(reads))
+    }
+}
+
+impl Operation for GroupAppletsOperation {
+    type Output = Vec<Applet>;
+    type Error = AppletError;
+
+    fn first(&mut self) -> Result<Next<Vec<Applet>>, AppletError> {
+        self.step = GroupReadStep::Page;
+        Ok(self.page(None))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Vec<Applet>>, AppletError> {
+        match self.step {
+            GroupReadStep::Page => {
+                let (rows, more) = result.page()?;
+                for (key, _) in rows {
+                    if let Some(bytes) = key
+                        .get(17..33)
+                        .and_then(|slice| <[u8; 16]>::try_from(slice).ok())
+                    {
+                        self.ids.push(Ulid::from_bytes(bytes));
+                    }
+                }
+                if let Some(after) = more {
+                    return Ok(self.page(Some(after)));
+                }
+                Ok(self.next_batch())
+            }
+            GroupReadStep::Read => {
+                for value in result.values()?.into_iter().flatten() {
+                    self.applets.push(Applet::from_bytes(&value)?);
+                }
+                Ok(self.next_batch())
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::applet::record::{Access, Embedding, Grants, Lifecycle};
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
+
+    fn sample_applet(group_id: GroupId, applet_id: Ulid) -> Applet {
+        let realm = RealmId([2; 32]);
+        Applet {
+            applet_id,
+            group_id,
+            name: "Demo".into(),
+            slug: "demo".into(),
+            host: "demo.apps.local".into(),
+            repository: None,
+            host_node: iroh::SecretKey::from_bytes(&[3; 32]).public(),
+            lifecycle: Lifecycle::Live,
+            access: Access::Private,
+            live: Some(1),
+            versions: Vec::new(),
+            drafts: Vec::new(),
+            grants: Grants::default(),
+            embedding: Embedding::default(),
+            guests: None,
+            domains: Vec::new(),
+            pending: None,
+            account: None,
+            role_id: None,
+            visitor_salt: [0; 32],
+            created_by: UserId::local(Ulid::from_bytes([1; 16]), realm),
+            created_at_ms: 1,
+            revision: 1,
+            automations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn pages_group_applets() {
+        let group_id = Ulid::from_bytes([11; 16]);
+        let first_id = Ulid::from_bytes([12; 16]);
+        let second_id = Ulid::from_bytes([13; 16]);
+        let mut operation = GroupAppletsOperation::new(group_id);
+
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Page { after: None, .. }))
+        ));
+
+        let cursor = group_key(group_id, first_id);
+        let second_page = operation
+            .next(IoResult::Page {
+                rows: vec![(cursor.clone(), Vec::new().into())],
+                next: Some(cursor),
+            })
+            .unwrap();
+        assert!(matches!(
+            second_page,
+            Next::Call(IoCall::Page { after: Some(_), .. })
+        ));
+
+        let read_batch = operation
+            .next(IoResult::Page {
+                rows: vec![(group_key(group_id, second_id), Vec::new().into())],
+                next: None,
+            })
+            .unwrap();
+        assert!(matches!(read_batch, Next::Call(IoCall::Read(ref keys)) if keys.len() == 2));
+
+        let first = sample_applet(group_id, first_id);
+        let done = operation
+            .next(IoResult::Values(vec![
+                Some(first.to_bytes().unwrap().into()),
+                None,
+            ]))
+            .unwrap();
+        assert_eq!(done, Next::Done(vec![first]));
+
+        // Empty group completes immediately after the index page without a Read call.
+        let mut empty = GroupAppletsOperation::new(group_id);
+        assert!(matches!(empty.first(), Ok(Next::Call(IoCall::Page { .. }))));
+        assert_eq!(
+            empty
+                .next(IoResult::Page {
+                    rows: Vec::new(),
+                    next: None,
+                })
+                .unwrap(),
+            Next::Done(Vec::new())
+        );
     }
 }

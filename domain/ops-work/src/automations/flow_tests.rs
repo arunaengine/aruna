@@ -185,6 +185,7 @@ impl Env {
         };
         cfg.features.insert(Feature::Automations, mode(autos));
         cfg.features.insert(Feature::Applets, mode(applets));
+        cfg.features.insert(Feature::Workflows, mode(true));
         self.write_row(
             REALM_CONFIG_KEYSPACE,
             self.realm.as_bytes().to_vec(),
@@ -202,6 +203,7 @@ impl Env {
     pub(super) fn base_spec(&self) -> Spec {
         Spec {
             triggers: vec![Trigger::Manual { form_json: None }],
+            conditions: Default::default(),
             stages: vec![Stage {
                 name: "alert".into(),
                 needs: None,
@@ -281,6 +283,7 @@ impl Env {
                     name: "ingest".into(),
                     description: "test".into(),
                     spec,
+                    workflow_id: None,
                 },
             ),
             &self.ctx,
@@ -316,6 +319,7 @@ async fn crud_and_widening() {
                 name: "qc".into(),
                 description: "checks".into(),
                 spec: env.base_spec(),
+                workflow_id: None,
             },
         ),
         &env.ctx,
@@ -373,6 +377,7 @@ async fn crud_and_widening() {
         name: Some("x".into()),
         description: None,
         spec: None,
+        workflow_id: None,
     };
     assert!(matches!(
         drive(
@@ -383,7 +388,7 @@ async fn crud_and_widening() {
         Err(AutoError::Conflict(_))
     ));
     let mut narrower = active.spec.clone();
-    narrower.scope.limits.per_hour = 5;
+    narrower.scope.limits.per_hour = Some(5);
     let narrowed = drive(
         ChangeAutoOperation::new(
             &env.owner,
@@ -392,6 +397,7 @@ async fn crud_and_widening() {
                 name: None,
                 description: None,
                 spec: Some(narrower),
+                workflow_id: None,
             },
             env.node,
         ),
@@ -400,9 +406,9 @@ async fn crud_and_widening() {
     .await
     .unwrap();
     assert!(narrowed.pending.is_none());
-    assert_eq!(narrowed.spec.scope.limits.per_hour, 5);
+    assert_eq!(narrowed.spec.scope.limits.per_hour, Some(5));
     let mut wider = narrowed.spec.clone();
-    wider.scope.limits.per_hour = 500;
+    wider.scope.limits.per_hour = Some(500);
     let staged = drive(
         ChangeAutoOperation::new(
             &env.owner,
@@ -411,6 +417,7 @@ async fn crud_and_widening() {
                 name: None,
                 description: None,
                 spec: Some(wider),
+                workflow_id: None,
             },
             env.node,
         ),
@@ -460,11 +467,11 @@ async fn paused_widening_staged() {
     .await
     .unwrap();
     assert_eq!(paused.lifecycle, Lifecycle::Paused);
-    let orig_per_hour = paused.spec.scope.limits.per_hour;
+    let orig_per_hour = paused.spec.scope.limits.hour_limit();
 
     // Widening edit while paused keeps approved spec intact and stages in pending.
     let mut wider = paused.spec.clone();
-    wider.scope.limits.per_hour = orig_per_hour + 100;
+    wider.scope.limits.per_hour = Some(orig_per_hour + 100);
     let edited = drive(
         ChangeAutoOperation::new(
             &env.owner,
@@ -473,6 +480,7 @@ async fn paused_widening_staged() {
                 name: None,
                 description: None,
                 spec: Some(wider.clone()),
+                workflow_id: None,
             },
             env.node,
         ),
@@ -480,12 +488,12 @@ async fn paused_widening_staged() {
     )
     .await
     .unwrap();
-    assert_eq!(edited.spec.scope.limits.per_hour, orig_per_hour);
+    assert_eq!(edited.spec.scope.limits.hour_limit(), orig_per_hour);
     assert_eq!(
         edited
             .pending
             .as_ref()
-            .map(|p| p.spec.scope.limits.per_hour),
+            .map(|p| p.spec.scope.limits.hour_limit()),
         Some(orig_per_hour + 100)
     );
 
@@ -502,7 +510,7 @@ async fn paused_widening_staged() {
     .await
     .unwrap();
     assert_eq!(resumed.lifecycle, Lifecycle::Active);
-    assert_eq!(resumed.spec.scope.limits.per_hour, orig_per_hour);
+    assert_eq!(resumed.spec.scope.limits.hour_limit(), orig_per_hour);
     assert!(resumed.pending.is_some());
 
     // Pause -> RequestApproval -> Reject returns to Paused with approved spec intact.
@@ -529,7 +537,7 @@ async fn paused_widening_staged() {
     .await
     .unwrap();
     assert_eq!(waiting.lifecycle, Lifecycle::WaitingForApproval);
-    assert_eq!(waiting.spec.scope.limits.per_hour, orig_per_hour);
+    assert_eq!(waiting.spec.scope.limits.hour_limit(), orig_per_hour);
     let rejected = drive(
         ChangeAutoOperation::new(
             &env.owner,
@@ -543,32 +551,37 @@ async fn paused_widening_staged() {
     .unwrap();
     assert_eq!(rejected.lifecycle, Lifecycle::Paused);
     assert!(rejected.pending.is_none());
-    assert_eq!(rejected.spec.scope.limits.per_hour, orig_per_hour);
+    assert_eq!(rejected.spec.scope.limits.hour_limit(), orig_per_hour);
 }
 
 #[tokio::test]
 async fn delete_blocked_active() {
     use super::control::CancelFiringOperation;
-    use super::start::StartManualOperation;
+    use super::start::{ManualStart, StartManualOperation};
 
     let env = Env::new().await;
     let mut spec = env.base_spec();
-    spec.scope.limits.max_active_firings = 1;
+    spec.scope.limits.max_active_firings = Some(1);
     let active = env.create_active(spec).await;
     let id = active.automation_id;
 
-    let first = drive(
+    let ManualStart::Started(first) = drive(
         StartManualOperation::new(&env.owner, id, env.node, "{}".into()),
         &env.ctx,
     )
     .await
-    .unwrap();
+    .unwrap() else {
+        panic!("expected started firing");
+    };
     let second = drive(
         StartManualOperation::new(&env.owner, id, env.node, "{}".into()),
         &env.ctx,
     )
     .await;
-    assert!(matches!(second, Err(AutoError::Limited(_))), "{second:?}");
+    assert!(
+        matches!(second, Err(AutoError::Limited { retry_after, .. }) if retry_after > 0),
+        "{second:?}"
+    );
 
     // Deletion is refused while an active firing exists.
     let blocked = drive(

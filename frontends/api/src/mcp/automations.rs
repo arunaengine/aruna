@@ -38,7 +38,8 @@ pub struct UpdateInput {
     pub name: Option<String>,
     /// Optional replacement description.
     pub description: Option<String>,
-    /// Optional replacement spec JSON object; widening changes on an active automation wait for admin approval.
+    /// Optional replacement spec JSON object; widening changes on an active automation wait
+    /// for admin approval.
     pub spec: Option<JsonPayload>,
 }
 
@@ -92,6 +93,7 @@ impl McpServer {
             name: input.name,
             description: input.description,
             spec,
+            workflow_id: None,
         };
         let (_, axum::Json(created)) = records::create_automation(
             State(self.state.clone()),
@@ -123,6 +125,7 @@ impl McpServer {
             name: input.name,
             description: input.description,
             spec,
+            workflow_id: None,
         };
         let axum::Json(updated) = records::update_automation(
             State(self.state.clone()),

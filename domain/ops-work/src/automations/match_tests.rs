@@ -15,7 +15,7 @@ use ulid::Ulid;
 
 use super::firing_reads::ListEventsOperation;
 use super::flow_tests::Env;
-use super::matcher::MatchEventsOperation;
+use super::matcher::{MatchCursor, MatchEventsOperation};
 use super::reads::LoadAutoOperation;
 use super::start::StartEventsOperation;
 
@@ -31,17 +31,21 @@ async fn matcher_and_replay() {
             prefix: "in/".into(),
             pattern: Some("*.csv".into()),
         },
-        Trigger::AppletSubmission { applet_id },
+        Trigger::AppletSubmission {
+            applet_id: Some(applet_id),
+        },
         Trigger::RunFinished {
             workflow_id: wf_id,
             status: None,
             applet_id: None,
         },
     ];
+    spec.scope.allow_outside_input = true;
     spec.scope.limits = Limits {
-        max_chain_depth: 1,
+        max_chain_depth: Some(1),
         ..Limits::default()
     };
+    spec.scope.allow_outside_input = true;
     let auto = env.create_active(spec).await;
 
     // Self-upload is skipped; matching user upload fires once; cursor prevents duplicates.
@@ -213,6 +217,7 @@ async fn out_of_order() {
             applet_id: Some(applet_id),
         },
     ];
+    spec.scope.allow_outside_input = true;
     let auto = env.create_active(spec).await;
     let loc = (env.realm, env.group, env.node);
 
@@ -335,6 +340,7 @@ async fn out_of_order() {
                 name: None,
                 description: None,
                 spec: Some(edited_spec),
+                workflow_id: None,
             },
             env.node,
         ),
@@ -348,15 +354,15 @@ async fn out_of_order() {
             auto.automation_id,
             Ulid::from_bytes([87; 16]),
             "data_uploaded/stale".into(),
-            auto.revision,
             Some(env.owner.user_id),
             TriggerPayload::DataUploaded {
                 bucket: "raw".into(),
                 key: "in/late.csv".into(),
                 version_id: Ulid::from_bytes([86; 16]),
                 path: "/p".into(),
-                size_bytes: 10,
+                size_bytes: Some(10),
             },
+            edited.updated_at_ms,
         ),
         &env.ctx,
     )
@@ -366,7 +372,7 @@ async fn out_of_order() {
 
     // Lowering max_chain_depth in a newer revision returns ChainDepth (not Unmatched) and pauses.
     let mut lowered_spec = edited.spec.clone();
-    lowered_spec.scope.limits.max_chain_depth = 1;
+    lowered_spec.scope.limits.max_chain_depth = Some(1);
     let lowered = drive(
         ChangeAutoOperation::new(
             &env.owner,
@@ -375,6 +381,7 @@ async fn out_of_order() {
                 name: None,
                 description: None,
                 spec: Some(lowered_spec),
+                workflow_id: None,
             },
             env.node,
         ),
@@ -388,7 +395,6 @@ async fn out_of_order() {
             auto.automation_id,
             Ulid::from_bytes([85; 16]),
             "run_finished/depth-hit".into(),
-            edited.revision,
             Some(env.owner.user_id),
             TriggerPayload::RunFinished {
                 workflow_id: wf_id,
@@ -399,6 +405,7 @@ async fn out_of_order() {
                 outside_input: false,
                 depth: 1,
             },
+            lowered.updated_at_ms,
         ),
         &env.ctx,
     )
@@ -407,7 +414,7 @@ async fn out_of_order() {
     assert_eq!(depth_hit, super::admit::AdmitOutcome::ChainDepth);
     // Restore higher chain depth for the direct applet run_finished check below.
     let mut restored_spec = lowered.spec.clone();
-    restored_spec.scope.limits.max_chain_depth = 3;
+    restored_spec.scope.limits.max_chain_depth = Some(3);
     let staged_up = drive(
         ChangeAutoOperation::new(
             &env.owner,
@@ -416,6 +423,7 @@ async fn out_of_order() {
                 name: None,
                 description: None,
                 spec: Some(restored_spec),
+                workflow_id: None,
             },
             env.node,
         ),
@@ -483,4 +491,62 @@ async fn out_of_order() {
             ..
         } if *run_id == direct_id && *aid == applet_id
     )));
+}
+
+#[tokio::test]
+async fn advances_with_cursor() {
+    use aruna_core::plugin_runs::AUTO_PENDING_ROW;
+
+    let env = Env::new().await;
+    let mut spec = env.base_spec();
+    spec.triggers = vec![Trigger::DataUploaded {
+        bucket: "raw".into(),
+        prefix: "in/".into(),
+        pattern: None,
+    }];
+    let _auto = env.create_active(spec).await;
+    let loc = (env.realm, env.group, env.node);
+    let first_event = SourceEvent::data_uploaded(
+        loc,
+        ("raw", "in/first.csv"),
+        Ulid::from_bytes([91; 16]),
+        Some(env.owner.user_id),
+        100,
+    );
+    let second_event = SourceEvent::data_uploaded(
+        loc,
+        ("raw", "in/second.csv"),
+        Ulid::from_bytes([92; 16]),
+        Some(env.owner.user_id),
+        200,
+    );
+    env.journal(&first_event).await;
+    env.journal(&second_event).await;
+
+    let (rows, _) = drive(
+        crate::plugins::journal::journal_page(AUTO_PENDING_ROW, None, 10),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+    let cursor = MatchCursor {
+        after: rows[0].0.clone(),
+        end_key: rows[1].0.clone(),
+    };
+    let resumed = drive(
+        MatchEventsOperation::new(env.realm).with_cursor(Some(cursor)),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!((resumed.scanned, resumed.fired), (1, 1));
+    assert_eq!(resumed.next_cursor, None);
+
+    // Wrapping to a fresh sweep picks up the earlier pending row.
+    let wrapped = drive(MatchEventsOperation::new(env.realm), &env.ctx)
+        .await
+        .unwrap();
+    assert_eq!((wrapped.scanned, wrapped.fired), (1, 1));
+    assert_eq!(wrapped.next_cursor, None);
 }

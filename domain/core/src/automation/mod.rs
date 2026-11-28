@@ -9,5 +9,7 @@ pub mod glob;
 pub mod graph;
 pub mod keys;
 pub mod record;
+pub mod rules;
+pub mod schedule;
 pub mod scope;
 pub mod usage;

@@ -19,7 +19,7 @@ use super::wire::{
     AutomationBody, AutomationPage, CreateAutoRequest, ListAutoQuery, UpdateAutoRequest,
     parse_lifecycle,
 };
-use super::{auto_error, limit, param_id, path_id, require_switches};
+use super::{auto_error, limit, param_id, path_id};
 use crate::auth::{RealmAuth, UnrestrictedAuth};
 use crate::error::{ErrorResponse, ServerResult};
 use crate::server::state::ServerState;
@@ -61,6 +61,11 @@ pub async fn list_automations(
         .as_deref()
         .map(parse_lifecycle)
         .transpose()?;
+    let workflow_id = query
+        .workflow_id
+        .as_deref()
+        .map(|id| param_id(id, "workflow_id"))
+        .transpose()?;
     let after = query
         .cursor
         .as_deref()
@@ -72,7 +77,8 @@ pub async fn list_automations(
         lifecycle,
         after,
         limit(query.limit),
-    );
+    )
+    .with_workflow(workflow_id);
     let page = drive(op, &state.get_ctx()).await.map_err(auto_error)?;
     Ok(Json(AutomationPage {
         items: page.items.iter().map(AutomationBody::from_domain).collect(),
@@ -92,8 +98,9 @@ pub async fn list_automations(
     responses(
         (status = 201, description = "Created draft automation", body = AutomationBody),
         (status = 400, description = "Invalid DAG, trigger or scope", body = ErrorResponse),
-        (status = 403, description = "Permission denied", body = ErrorResponse),
-        (status = 409, description = "Automations or applets feature disabled", body = ErrorResponse)
+        (status = 403, description = "Permission denied or feature disabled", body = ErrorResponse),
+        (status = 404, description = "Linked workflow not found", body = ErrorResponse),
+        (status = 409, description = "Linked workflow is already paired with another automation", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -103,16 +110,24 @@ pub async fn create_automation(
     Json(body): Json<CreateAutoRequest>,
 ) -> ServerResult<(StatusCode, Json<AutomationBody>)> {
     let group_id = param_id(&body.group_id, "group_id")?;
+    let workflow_id = body
+        .workflow_id
+        .as_deref()
+        .map(|id| param_id(id, "workflow_id"))
+        .transpose()?;
     let spec = body.spec.to_domain()?;
-    require_switches(&state, group_id, spec.uses_applets()).await?;
     let input = NewAuto {
         group_id,
         name: body.name,
         description: body.description,
         spec,
+        workflow_id,
     };
-    let op = CreateAutoOperation::new(&auth, state.get_node_id(), input);
-    let auto = drive(op, &state.get_ctx()).await.map_err(auto_error)?;
+    let operation = CreateAutoOperation::new(&auth, state.get_node_id(), input)
+        .with_disabled_features(state.disabled_features());
+    let auto = drive(operation, &state.get_ctx())
+        .await
+        .map_err(auto_error)?;
     Ok((
         StatusCode::CREATED,
         Json(AutomationBody::from_domain(&auto)),
@@ -158,9 +173,9 @@ pub async fn get_automation(
     responses(
         (status = 200, description = "Updated automation (widening changes become pending)", body = AutomationBody),
         (status = 400, description = "Invalid DAG, trigger or scope", body = ErrorResponse),
-        (status = 403, description = "Permission denied", body = ErrorResponse),
+        (status = 403, description = "Permission denied or feature disabled", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "Revision conflict or feature disabled", body = ErrorResponse)
+        (status = 409, description = "Revision or workflow-link conflict", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -171,29 +186,36 @@ pub async fn update_automation(
     Json(body): Json<UpdateAutoRequest>,
 ) -> ServerResult<Json<AutomationBody>> {
     let id = path_id(&id)?;
-    let spec = body.spec.as_ref().map(|s| s.to_domain()).transpose()?;
-    let existing = drive(
-        AutoAccessOperation::new(&auth, id, state.get_node_id(), Need::Write),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(auto_error)?;
-    let applets = spec
+    let spec = body
+        .spec
         .as_ref()
-        .map_or(existing.spec.uses_applets(), |s| s.uses_applets());
-    require_switches(&state, existing.group_id, applets).await?;
+        .map(|item| item.to_domain())
+        .transpose()?;
+    let workflow_id = body
+        .workflow_id
+        .map(|optional| {
+            optional
+                .as_deref()
+                .map(|text| param_id(text, "workflow_id"))
+                .transpose()
+        })
+        .transpose()?;
     let change = AutoChange::Update {
         name: body.name,
         description: body.description,
         spec,
+        workflow_id,
     };
-    let op = ChangeAutoOperation::new(
+    let operation = ChangeAutoOperation::new(
         &auth,
         (id, Some(body.expected_revision)),
         change,
         state.get_node_id(),
-    );
-    let auto = drive(op, &state.get_ctx()).await.map_err(auto_error)?;
+    )
+    .with_disabled_features(state.disabled_features());
+    let auto = drive(operation, &state.get_ctx())
+        .await
+        .map_err(auto_error)?;
     Ok(Json(AutomationBody::from_domain(&auto)))
 }
 

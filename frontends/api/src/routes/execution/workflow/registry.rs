@@ -165,7 +165,7 @@ pub async fn create_workflow(
     Ok((StatusCode::CREATED, Json(created_body(created))))
 }
 
-pub(super) fn created_body(created: aruna_ops_work::workflows::import::Created) -> WorkflowCreated {
+pub(crate) fn created_body(created: aruna_ops_work::workflows::import::Created) -> WorkflowCreated {
     WorkflowCreated {
         workflow_id: created.workflow_id.to_string(),
         version: created.version.to_string(),

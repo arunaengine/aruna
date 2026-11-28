@@ -3,11 +3,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::automation::keys::record_key as automation_key;
+use aruna_core::automation::record::Automation;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::{
-    WORKFLOW_KEYSPACE, WORKFLOW_SOURCE_KEYSPACE, WORKFLOW_VERSION_KEYSPACE,
+    AUTOMATIONS_KEYSPACE, WORKFLOW_KEYSPACE, WORKFLOW_SOURCE_KEYSPACE, WORKFLOW_VERSION_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::read_row;
 use aruna_core::structs::execution::workflow::{
     StoredWorkflowLanguage, WorkflowRecord, WorkflowVisibility, workflow_key,
 };
@@ -332,8 +335,10 @@ impl Operation for DeleteWorkflowOperation {
         self.removing = true;
         let rows = DeleteRowsOperation {
             workflow_id: self.workflow_id,
+            now_ms: 0,
             keys: Vec::new(),
-            deleting: false,
+            unlink: None,
+            step: DeleteStep::ReadWorkflow,
         };
         Ok(Next::Call(IoCall::child(rows)))
     }
@@ -343,32 +348,28 @@ impl Operation for DeleteWorkflowOperation {
     }
 }
 
-/// Removes the rows of a workflow, its versions and their files in one transaction.
+#[derive(Debug, PartialEq)]
+enum DeleteStep {
+    ReadWorkflow,
+    ReadAutomation,
+    PageVersions,
+    UnlinkAutomation,
+    DeleteRows,
+}
+
+/// Removes the rows of a workflow, its versions and their files in one transaction, clearing any
+/// paired automation backlink atomically.
 #[derive(Debug, PartialEq)]
 struct DeleteRowsOperation {
     workflow_id: Ulid,
+    now_ms: u64,
     keys: Vec<Key>,
-    deleting: bool,
+    unlink: Option<Box<Automation>>,
+    step: DeleteStep,
 }
 
-impl Operation for DeleteRowsOperation {
-    type Output = ();
-    type Error = CatalogError;
-
-    fn first(&mut self) -> Result<Next<()>, CatalogError> {
-        Ok(Next::Call(version_rows(self.workflow_id, None)))
-    }
-
-    fn next(&mut self, result: IoResult) -> Result<Next<()>, CatalogError> {
-        if self.deleting {
-            result.done()?;
-            return Ok(Next::Done(()));
-        }
-        let (rows, next) = result.page()?;
-        self.keys.extend(rows.into_iter().map(|(key, _)| key));
-        if next.is_some() {
-            return Ok(Next::Call(version_rows(self.workflow_id, next)));
-        }
+impl DeleteRowsOperation {
+    fn start_delete(&mut self) -> Next<()> {
         let mut rows = vec![(
             WORKFLOW_KEYSPACE.to_string(),
             workflow_key(self.workflow_id),
@@ -377,8 +378,79 @@ impl Operation for DeleteRowsOperation {
             rows.push((WORKFLOW_VERSION_KEYSPACE.into(), key.clone()));
             rows.push((WORKFLOW_SOURCE_KEYSPACE.into(), key));
         }
-        self.deleting = true;
-        Ok(Next::Call(IoCall::Delete(rows)))
+        self.step = DeleteStep::DeleteRows;
+        Next::Call(IoCall::Delete(rows))
+    }
+}
+
+impl Operation for DeleteRowsOperation {
+    type Output = ();
+    type Error = CatalogError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> Result<Next<()>, CatalogError> {
+        self.step = DeleteStep::ReadWorkflow;
+        Ok(Next::Call(read_row(
+            WORKFLOW_KEYSPACE,
+            workflow_key(self.workflow_id),
+        )))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, CatalogError> {
+        match std::mem::replace(&mut self.step, DeleteStep::DeleteRows) {
+            DeleteStep::ReadWorkflow => {
+                if let Some(bytes) = result.value()? {
+                    let record = WorkflowRecord::from_bytes(&bytes)?;
+                    if let Some(automation_id) = record.automation_id {
+                        self.step = DeleteStep::ReadAutomation;
+                        return Ok(Next::Call(read_row(
+                            AUTOMATIONS_KEYSPACE,
+                            automation_key(automation_id),
+                        )));
+                    }
+                }
+                self.step = DeleteStep::PageVersions;
+                Ok(Next::Call(version_rows(self.workflow_id, None)))
+            }
+            DeleteStep::ReadAutomation => {
+                if let Some(bytes) = result.value()? {
+                    let mut automation = Automation::from_bytes(&bytes)?;
+                    if automation.workflow_id == Some(self.workflow_id) {
+                        automation.workflow_id = None;
+                        automation.updated_at_ms = self.now_ms;
+                        automation.revision = automation.revision.saturating_add(1);
+                        self.unlink = Some(Box::new(automation));
+                    }
+                }
+                self.step = DeleteStep::PageVersions;
+                Ok(Next::Call(version_rows(self.workflow_id, None)))
+            }
+            DeleteStep::PageVersions => {
+                let (rows, next) = result.page()?;
+                self.keys.extend(rows.into_iter().map(|(key, _)| key));
+                if next.is_some() {
+                    self.step = DeleteStep::PageVersions;
+                    return Ok(Next::Call(version_rows(self.workflow_id, next)));
+                }
+                if let Some(automation) = self.unlink.take() {
+                    let row = crate::automation_row(&automation)?;
+                    self.step = DeleteStep::UnlinkAutomation;
+                    return Ok(Next::Call(IoCall::Write(vec![row])));
+                }
+                Ok(self.start_delete())
+            }
+            DeleteStep::UnlinkAutomation => {
+                result.done()?;
+                Ok(self.start_delete())
+            }
+            DeleteStep::DeleteRows => {
+                result.done()?;
+                Ok(Next::Done(()))
+            }
+        }
     }
 
     fn transaction(&self) -> TransactionMode {
