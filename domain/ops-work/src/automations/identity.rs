@@ -91,7 +91,9 @@ impl SyncIdentityOperation {
             true => (Some(self.account), Some(self.role_id)),
             false => (active.map(|_| self.account), None),
         };
-        if (self.auto.account, self.auto.role_id) != self.target {
+        if (self.auto.account, self.auto.role_id) != self.target
+            || (wanted && self.auto.identity_synced_revision < self.auto.revision)
+        {
             tasks.push_back(Task::Record);
         }
         tasks
@@ -152,7 +154,11 @@ impl SyncIdentityOperation {
                 let id = self.auto.automation_id;
                 let write = WriteAutoOperation::node(
                     id,
-                    AutoChange::Identity { account, role_id },
+                    AutoChange::Identity {
+                        account,
+                        role_id,
+                        synced_revision: self.auto.revision,
+                    },
                     actor.user_id,
                     actor.realm_id,
                 );

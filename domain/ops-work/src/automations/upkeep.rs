@@ -196,8 +196,7 @@ impl Operation for AutoUpkeepOperation {
                 let (rows, next) = result.page()?;
                 for (_, value) in rows {
                     let auto = Automation::from_bytes(&value)?;
-                    let has_role = auto.account.is_some() && auto.role_id.is_some();
-                    if auto.wants_account() != has_role && auto.granter().is_some() {
+                    if auto.needs_identity_sync() && auto.granter().is_some() {
                         self.repair.push(auto);
                     }
                 }

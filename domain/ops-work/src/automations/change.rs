@@ -1,29 +1,96 @@
-//! Creates and atomically mutates automation records with revision checks and widening rules.
+//! Creates and atomically mutates automation records with revision checks, link consistency
+//! and widening rules.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeSet;
+
 use aruna_core::automation::dag::{validate_scope, validate_spec};
-use aruna_core::automation::keys::schedule_key;
+use aruna_core::automation::keys::{record_key, schedule_cursor_key};
 use aruna_core::automation::record::{Automation, Lifecycle, PauseReason, PendingChange, Spec};
+use aruna_core::automation::schedule::ScheduleCursor;
 use aruna_core::automation::scope::is_widening;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
-use aruna_core::keyspaces::AUTOMATIONS_KEYSPACE;
+use aruna_core::keyspaces::{AUTOMATIONS_KEYSPACE, WORKFLOW_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::read_row;
+use aruna_core::structs::execution::workflow::{
+    WorkflowRecord, workflow_key, workflow_permission_path,
+};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::identity::features::Feature;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::blob::group_permission_path;
-use aruna_core::types::{GroupId, RoleId};
+use aruna_core::types::{GroupId, Key, KeySpace, RoleId, Value};
 use aruna_core::user::id::UserId;
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 use ulid::Ulid;
 
 use super::firing_reads::decode_ulid;
 use super::{
-    AutoError, active_page, allowed, authorize_path, auto_answer, auto_row, read_auto, schedule_row,
+    AutoError, active_page, allowed, authorize_path, auto_row, check_feature, plan_schedule_sync,
 };
 
-const MAX_NAME: usize = 120;
+pub(crate) const MAX_NAME: usize = 120;
+
+/// Trims and validates an automation name length (`1..=120` Unicode scalar values).
+pub(crate) fn validate_name(raw: &str) -> Result<String, AutoError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > MAX_NAME {
+        return Err(AutoError::Invalid(format!(
+            "name needs 1..={MAX_NAME} chars"
+        )));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Inputs required to construct a fresh draft `Automation` record.
+pub(crate) struct DraftAutoInput {
+    pub automation_id: Ulid,
+    pub group_id: GroupId,
+    pub name: String,
+    pub description: String,
+    pub host_node: NodeId,
+    pub spec: Spec,
+    pub created_by: UserId,
+    pub now_ms: u64,
+    pub workflow_id: Option<Ulid>,
+}
+
+/// Constructs a fresh draft `Automation` record with initial revision and zeroed sync state.
+pub(crate) fn draft_automation(input: DraftAutoInput) -> Automation {
+    Automation {
+        automation_id: input.automation_id,
+        group_id: input.group_id,
+        name: input.name,
+        description: input.description,
+        host_node: input.host_node,
+        lifecycle: Lifecycle::Draft,
+        pause_reason: None,
+        spec: input.spec,
+        pending: None,
+        account: None,
+        role_id: None,
+        approved_by: None,
+        approved_at_ms: None,
+        created_by: input.created_by,
+        created_at_ms: input.now_ms,
+        updated_at_ms: input.now_ms,
+        revision: 1,
+        identity_synced_revision: 0,
+        workflow_id: input.workflow_id,
+    }
+}
+
+fn workflow_row(record: &WorkflowRecord) -> Result<(KeySpace, Key, Value), AutoError> {
+    Ok((
+        WORKFLOW_KEYSPACE.to_string(),
+        workflow_key(record.workflow_id),
+        record.to_bytes()?.into(),
+    ))
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct NewAuto {
@@ -34,15 +101,25 @@ pub struct NewAuto {
     pub workflow_id: Option<Ulid>,
 }
 
-/// Creates a new draft automation on `local` after checking group WRITE and validating its DAG.
+#[derive(Debug, PartialEq)]
+enum CreateStep {
+    Config,
+    AuthGroup,
+    AuthWorkflow,
+    Commit,
+}
+
+/// Creates a new draft automation on `local` after checking feature switches, group WRITE,
+/// optional workflow pairing and DAG validation.
 #[derive(Debug, PartialEq)]
 pub struct CreateAutoOperation {
     auth: AuthContext,
     local: NodeId,
     input: NewAuto,
+    disabled_features: BTreeSet<Feature>,
     ids: IdMint,
     now_ms: u64,
-    record: Option<Automation>,
+    step: CreateStep,
 }
 
 impl CreateAutoOperation {
@@ -51,10 +128,39 @@ impl CreateAutoOperation {
             auth: auth.clone(),
             local,
             input,
+            disabled_features: BTreeSet::new(),
             ids: IdMint::default(),
             now_ms: 0,
-            record: None,
+            step: CreateStep::Config,
         }
+    }
+
+    pub fn with_disabled_features(mut self, disabled: BTreeSet<Feature>) -> Self {
+        self.disabled_features = disabled;
+        self
+    }
+
+    fn start_commit(&mut self) -> Result<Next<Automation>, AutoError> {
+        let name = validate_name(&self.input.name)?;
+        let record = draft_automation(DraftAutoInput {
+            automation_id: self.ids.mint(self.now_ms),
+            group_id: self.input.group_id,
+            name,
+            description: self.input.description.trim().to_string(),
+            host_node: self.local,
+            spec: self.input.spec.clone(),
+            created_by: self.auth.user_id,
+            now_ms: self.now_ms,
+            workflow_id: self.input.workflow_id,
+        });
+        let automation_id = record.automation_id;
+        let commit = WriteDraftOperation {
+            record,
+            now_ms: self.now_ms,
+            writing: false,
+        };
+        self.step = CreateStep::Commit;
+        Ok(Next::Call(IoCall::retry(commit, &automation_id.to_bytes())))
     }
 }
 
@@ -71,12 +177,7 @@ impl Operation for CreateAutoOperation {
     }
 
     fn first(&mut self) -> Result<Next<Automation>, AutoError> {
-        let name = self.input.name.trim();
-        if name.is_empty() || name.chars().count() > MAX_NAME {
-            return Err(AutoError::Invalid(format!(
-                "name needs 1..={MAX_NAME} chars"
-            )));
-        }
+        validate_name(&self.input.name)?;
         validate_spec(&self.input.spec).map_err(AutoError::Invalid)?;
         validate_scope(
             &self.input.spec,
@@ -85,45 +186,132 @@ impl Operation for CreateAutoOperation {
             self.local,
         )
         .map_err(AutoError::Invalid)?;
-        let path = group_permission_path(self.auth.realm_id, self.input.group_id, self.local);
-        Ok(Next::Call(authorize_path(
-            &self.auth,
-            &path,
-            Permission::WRITE,
-        )))
+        self.step = CreateStep::Config;
+        Ok(Next::Call(IoCall::child(GetConfigOperation::new(
+            self.auth.realm_id,
+        ))))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Automation>, AutoError> {
-        if let Some(record) = self.record.take() {
+        match std::mem::replace(&mut self.step, CreateStep::Commit) {
+            CreateStep::Config => {
+                let config = result
+                    .child::<RealmConfigDocument, GetConfigError>()?
+                    .map_err(|_| {
+                        AutoError::Unavailable("the realm feature policy cannot be read".into())
+                    })?;
+                check_feature(
+                    &config,
+                    &self.disabled_features,
+                    Feature::Automations,
+                    self.input.group_id,
+                )?;
+                if self.input.spec.uses_applets() {
+                    check_feature(
+                        &config,
+                        &self.disabled_features,
+                        Feature::Applets,
+                        self.input.group_id,
+                    )?;
+                }
+                let path =
+                    group_permission_path(self.auth.realm_id, self.input.group_id, self.local);
+                self.step = CreateStep::AuthGroup;
+                Ok(Next::Call(authorize_path(
+                    &self.auth,
+                    &path,
+                    Permission::WRITE,
+                )))
+            }
+            CreateStep::AuthGroup => {
+                if !allowed(result)? {
+                    return Err(AutoError::Forbidden);
+                }
+                if self.input.workflow_id.is_some() {
+                    let workflow_path =
+                        workflow_permission_path(self.auth.realm_id, self.input.group_id);
+                    self.step = CreateStep::AuthWorkflow;
+                    return Ok(Next::Call(authorize_path(
+                        &self.auth,
+                        &workflow_path,
+                        Permission::WRITE,
+                    )));
+                }
+                self.start_commit()
+            }
+            CreateStep::AuthWorkflow => {
+                if !allowed(result)? {
+                    return Err(AutoError::Forbidden);
+                }
+                self.start_commit()
+            }
+            CreateStep::Commit => Ok(Next::Done(result.child::<Automation, AutoError>()??)),
+        }
+    }
+
+    fn expected_error(error: &AutoError) -> bool {
+        !matches!(error, AutoError::Storage(_))
+    }
+}
+
+/// Atomically writes a new draft automation and, when linked, binds the paired workflow row.
+#[derive(Clone, Debug, PartialEq)]
+struct WriteDraftOperation {
+    record: Automation,
+    now_ms: u64,
+    writing: bool,
+}
+
+impl Operation for WriteDraftOperation {
+    type Output = Automation;
+    type Error = AutoError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+        self.record.created_at_ms = now_ms;
+        self.record.updated_at_ms = now_ms;
+    }
+
+    fn first(&mut self) -> Result<Next<Automation>, AutoError> {
+        if let Some(workflow_id) = self.record.workflow_id {
+            self.writing = false;
+            return Ok(Next::Call(read_row(
+                WORKFLOW_KEYSPACE,
+                workflow_key(workflow_id),
+            )));
+        }
+        self.writing = true;
+        Ok(Next::Call(IoCall::Write(vec![auto_row(&self.record)?])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Automation>, AutoError> {
+        if self.writing {
             result.done()?;
-            return Ok(Next::Done(record));
+            return Ok(Next::Done(self.record.clone()));
         }
-        if !allowed(result)? {
-            return Err(AutoError::Forbidden);
+        let bytes = result.value()?.ok_or(AutoError::NotFound)?;
+        let mut workflow = WorkflowRecord::from_bytes(&bytes)?;
+        if workflow.group_id != self.record.group_id {
+            return Err(AutoError::Invalid(
+                "workflow belongs to a different group".into(),
+            ));
         }
-        let record = Automation {
-            automation_id: self.ids.mint(self.now_ms),
-            group_id: self.input.group_id,
-            name: self.input.name.trim().to_string(),
-            description: self.input.description.trim().to_string(),
-            host_node: self.local,
-            lifecycle: Lifecycle::Draft,
-            pause_reason: None,
-            spec: self.input.spec.clone(),
-            pending: None,
-            account: None,
-            role_id: None,
-            approved_by: None,
-            approved_at_ms: None,
-            created_by: self.auth.user_id,
-            created_at_ms: self.now_ms,
-            updated_at_ms: self.now_ms,
-            revision: 1,
-            workflow_id: self.input.workflow_id,
-        };
-        let row = auto_row(&record)?;
-        self.record = Some(record);
-        Ok(Next::Call(IoCall::Write(vec![row])))
+        if workflow.automation_id.is_some() {
+            return Err(AutoError::Conflict(
+                "workflow is already linked to another automation".into(),
+            ));
+        }
+        workflow.automation_id = Some(self.record.automation_id);
+        workflow.updated_at_ms = self.now_ms;
+        self.writing = true;
+        Ok(Next::Call(IoCall::Write(vec![
+            auto_row(&self.record)?,
+            workflow_row(&workflow)?,
+        ])))
     }
 
     fn expected_error(error: &AutoError) -> bool {
