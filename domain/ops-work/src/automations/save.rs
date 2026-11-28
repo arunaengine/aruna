@@ -16,14 +16,13 @@ use aruna_core::structs::execution::workflow::{
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::features::Feature;
-use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::blob::group_permission_path;
-use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::document_repository::GetConfigOperation;
 
-use super::commit_bundle::{CommitBundleInput, CommitBundleOperation, map_catalog};
+use super::commit_bundle::{CommitBundleInput, CommitBundleOperation, SaveTarget, map_catalog};
 pub use super::commit_bundle::{SaveAutomation, SaveBundle, SaveWorkflow, SavedBundle};
 use super::identity::SyncIdentityOperation;
-use super::{AutoError, allowed, authorize_path, auto_answer, check_feature, read_auto};
+use super::{AutoError, allowed, authorize_path, auto_answer, check_features, read_auto};
 use crate::workflows::CatalogError;
 use crate::workflows::import::{PrepareVersionOperation, Prepared};
 
@@ -91,23 +90,22 @@ impl SaveBundleOperation {
     }
 
     fn start_commit(&mut self) -> Result<Next<SavedBundle>, AutoError> {
-        let (workflow_id, workflow_new) = match self.input.workflow.workflow_id {
-            Some(id) => (id, false),
-            None => (self.ids.mint(self.now_ms), true),
+        let workflow_target = match self.input.workflow.workflow_id {
+            Some(id) => SaveTarget::Update(id),
+            None => SaveTarget::Create(self.ids.mint(self.now_ms)),
         };
-        let (automation_id, automation_new) = match self.input.automation.automation_id {
-            Some(id) => (id, false),
-            None => (self.ids.mint(self.now_ms), true),
+        let automation_target = match self.input.automation.automation_id {
+            Some(id) => SaveTarget::Update(id),
+            None => SaveTarget::Create(self.ids.mint(self.now_ms)),
         };
+        let automation_id = automation_target.id();
         let commit = CommitBundleOperation::new(CommitBundleInput {
             group_id: self.input.group_id,
             local: self.local,
             realm_id: self.auth.realm_id,
             actor: self.auth.user_id,
-            workflow_id,
-            workflow_new,
-            automation_id,
-            automation_new,
+            workflow_target,
+            automation_target,
             workflow: self.input.workflow.clone(),
             automation: self.input.automation.clone(),
             prepared: self.prepared.take(),
@@ -164,31 +162,17 @@ impl Operation for SaveBundleOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<SavedBundle>, AutoError> {
         match std::mem::replace(&mut self.step, SaveStep::Done) {
             SaveStep::Config => {
-                let config = result
-                    .child::<RealmConfigDocument, GetConfigError>()?
-                    .map_err(|_| {
-                        AutoError::Unavailable("the realm feature policy cannot be read".into())
-                    })?;
-                check_feature(
-                    &config,
+                let features: &[Feature] = if self.input.automation.spec.uses_applets() {
+                    &[Feature::Workflows, Feature::Automations, Feature::Applets]
+                } else {
+                    &[Feature::Workflows, Feature::Automations]
+                };
+                check_features(
+                    result,
                     &self.disabled_features,
-                    Feature::Workflows,
                     self.input.group_id,
+                    features,
                 )?;
-                check_feature(
-                    &config,
-                    &self.disabled_features,
-                    Feature::Automations,
-                    self.input.group_id,
-                )?;
-                if self.input.automation.spec.uses_applets() {
-                    check_feature(
-                        &config,
-                        &self.disabled_features,
-                        Feature::Applets,
-                        self.input.group_id,
-                    )?;
-                }
                 let path =
                     group_permission_path(self.auth.realm_id, self.input.group_id, self.local);
                 self.step = SaveStep::AuthGroup;
@@ -281,14 +265,14 @@ impl Operation for SaveBundleOperation {
                     self.step = SaveStep::Sync(Box::new(saved));
                     return Ok(Next::Call(IoCall::child(sync)));
                 }
-                saved.identity_synced = true;
+                saved.identity_synced = !saved.automation.needs_identity_sync();
                 Ok(Next::Done(saved))
             }
             SaveStep::Sync(mut saved) => {
                 match result.child::<Automation, AutoError>()? {
                     Ok(updated) => {
+                        saved.identity_synced = !updated.needs_identity_sync();
                         saved.automation = updated;
-                        saved.identity_synced = true;
                     }
                     Err(_) => {
                         // The workflow and automation rows already committed; execution paths

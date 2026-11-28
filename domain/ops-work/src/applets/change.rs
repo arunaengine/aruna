@@ -3,8 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeSet;
-
 use aruna_core::applet::hosts::{HostKind, HostRow, host_key};
 use aruna_core::applet::notices::{Notice, notice_key};
 use aruna_core::applet::record::{
@@ -96,8 +94,6 @@ pub enum AppletChange {
         account: Option<UserId>,
         role_id: Option<RoleId>,
     },
-    /// Replaces the list of group automations triggered by submissions to this applet.
-    Automations(Vec<Ulid>),
 }
 
 impl AppletChange {
@@ -268,14 +264,6 @@ pub fn apply(
         AppletChange::Identity { account, role_id } => {
             applet.account = account;
             applet.role_id = role_id;
-        }
-        AppletChange::Automations(mut ids) => {
-            if applet.lifecycle == Lifecycle::TakenDown {
-                return Err(AppletError::Conflict("the applet is taken down".into()));
-            }
-            let mut seen = BTreeSet::new();
-            ids.retain(|id| seen.insert(*id));
-            applet.automations = ids;
         }
     }
     applet.revision += 1;

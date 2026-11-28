@@ -6,9 +6,9 @@
 use std::collections::BTreeSet;
 
 use aruna_core::automation::dag::{validate_scope, validate_spec};
-use aruna_core::automation::keys::{record_key, schedule_cursor_key};
+use aruna_core::automation::keys::{group_auto_key, record_key, schedule_cursor_key};
 use aruna_core::automation::record::{Automation, Lifecycle, PauseReason, PendingChange, Spec};
-use aruna_core::automation::schedule::ScheduleCursor;
+use aruna_core::automation::schedule::{CursorMode, ScheduleCursor};
 use aruna_core::automation::scope::is_widening;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
@@ -21,16 +21,16 @@ use aruna_core::structs::execution::workflow::{
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::features::Feature;
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_core::types::{GroupId, Key, KeySpace, RoleId, Value};
 use aruna_core::user::id::UserId;
-use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::document_repository::GetConfigOperation;
 use ulid::Ulid;
 
 use super::firing_reads::decode_ulid;
 use super::{
-    AutoError, active_page, allowed, authorize_path, auto_row, check_feature, plan_schedule_sync,
+    AutoError, active_page, allowed, authorize_path, auto_rows, check_features, plan_schedule_sync,
 };
 
 pub(crate) const MAX_NAME: usize = 120;
@@ -157,7 +157,7 @@ impl CreateAutoOperation {
         let commit = WriteDraftOperation {
             record,
             now_ms: self.now_ms,
-            writing: false,
+            step: DraftStep::Check,
         };
         self.step = CreateStep::Commit;
         Ok(Next::Call(IoCall::retry(commit, &automation_id.to_bytes())))
@@ -195,25 +195,17 @@ impl Operation for CreateAutoOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<Automation>, AutoError> {
         match std::mem::replace(&mut self.step, CreateStep::Commit) {
             CreateStep::Config => {
-                let config = result
-                    .child::<RealmConfigDocument, GetConfigError>()?
-                    .map_err(|_| {
-                        AutoError::Unavailable("the realm feature policy cannot be read".into())
-                    })?;
-                check_feature(
-                    &config,
+                let features: &[Feature] = if self.input.spec.uses_applets() {
+                    &[Feature::Automations, Feature::Applets]
+                } else {
+                    &[Feature::Automations]
+                };
+                check_features(
+                    result,
                     &self.disabled_features,
-                    Feature::Automations,
                     self.input.group_id,
+                    features,
                 )?;
-                if self.input.spec.uses_applets() {
-                    check_feature(
-                        &config,
-                        &self.disabled_features,
-                        Feature::Applets,
-                        self.input.group_id,
-                    )?;
-                }
                 let path =
                     group_permission_path(self.auth.realm_id, self.input.group_id, self.local);
                 self.step = CreateStep::AuthGroup;
@@ -254,12 +246,18 @@ impl Operation for CreateAutoOperation {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DraftStep {
+    Check,
+    Write,
+}
+
 /// Atomically writes a new draft automation and, when linked, binds the paired workflow row.
 #[derive(Clone, Debug, PartialEq)]
 struct WriteDraftOperation {
     record: Automation,
     now_ms: u64,
-    writing: bool,
+    step: DraftStep,
 }
 
 impl Operation for WriteDraftOperation {
@@ -278,40 +276,43 @@ impl Operation for WriteDraftOperation {
 
     fn first(&mut self) -> Result<Next<Automation>, AutoError> {
         if let Some(workflow_id) = self.record.workflow_id {
-            self.writing = false;
+            self.step = DraftStep::Check;
             return Ok(Next::Call(read_row(
                 WORKFLOW_KEYSPACE,
                 workflow_key(workflow_id),
             )));
         }
-        self.writing = true;
-        Ok(Next::Call(IoCall::Write(vec![auto_row(&self.record)?])))
+        self.step = DraftStep::Write;
+        Ok(Next::Call(IoCall::Write(auto_rows(&self.record)?)))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Automation>, AutoError> {
-        if self.writing {
-            result.done()?;
-            return Ok(Next::Done(self.record.clone()));
+        match self.step {
+            DraftStep::Write => {
+                result.done()?;
+                Ok(Next::Done(self.record.clone()))
+            }
+            DraftStep::Check => {
+                let bytes = result.value()?.ok_or(AutoError::NotFound)?;
+                let mut workflow = WorkflowRecord::from_bytes(&bytes)?;
+                if workflow.group_id != self.record.group_id {
+                    return Err(AutoError::Invalid(
+                        "workflow belongs to a different group".into(),
+                    ));
+                }
+                if workflow.automation_id.is_some() {
+                    return Err(AutoError::Conflict(
+                        "workflow is already linked to another automation".into(),
+                    ));
+                }
+                workflow.automation_id = Some(self.record.automation_id);
+                workflow.updated_at_ms = self.now_ms;
+                self.step = DraftStep::Write;
+                let mut writes = auto_rows(&self.record)?;
+                writes.push(workflow_row(&workflow)?);
+                Ok(Next::Call(IoCall::Write(writes)))
+            }
         }
-        let bytes = result.value()?.ok_or(AutoError::NotFound)?;
-        let mut workflow = WorkflowRecord::from_bytes(&bytes)?;
-        if workflow.group_id != self.record.group_id {
-            return Err(AutoError::Invalid(
-                "workflow belongs to a different group".into(),
-            ));
-        }
-        if workflow.automation_id.is_some() {
-            return Err(AutoError::Conflict(
-                "workflow is already linked to another automation".into(),
-            ));
-        }
-        workflow.automation_id = Some(self.record.automation_id);
-        workflow.updated_at_ms = self.now_ms;
-        self.writing = true;
-        Ok(Next::Call(IoCall::Write(vec![
-            auto_row(&self.record)?,
-            workflow_row(&workflow)?,
-        ])))
     }
 
     fn expected_error(error: &AutoError) -> bool {
@@ -603,7 +604,11 @@ impl WriteAutoOperation {
         cursor: Option<ScheduleCursor>,
         extra_writes: Vec<(KeySpace, Key, Value)>,
     ) -> Result<Next<Automation>, AutoError> {
-        let was_active = auto.lifecycle == Lifecycle::Active;
+        let mode = if auto.lifecycle == Lifecycle::Active {
+            CursorMode::Preserve
+        } else {
+            CursorMode::Reset
+        };
         let update_schedule = !matches!(self.change, AutoChange::Identity { .. });
         apply_change(
             &mut auto,
@@ -612,15 +617,21 @@ impl WriteAutoOperation {
             self.realm_id,
             self.now_ms,
         )?;
-        let mut writes = vec![auto_row(&auto)?];
+        let mut writes = auto_rows(&auto)?;
         writes.extend(extra_writes);
-        let deletes = if update_schedule {
-            let sync = plan_schedule_sync(&auto, cursor.as_ref(), was_active, self.now_ms)?;
+        let mut deletes = if update_schedule {
+            let sync = plan_schedule_sync(&auto, cursor.as_ref(), mode, self.now_ms)?;
             writes.extend(sync.writes);
             sync.deletes
         } else {
             Vec::new()
         };
+        if auto.lifecycle == Lifecycle::Removed {
+            deletes.push((
+                AUTOMATIONS_KEYSPACE.to_string(),
+                group_auto_key(auto.group_id, auto.automation_id),
+            ));
+        }
         self.step = WriteStep::Write {
             record: Box::new(auto),
             deletes,
