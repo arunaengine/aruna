@@ -15,7 +15,7 @@ use ulid::Ulid;
 
 use super::firing_reads::ListEventsOperation;
 use super::flow_tests::Env;
-use super::matcher::MatchEventsOperation;
+use super::matcher::{MatchCursor, MatchEventsOperation};
 use super::reads::LoadAutoOperation;
 use super::start::StartEventsOperation;
 
@@ -491,4 +491,62 @@ async fn out_of_order() {
             ..
         } if *run_id == direct_id && *aid == applet_id
     )));
+}
+
+#[tokio::test]
+async fn advances_with_cursor() {
+    use aruna_core::plugin_runs::AUTO_PENDING_ROW;
+
+    let env = Env::new().await;
+    let mut spec = env.base_spec();
+    spec.triggers = vec![Trigger::DataUploaded {
+        bucket: "raw".into(),
+        prefix: "in/".into(),
+        pattern: None,
+    }];
+    let _auto = env.create_active(spec).await;
+    let loc = (env.realm, env.group, env.node);
+    let first_event = SourceEvent::data_uploaded(
+        loc,
+        ("raw", "in/first.csv"),
+        Ulid::from_bytes([91; 16]),
+        Some(env.owner.user_id),
+        100,
+    );
+    let second_event = SourceEvent::data_uploaded(
+        loc,
+        ("raw", "in/second.csv"),
+        Ulid::from_bytes([92; 16]),
+        Some(env.owner.user_id),
+        200,
+    );
+    env.journal(&first_event).await;
+    env.journal(&second_event).await;
+
+    let (rows, _) = drive(
+        crate::plugins::journal::journal_page(AUTO_PENDING_ROW, None, 10),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+    let cursor = MatchCursor {
+        after: rows[0].0.clone(),
+        end_key: rows[1].0.clone(),
+    };
+    let resumed = drive(
+        MatchEventsOperation::new(env.realm).with_cursor(Some(cursor)),
+        &env.ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!((resumed.scanned, resumed.fired), (1, 1));
+    assert_eq!(resumed.next_cursor, None);
+
+    // Wrapping to a fresh sweep picks up the earlier pending row.
+    let wrapped = drive(MatchEventsOperation::new(env.realm), &env.ctx)
+        .await
+        .unwrap();
+    assert_eq!((wrapped.scanned, wrapped.fired), (1, 1));
+    assert_eq!(wrapped.next_cursor, None);
 }

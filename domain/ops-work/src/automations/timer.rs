@@ -129,7 +129,10 @@ impl Operation for TickTimersOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<TimerReport>, AutoError> {
         match std::mem::replace(&mut self.step, TimerStep::Config) {
             TimerStep::Config => {
-                self.config = result.child::<RealmConfigDocument, GetConfigError>()?.ok();
+                let config = result
+                    .child::<RealmConfigDocument, GetConfigError>()?
+                    .map_err(|error| AutoError::Storage(error.to_string()))?;
+                self.config = Some(config);
                 self.step = TimerStep::Index;
                 Ok(Next::Call(schedule_due_page(None)))
             }

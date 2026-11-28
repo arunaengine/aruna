@@ -11,7 +11,7 @@ use aruna_core::id::NodeId;
 use aruna_core::structs::identity::features::Feature;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_ops_work::automations::control::AckCancelsOperation;
-use aruna_ops_work::automations::matcher::MatchEventsOperation;
+use aruna_ops_work::automations::matcher::{MatchCursor, MatchEventsOperation};
 use aruna_ops_work::automations::runner::StepFiringsOperation;
 use aruna_ops_work::automations::timer::TickTimersOperation;
 use aruna_runner::driver::{DriverContext, drive};
@@ -33,12 +33,12 @@ pub fn spawn_worker(
 ) {
     let token = shutdown.token();
     shutdown.spawn(async move {
-        let mut match_cursor: Option<Vec<u8>> = None;
+        let mut match_cursor: Option<MatchCursor> = None;
         loop {
             let mut busy = false;
             let matcher = MatchEventsOperation::new(realm_id)
                 .with_disabled_features(disabled_features.clone())
-                .with_after(match_cursor.clone());
+                .with_cursor(match_cursor.clone());
             match drive(matcher, context.as_ref()).await {
                 Ok(report) => {
                     let made_progress =
