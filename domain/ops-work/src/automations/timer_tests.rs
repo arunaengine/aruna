@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeSet;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use aruna_core::automation::firing::{Firing, FiringState, SkippedFiring, TriggerPayload};
 use aruna_core::automation::keys::{active_key, kept_key, schedule_cursor_key, schedule_due_key};
@@ -34,13 +33,6 @@ use crate::automations::matcher::MatchEventsOperation;
 use crate::automations::reads::LoadAutoOperation;
 use crate::automations::start::{ManualStart, StartEventsOperation, StartManualOperation};
 use crate::automations::{AutoError, schedule_cursor_row, schedule_due_row};
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
-}
 
 fn utc_clock(ms: u64) -> ClockTime {
     let total_minutes = (ms / 60_000) % 1440;
@@ -108,6 +100,9 @@ fn steps_timer_phases() {
         zone: "UTC".into(),
     };
 
+    let automation = hourly_auto(realm, auto_id, schedule);
+    let group_bytes: aruna_core::types::Value = automation.group_id.to_bytes().to_vec().into();
+
     // 1. Future due_ms stops immediately without reading any automation record.
     let mut idle = TickTimersOperation::new(realm);
     idle.stamp(now);
@@ -120,13 +115,13 @@ fn steps_timer_phases() {
     ));
     let done = idle
         .next(IoResult::Page {
-            rows: vec![(schedule_due_key(now + 60_000, auto_id), Vec::new().into())],
+            rows: vec![(schedule_due_key(now + 60_000, auto_id), group_bytes.clone())],
             next: Some(schedule_due_key(now + 60_000, auto_id)),
         })
         .unwrap();
     assert_eq!(done, Next::Done(TimerReport::default()));
 
-    // 2. Disabled feature skips active due automation without calling Admit.
+    // 2. Disabled feature skips due automation right in index scan with zero record reads.
     let mut gated = TickTimersOperation::new(realm);
     gated.stamp(now);
     gated.first().unwrap();
@@ -135,27 +130,13 @@ fn steps_timer_phases() {
             enabled_config(realm, false),
         ))))
         .unwrap();
-    let read_auto = gated
+    let skipped_off = gated
         .next(IoResult::Page {
-            rows: vec![(schedule_due_key(now - 1_000, auto_id), Vec::new().into())],
+            rows: vec![(schedule_due_key(now - 1_000, auto_id), group_bytes.clone())],
             next: None,
         })
         .unwrap();
-    assert!(matches!(read_auto, Next::Call(IoCall::Read(_))));
-    let automation = hourly_auto(realm, auto_id, schedule.clone());
-    let skipped_off = gated
-        .next(IoResult::Values(vec![Some(
-            automation.to_bytes().unwrap().into(),
-        )]))
-        .unwrap();
-    assert_eq!(
-        skipped_off,
-        Next::Done(TimerReport {
-            checked: 1,
-            fired: 0,
-            skipped: 0,
-        })
-    );
+    assert_eq!(skipped_off, Next::Done(TimerReport::default()));
 
     // 3. Missed range followed by a live slot triggers a second Admit call on the same tick.
     let exact_hour = (now / 3_600_000) * 3_600_000;
@@ -169,19 +150,14 @@ fn steps_timer_phases() {
             enabled_config(realm, true),
         ))))
         .unwrap();
-    active
+    let first_admit = active
         .next(IoResult::Page {
             rows: vec![(
                 schedule_due_key(exact_hour - 7_200_000, auto_id),
-                Vec::new().into(),
+                group_bytes.clone(),
             )],
             next: None,
         })
-        .unwrap();
-    let first_admit = active
-        .next(IoResult::Values(vec![Some(
-            automation.to_bytes().unwrap().into(),
-        )]))
         .unwrap();
     assert!(matches!(first_admit, Next::Call(IoCall::Child(_))));
 
@@ -237,17 +213,13 @@ fn steps_timer_phases() {
             enabled_config(realm, true),
         ))))
         .unwrap();
-    conflict
+    let admit_call = conflict
         .next(IoResult::Page {
-            rows: vec![(schedule_due_key(exact_hour, auto_id), Vec::new().into())],
+            rows: vec![(schedule_due_key(exact_hour, auto_id), group_bytes)],
             next: None,
         })
         .unwrap();
-    conflict
-        .next(IoResult::Values(vec![Some(
-            automation.to_bytes().unwrap().into(),
-        )]))
-        .unwrap();
+    assert!(matches!(admit_call, Next::Call(IoCall::Child(_))));
     let handled = conflict
         .next(IoResult::Child(ChildOutcome::new(Err::<
             AdmitOutcome,
@@ -283,15 +255,15 @@ fn steps_admit_phases() {
     let mut auto = hourly_auto(realm, auto_id, schedule.clone());
     auto.spec.scope.limits.per_hour = Some(1);
 
-    // 1. Live schedule hitting per_hour limit writes a Skipped firing with Starts check & moves due row.
+    // 1. Live schedule hitting per_hour writes a Skipped firing and advances the due row.
     let cursor = ScheduleCursor {
         due_ms: exact_hour,
         anchors: vec![ScheduleAnchor {
-            schedule: schedule.clone(),
+            schedule,
             last_ms: exact_hour - 3_600_000,
         }],
     };
-    let mut capped = AdmitFiringOp::schedule(auto_id, firing_id);
+    let mut capped = AdmitFiringOp::schedule(auto_id, firing_id, tick_now);
     capped.stamp(tick_now);
     assert!(matches!(
         capped.first(),
@@ -319,7 +291,7 @@ fn steps_admit_phases() {
     // 2. Removed schedule in fresh Automation clears cursor+due rows and returns Unmatched.
     let mut removed_auto = auto.clone();
     removed_auto.spec.triggers = vec![Trigger::Manual { form_json: None }];
-    let mut stale = AdmitFiringOp::schedule(auto_id, firing_id);
+    let mut stale = AdmitFiringOp::schedule(auto_id, firing_id, tick_now);
     stale.stamp(tick_now);
     stale.first().unwrap();
     let cleanup = stale
@@ -336,33 +308,46 @@ fn steps_admit_phases() {
         Next::Done(AdmitOutcome::Unmatched)
     );
 
-    // 3. Rate window key pinning: advancing clock between first() and next() still writes initial key.
-    let mut pinned = AdmitFiringOp::manual(
+    // 3. Rate-window keys stay pinned across a tx conflict retry crossing midnight UTC.
+    let utc_midnight = 1_764_374_400_000u64;
+    let initial_template = AdmitFiringOp::manual(
         auto_id,
         firing_id,
         TriggerPayload::Manual {
             values_json: "{}".into(),
             actor: aruna_core::user::id::UserId::nil(realm),
         },
+        utc_midnight - 1_000,
     );
-    pinned.stamp(exact_hour - 1_000);
-    let Next::Call(IoCall::Read(read_keys)) = pinned.first().unwrap() else {
+    let mut attempt_one = initial_template.clone();
+    attempt_one.stamp(utc_midnight - 1_000);
+    let Next::Call(IoCall::Read(first_reads)) = attempt_one.first().unwrap() else {
         panic!("expected Read");
     };
-    let initial_hour_key = read_keys[1].1.clone();
-    pinned.stamp(exact_hour + 5_000);
+    let initial_hour_key = first_reads[1].1.clone();
+    let initial_day_key = first_reads[2].1.clone();
+
+    // Retry clones the pre-first() op and stamps after midnight UTC; keys must not change.
+    let mut attempt_two = initial_template;
+    attempt_two.stamp(utc_midnight + 1_000);
+    let Next::Call(IoCall::Read(retry_reads)) = attempt_two.first().unwrap() else {
+        panic!("expected Read");
+    };
+    assert_eq!(retry_reads[1].1, initial_hour_key);
+    assert_eq!(retry_reads[2].1, initial_day_key);
+
     let mut manual_auto = auto;
     manual_auto.spec.triggers = vec![Trigger::Manual { form_json: None }];
     manual_auto.spec.scope.limits.per_hour = Some(5);
     assert!(matches!(
-        pinned.next(IoResult::Values(vec![
+        attempt_two.next(IoResult::Values(vec![
             Some(manual_auto.to_bytes().unwrap().into()),
             None,
             None,
         ])),
         Ok(Next::Call(IoCall::Page { .. }))
     ));
-    let Next::Call(IoCall::Write(writes)) = pinned
+    let Next::Call(IoCall::Write(writes)) = attempt_two
         .next(IoResult::Page {
             rows: Vec::new(),
             next: None,
@@ -372,23 +357,24 @@ fn steps_admit_phases() {
         panic!("expected Write");
     };
     assert!(writes.iter().any(|(_, key, _)| *key == initial_hour_key));
+    assert!(writes.iter().any(|(_, key, _)| *key == initial_day_key));
 }
 
 #[tokio::test]
 async fn fires_and_skips() {
     let env = Env::new().await;
-    // Create with a placeholder schedule, then align `at` right before rewinding so slow machines
-    // never push the live slot past `LIVE_GRACE_MS`.
+    // Create with a placeholder schedule and active cap = 1 (immune to hour boundaries),
+    // then align `at` using the driver-stamped timestamp.
     let initial_schedule = ScheduleSpec {
         every: ScheduleEvery::Hours,
-        at: utc_clock(now_ms()),
+        at: ClockTime::new(0, 0).unwrap(),
         days: Vec::new(),
         hours: Some(1),
         zone: "UTC".into(),
     };
     let mut spec = env.base_spec();
-    spec.triggers = vec![Trigger::Schedule(initial_schedule.clone())];
-    spec.scope.limits.per_hour = Some(1);
+    spec.triggers = vec![Trigger::Schedule(initial_schedule)];
+    spec.scope.limits.max_active_firings = Some(1);
     let active = env.create_active(spec).await;
     let auto_id = active.automation_id;
 
@@ -407,9 +393,8 @@ async fn fires_and_skips() {
         .is_some()
     );
 
-    // Rewind the schedule cursor right at current UTC minute so one live slot is due.
-    let now = now_ms();
-    let live_slot_ms = (now / 60_000) * 60_000;
+    // Rewind the schedule cursor right at the driver-stamped UTC minute so one live slot is due.
+    let live_slot_ms = (active.updated_at_ms / 60_000) * 60_000;
     let aligned = ScheduleSpec {
         every: ScheduleEvery::Hours,
         at: utc_clock(live_slot_ms),
@@ -434,7 +419,7 @@ async fn fires_and_skips() {
     };
     let (space, key, value) = schedule_cursor_row(auto_id, &rewind).unwrap();
     env.write_row(&space, key, value).await;
-    let (due_space, due_key, due_value) = schedule_due_row(rewind.due_ms, auto_id);
+    let (due_space, due_key, due_value) = schedule_due_row(rewind.due_ms, auto_id, env.group);
     env.write_row(&due_space, due_key, due_value).await;
 
     let first = drive(TickTimersOperation::new(env.realm), &env.ctx)
@@ -449,7 +434,7 @@ async fn fires_and_skips() {
     assert_eq!((idle.checked, idle.fired, idle.skipped), (0, 0, 0));
 
     // Rewind 48.5 hours so 48 missed starts collapse into ONE summary skipped firing and the live
-    // slot is capped by per_hour = 1 as a second skipped firing in the same tick.
+    // slot is capped by max_active_firings = 1 as a second skipped firing in the same tick.
     let long_outage = ScheduleCursor {
         due_ms: live_slot_ms.saturating_sub(48 * 3_600_000),
         anchors: vec![ScheduleAnchor {
@@ -459,7 +444,7 @@ async fn fires_and_skips() {
     };
     let (space, key, value) = schedule_cursor_row(auto_id, &long_outage).unwrap();
     env.write_row(&space, key, value).await;
-    let (due_space, due_key, due_value) = schedule_due_row(long_outage.due_ms, auto_id);
+    let (due_space, due_key, due_value) = schedule_due_row(long_outage.due_ms, auto_id, env.group);
     env.write_row(&due_space, due_key, due_value).await;
 
     let missed = drive(TickTimersOperation::new(env.realm), &env.ctx)
@@ -581,7 +566,9 @@ async fn fires_and_skips() {
 #[tokio::test]
 async fn enforces_condition_guards() {
     let env = Env::new().await;
-    let now = now_ms();
+    // Seed one active record to obtain the driver's stamped timestamp without SystemTime::now().
+    let anchor = env.create_active(env.base_spec()).await;
+    let now = anchor.updated_at_ms;
     let (from, to) = outside_utc_window(now);
 
     // Manual start with failing time_of_day condition returns ManualStart::Skipped.

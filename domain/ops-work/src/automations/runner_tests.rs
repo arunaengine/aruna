@@ -656,7 +656,7 @@ async fn pinned_spec_cancel() {
     )
     .await;
     assert!(
-        matches!(capped_resume, Err(AutoError::Limited(_))),
+        matches!(capped_resume, Err(AutoError::Limited { .. })),
         "{capped_resume:?}"
     );
     assert!(

@@ -362,6 +362,7 @@ async fn out_of_order() {
                 path: "/p".into(),
                 size_bytes: Some(10),
             },
+            edited.updated_at_ms,
         ),
         &env.ctx,
     )
@@ -404,6 +405,7 @@ async fn out_of_order() {
                 outside_input: false,
                 depth: 1,
             },
+            lowered.updated_at_ms,
         ),
         &env.ctx,
     )

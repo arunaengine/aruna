@@ -578,7 +578,10 @@ async fn delete_blocked_active() {
         &env.ctx,
     )
     .await;
-    assert!(matches!(second, Err(AutoError::Limited(_))), "{second:?}");
+    assert!(
+        matches!(second, Err(AutoError::Limited { retry_after, .. }) if retry_after > 0),
+        "{second:?}"
+    );
 
     // Deletion is refused while an active firing exists.
     let blocked = drive(

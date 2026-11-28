@@ -243,7 +243,7 @@ async fn copy_stage_checks() {
     assert!(matches!(count_call, Next::Call(IoCall::Child(_))));
     let over = op2
         .next(IoResult::Child(ChildOutcome::new(Err::<(), AutoError>(
-            AutoError::Limited("cap".into()),
+            AutoError::limited("cap", 60),
         ))))
         .unwrap();
     assert!(matches!(over, Next::Call(IoCall::Delete(_))));

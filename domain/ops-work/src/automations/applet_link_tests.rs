@@ -22,7 +22,7 @@ use aruna_ops_identity::document_repository::GetConfigError;
 use aruna_runner::driver::drive;
 use ulid::Ulid;
 
-use super::{AppletLinkTarget, LinkAppletOperation};
+use super::{AppletLinkTarget, LinkAppletOperation, WriteLinkOperation};
 use crate::applets::AppletError;
 use crate::automations::AutoError;
 use crate::automations::change::AutoChange;
@@ -139,7 +139,7 @@ fn steps_link_phases() {
         Err(AutoError::FeatureOff(Feature::Automations, _))
     ));
 
-    // Enabled features advance to batch-reading target automations, then rejecting cross-group IDs.
+    // Enabled features advance to the transactional WriteLinkOperation child.
     let mut enabled_op = LinkAppletOperation::new(&auth, target, vec![auto_id], node)
         .with_disabled_features(BTreeSet::new());
     assert!(matches!(
@@ -148,7 +148,7 @@ fn steps_link_phases() {
     ));
     assert!(matches!(
         enabled_op.next(IoResult::Child(ChildOutcome::new(Ok::<_, AppletError>(
-            applet
+            applet.clone()
         )))),
         Ok(Next::Call(IoCall::Child(_)))
     ));
@@ -162,12 +162,17 @@ fn steps_link_phases() {
             },
         );
     }
-    let read_call = enabled_op
+    let write_child = enabled_op
         .next(IoResult::Child(ChildOutcome::new(Ok::<_, GetConfigError>(
             enabled_config,
         ))))
         .unwrap();
-    assert!(matches!(read_call, Next::Call(IoCall::Read(ref keys)) if keys.len() == 1));
+    assert!(matches!(write_child, Next::Call(IoCall::Child(_))));
+
+    // WriteLinkOperation reads applet + target automations in ONE write tx so stale approvals fail.
+    let mut write_tx = WriteLinkOperation::new(target, vec![auto_id], node);
+    let tx_reads = write_tx.first().unwrap();
+    assert!(matches!(tx_reads, Next::Call(IoCall::Read(ref keys)) if keys.len() == 2));
 
     let other_group = aruna_core::automation::record::Automation {
         automation_id: auto_id,
@@ -190,10 +195,275 @@ fn steps_link_phases() {
         identity_synced_revision: 0,
         workflow_id: None,
     };
-    let cross_group = enabled_op.next(IoResult::Values(vec![Some(
-        other_group.to_bytes().unwrap().into(),
-    )]));
+    let cross_group = write_tx.next(IoResult::Values(vec![
+        Some(applet.to_bytes().unwrap().into()),
+        Some(other_group.to_bytes().unwrap().into()),
+    ]));
     assert!(matches!(cross_group, Err(AutoError::Invalid(_))));
+
+    // Public applet + freshly approved wildcard automation without outside input fails in-tx.
+    let mut public_applet = applet;
+    public_applet.access = Access::Public;
+    let mut wildcard_auto = other_group;
+    wildcard_auto.group_id = group_id;
+    wildcard_auto.approved_by = Some(auth.user_id);
+    wildcard_auto
+        .spec
+        .triggers
+        .push(Trigger::AppletSubmission { applet_id: None });
+    let mut stale_tx = WriteLinkOperation::new(target, vec![auto_id], node);
+    stale_tx.first().unwrap();
+    let stale_err = stale_tx.next(IoResult::Values(vec![
+        Some(public_applet.to_bytes().unwrap().into()),
+        Some(wildcard_auto.to_bytes().unwrap().into()),
+    ]));
+    assert!(matches!(stale_err, Err(AutoError::Conflict(_))));
+}
+
+#[test]
+fn steps_gate_phases() {
+    use aruna_core::automation::firing::{Firing, TriggerPayload};
+    use aruna_core::automation::record::{Automation, Lifecycle, PendingChange};
+    use aruna_core::errors::AuthorizationError;
+
+    use crate::automations::control::{DecideStageOperation, ResumeFiringOperation};
+    use crate::automations::start::{StartEventsOperation, StartManualOperation};
+
+    let realm = aruna_core::structs::identity::realm::RealmId([6; 32]);
+    let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
+    let group_id = Ulid::from_bytes([8; 16]);
+    let auto_id = Ulid::from_bytes([10; 16]);
+    let firing_id = Ulid::from_bytes([11; 16]);
+    let event_id = Ulid::from_bytes([12; 16]);
+    let auth = aruna_core::structs::identity::auth::AuthContext::new(
+        aruna_core::user::id::UserId::local(Ulid::from_bytes([1; 16]), realm),
+        realm,
+    );
+
+    let config_for = |autos: bool, applets: bool| {
+        let mut cfg = RealmConfigDocument::default_for_realm(realm, Vec::new());
+        for (feature, on) in [(Feature::Automations, autos), (Feature::Applets, applets)] {
+            cfg.features.insert(
+                feature,
+                FeatureMode::Scoped {
+                    default: on,
+                    groups: Default::default(),
+                },
+            );
+        }
+        cfg
+    };
+
+    let mut manual_spec = aruna_core::automation::record::Spec::default();
+    manual_spec
+        .triggers
+        .push(Trigger::Manual { form_json: None });
+    let mut applet_spec = aruna_core::automation::record::Spec::default();
+    applet_spec
+        .triggers
+        .push(Trigger::AppletSubmission { applet_id: None });
+
+    let make_auto =
+        |spec: aruna_core::automation::record::Spec, pending: Option<PendingChange>| Automation {
+            automation_id: auto_id,
+            group_id,
+            name: "gated".into(),
+            description: String::new(),
+            host_node: node,
+            lifecycle: Lifecycle::Paused,
+            pause_reason: None,
+            spec,
+            pending,
+            account: None,
+            role_id: None,
+            approved_by: Some(auth.user_id),
+            approved_at_ms: Some(1),
+            created_by: auth.user_id,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            revision: 2,
+            identity_synced_revision: 2,
+            workflow_id: None,
+        };
+    let manual_auto = make_auto(manual_spec.clone(), None);
+    let firing = Firing::new(
+        firing_id,
+        auto_id,
+        group_id,
+        2,
+        &manual_spec,
+        TriggerPayload::Manual {
+            values_json: "{}".into(),
+            actor: auth.user_id,
+        },
+        10,
+    );
+
+    // 1. StartManualOperation enforces Feature::Automations inside Config step.
+    let mut manual_op = StartManualOperation::new(&auth, auto_id, node, "{}".into());
+    assert!(matches!(
+        manual_op.first(),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    assert!(matches!(
+        manual_op.next(IoResult::Child(ChildOutcome::new(Ok::<_, AutoError>(
+            manual_auto.clone()
+        )))),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    let manual_off = manual_op.next(IoResult::Child(ChildOutcome::new(Ok::<_, GetConfigError>(
+        config_for(false, true),
+    ))));
+    assert!(matches!(
+        manual_off,
+        Err(AutoError::FeatureOff(Feature::Automations, _))
+    ));
+
+    // 2. StartEventsOperation enforces Feature::Applets for applet-trigger automations.
+    let applet_auto = make_auto(applet_spec.clone(), None);
+    let mut replay_op = StartEventsOperation::new(&auth, auto_id, node, vec![event_id]);
+    replay_op.first().unwrap();
+    replay_op
+        .next(IoResult::Child(ChildOutcome::new(Ok::<_, AutoError>(
+            applet_auto,
+        ))))
+        .unwrap();
+    let replay_off = replay_op.next(IoResult::Child(ChildOutcome::new(Ok::<_, GetConfigError>(
+        config_for(true, false),
+    ))));
+    assert!(matches!(
+        replay_off,
+        Err(AutoError::FeatureOff(Feature::Applets, _))
+    ));
+
+    // 3. ResumeFiringOperation enforces Feature::Automations after write access.
+    let mut resume_op = ResumeFiringOperation::new(&auth, firing_id, node);
+    resume_op.first().unwrap();
+    resume_op
+        .next(IoResult::Child(ChildOutcome::new(Ok::<_, AutoError>((
+            firing.clone(),
+            manual_auto.clone(),
+        )))))
+        .unwrap();
+    resume_op
+        .next(IoResult::Child(ChildOutcome::new(Ok::<_, AutoError>(
+            manual_auto.clone(),
+        ))))
+        .unwrap();
+    let resume_off = resume_op.next(IoResult::Child(ChildOutcome::new(Ok::<_, GetConfigError>(
+        config_for(false, true),
+    ))));
+    assert!(matches!(
+        resume_off,
+        Err(AutoError::FeatureOff(Feature::Automations, _))
+    ));
+
+    // 4. DecideStageOperation checks Feature::Automations on approve, skips on reject.
+    let mut approve_stage =
+        DecideStageOperation::new(&auth, firing_id, "gate".into(), true, None, node);
+    approve_stage.first().unwrap();
+    approve_stage
+        .next(IoResult::Child(ChildOutcome::new(Ok::<_, AutoError>((
+            firing.clone(),
+            manual_auto.clone(),
+        )))))
+        .unwrap();
+    assert!(matches!(
+        approve_stage.next(IoResult::Child(ChildOutcome::new(Ok::<
+            _,
+            AuthorizationError,
+        >(true)))),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    let stage_off = approve_stage.next(IoResult::Child(ChildOutcome::new(
+        Ok::<_, GetConfigError>(config_for(false, true)),
+    )));
+    assert!(matches!(
+        stage_off,
+        Err(AutoError::FeatureOff(Feature::Automations, _))
+    ));
+
+    let mut reject_stage =
+        DecideStageOperation::new(&auth, firing_id, "gate".into(), false, None, node);
+    reject_stage.first().unwrap();
+    reject_stage
+        .next(IoResult::Child(ChildOutcome::new(Ok::<_, AutoError>((
+            firing,
+            manual_auto,
+        )))))
+        .unwrap();
+    // Reject skips Config and commits directly.
+    let reject_next = reject_stage
+        .next(IoResult::Child(ChildOutcome::new(Ok::<
+            _,
+            AuthorizationError,
+        >(true))))
+        .unwrap();
+    assert!(matches!(reject_next, Next::Call(IoCall::Child(_))));
+
+    // 5. ChangeAutoOperation::Resume checks auto.spec, while Approve checks pending.spec.
+    let pending_applet = PendingChange {
+        spec: applet_spec.clone(),
+        requested_by: auth.user_id,
+        requested_at_ms: 2,
+    };
+    let manual_with_pending = make_auto(manual_spec.clone(), Some(pending_applet));
+    let mut resume_manual =
+        ChangeAutoOperation::new(&auth, (auto_id, None), AutoChange::Resume, node);
+    resume_manual.first().unwrap();
+    resume_manual
+        .next(IoResult::Child(ChildOutcome::new(Ok::<_, AutoError>(
+            manual_with_pending.clone(),
+        ))))
+        .unwrap();
+    // Applets off: Resume still proceeds because active auto.spec is manual-only.
+    let resume_allowed =
+        resume_manual.next(IoResult::Child(ChildOutcome::new(Ok::<_, GetConfigError>(
+            config_for(true, false),
+        ))));
+    assert!(matches!(resume_allowed, Ok(Next::Call(IoCall::Child(_)))));
+
+    // Applets off: Approve is refused because pending.spec uses applets.
+    let mut approve_pending =
+        ChangeAutoOperation::new(&auth, (auto_id, None), AutoChange::Approve, node);
+    approve_pending.first().unwrap();
+    approve_pending
+        .next(IoResult::Child(ChildOutcome::new(Ok::<_, AutoError>(
+            manual_with_pending,
+        ))))
+        .unwrap();
+    let approve_refused =
+        approve_pending.next(IoResult::Child(ChildOutcome::new(Ok::<_, GetConfigError>(
+            config_for(true, false),
+        ))));
+    assert!(matches!(
+        approve_refused,
+        Err(AutoError::FeatureOff(Feature::Applets, _))
+    ));
+
+    // Applets off: Resume on approved applet spec with pending manual spec is refused.
+    let pending_manual = PendingChange {
+        spec: manual_spec,
+        requested_by: auth.user_id,
+        requested_at_ms: 2,
+    };
+    let applet_with_pending = make_auto(applet_spec, Some(pending_manual));
+    let mut resume_applet =
+        ChangeAutoOperation::new(&auth, (auto_id, None), AutoChange::Resume, node);
+    resume_applet.first().unwrap();
+    resume_applet
+        .next(IoResult::Child(ChildOutcome::new(Ok::<_, AutoError>(
+            applet_with_pending,
+        ))))
+        .unwrap();
+    let resume_refused =
+        resume_applet.next(IoResult::Child(ChildOutcome::new(Ok::<_, GetConfigError>(
+            config_for(true, false),
+        ))));
+    assert!(matches!(
+        resume_refused,
+        Err(AutoError::FeatureOff(Feature::Applets, _))
+    ));
 }
 
 #[tokio::test]
@@ -316,7 +586,7 @@ async fn guards_wildcard_applets() {
         .unwrap();
     assert_eq!((blocked_run.fired, blocked_run.skipped), (0, 1));
 
-    // Approving `allow_outside_input = true` requires admin approval (widening), then allows link+fire.
+    // Approving `allow_outside_input = true` requires admin approval, then allows link and fire.
     let mut outside_spec = spec;
     outside_spec.scope.allow_outside_input = true;
     let pending = drive(
